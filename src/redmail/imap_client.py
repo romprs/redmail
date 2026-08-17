@@ -22,7 +22,9 @@ class MessageSummary:
     uid: int
     subject: str
     sender: str
+    sender_email: str
     date: str
+    message_id: str
 
 
 def list_folders(account: Account) -> list[str]:
@@ -78,11 +80,15 @@ def _decode_payload(part: Message) -> str:
 
 
 def _to_summary(uid: int, envelope) -> MessageSummary:
+    sender_display, sender_email = _format_address(envelope.from_)
+    message_id = envelope.message_id
     return MessageSummary(
         uid=uid,
         subject=_decode_subject(envelope.subject),
-        sender=_format_address(envelope.from_),
+        sender=sender_display,
+        sender_email=sender_email,
         date=envelope.date.strftime("%Y-%m-%d %H:%M") if envelope.date else "",
+        message_id=message_id.decode("ascii", errors="replace") if message_id else "",
     )
 
 
@@ -102,12 +108,14 @@ def _decode_rfc2047(raw: bytes) -> str:
     )
 
 
-def _format_address(addresses) -> str:
+def _format_address(addresses) -> tuple[str, str]:
+    """Возвращает (отображаемое имя, email-адрес) первого адреса в списке."""
     if not addresses:
-        return "(неизвестно)"
+        return "(неизвестно)", ""
     address = addresses[0]
-    if address.name:
-        return _decode_rfc2047(address.name)
     mailbox = address.mailbox.decode("utf-8", errors="replace") if address.mailbox else ""
     host = address.host.decode("utf-8", errors="replace") if address.host else ""
-    return f"{mailbox}@{host}" if mailbox and host else mailbox or "(неизвестно)"
+    email = f"{mailbox}@{host}" if mailbox and host else mailbox
+    if address.name:
+        return _decode_rfc2047(address.name), email
+    return (email or "(неизвестно)"), email

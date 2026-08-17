@@ -23,6 +23,7 @@ def test_fetch_folder_summaries_parses_envelope() -> None:
         subject=encoded_subject,
         from_=[_address(b"Ivan Petrov", b"ivan", b"example.com")],
         date=datetime(2026, 8, 17, 10, 30),
+        message_id=b"<abc123@example.com>",
     )
 
     fake_client = MagicMock()
@@ -39,7 +40,9 @@ def test_fetch_folder_summaries_parses_envelope() -> None:
     assert summary.uid == 3
     assert summary.subject == "Привет из РЕД ОС"
     assert summary.sender == "Ivan Petrov"
+    assert summary.sender_email == "ivan@example.com"
     assert summary.date == "2026-08-17 10:30"
+    assert summary.message_id == "<abc123@example.com>"
     fake_client.login.assert_called_once_with("ivan", "secret")
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
 
@@ -80,6 +83,7 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
         subject=None,
         from_=[_address(encoded_name, b"noreply", b"avito.ru")],
         date=None,
+        message_id=None,
     )
     fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope}}
 
@@ -88,6 +92,7 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
         summaries = fetch_folder_summaries(account)
 
     assert summaries[0].sender == "Авито"
+    assert summaries[0].sender_email == "noreply@avito.ru"
 
 
 def test_format_address_without_display_name() -> None:
@@ -98,6 +103,7 @@ def test_format_address_without_display_name() -> None:
         subject=None,
         from_=[_address(None, b"ivan", b"example.com")],
         date=None,
+        message_id=None,
     )
     fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope}}
 
@@ -106,8 +112,10 @@ def test_format_address_without_display_name() -> None:
         summaries = fetch_folder_summaries(account)
 
     assert summaries[0].sender == "ivan@example.com"
+    assert summaries[0].sender_email == "ivan@example.com"
     assert summaries[0].subject == "(без темы)"
     assert summaries[0].date == ""
+    assert summaries[0].message_id == ""
 
 
 def test_list_folders_returns_names() -> None:
