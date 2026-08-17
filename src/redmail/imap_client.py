@@ -27,30 +27,58 @@ class MessageSummary:
     message_id: str
 
 
-def list_folders(account: Account) -> list[str]:
-    with IMAPClient(account.host, port=account.port, ssl=account.use_ssl) as client:
-        client.login(account.username, account.password)
-        return [name for _flags, _delimiter, name in client.list_folders()]
+class ImapSession:
+    """Одно живое IMAP-соединение на всё время работы с ящиком.
 
+    Открывать новое соединение (TCP + TLS + логин) на каждый клик по папке
+    или письму — секунды задержки на медленной сети. Здесь соединение
+    держится, пока пользователь не переподключится или не закроет окно.
+    """
 
-def fetch_folder_summaries(account: Account, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
-    with IMAPClient(account.host, port=account.port, ssl=account.use_ssl) as client:
-        client.login(account.username, account.password)
-        client.select_folder(folder, readonly=True)
-        uids = sorted(client.search(["ALL"]))[-limit:]
+    def __init__(self, account: Account):
+        self.account = account
+        self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
+        self._client.login(account.username, account.password)
+        self._selected_folder: str | None = None
+
+    def close(self) -> None:
+        try:
+            self._client.logout()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "ImapSession":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def list_folders(self) -> list[str]:
+        return [
+            name
+            for flags, _delimiter, name in self._client.list_folders()
+            if b"\\Noselect" not in flags
+        ]
+
+    def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
+        self._select(folder)
+        uids = sorted(self._client.search(["ALL"]))[-limit:]
         if not uids:
             return []
-        response = client.fetch(uids, ["ENVELOPE"])
+        response = self._client.fetch(uids, ["ENVELOPE"])
         return [_to_summary(uid, response[uid][b"ENVELOPE"]) for uid in reversed(uids)]
 
-
-def fetch_message_body(account: Account, folder: str, uid: int) -> str:
-    with IMAPClient(account.host, port=account.port, ssl=account.use_ssl) as client:
-        client.login(account.username, account.password)
-        client.select_folder(folder, readonly=True)
-        response = client.fetch([uid], ["BODY.PEEK[]"])
+    def fetch_message_body(self, folder: str, uid: int) -> str:
+        self._select(folder)
+        response = self._client.fetch([uid], ["BODY.PEEK[]"])
         raw = response[uid][b"BODY[]"]
         return _extract_text(message_from_bytes(raw))
+
+    def _select(self, folder: str) -> None:
+        # Папка уже открыта этой же сессией — второй SELECT только теряет время.
+        if self._selected_folder != folder:
+            self._client.select_folder(folder, readonly=True)
+            self._selected_folder = folder
 
 
 def _extract_text(message: Message) -> str:

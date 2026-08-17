@@ -24,13 +24,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from redmail.imap_client import (
-    Account,
-    MessageSummary,
-    fetch_folder_summaries,
-    fetch_message_body,
-    list_folders,
-)
+from redmail.imap_client import Account, ImapSession, MessageSummary
 from redmail.smtp_client import OutgoingMessage, SmtpAccount, send_message
 
 
@@ -154,6 +148,7 @@ class MainWindow(QMainWindow):
         self.resize(1100, 640)
 
         self.account: Account | None = None
+        self.session: ImapSession | None = None
         self.smtp_account: SmtpAccount | None = None
         self.current_folder: str | None = None
         self.current_summaries: list[MessageSummary] = []
@@ -218,12 +213,17 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            folders = list_folders(account)
+            session = ImapSession(account)
+            folders = session.list_folders()
         except Exception as exc:  # показываем пользователю любую ошибку подключения как есть
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
             return
 
+        if self.session:
+            self.session.close()
+
         self.account = account
+        self.session = session
         smtp_account = dialog.smtp_account()
         self.smtp_account = smtp_account if smtp_account.host else None
 
@@ -236,13 +236,13 @@ class MainWindow(QMainWindow):
             self.folder_list.setCurrentRow(default_row)
 
     def on_folder_selected(self, folder: str) -> None:
-        if not self.account or not folder:
+        if not self.session or not folder:
             return
         self.current_folder = folder
         self.reading_pane.clear()
         self.selected_summary = None
         try:
-            summaries = fetch_folder_summaries(self.account, folder)
+            summaries = self.session.fetch_folder_summaries(folder)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
@@ -258,13 +258,13 @@ class MainWindow(QMainWindow):
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
-        if not rows or not self.account or not self.current_folder:
+        if not rows or not self.session or not self.current_folder:
             return
         row = rows[0].row()
         summary = self.current_summaries[row]
         self.selected_summary = summary
         try:
-            body = fetch_message_body(self.account, self.current_folder, summary.uid)
+            body = self.session.fetch_message_body(self.current_folder, summary.uid)
         except Exception as exc:
             self.current_body = ""
             self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {exc}")
@@ -327,3 +327,8 @@ class MainWindow(QMainWindow):
             return
 
         self.statusBar().showMessage(f"Письмо отправлено: {', '.join(recipients)}", 5000)
+
+    def closeEvent(self, event) -> None:
+        if self.session:
+            self.session.close()
+        super().closeEvent(event)
