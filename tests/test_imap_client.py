@@ -58,7 +58,7 @@ def test_fetch_message_body_skips_reselect_of_same_folder() -> None:
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         session = ImapSession(_account())
         session.fetch_folder_summaries("INBOX")
-        session.fetch_message_body("INBOX", 5)
+        session.fetch_message_content("INBOX", 5)
 
     assert fake_client.select_folder.call_count == 1
 
@@ -188,7 +188,7 @@ def test_format_address_without_display_name() -> None:
     assert summaries[0].message_id == ""
 
 
-def test_fetch_message_body_plain_text() -> None:
+def test_fetch_message_content_plain_text() -> None:
     fake_client = _client()
     raw = (
         b"From: ivan@example.com\r\n"
@@ -200,13 +200,14 @@ def test_fetch_message_body_plain_text() -> None:
     fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
-        body = ImapSession(_account()).fetch_message_body("INBOX", 5)
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
 
-    assert body == "Привет!"
+    assert content.text == "Привет!"
+    assert content.attachments == []
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
 
 
-def test_fetch_message_body_html_only_shows_placeholder() -> None:
+def test_fetch_message_content_html_only_shows_placeholder() -> None:
     fake_client = _client()
     raw = (
         b"From: ivan@example.com\r\n"
@@ -217,9 +218,33 @@ def test_fetch_message_body_html_only_shows_placeholder() -> None:
     fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
-        body = ImapSession(_account()).fetch_message_body("INBOX", 5)
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
 
-    assert "HTML" in body
+    assert "HTML" in content.text
+
+
+def test_fetch_message_content_extracts_attachment() -> None:
+    from email.message import EmailMessage
+
+    built = EmailMessage()
+    built["From"] = "ivan@example.com"
+    built["Subject"] = "With attachment"
+    built.set_content("Смотри файл во вложении.")
+    built.add_attachment(b"file-bytes-here", maintype="text", subtype="plain", filename="notes.txt")
+    raw = built.as_bytes()
+
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert content.text.strip() == "Смотри файл во вложении."
+    assert len(content.attachments) == 1
+    attachment = content.attachments[0]
+    assert attachment.filename == "notes.txt"
+    assert attachment.payload == b"file-bytes-here"
+    assert attachment.size == len(b"file-bytes-here")
 
 
 def test_close_logs_out() -> None:

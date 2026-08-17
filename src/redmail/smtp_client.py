@@ -15,6 +15,13 @@ class SmtpAccount:
 
 
 @dataclass
+class OutgoingAttachment:
+    filename: str
+    content_type: str
+    payload: bytes
+
+
+@dataclass
 class OutgoingMessage:
     sender: str
     to: list[str]
@@ -22,6 +29,7 @@ class OutgoingMessage:
     body: str
     in_reply_to: str | None = None
     references: list[str] = field(default_factory=list)
+    attachments: list[OutgoingAttachment] = field(default_factory=list)
 
 
 def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
@@ -33,6 +41,15 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
         email_message["In-Reply-To"] = message.in_reply_to
         email_message["References"] = " ".join([*message.references, message.in_reply_to])
     email_message.set_content(message.body)
+
+    for attachment in message.attachments:
+        maintype, _, subtype = attachment.content_type.partition("/")
+        email_message.add_attachment(
+            attachment.payload,
+            maintype=maintype or "application",
+            subtype=subtype or "octet-stream",
+            filename=attachment.filename,
+        )
 
     smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
     with smtp_cls(account.host, account.port, timeout=30) as client:

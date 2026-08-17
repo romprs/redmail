@@ -1,24 +1,19 @@
 from __future__ import annotations
 
 import json
-import os
-import sys
 from pathlib import Path
 
 import keyring
 
 from redmail.imap_client import Account
+from redmail.paths import app_dir
 from redmail.smtp_client import SmtpAccount
 
 _KEYRING_SERVICE = "redmail"
 
 
 def _config_path() -> Path:
-    if sys.platform == "win32":
-        base = Path(os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming")))
-    else:
-        base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
-    return base / "redmail" / "account.json"
+    return app_dir() / "account.json"
 
 
 def save_account(account: Account, smtp: SmtpAccount | None) -> None:

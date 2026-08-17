@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from redmail.smtp_client import OutgoingMessage, SmtpAccount, send_message
+from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
 
 
 def test_send_message_starttls_flow() -> None:
@@ -83,3 +83,27 @@ def test_send_message_multiple_recipients() -> None:
 
     sent = fake_client.send_message.call_args[0][0]
     assert sent["To"] == "a@example.com, b@example.com"
+
+
+def test_send_message_with_attachment() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(
+            sender="ivan@example.com",
+            to=["boss@example.com"],
+            subject="Отчёт",
+            body="Во вложении отчёт.",
+            attachments=[
+                OutgoingAttachment(filename="report.txt", content_type="text/plain", payload=b"data-inside")
+            ],
+        )
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    attachments = [part for part in sent.iter_attachments()]
+    assert len(attachments) == 1
+    assert attachments[0].get_filename() == "report.txt"
+    assert attachments[0].get_payload(decode=True) == b"data-inside"

@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import mimetypes
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
+    QHBoxLayout,
     QHeaderView,
     QLineEdit,
     QListWidget,
@@ -15,6 +20,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QPushButton,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -22,11 +28,21 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QToolBar,
     QVBoxLayout,
+    QWidget,
 )
 
 from redmail.config_store import load_account, save_account
-from redmail.imap_client import Account, ImapSession, MessageSummary
-from redmail.smtp_client import OutgoingMessage, SmtpAccount, send_message
+from redmail.imap_client import Account, Attachment, ImapSession, MessageSummary
+from redmail.mailbox import CachedMailbox
+from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+
+
+def _format_size(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} Б"
+    if num_bytes < 1024 * 1024:
+        return f"{num_bytes / 1024:.0f} КБ"
+    return f"{num_bytes / (1024 * 1024):.1f} МБ"
 
 
 class AccountDialog(QDialog):
@@ -109,7 +125,8 @@ class ComposeDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 420)
+        self.resize(560, 460)
+        self.attachments: list[OutgoingAttachment] = []
 
         self.to_edit = QLineEdit(to)
         self.to_edit.setPlaceholderText("Через запятую, если получателей несколько")
@@ -119,6 +136,19 @@ class ComposeDialog(QDialog):
         form = QFormLayout()
         form.addRow("Кому", self.to_edit)
         form.addRow("Тема", self.subject_edit)
+
+        self.attachments_list = QListWidget()
+        self.attachments_list.setMaximumHeight(70)
+
+        attach_button = QPushButton("Прикрепить файл…")
+        attach_button.clicked.connect(self._on_attach)
+        remove_button = QPushButton("Убрать")
+        remove_button.clicked.connect(self._on_remove_attachment)
+
+        attach_row = QHBoxLayout()
+        attach_row.addWidget(attach_button)
+        attach_row.addWidget(remove_button)
+        attach_row.addStretch(1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -130,8 +160,30 @@ class ComposeDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        layout.addLayout(attach_row)
+        layout.addWidget(self.attachments_list)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
+
+    def _on_attach(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
+        for path in paths:
+            data = Path(path).read_bytes()
+            content_type, _ = mimetypes.guess_type(path)
+            attachment = OutgoingAttachment(
+                filename=Path(path).name,
+                content_type=content_type or "application/octet-stream",
+                payload=data,
+            )
+            self.attachments.append(attachment)
+            self.attachments_list.addItem(f"{attachment.filename} ({_format_size(len(data))})")
+
+    def _on_remove_attachment(self) -> None:
+        row = self.attachments_list.currentRow()
+        if row < 0:
+            return
+        self.attachments_list.takeItem(row)
+        del self.attachments[row]
 
     def recipients(self) -> list[str]:
         return [addr.strip() for addr in self.to_edit.text().split(",") if addr.strip()]
@@ -150,11 +202,12 @@ class MainWindow(QMainWindow):
         self.resize(1100, 640)
 
         self.account: Account | None = None
-        self.session: ImapSession | None = None
+        self.mailbox: CachedMailbox | None = None
         self.smtp_account: SmtpAccount | None = None
         self.current_folder: str | None = None
         self.current_summaries: list[MessageSummary] = []
         self.current_body: str = ""
+        self.current_attachments: list[Attachment] = []
         self.selected_summary: MessageSummary | None = None
 
         self.folder_list = QListWidget(self)
@@ -167,13 +220,24 @@ class MainWindow(QMainWindow):
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.itemSelectionChanged.connect(self.on_message_selected)
 
+        self.attachments_list = QListWidget(self)
+        self.attachments_list.setMaximumHeight(70)
+        self.attachments_list.itemDoubleClicked.connect(self.on_save_attachment)
+        self.attachments_list.hide()
+
         self.reading_pane = QPlainTextEdit(self)
         self.reading_pane.setReadOnly(True)
         self.reading_pane.setPlaceholderText("Выберите письмо, чтобы увидеть текст")
 
+        reading_container = QWidget(self)
+        reading_layout = QVBoxLayout(reading_container)
+        reading_layout.setContentsMargins(0, 0, 0, 0)
+        reading_layout.addWidget(self.attachments_list)
+        reading_layout.addWidget(self.reading_pane)
+
         right_splitter = QSplitter(Qt.Orientation.Vertical, self)
         right_splitter.addWidget(self.table)
-        right_splitter.addWidget(self.reading_pane)
+        right_splitter.addWidget(reading_container)
         right_splitter.setStretchFactor(0, 2)
         right_splitter.setStretchFactor(1, 1)
 
@@ -234,11 +298,11 @@ class MainWindow(QMainWindow):
         session: ImapSession,
         folders: list[str],
     ) -> None:
-        if self.session:
-            self.session.close()
+        if self.mailbox:
+            self.mailbox.close()
 
         self.account = account
-        self.session = session
+        self.mailbox = CachedMailbox(session, account)
         self.smtp_account = smtp_account
 
         self.folder_list.clear()
@@ -285,13 +349,16 @@ class MainWindow(QMainWindow):
             )
 
     def on_folder_selected(self, folder: str) -> None:
-        if not self.session or not folder:
+        if not self.mailbox or not folder:
             return
         self.current_folder = folder
         self.reading_pane.clear()
         self.selected_summary = None
+        self.current_attachments = []
+        self.attachments_list.clear()
+        self.attachments_list.hide()
         try:
-            summaries = self.session.fetch_folder_summaries(folder)
+            summaries = self.mailbox.folder_summaries(folder)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
@@ -307,19 +374,46 @@ class MainWindow(QMainWindow):
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
-        if not rows or not self.session or not self.current_folder:
+        if not rows or not self.mailbox or not self.current_folder:
             return
         row = rows[0].row()
         summary = self.current_summaries[row]
         self.selected_summary = summary
         try:
-            body = self.session.fetch_message_body(self.current_folder, summary.uid)
+            content = self.mailbox.message_content(self.current_folder, summary.uid)
         except Exception as exc:
             self.current_body = ""
+            self.current_attachments = []
             self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {exc}")
+            self.attachments_list.clear()
+            self.attachments_list.hide()
             return
-        self.current_body = body
-        self.reading_pane.setPlainText(body)
+        self.current_body = content.text
+        self.current_attachments = content.attachments
+        self.reading_pane.setPlainText(content.text)
+        self._refresh_attachments_list()
+
+    def _refresh_attachments_list(self) -> None:
+        self.attachments_list.clear()
+        if not self.current_attachments:
+            self.attachments_list.hide()
+            return
+        for attachment in self.current_attachments:
+            self.attachments_list.addItem(f"Вложение: {attachment.filename} ({_format_size(attachment.size)})")
+        self.attachments_list.show()
+
+    def on_save_attachment(self, item: QListWidgetItem) -> None:
+        index = self.attachments_list.row(item)
+        attachment = self.current_attachments[index]
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", attachment.filename)
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось сохранить", str(exc))
+            return
+        self.statusBar().showMessage(f"Сохранено: {path}", 5000)
 
     def on_compose(self) -> None:
         if not self.smtp_account:
@@ -368,6 +462,7 @@ class MainWindow(QMainWindow):
             subject=dialog.subject(),
             body=dialog.body(),
             in_reply_to=in_reply_to,
+            attachments=dialog.attachments,
         )
         try:
             send_message(self.smtp_account, message)
@@ -378,6 +473,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Письмо отправлено: {', '.join(recipients)}", 5000)
 
     def closeEvent(self, event) -> None:
-        if self.session:
-            self.session.close()
+        if self.mailbox:
+            self.mailbox.close()
         super().closeEvent(event)

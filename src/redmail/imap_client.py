@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header
 from email.message import Message
@@ -27,6 +27,23 @@ class MessageSummary:
     message_id: str
 
 
+@dataclass
+class Attachment:
+    filename: str
+    content_type: str
+    payload: bytes
+
+    @property
+    def size(self) -> int:
+        return len(self.payload)
+
+
+@dataclass
+class MessageContent:
+    text: str
+    attachments: list[Attachment] = field(default_factory=list)
+
+
 class ImapSession:
     """Одно живое IMAP-соединение на всё время работы с ящиком.
 
@@ -40,6 +57,7 @@ class ImapSession:
         self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
         self._client.login(account.username, account.password)
         self._selected_folder: str | None = None
+        self._selected_exists = 0
 
     def close(self) -> None:
         try:
@@ -60,15 +78,25 @@ class ImapSession:
             if b"\\Noselect" not in flags
         ]
 
-    def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
-        # Всегда переселектим (не полагаемся на _select с его пропуском повтора):
-        # EXISTS должен быть свежим, иначе не заметим письма, пришедшие после
-        # прошлого захода в эту же папку. Само SELECT — та же цена, что раньше
-        # платили за отдельный SEARCH ALL, но так мы совсем убираем этот SEARCH:
-        # диапазон последних `limit` писем считаем по EXISTS, без лишнего запроса.
+    def folder_message_count(self, folder: str) -> int:
+        """SELECT папку, вернуть общее число писем в ней (EXISTS).
+
+        Дешёвая операция (без сканирования, в отличие от SEARCH) — на ней
+        удобно проверять, изменилось ли что-то в папке с прошлого раза,
+        прежде чем платить за полный FETCH сводок (см. CachedMailbox).
+        """
         status = self._client.select_folder(folder, readonly=True)
         self._selected_folder = folder
-        total = status[b"EXISTS"]
+        self._selected_exists = status[b"EXISTS"]
+        return self._selected_exists
+
+    def fetch_summaries(self, limit: int = 50) -> list[MessageSummary]:
+        """Сводки последних `limit` писем уже выбранной папки.
+
+        Требует, чтобы перед этим была вызвана folder_message_count —
+        отдельного SELECT здесь больше нет.
+        """
+        total = self._selected_exists
         if total == 0:
             return []
         start = max(1, total - limit + 1)
@@ -85,11 +113,15 @@ class ImapSession:
         by_seq = sorted(response.items(), key=lambda item: item[0], reverse=True)
         return [_to_summary(data[b"UID"], data[b"ENVELOPE"]) for _seq, data in by_seq]
 
-    def fetch_message_body(self, folder: str, uid: int) -> str:
+    def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
+        self.folder_message_count(folder)
+        return self.fetch_summaries(limit)
+
+    def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
         self._select(folder)
         response = self._client.fetch([uid], ["BODY.PEEK[]"])
         raw = response[uid][b"BODY[]"]
-        return _extract_text(message_from_bytes(raw))
+        return _extract_content(message_from_bytes(raw))
 
     def _select(self, folder: str) -> None:
         # Папка уже открыта этой же сессией — второй SELECT только теряет время.
@@ -98,24 +130,42 @@ class ImapSession:
             self._selected_folder = folder
 
 
-def _extract_text(message: Message) -> str:
-    if message.is_multipart():
-        plain_part = next(
-            (part for part in message.walk() if part.get_content_type() == "text/plain"),
-            None,
-        )
-        if plain_part is not None:
-            return _decode_payload(plain_part)
-        html_part = next(
-            (part for part in message.walk() if part.get_content_type() == "text/html"),
-            None,
-        )
-        if html_part is not None:
-            return "(письмо в формате HTML — предпросмотр текста недоступен)"
-        return "(нет текстового содержимого)"
-    if message.get_content_type() == "text/plain":
-        return _decode_payload(message)
-    return "(письмо в формате HTML — предпросмотр текста недоступен)"
+def _extract_content(message: Message) -> MessageContent:
+    if not message.is_multipart():
+        if message.get_content_type() == "text/plain":
+            return MessageContent(text=_decode_payload(message))
+        return MessageContent(text="(письмо в формате HTML — предпросмотр текста недоступен)")
+
+    text: str | None = None
+    html_seen = False
+    attachments: list[Attachment] = []
+
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+
+        filename = part.get_filename()
+        is_attachment = bool(filename) or part.get_content_disposition() == "attachment"
+        if is_attachment:
+            attachments.append(
+                Attachment(
+                    filename=filename or "(без имени)",
+                    content_type=part.get_content_type(),
+                    payload=part.get_payload(decode=True) or b"",
+                )
+            )
+            continue
+
+        content_type = part.get_content_type()
+        if content_type == "text/plain" and text is None:
+            text = _decode_payload(part)
+        elif content_type == "text/html":
+            html_seen = True
+
+    if text is None:
+        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html_seen else "(нет текстового содержимого)"
+
+    return MessageContent(text=text, attachments=attachments)
 
 
 def _decode_payload(part: Message) -> str:
