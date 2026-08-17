@@ -16,9 +16,15 @@ def _account() -> Account:
     return Account(host="imap.example.com", username="ivan", password="secret")
 
 
+def _client(exists: int = 0) -> MagicMock:
+    client = MagicMock()
+    client.use_uid = True
+    client.select_folder.return_value = {b"EXISTS": exists}
+    return client
+
+
 def test_session_logs_in_once_on_construction() -> None:
-    fake_client = MagicMock()
-    fake_client.search.return_value = []
+    fake_client = _client(exists=0)
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         session = ImapSession(_account())
@@ -29,19 +35,32 @@ def test_session_logs_in_once_on_construction() -> None:
     fake_client.login.assert_called_once_with("ivan", "secret")
 
 
-def test_session_skips_reselect_of_same_folder() -> None:
-    fake_client = MagicMock()
-    fake_client.search.return_value = []
+def test_fetch_folder_summaries_always_reselects_for_fresh_exists() -> None:
+    # Намеренно НЕ пропускаем повторный SELECT для той же папки: иначе, раз мы
+    # больше не делаем отдельный SEARCH ALL, можно не заметить письма, пришедшие
+    # после прошлого захода в эту же папку.
+    fake_client = _client(exists=0)
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         session = ImapSession(_account())
         session.fetch_folder_summaries("INBOX")
         session.fetch_folder_summaries("INBOX")
-        session.fetch_folder_summaries("Archive")
 
     assert fake_client.select_folder.call_count == 2
-    fake_client.select_folder.assert_any_call("INBOX", readonly=True)
-    fake_client.select_folder.assert_any_call("Archive", readonly=True)
+
+
+def test_fetch_message_body_skips_reselect_of_same_folder() -> None:
+    fake_client = _client(exists=0)
+    fake_client.fetch.return_value = {
+        5: {b"BODY[]": b"From: a@example.com\r\nContent-Type: text/plain\r\n\r\nhi"}
+    }
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.fetch_folder_summaries("INBOX")
+        session.fetch_message_body("INBOX", 5)
+
+    assert fake_client.select_folder.call_count == 1
 
 
 def test_list_folders_excludes_noselect_folders() -> None:
@@ -70,27 +89,48 @@ def test_fetch_folder_summaries_parses_envelope() -> None:
         message_id=b"<abc123@example.com>",
     )
 
-    fake_client = MagicMock()
-    fake_client.search.return_value = [1, 2, 3]
-    fake_client.fetch.return_value = {3: {b"ENVELOPE": envelope}}
+    fake_client = _client(exists=3)
+    fake_client.fetch.return_value = {3: {b"ENVELOPE": envelope, b"UID": 42}}
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         summaries = ImapSession(_account()).fetch_folder_summaries(limit=1)
 
     assert len(summaries) == 1
     summary = summaries[0]
-    assert summary.uid == 3
+    assert summary.uid == 42
     assert summary.subject == "Привет из РЕД ОС"
     assert summary.sender == "Ivan Petrov"
     assert summary.sender_email == "ivan@example.com"
     assert summary.date == "2026-08-17 10:30"
     assert summary.message_id == "<abc123@example.com>"
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
+    # 3 письма в папке, лимит 1 — просим только последнее по номеру, без SEARCH.
+    fake_client.fetch.assert_called_once_with("3:*", ["ENVELOPE", "UID"])
+    # Временный sequence-режим не должен просочиться в следующие вызовы.
+    assert fake_client.use_uid is True
+
+
+def test_fetch_folder_summaries_orders_newest_first() -> None:
+    def envelope(subject: bytes) -> SimpleNamespace:
+        return SimpleNamespace(
+            subject=subject, from_=[_address(None, b"a", b"example.com")], date=None, message_id=None
+        )
+
+    fake_client = _client(exists=5)
+    fake_client.fetch.return_value = {
+        4: {b"ENVELOPE": envelope(b"older"), b"UID": 104},
+        5: {b"ENVELOPE": envelope(b"newer"), b"UID": 105},
+    }
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summaries = ImapSession(_account()).fetch_folder_summaries(limit=2)
+
+    assert [s.uid for s in summaries] == [105, 104]
+    fake_client.fetch.assert_called_once_with("4:*", ["ENVELOPE", "UID"])
 
 
 def test_fetch_folder_summaries_uses_requested_folder() -> None:
-    fake_client = MagicMock()
-    fake_client.search.return_value = []
+    fake_client = _client(exists=0)
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         ImapSession(_account()).fetch_folder_summaries(folder="Archive")
@@ -99,8 +139,7 @@ def test_fetch_folder_summaries_uses_requested_folder() -> None:
 
 
 def test_fetch_folder_summaries_empty_mailbox() -> None:
-    fake_client = MagicMock()
-    fake_client.search.return_value = []
+    fake_client = _client(exists=0)
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         summaries = ImapSession(_account()).fetch_folder_summaries()
@@ -113,15 +152,14 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
     # Реальный кейс с боевого ящика: некоторые отправители (например, Авито)
     # присылают имя в ENVELOPE закодированным словом, а не сырым UTF-8.
     encoded_name = Header("Авито", "utf-8").encode().encode("ascii")
-    fake_client = MagicMock()
-    fake_client.search.return_value = [1]
+    fake_client = _client(exists=1)
     envelope = SimpleNamespace(
         subject=None,
         from_=[_address(encoded_name, b"noreply", b"avito.ru")],
         date=None,
         message_id=None,
     )
-    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope}}
+    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"UID": 1}}
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         summaries = ImapSession(_account()).fetch_folder_summaries()
@@ -131,15 +169,14 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
 
 
 def test_format_address_without_display_name() -> None:
-    fake_client = MagicMock()
-    fake_client.search.return_value = [1]
+    fake_client = _client(exists=1)
     envelope = SimpleNamespace(
         subject=None,
         from_=[_address(None, b"ivan", b"example.com")],
         date=None,
         message_id=None,
     )
-    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope}}
+    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"UID": 1}}
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         summaries = ImapSession(_account()).fetch_folder_summaries()
@@ -152,7 +189,7 @@ def test_format_address_without_display_name() -> None:
 
 
 def test_fetch_message_body_plain_text() -> None:
-    fake_client = MagicMock()
+    fake_client = _client()
     raw = (
         b"From: ivan@example.com\r\n"
         b"To: test@example.com\r\n"
@@ -170,7 +207,7 @@ def test_fetch_message_body_plain_text() -> None:
 
 
 def test_fetch_message_body_html_only_shows_placeholder() -> None:
-    fake_client = MagicMock()
+    fake_client = _client()
     raw = (
         b"From: ivan@example.com\r\n"
         b"Content-Type: text/html; charset=utf-8\r\n"

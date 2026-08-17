@@ -61,12 +61,29 @@ class ImapSession:
         ]
 
     def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
-        self._select(folder)
-        uids = sorted(self._client.search(["ALL"]))[-limit:]
-        if not uids:
+        # Всегда переселектим (не полагаемся на _select с его пропуском повтора):
+        # EXISTS должен быть свежим, иначе не заметим письма, пришедшие после
+        # прошлого захода в эту же папку. Само SELECT — та же цена, что раньше
+        # платили за отдельный SEARCH ALL, но так мы совсем убираем этот SEARCH:
+        # диапазон последних `limit` писем считаем по EXISTS, без лишнего запроса.
+        status = self._client.select_folder(folder, readonly=True)
+        self._selected_folder = folder
+        total = status[b"EXISTS"]
+        if total == 0:
             return []
-        response = self._client.fetch(uids, ["ENVELOPE"])
-        return [_to_summary(uid, response[uid][b"ENVELOPE"]) for uid in reversed(uids)]
+        start = max(1, total - limit + 1)
+
+        # Порядковые номера, а не UID — иначе пришлось бы всё равно узнавать
+        # реальные UID через SEARCH. UID запрашиваем отдельным полем: он
+        # возвращается независимо от режима нумерации.
+        self._client.use_uid = False
+        try:
+            response = self._client.fetch(f"{start}:*", ["ENVELOPE", "UID"])
+        finally:
+            self._client.use_uid = True
+
+        by_seq = sorted(response.items(), key=lambda item: item[0], reverse=True)
+        return [_to_summary(data[b"UID"], data[b"ENVELOPE"]) for _seq, data in by_seq]
 
     def fetch_message_body(self, folder: str, uid: int) -> str:
         self._select(folder)
