@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -24,24 +24,25 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+from redmail.config_store import load_account, save_account
 from redmail.imap_client import Account, ImapSession, MessageSummary
 from redmail.smtp_client import OutgoingMessage, SmtpAccount, send_message
 
 
 class AccountDialog(QDialog):
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, *, account: Account | None = None, smtp: SmtpAccount | None = None):
         super().__init__(parent)
         self.setWindowTitle("Учётная запись почты")
 
-        self.host_edit = QLineEdit()
+        self.host_edit = QLineEdit(account.host if account else "")
         self.port_edit = QSpinBox()
         self.port_edit.setRange(1, 65535)
-        self.port_edit.setValue(993)
-        self.user_edit = QLineEdit()
-        self.password_edit = QLineEdit()
+        self.port_edit.setValue(account.port if account else 993)
+        self.user_edit = QLineEdit(account.username if account else "")
+        self.password_edit = QLineEdit(account.password if account else "")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.ssl_check = QCheckBox("Использовать SSL")
-        self.ssl_check.setChecked(True)
+        self.ssl_check.setChecked(account.use_ssl if account else True)
 
         imap_form = QFormLayout()
         imap_form.addRow("Сервер", self.host_edit)
@@ -52,11 +53,12 @@ class AccountDialog(QDialog):
         imap_group = QGroupBox("Входящая почта (IMAP)")
         imap_group.setLayout(imap_form)
 
-        self.smtp_host_edit = QLineEdit()
+        self.smtp_host_edit = QLineEdit(smtp.host if smtp else "")
         self.smtp_port_edit = QSpinBox()
         self.smtp_port_edit.setRange(1, 65535)
-        self.smtp_port_edit.setValue(587)
+        self.smtp_port_edit.setValue(smtp.port if smtp else 587)
         self.smtp_ssl_check = QCheckBox("SSL напрямую (порт 465) вместо STARTTLS")
+        self.smtp_ssl_check.setChecked(smtp.use_ssl if smtp else False)
 
         smtp_form = QFormLayout()
         smtp_form.addRow("Сервер", self.smtp_host_edit)
@@ -202,8 +204,58 @@ class MainWindow(QMainWindow):
 
         self.setStatusBar(QStatusBar(self))
 
+        QTimer.singleShot(0, self._restore_saved_account)
+
+    def _restore_saved_account(self) -> None:
+        try:
+            saved = load_account()
+        except Exception:
+            saved = None
+        if not saved:
+            return
+        account, smtp_account = saved
+        try:
+            session = ImapSession(account)
+            folders = session.list_folders()
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Не удалось войти с сохранёнными данными",
+                f"{account.username}: {exc}\n\nПодключитесь заново вручную.",
+            )
+            return
+        self._apply_connection(account, smtp_account, session, folders)
+        self.statusBar().showMessage(f"Восстановлено подключение: {account.username}", 5000)
+
+    def _apply_connection(
+        self,
+        account: Account,
+        smtp_account: SmtpAccount | None,
+        session: ImapSession,
+        folders: list[str],
+    ) -> None:
+        if self.session:
+            self.session.close()
+
+        self.account = account
+        self.session = session
+        self.smtp_account = smtp_account
+
+        self.folder_list.clear()
+        for name in folders:
+            self.folder_list.addItem(QListWidgetItem(name))
+
+        default_row = folders.index("INBOX") if "INBOX" in folders else 0
+        if folders:
+            self.folder_list.setCurrentRow(default_row)
+
     def on_connect(self) -> None:
-        dialog = AccountDialog(self)
+        saved = None
+        try:
+            saved = load_account()
+        except Exception:
+            pass
+        dialog = AccountDialog(self, account=saved[0] if saved else None, smtp=saved[1] if saved else None)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -219,21 +271,18 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
             return
 
-        if self.session:
-            self.session.close()
-
-        self.account = account
-        self.session = session
         smtp_account = dialog.smtp_account()
-        self.smtp_account = smtp_account if smtp_account.host else None
+        smtp_account = smtp_account if smtp_account.host else None
+        self._apply_connection(account, smtp_account, session, folders)
 
-        self.folder_list.clear()
-        for name in folders:
-            self.folder_list.addItem(QListWidgetItem(name))
-
-        default_row = folders.index("INBOX") if "INBOX" in folders else 0
-        if folders:
-            self.folder_list.setCurrentRow(default_row)
+        try:
+            save_account(account, smtp_account)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "Не удалось сохранить настройки",
+                f"Подключение работает, но запомнить его для следующего запуска не вышло: {exc}",
+            )
 
     def on_folder_selected(self, folder: str) -> None:
         if not self.session or not folder:

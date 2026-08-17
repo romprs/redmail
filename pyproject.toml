@@ -6,6 +6,7 @@ requires-python = ">=3.9"
 dependencies = [
     "PySide6",
     "imapclient",
+    "keyring",
 ]
 
 [build-system]
