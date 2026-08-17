@@ -5,14 +5,19 @@ from email.header import Header
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from redmail.imap_client import Account, fetch_inbox_summaries
+from redmail.imap_client import (
+    Account,
+    fetch_folder_summaries,
+    fetch_message_body,
+    list_folders,
+)
 
 
 def _address(name: bytes | None, mailbox: bytes, host: bytes) -> SimpleNamespace:
     return SimpleNamespace(name=name, mailbox=mailbox, host=host)
 
 
-def test_fetch_inbox_summaries_parses_envelope() -> None:
+def test_fetch_folder_summaries_parses_envelope() -> None:
     encoded_subject = Header("Привет из РЕД ОС", "utf-8").encode().encode("ascii")
     envelope = SimpleNamespace(
         subject=encoded_subject,
@@ -27,7 +32,7 @@ def test_fetch_inbox_summaries_parses_envelope() -> None:
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         account = Account(host="imap.example.com", username="ivan", password="secret")
-        summaries = fetch_inbox_summaries(account, limit=1)
+        summaries = fetch_folder_summaries(account, limit=1)
 
     assert len(summaries) == 1
     summary = summaries[0]
@@ -39,14 +44,26 @@ def test_fetch_inbox_summaries_parses_envelope() -> None:
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
 
 
-def test_fetch_inbox_summaries_empty_mailbox() -> None:
+def test_fetch_folder_summaries_uses_requested_folder() -> None:
     fake_client = MagicMock()
     fake_client.__enter__.return_value = fake_client
     fake_client.search.return_value = []
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         account = Account(host="imap.example.com", username="ivan", password="secret")
-        summaries = fetch_inbox_summaries(account)
+        fetch_folder_summaries(account, folder="Archive")
+
+    fake_client.select_folder.assert_called_once_with("Archive", readonly=True)
+
+
+def test_fetch_folder_summaries_empty_mailbox() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.search.return_value = []
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        account = Account(host="imap.example.com", username="ivan", password="secret")
+        summaries = fetch_folder_summaries(account)
 
     assert summaries == []
     fake_client.fetch.assert_not_called()
@@ -68,7 +85,7 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         account = Account(host="imap.example.com", username="ivan", password="secret")
-        summaries = fetch_inbox_summaries(account)
+        summaries = fetch_folder_summaries(account)
 
     assert summaries[0].sender == "Авито"
 
@@ -86,8 +103,61 @@ def test_format_address_without_display_name() -> None:
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         account = Account(host="imap.example.com", username="ivan", password="secret")
-        summaries = fetch_inbox_summaries(account)
+        summaries = fetch_folder_summaries(account)
 
     assert summaries[0].sender == "ivan@example.com"
     assert summaries[0].subject == "(без темы)"
     assert summaries[0].date == ""
+
+
+def test_list_folders_returns_names() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    fake_client.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\HasNoChildren",), b"/", "Archive"),
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        account = Account(host="imap.example.com", username="ivan", password="secret")
+        folders = list_folders(account)
+
+    assert folders == ["INBOX", "Archive"]
+
+
+def test_fetch_message_body_plain_text() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    raw = (
+        b"From: ivan@example.com\r\n"
+        b"To: test@example.com\r\n"
+        b"Subject: Test\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+    ) + "Привет!".encode("utf-8")
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        account = Account(host="imap.example.com", username="ivan", password="secret")
+        body = fetch_message_body(account, "INBOX", 5)
+
+    assert body == "Привет!"
+    fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
+
+
+def test_fetch_message_body_html_only_shows_placeholder() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+    raw = (
+        b"From: ivan@example.com\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n"
+        b"\r\n"
+        b"<p>hello</p>"
+    )
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        account = Account(host="imap.example.com", username="ivan", password="secret")
+        body = fetch_message_body(account, "INBOX", 5)
+
+    assert "HTML" in body
