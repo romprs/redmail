@@ -12,8 +12,34 @@ from redmail.smtp_client import SmtpAccount
 _KEYRING_SERVICE = "redmail"
 
 
+_DEFAULT_POLL_INTERVAL_MINUTES = 5
+
+
 def _config_path() -> Path:
     return app_dir() / "account.json"
+
+
+def _settings_path() -> Path:
+    return app_dir() / "settings.json"
+
+
+def load_poll_interval_minutes() -> int:
+    path = _settings_path()
+    if not path.exists():
+        return _DEFAULT_POLL_INTERVAL_MINUTES
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return int(data.get("poll_interval_minutes", _DEFAULT_POLL_INTERVAL_MINUTES))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return _DEFAULT_POLL_INTERVAL_MINUTES
+
+
+def save_poll_interval_minutes(minutes: int) -> None:
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"poll_interval_minutes": minutes}, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 def save_account(account: Account, smtp: SmtpAccount | None) -> None:

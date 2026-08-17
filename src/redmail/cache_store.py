@@ -25,6 +25,9 @@ CREATE TABLE IF NOT EXISTS messages (
     sender_email TEXT NOT NULL,
     date TEXT NOT NULL,
     message_id TEXT NOT NULL,
+    has_attachments INTEGER NOT NULL DEFAULT 0,
+    flagged INTEGER NOT NULL DEFAULT 0,
+    importance TEXT NOT NULL DEFAULT 'normal',
     body TEXT,
     PRIMARY KEY (account, folder, uid)
 );
@@ -39,6 +42,14 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 """
 
+# Столбцы добавились после первого релиза кэша — для баз, созданных раньше,
+# CREATE TABLE IF NOT EXISTS их не добавит, поэтому досоздаём миграцией.
+_MIGRATIONS = (
+    "ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN importance TEXT NOT NULL DEFAULT 'normal'",
+)
+
 
 def _db_path() -> Path:
     return app_dir() / "cache.sqlite3"
@@ -49,6 +60,11 @@ def _connect() -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
+    for migration in _MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # столбец уже есть
     return conn
 
 
@@ -64,15 +80,23 @@ def get_folder_exists(account_key: str, folder: str) -> int | None:
 def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid, subject, sender, sender_email, date, message_id "
+            "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, flagged, importance "
             "FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
             (account_key, folder),
         ).fetchall()
     return [
         MessageSummary(
-            uid=uid, subject=subject, sender=sender, sender_email=sender_email, date=date, message_id=message_id
+            uid=uid,
+            subject=subject,
+            sender=sender,
+            sender_email=sender_email,
+            date=date,
+            message_id=message_id,
+            has_attachments=bool(has_attachments),
+            flagged=bool(flagged),
+            importance=importance,
         )
-        for uid, subject, sender, sender_email, date, message_id in rows
+        for uid, subject, sender, sender_email, date, message_id, has_attachments, flagged, importance in rows
     ]
 
 
@@ -97,15 +121,47 @@ def save_folder_summaries(
         else:
             conn.execute("DELETE FROM messages WHERE account = ? AND folder = ?", (account_key, folder))
         conn.executemany(
-            "INSERT INTO messages (account, folder, uid, position, subject, sender, sender_email, date, message_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO messages "
+            "(account, folder, uid, position, subject, sender, sender_email, date, message_id, "
+            "has_attachments, flagged, importance) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account, folder, uid) DO UPDATE SET "
             "position = excluded.position, subject = excluded.subject, sender = excluded.sender, "
-            "sender_email = excluded.sender_email, date = excluded.date, message_id = excluded.message_id",
+            "sender_email = excluded.sender_email, date = excluded.date, message_id = excluded.message_id, "
+            "has_attachments = excluded.has_attachments, flagged = excluded.flagged, "
+            "importance = excluded.importance",
             [
-                (account_key, folder, s.uid, position, s.subject, s.sender, s.sender_email, s.date, s.message_id)
+                (
+                    account_key, folder, s.uid, position, s.subject, s.sender, s.sender_email, s.date,
+                    s.message_id, int(s.has_attachments), int(s.flagged), s.importance,
+                )
                 for position, s in enumerate(summaries)
             ],
+        )
+        conn.commit()
+
+
+def set_flagged(account_key: str, folder: str, uid: int, flagged: bool) -> None:
+    with closing(_connect()) as conn:
+        conn.execute(
+            "UPDATE messages SET flagged = ? WHERE account = ? AND folder = ? AND uid = ?",
+            (int(flagged), account_key, folder, uid),
+        )
+        conn.commit()
+
+
+def delete_messages(account_key: str, folder: str, uids: list[int]) -> None:
+    if not uids:
+        return
+    placeholders = ",".join("?" * len(uids))
+    with closing(_connect()) as conn:
+        conn.execute(
+            f"DELETE FROM messages WHERE account = ? AND folder = ? AND uid IN ({placeholders})",
+            (account_key, folder, *uids),
+        )
+        conn.execute(
+            f"DELETE FROM attachments WHERE account = ? AND folder = ? AND uid IN ({placeholders})",
+            (account_key, folder, *uids),
         )
         conn.commit()
 
@@ -129,7 +185,8 @@ def get_message_content(account_key: str, folder: str, uid: int) -> MessageConte
 def save_message_content(account_key: str, folder: str, uid: int, content: MessageContent) -> None:
     with closing(_connect()) as conn:
         conn.execute(
-            "INSERT INTO messages (account, folder, uid, position, subject, sender, sender_email, date, message_id, body) "
+            "INSERT INTO messages "
+            "(account, folder, uid, position, subject, sender, sender_email, date, message_id, body) "
             "VALUES (?, ?, ?, -1, '', '', '', '', '', ?) "
             "ON CONFLICT(account, folder, uid) DO UPDATE SET body = excluded.body",
             (account_key, folder, uid, content.text),

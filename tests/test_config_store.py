@@ -3,7 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import patch
 
-from redmail.config_store import load_account, save_account
+from redmail.config_store import (
+    load_account,
+    load_poll_interval_minutes,
+    save_account,
+    save_poll_interval_minutes,
+)
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
 
@@ -76,3 +81,23 @@ def test_load_account_returns_none_when_password_missing_from_keyring(tmp_path: 
         account = Account(host="imap.example.com", username="ivan", password="secret")
         save_account(account, None)
         assert load_account() is None
+
+
+def test_poll_interval_defaults_to_five_minutes(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_poll_interval_minutes() == 5
+
+
+def test_poll_interval_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_poll_interval_minutes(15)
+        assert load_poll_interval_minutes() == 15
+
+
+def test_poll_interval_survives_corrupt_file(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text("not json", encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_poll_interval_minutes() == 5

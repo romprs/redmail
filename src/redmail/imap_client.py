@@ -7,6 +7,8 @@ from email.message import Message
 
 from imapclient import IMAPClient
 
+_HEADER_FIELDS = "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"
+
 
 @dataclass
 class Account:
@@ -25,6 +27,9 @@ class MessageSummary:
     sender_email: str
     date: str
     message_id: str
+    has_attachments: bool = False
+    flagged: bool = False
+    importance: str = "normal"  # "high" | "normal" | "low"
 
 
 @dataclass
@@ -85,7 +90,7 @@ class ImapSession:
         удобно проверять, изменилось ли что-то в папке с прошлого раза,
         прежде чем платить за полный FETCH сводок (см. CachedMailbox).
         """
-        status = self._client.select_folder(folder, readonly=True)
+        status = self._client.select_folder(folder, readonly=False)
         self._selected_folder = folder
         self._selected_exists = status[b"EXISTS"]
         return self._selected_exists
@@ -106,12 +111,14 @@ class ImapSession:
         # возвращается независимо от режима нумерации.
         self._client.use_uid = False
         try:
-            response = self._client.fetch(f"{start}:*", ["ENVELOPE", "UID"])
+            response = self._client.fetch(
+                f"{start}:*", ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", _HEADER_FIELDS]
+            )
         finally:
             self._client.use_uid = True
 
         by_seq = sorted(response.items(), key=lambda item: item[0], reverse=True)
-        return [_to_summary(data[b"UID"], data[b"ENVELOPE"]) for _seq, data in by_seq]
+        return [_to_summary(data) for _seq, data in by_seq]
 
     def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
         self.folder_message_count(folder)
@@ -123,10 +130,24 @@ class ImapSession:
         raw = response[uid][b"BODY[]"]
         return _extract_content(message_from_bytes(raw))
 
+    def set_flagged(self, folder: str, uid: int, flagged: bool) -> None:
+        self._select(folder)
+        if flagged:
+            self._client.add_flags([uid], [b"\\Flagged"])
+        else:
+            self._client.remove_flags([uid], [b"\\Flagged"])
+
+    def delete_messages(self, folder: str, uids: list[int]) -> None:
+        if not uids:
+            return
+        self._select(folder)
+        self._client.delete_messages(uids)
+        self._client.expunge()
+
     def _select(self, folder: str) -> None:
         # Папка уже открыта этой же сессией — второй SELECT только теряет время.
         if self._selected_folder != folder:
-            self._client.select_folder(folder, readonly=True)
+            self._client.select_folder(folder, readonly=False)
             self._selected_folder = folder
 
 
@@ -174,17 +195,65 @@ def _decode_payload(part: Message) -> str:
     return payload.decode(charset, errors="replace")
 
 
-def _to_summary(uid: int, envelope) -> MessageSummary:
+def _to_summary(data: dict) -> MessageSummary:
+    envelope = data[b"ENVELOPE"]
     sender_display, sender_email = _format_address(envelope.from_)
     message_id = envelope.message_id
+    flags = data.get(b"FLAGS", ())
     return MessageSummary(
-        uid=uid,
+        uid=data[b"UID"],
         subject=_decode_subject(envelope.subject),
         sender=sender_display,
         sender_email=sender_email,
         date=envelope.date.strftime("%Y-%m-%d %H:%M") if envelope.date else "",
         message_id=message_id.decode("ascii", errors="replace") if message_id else "",
+        has_attachments=_body_has_attachment(data[b"BODYSTRUCTURE"]) if b"BODYSTRUCTURE" in data else False,
+        flagged=b"\\Flagged" in flags,
+        importance=_parse_importance(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b"")),
     )
+
+
+def _body_has_attachment(structure) -> bool:
+    """Смотрит в BODYSTRUCTURE, не скачивая тело письма целиком.
+
+    BODYSTRUCTURE — сырая вложенная структура по RFC 3501 (см. imapclient
+    response_types.BodyData), без готового поля "это вложение". Ищем
+    Content-Disposition: attachment паттерн-мэтчингом (2-элементный кортеж
+    вида (b'ATTACHMENT', (...))), а не по фиксированному индексу — точная
+    позиция disposition в кортеже "плавает" в зависимости от типа part'а
+    (у text/* и message/rfc822 есть дополнительные поля перед ней).
+    """
+    if structure.is_multipart:
+        parts, rest = structure[0], structure[1:]
+        if _disposition_is_attachment(rest):
+            return True
+        return any(_body_has_attachment(part) for part in parts)
+    return _disposition_is_attachment(structure)
+
+
+def _disposition_is_attachment(fields) -> bool:
+    for value in fields:
+        if isinstance(value, (tuple, list)) and len(value) == 2 and isinstance(value[0], bytes):
+            if value[0].upper() == b"ATTACHMENT":
+                return True
+    return False
+
+
+def _parse_importance(raw: bytes) -> str:
+    if not raw or not raw.strip():
+        return "normal"
+    headers = message_from_bytes(raw)
+    importance = (headers.get("Importance") or "").strip().lower()
+    if importance in ("high", "urgent"):
+        return "high"
+    if importance == "low":
+        return "low"
+    priority = (headers.get("X-Priority") or "").strip()
+    if priority[:1] in ("1", "2"):
+        return "high"
+    if priority[:1] in ("4", "5"):
+        return "low"
+    return "normal"
 
 
 def _decode_subject(raw: bytes | None) -> str:

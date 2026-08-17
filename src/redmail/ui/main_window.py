@@ -31,10 +31,26 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redmail.config_store import load_account, save_account
+from redmail.config_store import (
+    load_account,
+    load_poll_interval_minutes,
+    save_account,
+    save_poll_interval_minutes,
+)
 from redmail.imap_client import Account, Attachment, ImapSession, MessageSummary
 from redmail.mailbox import CachedMailbox
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+
+COL_CHECK = 0
+COL_FLAG = 1
+COL_IMPORTANCE = 2
+COL_ATTACHMENT = 3
+COL_SENDER = 4
+COL_SUBJECT = 5
+COL_DATE = 6
+
+_FLAG_MARK = "⚑"  # ⚑ — компактнее и надёжнее по шрифтам, чем цветной эмодзи-флаг
+_ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
 
 
 def _format_size(num_bytes: int) -> str:
@@ -43,6 +59,14 @@ def _format_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024:
         return f"{num_bytes / 1024:.0f} КБ"
     return f"{num_bytes / (1024 * 1024):.1f} МБ"
+
+
+def _importance_mark(importance: str) -> str:
+    if importance == "high":
+        return "!"
+    if importance == "low":
+        return "↓"  # ↓
+    return ""
 
 
 class AccountDialog(QDialog):
@@ -111,6 +135,33 @@ class AccountDialog(QDialog):
             port=self.smtp_port_edit.value(),
             use_ssl=self.smtp_ssl_check.isChecked(),
         )
+
+
+class SettingsDialog(QDialog):
+    def __init__(self, parent=None, *, poll_interval_minutes: int = 5):
+        super().__init__(parent)
+        self.setWindowTitle("Параметры")
+
+        self.interval_edit = QSpinBox()
+        self.interval_edit.setRange(1, 180)
+        self.interval_edit.setSuffix(" мин.")
+        self.interval_edit.setValue(poll_interval_minutes)
+
+        form = QFormLayout()
+        form.addRow("Проверять почту каждые", self.interval_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def poll_interval_minutes(self) -> int:
+        return self.interval_edit.value()
 
 
 class ComposeDialog(QDialog):
@@ -199,7 +250,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Почтовый клиент RED OS — прототип")
-        self.resize(1100, 640)
+        self.resize(1200, 640)
 
         self.account: Account | None = None
         self.mailbox: CachedMailbox | None = None
@@ -209,16 +260,22 @@ class MainWindow(QMainWindow):
         self.current_body: str = ""
         self.current_attachments: list[Attachment] = []
         self.selected_summary: MessageSummary | None = None
+        self.poll_interval_minutes = load_poll_interval_minutes()
 
         self.folder_list = QListWidget(self)
         self.folder_list.currentTextChanged.connect(self.on_folder_selected)
 
-        self.table = QTableWidget(0, 3, self)
-        self.table.setHorizontalHeaderLabels(["От кого", "Тема", "Дата"])
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table = QTableWidget(0, 7, self)
+        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
+        for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.itemSelectionChanged.connect(self.on_message_selected)
+        self.table.itemClicked.connect(self.on_table_item_clicked)
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(70)
@@ -246,7 +303,7 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(right_splitter)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([200, 900])
+        main_splitter.setSizes([200, 1000])
         self.setCentralWidget(main_splitter)
 
         toolbar = QToolBar("Основная", self)
@@ -255,6 +312,10 @@ class MainWindow(QMainWindow):
         connect_action = QAction("Подключиться…", self)
         connect_action.triggered.connect(self.on_connect)
         toolbar.addAction(connect_action)
+
+        refresh_action = QAction("Обновить", self)
+        refresh_action.triggered.connect(self.on_refresh)
+        toolbar.addAction(refresh_action)
 
         toolbar.addSeparator()
 
@@ -266,9 +327,26 @@ class MainWindow(QMainWindow):
         reply_action.triggered.connect(self.on_reply)
         toolbar.addAction(reply_action)
 
+        delete_action = QAction("Удалить", self)
+        delete_action.triggered.connect(self.on_delete_selected)
+        toolbar.addAction(delete_action)
+
+        toolbar.addSeparator()
+
+        settings_action = QAction("Параметры…", self)
+        settings_action.triggered.connect(self.on_settings)
+        toolbar.addAction(settings_action)
+
         self.setStatusBar(QStatusBar(self))
 
+        self.poll_timer = QTimer(self)
+        self.poll_timer.timeout.connect(self._on_periodic_refresh)
+        self._restart_poll_timer()
+
         QTimer.singleShot(0, self._restore_saved_account)
+
+    def _restart_poll_timer(self) -> None:
+        self.poll_timer.start(self.poll_interval_minutes * 60_000)
 
     def _restore_saved_account(self) -> None:
         try:
@@ -348,29 +426,144 @@ class MainWindow(QMainWindow):
                 f"Подключение работает, но запомнить его для следующего запуска не вышло: {exc}",
             )
 
+    def on_settings(self) -> None:
+        dialog = SettingsDialog(self, poll_interval_minutes=self.poll_interval_minutes)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.poll_interval_minutes = dialog.poll_interval_minutes()
+        try:
+            save_poll_interval_minutes(self.poll_interval_minutes)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
+        self._restart_poll_timer()
+
     def on_folder_selected(self, folder: str) -> None:
         if not self.mailbox or not folder:
             return
         self.current_folder = folder
-        self.reading_pane.clear()
-        self.selected_summary = None
-        self.current_attachments = []
-        self.attachments_list.clear()
-        self.attachments_list.hide()
+        self._clear_reading_pane()
         try:
             summaries = self.mailbox.folder_summaries(folder)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
+        self._render_folder(summaries)
+
+    def on_refresh(self) -> None:
+        if not self.mailbox or not self.current_folder:
+            return
+        try:
+            summaries = self.mailbox.refresh_folder(self.current_folder)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка обновления", str(exc))
+            return
+        self._render_folder(summaries)
+        self.statusBar().showMessage(f"Обновлено: {self.current_folder}", 3000)
+
+    def _on_periodic_refresh(self) -> None:
+        # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
+        # чтобы не перебивать пользователя, если тот занят (например, пишет письмо).
+        if not self.mailbox or not self.current_folder:
+            return
+        try:
+            summaries = self.mailbox.refresh_folder(self.current_folder)
+        except Exception:
+            return
+        self._render_folder(summaries)
+
+    def _clear_reading_pane(self) -> None:
+        self.reading_pane.clear()
+        self.selected_summary = None
+        self.current_attachments = []
+        self.attachments_list.clear()
+        self.attachments_list.hide()
+
+    def _render_folder(self, summaries: list[MessageSummary]) -> None:
+        previously_selected_uid = self.selected_summary.uid if self.selected_summary else None
 
         self.current_summaries = summaries
         self.table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
-            self.table.setItem(row, 0, QTableWidgetItem(summary.sender))
-            self.table.setItem(row, 1, QTableWidgetItem(summary.subject))
-            self.table.setItem(row, 2, QTableWidgetItem(summary.date))
+            check_item = QTableWidgetItem()
+            check_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            check_item.setCheckState(Qt.CheckState.Unchecked)
+            self.table.setItem(row, COL_CHECK, check_item)
 
-        self.statusBar().showMessage(f"{folder}: писем {len(summaries)}", 5000)
+            self.table.setItem(row, COL_FLAG, self._readonly_item(_FLAG_MARK if summary.flagged else ""))
+            self.table.setItem(row, COL_IMPORTANCE, self._readonly_item(_importance_mark(summary.importance)))
+            self.table.setItem(
+                row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
+            )
+            self.table.setItem(row, COL_SENDER, QTableWidgetItem(summary.sender))
+            self.table.setItem(row, COL_SUBJECT, QTableWidgetItem(summary.subject))
+            self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
+
+        self.statusBar().showMessage(f"{self.current_folder}: писем {len(summaries)}", 5000)
+
+        if previously_selected_uid is not None:
+            for row, summary in enumerate(summaries):
+                if summary.uid == previously_selected_uid:
+                    self.table.selectRow(row)
+                    break
+
+    @staticmethod
+    def _readonly_item(text: str) -> QTableWidgetItem:
+        item = QTableWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        return item
+
+    def on_table_item_clicked(self, item: QTableWidgetItem) -> None:
+        if item.column() != COL_FLAG or not self.mailbox or not self.current_folder:
+            return
+        row = item.row()
+        summary = self.current_summaries[row]
+        new_state = not summary.flagged
+        try:
+            self.mailbox.toggle_flag(self.current_folder, summary.uid, new_state)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось изменить флаг", str(exc))
+            return
+        summary.flagged = new_state
+        item.setText(_FLAG_MARK if new_state else "")
+
+    def on_delete_selected(self) -> None:
+        if not self.mailbox or not self.current_folder:
+            return
+        checked_rows = [
+            row
+            for row in range(self.table.rowCount())
+            if self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
+        ]
+        if not checked_rows:
+            QMessageBox.information(self, "Нечего удалять", "Отметьте галочками письма, которые нужно удалить.")
+            return
+
+        uids = [self.current_summaries[row].uid for row in checked_rows]
+        confirm = QMessageBox.question(
+            self,
+            "Удалить письма",
+            f"Удалить выбранные письма ({len(uids)})? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            self.mailbox.delete_messages(self.current_folder, uids)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка удаления", str(exc))
+            return
+
+        if self.selected_summary and self.selected_summary.uid in uids:
+            self._clear_reading_pane()
+        try:
+            summaries = self.mailbox.refresh_folder(self.current_folder)
+        except Exception as exc:
+            QMessageBox.warning(self, "Письма удалены, но обновить список не удалось", str(exc))
+            return
+        self._render_folder(summaries)
+        self.statusBar().showMessage(f"Удалено писем: {len(uids)}", 5000)
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
@@ -473,6 +666,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Письмо отправлено: {', '.join(recipients)}", 5000)
 
     def closeEvent(self, event) -> None:
+        self.poll_timer.stop()
         if self.mailbox:
             self.mailbox.close()
         super().closeEvent(event)

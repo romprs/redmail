@@ -7,10 +7,12 @@ from redmail import cache_store
 from redmail.imap_client import Attachment, MessageContent, MessageSummary
 
 
-def _summary(uid: int, subject: str) -> MessageSummary:
+def _summary(
+    uid: int, subject: str, *, has_attachments: bool = False, flagged: bool = False, importance: str = "normal"
+) -> MessageSummary:
     return MessageSummary(
         uid=uid, subject=subject, sender="Ivan", sender_email="ivan@example.com", date="2026-08-18 10:00",
-        message_id=f"<{uid}@example.com>",
+        message_id=f"<{uid}@example.com>", has_attachments=has_attachments, flagged=flagged, importance=importance,
     )
 
 
@@ -73,3 +75,52 @@ def test_message_content_can_be_cached_before_folder_is_listed(tmp_path: Path) -
         cached = cache_store.get_message_content("acc", "Sent", 7)
         assert cached is not None
         assert cached.text == "hi"
+
+
+def test_folder_summaries_round_trip_flag_attachment_importance(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries(
+            "acc", "INBOX", 1, [_summary(1, "A", has_attachments=True, flagged=True, importance="high")]
+        )
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+
+    assert cached[0].has_attachments is True
+    assert cached[0].flagged is True
+    assert cached[0].importance == "high"
+
+
+def test_set_flagged_updates_cached_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 1, [_summary(1, "A")])
+        cache_store.set_flagged("acc", "INBOX", 1, True)
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+
+    assert cached[0].flagged is True
+
+
+def test_delete_messages_removes_from_cache(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 2, [_summary(1, "A"), _summary(2, "B")])
+        cache_store.save_message_content(
+            "acc", "INBOX", 1,
+            MessageContent(text="body", attachments=[Attachment(filename="f.txt", content_type="text/plain", payload=b"x")]),
+        )
+
+        cache_store.delete_messages("acc", "INBOX", [1])
+
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+        assert [s.uid for s in cached] == [2]
+        assert cache_store.get_message_content("acc", "INBOX", 1) is None
+
+
+def test_delete_messages_noop_for_empty_list(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 1, [_summary(1, "A")])
+        cache_store.delete_messages("acc", "INBOX", [])
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+
+    assert [s.uid for s in cached] == [1]

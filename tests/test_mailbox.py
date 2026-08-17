@@ -18,7 +18,40 @@ def _summary(uid: int) -> MessageSummary:
     )
 
 
-def test_folder_summaries_skips_network_when_exists_unchanged(tmp_path: Path) -> None:
+def test_folder_summaries_hits_network_once_when_cache_empty(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 1
+    session.fetch_summaries.return_value = [_summary(1)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        summaries = mailbox.folder_summaries("INBOX")
+
+    assert [s.uid for s in summaries] == [1]
+    session.folder_message_count.assert_called_once()
+    session.fetch_summaries.assert_called_once()
+
+
+def test_folder_summaries_never_hits_network_once_cached(tmp_path: Path) -> None:
+    # Ключевое требование: переключение между уже открытыми папками не должно
+    # спрашивать сервер вообще — ни SELECT, ни FETCH.
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 1
+    session.fetch_summaries.return_value = [_summary(1)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        mailbox.folder_summaries("INBOX")  # первый раз — сеть
+        mailbox.folder_summaries("INBOX")
+        mailbox.folder_summaries("INBOX")
+
+    session.folder_message_count.assert_called_once()
+    session.fetch_summaries.assert_called_once()
+
+
+def test_refresh_folder_skips_fetch_when_exists_unchanged(tmp_path: Path) -> None:
     db_path = tmp_path / "cache.sqlite3"
     session = MagicMock()
     session.folder_message_count.return_value = 5
@@ -26,19 +59,16 @@ def test_folder_summaries_skips_network_when_exists_unchanged(tmp_path: Path) ->
 
     with patch("redmail.cache_store._db_path", return_value=db_path):
         mailbox = CachedMailbox(session, _account())
-        first = mailbox.folder_summaries("INBOX")
-        assert session.fetch_summaries.call_count == 1
+        mailbox.refresh_folder("INBOX")
+        mailbox.refresh_folder("INBOX")
 
-        second = mailbox.folder_summaries("INBOX")
-
-    # EXISTS не поменялся (5 оба раза) — второй вызов не должен был снова
+    # EXISTS не поменялся (5 оба раза) — второй refresh не должен снова
     # ходить в сеть за сводками, только за EXISTS (folder_message_count).
     assert session.fetch_summaries.call_count == 1
     assert session.folder_message_count.call_count == 2
-    assert [s.uid for s in second] == [s.uid for s in first]
 
 
-def test_folder_summaries_refetches_when_exists_changes(tmp_path: Path) -> None:
+def test_refresh_folder_refetches_when_exists_changes(tmp_path: Path) -> None:
     db_path = tmp_path / "cache.sqlite3"
     session = MagicMock()
     session.folder_message_count.side_effect = [5, 6]
@@ -46,8 +76,8 @@ def test_folder_summaries_refetches_when_exists_changes(tmp_path: Path) -> None:
 
     with patch("redmail.cache_store._db_path", return_value=db_path):
         mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")
-        second = mailbox.folder_summaries("INBOX")
+        mailbox.refresh_folder("INBOX")
+        second = mailbox.refresh_folder("INBOX")
 
     assert session.fetch_summaries.call_count == 2
     assert len(second) == 2
@@ -65,6 +95,38 @@ def test_message_content_cached_after_first_fetch(tmp_path: Path) -> None:
 
     assert session.fetch_message_content.call_count == 1
     assert first.text == second.text == "hello"
+
+
+def test_toggle_flag_updates_session_and_cache(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 1
+    session.fetch_summaries.return_value = [_summary(1)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        mailbox.folder_summaries("INBOX")
+        mailbox.toggle_flag("INBOX", 1, True)
+        cached = mailbox.folder_summaries("INBOX")
+
+    session.set_flagged.assert_called_once_with("INBOX", 1, True)
+    assert cached[0].flagged is True
+
+
+def test_delete_messages_updates_session_and_cache(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 2
+    session.fetch_summaries.return_value = [_summary(1), _summary(2)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        mailbox.folder_summaries("INBOX")
+        mailbox.delete_messages("INBOX", [1])
+        cached = mailbox.folder_summaries("INBOX")
+
+    session.delete_messages.assert_called_once_with("INBOX", [1])
+    assert [s.uid for s in cached] == [2]
 
 
 def test_different_accounts_do_not_share_cache(tmp_path: Path) -> None:

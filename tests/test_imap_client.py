@@ -5,7 +5,11 @@ from email.header import Header
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from imapclient.response_types import BodyData
+
 from redmail.imap_client import Account, ImapSession
+
+_FETCH_FIELDS = ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"]
 
 
 def _address(name: bytes | None, mailbox: bytes, host: bytes) -> SimpleNamespace:
@@ -103,9 +107,12 @@ def test_fetch_folder_summaries_parses_envelope() -> None:
     assert summary.sender_email == "ivan@example.com"
     assert summary.date == "2026-08-17 10:30"
     assert summary.message_id == "<abc123@example.com>"
-    fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
+    assert summary.has_attachments is False
+    assert summary.flagged is False
+    assert summary.importance == "normal"
+    fake_client.select_folder.assert_called_once_with("INBOX", readonly=False)
     # 3 письма в папке, лимит 1 — просим только последнее по номеру, без SEARCH.
-    fake_client.fetch.assert_called_once_with("3:*", ["ENVELOPE", "UID"])
+    fake_client.fetch.assert_called_once_with("3:*", _FETCH_FIELDS)
     # Временный sequence-режим не должен просочиться в следующие вызовы.
     assert fake_client.use_uid is True
 
@@ -126,7 +133,113 @@ def test_fetch_folder_summaries_orders_newest_first() -> None:
         summaries = ImapSession(_account()).fetch_folder_summaries(limit=2)
 
     assert [s.uid for s in summaries] == [105, 104]
-    fake_client.fetch.assert_called_once_with("4:*", ["ENVELOPE", "UID"])
+    fake_client.fetch.assert_called_once_with("4:*", _FETCH_FIELDS)
+
+
+def test_fetch_folder_summaries_reads_flags_attachment_and_importance() -> None:
+    envelope = SimpleNamespace(
+        subject=None, from_=[_address(None, b"a", b"example.com")], date=None, message_id=None
+    )
+    # Форма — как в реальном ответе Gmail для multipart/mixed с вложением
+    # (alternative-часть + вложение с Content-Disposition: attachment),
+    # построена напрямую в уже "разобранном" виде (как после BodyData.create).
+    plain_part = BodyData((b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"BASE64", 114, 3, None, None, None))
+    html_part = BodyData(
+        (b"TEXT", b"HTML", (b"CHARSET", b"UTF-8"), None, None, b"QUOTED-PRINTABLE", 455, 10, None, None, None)
+    )
+    alternative = BodyData(([plain_part, html_part], b"ALTERNATIVE", (b"BOUNDARY", b"xyz"), None, None))
+    attachment_part = BodyData(
+        (
+            b"APPLICATION",
+            b"PDF",
+            (b"NAME", b"report.pdf"),
+            None,
+            None,
+            b"BASE64",
+            2048,
+            None,
+            (b"ATTACHMENT", (b"FILENAME", b"report.pdf")),
+            None,
+        )
+    )
+    bodystructure = BodyData(([alternative, attachment_part], b"MIXED", (b"BOUNDARY", b"abc"), None, None))
+
+    fake_client = _client(exists=1)
+    fake_client.fetch.return_value = {
+        1: {
+            b"ENVELOPE": envelope,
+            b"UID": 9,
+            b"FLAGS": (b"\\Flagged", b"\\Seen"),
+            b"BODYSTRUCTURE": bodystructure,
+            b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]": b"Importance: high\r\n\r\n",
+        }
+    }
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summary = ImapSession(_account()).fetch_folder_summaries()[0]
+
+    assert summary.has_attachments is True
+    assert summary.flagged is True
+    assert summary.importance == "high"
+
+
+def test_fetch_folder_summaries_alternative_only_has_no_attachment() -> None:
+    # multipart/alternative (обычное HTML-письмо с текстовой версией) — без
+    # вложений. is_multipart=True само по себе не должно давать скрепку.
+    envelope = SimpleNamespace(
+        subject=None, from_=[_address(None, b"a", b"example.com")], date=None, message_id=None
+    )
+    plain_part = BodyData((b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"BASE64", 114, 3, None, None, None))
+    html_part = BodyData(
+        (b"TEXT", b"HTML", (b"CHARSET", b"UTF-8"), None, None, b"QUOTED-PRINTABLE", 455, 10, None, None, None)
+    )
+    bodystructure = BodyData(([plain_part, html_part], b"ALTERNATIVE", (b"BOUNDARY", b"xyz"), None, None))
+
+    fake_client = _client(exists=1)
+    fake_client.fetch.return_value = {
+        1: {b"ENVELOPE": envelope, b"UID": 9, b"BODYSTRUCTURE": bodystructure}
+    }
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summary = ImapSession(_account()).fetch_folder_summaries()[0]
+
+    assert summary.has_attachments is False
+
+
+def test_set_flagged_adds_and_removes_flag() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_flagged("INBOX", 7, True)
+        session.set_flagged("INBOX", 7, False)
+
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged"])
+    fake_client.remove_flags.assert_called_once_with([7], [b"\\Flagged"])
+    # Папка одна и та же — второй раз переселектить не должны.
+    assert fake_client.select_folder.call_count == 1
+
+
+def test_delete_messages_flags_and_expunges() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.delete_messages("INBOX", [1, 2, 3])
+
+    fake_client.delete_messages.assert_called_once_with([1, 2, 3])
+    fake_client.expunge.assert_called_once()
+
+
+def test_delete_messages_noop_for_empty_list() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.delete_messages("INBOX", [])
+
+    fake_client.delete_messages.assert_not_called()
+    fake_client.expunge.assert_not_called()
 
 
 def test_fetch_folder_summaries_uses_requested_folder() -> None:
@@ -135,7 +248,7 @@ def test_fetch_folder_summaries_uses_requested_folder() -> None:
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         ImapSession(_account()).fetch_folder_summaries(folder="Archive")
 
-    fake_client.select_folder.assert_called_once_with("Archive", readonly=True)
+    fake_client.select_folder.assert_called_once_with("Archive", readonly=False)
 
 
 def test_fetch_folder_summaries_empty_mailbox() -> None:
@@ -204,7 +317,7 @@ def test_fetch_message_content_plain_text() -> None:
 
     assert content.text == "Привет!"
     assert content.attachments == []
-    fake_client.select_folder.assert_called_once_with("INBOX", readonly=True)
+    fake_client.select_folder.assert_called_once_with("INBOX", readonly=False)
 
 
 def test_fetch_message_content_html_only_shows_placeholder() -> None:
