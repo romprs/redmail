@@ -1,0 +1,175 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from redmail import calendar_store
+from redmail.calendar_store import Attendee, Event
+
+
+def _event(uid: str = "e1@redmail", start_hour: int = 10) -> Event:
+    start = datetime(2026, 9, 1, start_hour, tzinfo=timezone.utc)
+    return Event(
+        uid=uid,
+        summary="Совещание",
+        dtstart=start,
+        dtend=start + timedelta(hours=1),
+        organizer_email="organizer@example.com",
+        organizer_name="Организатор",
+        is_organizer=False,
+        attendees=[Attendee(email="me@example.com", name="Я", participation="needs-action")],
+    )
+
+
+def test_create_and_is_calendar_file(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    assert calendar_store.is_calendar_file(path) is False
+    calendar_store.create_calendar(path)
+    assert calendar_store.is_calendar_file(path) is True
+
+
+def test_save_and_get_event(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    calendar_store.save_event(path, event)
+
+    fetched = calendar_store.get_event(path, "e1@redmail")
+    assert fetched is not None
+    assert fetched.summary == "Совещание"
+    assert fetched.dtstart == event.dtstart
+    assert fetched.attendees == [Attendee(email="me@example.com", name="Я", participation="needs-action")]
+
+
+def test_get_event_missing_returns_none(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    assert calendar_store.get_event(path, "nope") is None
+
+
+def test_save_event_upserts_by_uid(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    calendar_store.save_event(path, event)
+    event.summary = "Перенесённое совещание"
+    event.sequence = 1
+    calendar_store.save_event(path, event)
+
+    all_events = calendar_store.list_events(path)
+    assert len(all_events) == 1
+    assert all_events[0].summary == "Перенесённое совещание"
+    assert all_events[0].sequence == 1
+
+
+def test_list_events_filters_by_range(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event("e1@redmail", start_hour=9))
+    calendar_store.save_event(path, _event("e2@redmail", start_hour=15))
+
+    window_start = datetime(2026, 9, 1, 12, tzinfo=timezone.utc)
+    in_range = calendar_store.list_events(path, start=window_start)
+    assert [e.uid for e in in_range] == ["e2@redmail"]
+
+
+def test_delete_event(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    calendar_store.delete_event(path, "e1@redmail")
+    assert calendar_store.get_event(path, "e1@redmail") is None
+
+
+def test_reschedule_event_bumps_sequence(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    new_start = datetime(2026, 9, 2, 14, tzinfo=timezone.utc)
+    new_end = new_start + timedelta(hours=1)
+
+    updated = calendar_store.reschedule_event(path, "e1@redmail", new_start, new_end)
+
+    assert updated is not None
+    assert updated.dtstart == new_start
+    assert updated.sequence == 1
+    assert calendar_store.get_event(path, "e1@redmail").dtstart == new_start
+
+
+def test_reschedule_event_missing_returns_none(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    assert calendar_store.reschedule_event(path, "nope", datetime.now(timezone.utc), datetime.now(timezone.utc)) is None
+
+
+def test_apply_invite_creates_new_event(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = calendar_store.apply_invite(path, "REQUEST", _event())
+    assert event.status == "confirmed"
+    assert calendar_store.get_event(path, "e1@redmail") is not None
+
+
+def test_apply_invite_preserves_my_participation_on_resend(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.apply_invite(path, "REQUEST", _event())
+    calendar_store.set_my_participation(path, "e1@redmail", "accepted")
+
+    # Организатор прислал то же приглашение ещё раз (например, поправил
+    # текст) — наш собственный ответ на него не должен слететь обратно в
+    # needs-action.
+    resent = _event()
+    resent.summary = "Совещание (уточнение)"
+    updated = calendar_store.apply_invite(path, "REQUEST", resent)
+    assert updated.my_participation == "accepted"
+    assert updated.summary == "Совещание (уточнение)"
+
+
+def test_apply_invite_cancel_marks_cancelled(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.apply_invite(path, "REQUEST", _event())
+    cancelled = calendar_store.apply_invite(path, "CANCEL", _event())
+    assert cancelled.status == "cancelled"
+    assert calendar_store.get_event(path, "e1@redmail").status == "cancelled"
+
+
+def test_set_my_participation_updates_own_status_only(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    updated = calendar_store.set_my_participation(path, "e1@redmail", "declined")
+    assert updated is not None
+    assert updated.my_participation == "declined"
+    # Список приглашённых (чужие статусы) моим собственным ответом не трогается.
+    assert updated.attendees[0].participation == "needs-action"
+
+
+def test_set_my_participation_missing_event_returns_none(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    assert calendar_store.set_my_participation(path, "nope", "accepted") is None
+
+
+def test_apply_reply_updates_attendee_participation(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    updated = calendar_store.apply_reply(path, "e1@redmail", "me@example.com", "accepted")
+    assert updated is not None
+    assert updated.attendees[0].participation == "accepted"
+
+
+def test_apply_reply_adds_unknown_attendee(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    updated = calendar_store.apply_reply(path, "e1@redmail", "other@example.com", "declined")
+    assert updated is not None
+    emails = {a.email: a.participation for a in updated.attendees}
+    assert emails["other@example.com"] == "declined"
+
+
+def test_apply_reply_missing_event_returns_none(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    assert calendar_store.apply_reply(path, "nope", "a@example.com", "accepted") is None
+
+
+def test_all_day_event_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    event = Event(uid="allday@redmail", summary="Отпуск", dtstart=start, dtend=start + timedelta(days=1), all_day=True)
+    calendar_store.save_event(path, event)
+    fetched = calendar_store.get_event(path, "allday@redmail")
+    assert fetched.all_day is True
