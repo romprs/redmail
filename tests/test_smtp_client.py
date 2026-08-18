@@ -107,3 +107,34 @@ def test_send_message_with_attachment() -> None:
     assert len(attachments) == 1
     assert attachments[0].get_filename() == "report.txt"
     assert attachments[0].get_payload(decode=True) == b"data-inside"
+
+
+def test_send_message_with_calendar_invite_carries_method_param() -> None:
+    # Outlook и другие iTIP-совместимые клиенты определяют, что вложение —
+    # приглашение (а не просто файл), по параметру method= у Content-Type,
+    # рядом с METHOD: внутри самого .ics.
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(
+            sender="ivan@example.com",
+            to=["colleague@example.com"],
+            subject="Приглашение: Совещание",
+            body="Вас пригласили на встречу.",
+            attachments=[
+                OutgoingAttachment(
+                    filename="invite.ics",
+                    content_type="text/calendar",
+                    payload=b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n",
+                    content_type_params={"method": "REQUEST"},
+                )
+            ],
+        )
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    attachment = next(sent.iter_attachments())
+    assert attachment.get_content_type() == "text/calendar"
+    assert attachment.get_param("method") == "REQUEST"

@@ -210,6 +210,8 @@ def extract_content(message: Message) -> MessageContent:
     if not message.is_multipart():
         if message.get_content_type() == "text/plain":
             return MessageContent(text=_decode_payload(message))
+        if message.get_content_type() == "text/calendar":
+            return MessageContent(text="", attachments=[_calendar_attachment(message)])
         return MessageContent(text="(письмо в формате HTML — предпросмотр текста недоступен)")
 
     text: str | None = None
@@ -221,18 +223,22 @@ def extract_content(message: Message) -> MessageContent:
             continue
 
         filename = part.get_filename()
-        is_attachment = bool(filename) or part.get_content_disposition() == "attachment"
+        content_type = part.get_content_type()
+        # text/calendar (RFC 5546 iTIP-приглашение) сохраняем как вложение
+        # всегда — не только когда отправитель явно проставил
+        # Content-Disposition: attachment/filename (не все серверы это
+        # делают), иначе приглашение молча потеряется.
+        is_attachment = bool(filename) or part.get_content_disposition() == "attachment" or content_type == "text/calendar"
         if is_attachment:
             attachments.append(
-                Attachment(
+                _calendar_attachment(part) if content_type == "text/calendar" else Attachment(
                     filename=filename or "(без имени)",
-                    content_type=part.get_content_type(),
+                    content_type=content_type,
                     payload=part.get_payload(decode=True) or b"",
                 )
             )
             continue
 
-        content_type = part.get_content_type()
         if content_type == "text/plain" and text is None:
             text = _decode_payload(part)
         elif content_type == "text/html":
@@ -242,6 +248,14 @@ def extract_content(message: Message) -> MessageContent:
         text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html_seen else "(нет текстового содержимого)"
 
     return MessageContent(text=text, attachments=attachments)
+
+
+def _calendar_attachment(part: Message) -> Attachment:
+    return Attachment(
+        filename=part.get_filename() or "invite.ics",
+        content_type="text/calendar",
+        payload=part.get_payload(decode=True) or b"",
+    )
 
 
 def _decode_payload(part: Message) -> str:

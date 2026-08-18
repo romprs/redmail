@@ -447,6 +447,56 @@ def test_fetch_message_content_extracts_attachment() -> None:
     assert attachment.size == len(b"file-bytes-here")
 
 
+def test_fetch_message_content_keeps_inline_calendar_part_without_disposition() -> None:
+    # Не все серверы ставят Content-Disposition: attachment/filename на
+    # text/calendar-часть приглашения (RFC 5546 этого не требует) — раньше
+    # такая часть тихо терялась (не текст, не HTML, без имени файла).
+    raw = (
+        b"From: organizer@example.com\r\n"
+        b"Subject: Invite\r\n"
+        b'Content-Type: multipart/mixed; boundary="B"\r\n'
+        b"\r\n"
+        b"--B\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n"
+        b"\r\n"
+        b"You are invited.\r\n"
+        b"--B\r\n"
+        b"Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n"
+        b"\r\n"
+        b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+        b"--B--\r\n"
+    )
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert len(content.attachments) == 1
+    assert content.attachments[0].content_type == "text/calendar"
+    assert content.attachments[0].payload == b"BEGIN:VCALENDAR\r\nEND:VCALENDAR"
+
+
+def test_fetch_message_content_bare_calendar_message() -> None:
+    # Редкий случай: всё письмо целиком — один text/calendar без обёртки
+    # multipart (не приходит от Gmail/Exchange, но валидно по MIME).
+    raw = (
+        b"From: organizer@example.com\r\n"
+        b"Subject: Invite\r\n"
+        b"Content-Type: text/calendar; method=REQUEST; charset=utf-8\r\n"
+        b"\r\n"
+        b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+    )
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert len(content.attachments) == 1
+    assert content.attachments[0].content_type == "text/calendar"
+
+
 def test_close_logs_out() -> None:
     fake_client = MagicMock()
 

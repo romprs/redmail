@@ -19,6 +19,11 @@ class OutgoingAttachment:
     filename: str
     content_type: str
     payload: bytes
+    # Доп. параметры Content-Type — нужно для приглашений: MIME-параметр
+    # method= (RFC 5546) рядом с METHOD: внутри самого .ics — многие клиенты
+    # (Outlook в их числе) ищут именно внешний параметр, чтобы показать
+    # интерфейс "принять/отклонить", а не просто вложение.
+    content_type_params: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -49,6 +54,7 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
             maintype=maintype or "application",
             subtype=subtype or "octet-stream",
             filename=attachment.filename,
+            params=attachment.content_type_params or None,
         )
 
     smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP

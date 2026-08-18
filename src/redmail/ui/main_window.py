@@ -42,7 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redmail import archive_store
+from redmail import archive_store, calendar_store, itip
 from redmail.config_store import (
     load_account,
     load_font_scale,
@@ -53,8 +53,9 @@ from redmail.config_store import (
     save_pane_orientation,
     save_poll_interval_minutes,
 )
-from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageSummary
+from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
+from redmail.paths import app_dir
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
 
 COL_CHECK = 0
@@ -85,6 +86,14 @@ _DISPLAY_NAMES: dict[str, str] = {"INBOX": "Входящие"}
 # Ключ "источника" для узлов дерева папок живого ящика (см. UserRole ниже) —
 # отличает их от узлов открытых архивов, чей ключ — строковый путь к файлу.
 _LIVE_SOURCE_KEY = "__live__"
+
+_PARTICIPATION_LABELS: dict[str, str] = {
+    "accepted": "Принял(а) участие",
+    "declined": "Отклонил(а)",
+    "tentative": "Участие под вопросом",
+    "needs-action": "Ещё не ответил(а)",
+}
+_REPLY_VERBS: dict[str, str] = {"accepted": "Принято", "declined": "Отклонено", "tentative": "Под вопросом"}
 
 _MARKER_ICON_SIZE = 16
 
@@ -409,6 +418,11 @@ class MainWindow(QMainWindow):
         self._temp_attachment_dirs: list[Path] = []
         self._base_font_point_size = QApplication.instance().font().pointSizeF() or 10.0
 
+        # Один локальный календарь на пользователя (не на учётную запись —
+        # как и почтовый кэш, это просто локальное состояние приложения).
+        self.calendar_path = app_dir() / "calendar.rmcal"
+        self.current_invite: itip.IncomingInvite | None = None
+
         self.folder_tree = QTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.currentItemChanged.connect(self.on_folder_item_changed)
@@ -447,6 +461,23 @@ class MainWindow(QMainWindow):
         self.attachments_list.customContextMenuRequested.connect(self.on_attachment_context_menu)
         self.attachments_list.hide()
 
+        self.invite_bar = QWidget(self)
+        self.invite_bar.setAutoFillBackground(True)
+        invite_layout = QHBoxLayout(self.invite_bar)
+        invite_layout.setContentsMargins(8, 6, 8, 6)
+        self.invite_label = QLabel(self.invite_bar)
+        self.invite_label.setWordWrap(True)
+        invite_layout.addWidget(self.invite_label, 1)
+        self.invite_accept_button = QPushButton("Принять", self.invite_bar)
+        self.invite_tentative_button = QPushButton("Предварительно", self.invite_bar)
+        self.invite_decline_button = QPushButton("Отклонить", self.invite_bar)
+        self.invite_accept_button.clicked.connect(lambda: self.on_invite_response("accepted"))
+        self.invite_tentative_button.clicked.connect(lambda: self.on_invite_response("tentative"))
+        self.invite_decline_button.clicked.connect(lambda: self.on_invite_response("declined"))
+        for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+            invite_layout.addWidget(button)
+        self.invite_bar.hide()
+
         self.reading_pane = QPlainTextEdit(self)
         self.reading_pane.setReadOnly(True)
         self.reading_pane.setPlaceholderText("Выберите письмо, чтобы увидеть текст")
@@ -454,6 +485,7 @@ class MainWindow(QMainWindow):
         reading_container = QWidget(self)
         reading_layout = QVBoxLayout(reading_container)
         reading_layout.setContentsMargins(0, 0, 0, 0)
+        reading_layout.addWidget(self.invite_bar)
         reading_layout.addWidget(self.attachments_list)
         reading_layout.addWidget(self.reading_pane)
 
@@ -946,6 +978,8 @@ class MainWindow(QMainWindow):
         self.current_attachments = []
         self.attachments_list.clear()
         self.attachments_list.hide()
+        self.current_invite = None
+        self.invite_bar.hide()
 
     def on_filter_changed(self, text: str) -> None:
         needle = text.strip().lower()
@@ -1115,6 +1149,8 @@ class MainWindow(QMainWindow):
         if summary is None:
             return
         self.selected_summary = summary
+        self.current_invite = None
+        self.invite_bar.hide()
         try:
             content = self.active_source.message_content(self.current_folder, summary.uid)
         except Exception as exc:
@@ -1127,7 +1163,105 @@ class MainWindow(QMainWindow):
         self.current_body = content.text
         self.current_attachments = content.attachments
         self.reading_pane.setPlainText(content.text)
+        self._update_invite_bar(content)
         self._refresh_attachments_list()
+
+    def _update_invite_bar(self, content: MessageContent) -> None:
+        calendar_part = next((a for a in content.attachments if a.content_type == "text/calendar"), None)
+        if calendar_part is None or not self.account:
+            return
+        try:
+            invite = itip.parse_invite(calendar_part.payload, my_email=self.account.username)
+        except Exception:
+            return  # повреждённый или непонятный .ics — просто не показываем панель
+
+        if invite.method == "REQUEST":
+            event = calendar_store.apply_invite(self.calendar_path, "REQUEST", invite.event)
+            self.current_invite = invite
+            when = self._format_event_time(event)
+            text = f"Приглашение: «{event.summary}» — {when}"
+            if event.location:
+                text += f", {event.location}"
+            text += f"\nОрганизатор: {event.organizer_name or event.organizer_email}"
+            if event.my_participation != "needs-action":
+                text += f" · {_PARTICIPATION_LABELS[event.my_participation]}"
+            self.invite_label.setText(text)
+            can_respond = bool(self.smtp_account) and event.my_participation == "needs-action"
+            for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+                button.setEnabled(can_respond)
+            self.invite_bar.show()
+        elif invite.method == "CANCEL":
+            calendar_store.apply_invite(self.calendar_path, "CANCEL", invite.event)
+            self.current_invite = None
+            self.invite_label.setText(f"Встреча отменена: «{invite.event.summary}»")
+            for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+                button.setEnabled(False)
+            self.invite_bar.show()
+        elif invite.method == "REPLY" and invite.replying_attendee_email:
+            participation = next(
+                (a.participation for a in invite.event.attendees if a.email == invite.replying_attendee_email),
+                "needs-action",
+            )
+            calendar_store.apply_reply(
+                self.calendar_path, invite.event.uid, invite.replying_attendee_email, participation
+            )
+            self.current_invite = None
+            label = _PARTICIPATION_LABELS.get(participation, participation)
+            self.invite_label.setText(f"{invite.replying_attendee_email}: {label} — «{invite.event.summary}»")
+            for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+                button.setEnabled(False)
+            self.invite_bar.show()
+
+    @staticmethod
+    def _format_event_time(event: calendar_store.Event) -> str:
+        start_local = event.dtstart.astimezone()
+        end_local = event.dtend.astimezone()
+        if event.all_day:
+            return f"{start_local.strftime('%d.%m.%Y')} (весь день)"
+        if start_local.date() == end_local.date():
+            return f"{start_local.strftime('%d.%m.%Y %H:%M')}–{end_local.strftime('%H:%M')}"
+        return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
+
+    def on_invite_response(self, participation: str) -> None:
+        if self.current_invite is None or not self.account:
+            return
+        if not self.smtp_account:
+            QMessageBox.warning(
+                self, "Нет исходящей почты", "Укажите сервер SMTP в настройках, чтобы ответить на приглашение."
+            )
+            return
+        uid = self.current_invite.event.uid
+        event = calendar_store.set_my_participation(self.calendar_path, uid, participation)
+        if event is None:
+            return
+
+        ics = itip.build_reply_ics(event, self.account.username, self.account.username, participation)
+        verb = _REPLY_VERBS[participation]
+        message = OutgoingMessage(
+            sender=self.account.username,
+            to=[event.organizer_email],
+            subject=f"{verb}: {event.summary}",
+            body=f"{verb}: «{event.summary}»",
+            attachments=[
+                OutgoingAttachment(
+                    filename="reply.ics",
+                    content_type="text/calendar",
+                    payload=ics,
+                    content_type_params={"method": "REPLY"},
+                )
+            ],
+        )
+        try:
+            send_message(self.smtp_account, message)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось отправить ответ", str(exc))
+            return
+
+        self.current_invite = None
+        self.invite_label.setText(f"«{event.summary}» — {_PARTICIPATION_LABELS[participation]}")
+        for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+            button.setEnabled(False)
+        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {verb.lower()}", 5000)
 
     def _refresh_attachments_list(self) -> None:
         self.attachments_list.clear()
