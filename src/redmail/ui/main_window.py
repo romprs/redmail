@@ -4,8 +4,9 @@ import mimetypes
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPixmap
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -18,15 +19,19 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QToolBar,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -37,7 +42,7 @@ from redmail.config_store import (
     save_account,
     save_poll_interval_minutes,
 )
-from redmail.imap_client import Account, Attachment, ImapSession, MessageSummary
+from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageSummary
 from redmail.mailbox import CachedMailbox
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
 
@@ -49,8 +54,31 @@ COL_SENDER = 4
 COL_SUBJECT = 5
 COL_DATE = 6
 
-_FLAG_MARK = "⚑"  # ⚑ — компактнее и надёжнее по шрифтам, чем цветной эмодзи-флаг
+_FLAG_MARK = "⚑"
 _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
+
+# Gmail заворачивает Отправленные/Корзину и т.п. в служебный контейнер
+# "[Gmail]" — сам по себе не открывается (см. \Noselect в list_folders),
+# но его имя остаётся частью названий дочерних папок. В дереве эта
+# служебная обёртка не нужна — реальную иерархию задаёт узел учётной записи.
+_HIDDEN_PATH_SEGMENTS = {"[Gmail]", "[Google Mail]"}
+
+_MARKER_LABELS: dict[str, str] = {
+    "red": "Красный",
+    "orange": "Оранжевый",
+    "yellow": "Жёлтый",
+    "green": "Зелёный",
+    "blue": "Синий",
+    "purple": "Фиолетовый",
+}
+_MARKER_HEX: dict[str, str] = {
+    "red": "#D64545",
+    "orange": "#E08A2B",
+    "yellow": "#C9A227",
+    "green": "#4C9A5B",
+    "blue": "#3B6FB6",
+    "purple": "#8B5CB6",
+}
 
 
 def _format_size(num_bytes: int) -> str:
@@ -65,7 +93,7 @@ def _importance_mark(importance: str) -> str:
     if importance == "high":
         return "!"
     if importance == "low":
-        return "↓"  # ↓
+        return "↓"
     return ""
 
 
@@ -255,15 +283,22 @@ class MainWindow(QMainWindow):
         self.account: Account | None = None
         self.mailbox: CachedMailbox | None = None
         self.smtp_account: SmtpAccount | None = None
+        self.trash_folder_name: str | None = None
         self.current_folder: str | None = None
         self.current_summaries: list[MessageSummary] = []
+        self.summaries_by_uid: dict[int, MessageSummary] = {}
         self.current_body: str = ""
         self.current_attachments: list[Attachment] = []
         self.selected_summary: MessageSummary | None = None
         self.poll_interval_minutes = load_poll_interval_minutes()
 
-        self.folder_list = QListWidget(self)
-        self.folder_list.currentTextChanged.connect(self.on_folder_selected)
+        self.folder_tree = QTreeWidget(self)
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.currentItemChanged.connect(self.on_folder_item_changed)
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("Фильтр по теме или отправителю…")
+        self.filter_edit.textChanged.connect(self.on_filter_changed)
 
         self.table = QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
@@ -272,10 +307,18 @@ class MainWindow(QMainWindow):
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionsMovable(True)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self.on_message_selected)
         self.table.itemClicked.connect(self.on_table_item_clicked)
+
+        table_container = QWidget(self)
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self.filter_edit)
+        table_layout.addWidget(self.table)
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(70)
@@ -293,17 +336,17 @@ class MainWindow(QMainWindow):
         reading_layout.addWidget(self.reading_pane)
 
         right_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        right_splitter.addWidget(self.table)
+        right_splitter.addWidget(table_container)
         right_splitter.addWidget(reading_container)
         right_splitter.setStretchFactor(0, 2)
         right_splitter.setStretchFactor(1, 1)
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        main_splitter.addWidget(self.folder_list)
+        main_splitter.addWidget(self.folder_tree)
         main_splitter.addWidget(right_splitter)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([200, 1000])
+        main_splitter.setSizes([220, 980])
         self.setCentralWidget(main_splitter)
 
         toolbar = QToolBar("Основная", self)
@@ -328,6 +371,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(reply_action)
 
         delete_action = QAction("Удалить", self)
+        delete_action.setToolTip("В корзину. Shift+Удалить — безвозвратно.")
         delete_action.triggered.connect(self.on_delete_selected)
         toolbar.addAction(delete_action)
 
@@ -374,7 +418,7 @@ class MainWindow(QMainWindow):
         account: Account,
         smtp_account: SmtpAccount | None,
         session: ImapSession,
-        folders: list[str],
+        folders: list[FolderInfo],
     ) -> None:
         if self.mailbox:
             self.mailbox.close()
@@ -382,14 +426,43 @@ class MainWindow(QMainWindow):
         self.account = account
         self.mailbox = CachedMailbox(session, account)
         self.smtp_account = smtp_account
+        self.trash_folder_name = session.trash_folder()
 
-        self.folder_list.clear()
-        for name in folders:
-            self.folder_list.addItem(QListWidgetItem(name))
+        self._populate_folder_tree(folders)
 
-        default_row = folders.index("INBOX") if "INBOX" in folders else 0
-        if folders:
-            self.folder_list.setCurrentRow(default_row)
+    def _populate_folder_tree(self, folders: list[FolderInfo]) -> None:
+        self.folder_tree.clear()
+        root = QTreeWidgetItem([self.account.username])
+        root.setFlags(root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.folder_tree.addTopLevelItem(root)
+
+        nodes: dict[tuple[str, ...], QTreeWidgetItem] = {(): root}
+        inbox_item: QTreeWidgetItem | None = None
+        first_selectable: QTreeWidgetItem | None = None
+
+        for info in folders:
+            delimiter = info.delimiter or "/"
+            parts = [p for p in info.name.split(delimiter) if p not in _HIDDEN_PATH_SEGMENTS] or [info.name]
+            path: tuple[str, ...] = ()
+            parent = root
+            for part in parts:
+                path = path + (part,)
+                node = nodes.get(path)
+                if node is None:
+                    node = QTreeWidgetItem([part])
+                    parent.addChild(node)
+                    nodes[path] = node
+                parent = node
+            parent.setData(0, Qt.ItemDataRole.UserRole, info.name)
+            if first_selectable is None:
+                first_selectable = parent
+            if info.name == "INBOX":
+                inbox_item = parent
+
+        self.folder_tree.expandAll()
+        default_item = inbox_item or first_selectable
+        if default_item is not None:
+            self.folder_tree.setCurrentItem(default_item)
 
     def on_connect(self) -> None:
         saved = None
@@ -437,13 +510,16 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
         self._restart_poll_timer()
 
-    def on_folder_selected(self, folder: str) -> None:
-        if not self.mailbox or not folder:
+    def on_folder_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
+        if current is None or not self.mailbox:
             return
-        self.current_folder = folder
+        folder_name = current.data(0, Qt.ItemDataRole.UserRole)
+        if not folder_name:
+            return  # промежуточный узел иерархии, не настоящая папка
+        self.current_folder = folder_name
         self._clear_reading_pane()
         try:
-            summaries = self.mailbox.folder_summaries(folder)
+            summaries = self.mailbox.folder_summaries(folder_name)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
@@ -478,18 +554,39 @@ class MainWindow(QMainWindow):
         self.attachments_list.clear()
         self.attachments_list.hide()
 
+    def on_filter_changed(self, text: str) -> None:
+        needle = text.strip().lower()
+        for row in range(self.table.rowCount()):
+            if not needle:
+                self.table.setRowHidden(row, False)
+                continue
+            sender = self.table.item(row, COL_SENDER).text().lower()
+            subject = self.table.item(row, COL_SUBJECT).text().lower()
+            self.table.setRowHidden(row, needle not in sender and needle not in subject)
+
     def _render_folder(self, summaries: list[MessageSummary]) -> None:
         previously_selected_uid = self.selected_summary.uid if self.selected_summary else None
 
         self.current_summaries = summaries
+        self.summaries_by_uid = {s.uid: s for s in summaries}
+
+        # Сортировку на время заполнения отключаем: иначе Qt переставляет
+        # строки после каждого setItem(), и индекс row перестаёт совпадать
+        # с тем, что мы только что туда положили.
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
             check_item = QTableWidgetItem()
             check_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
             check_item.setCheckState(Qt.CheckState.Unchecked)
+            check_item.setData(Qt.ItemDataRole.UserRole, summary.uid)
             self.table.setItem(row, COL_CHECK, check_item)
 
-            self.table.setItem(row, COL_FLAG, self._readonly_item(_FLAG_MARK if summary.flagged else ""))
+            flag_item = self._readonly_item(_FLAG_MARK if summary.marker_color else "")
+            if summary.marker_color:
+                flag_item.setForeground(QColor(_MARKER_HEX[summary.marker_color]))
+            self.table.setItem(row, COL_FLAG, flag_item)
+
             self.table.setItem(row, COL_IMPORTANCE, self._readonly_item(_importance_mark(summary.importance)))
             self.table.setItem(
                 row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
@@ -497,12 +594,14 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_SENDER, QTableWidgetItem(summary.sender))
             self.table.setItem(row, COL_SUBJECT, QTableWidgetItem(summary.subject))
             self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
+        self.table.setSortingEnabled(True)
 
         self.statusBar().showMessage(f"{self.current_folder}: писем {len(summaries)}", 5000)
+        self.on_filter_changed(self.filter_edit.text())
 
         if previously_selected_uid is not None:
-            for row, summary in enumerate(summaries):
-                if summary.uid == previously_selected_uid:
+            for row in range(self.table.rowCount()):
+                if self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) == previously_selected_uid:
                     self.table.selectRow(row)
                     break
 
@@ -513,49 +612,86 @@ class MainWindow(QMainWindow):
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         return item
 
+    def _summary_for_row(self, row: int) -> MessageSummary | None:
+        uid = self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
+        return self.summaries_by_uid.get(uid)
+
     def on_table_item_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() != COL_FLAG or not self.mailbox or not self.current_folder:
             return
-        row = item.row()
-        summary = self.current_summaries[row]
-        new_state = not summary.flagged
-        try:
-            self.mailbox.toggle_flag(self.current_folder, summary.uid, new_state)
-        except Exception as exc:
-            QMessageBox.critical(self, "Не удалось изменить флаг", str(exc))
+        summary = self._summary_for_row(item.row())
+        if summary is None:
             return
-        summary.flagged = new_state
-        item.setText(_FLAG_MARK if new_state else "")
+        self._open_marker_menu(item, summary)
+
+    def _open_marker_menu(self, item: QTableWidgetItem, summary: MessageSummary) -> None:
+        menu = QMenu(self)
+        none_action = menu.addAction("Без маркера")
+        menu.addSeparator()
+        action_colors: dict[QAction, str] = {}
+        for color, label in _MARKER_LABELS.items():
+            action = menu.addAction(label)
+            pixmap = QPixmap(12, 12)
+            pixmap.fill(QColor(_MARKER_HEX[color]))
+            action.setIcon(QIcon(pixmap))
+            action_colors[action] = color
+
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        new_color = None if chosen is none_action else action_colors[chosen]
+
+        try:
+            self.mailbox.set_marker(self.current_folder, summary.uid, new_color)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось изменить маркер", str(exc))
+            return
+
+        summary.marker_color = new_color
+        item.setText(_FLAG_MARK if new_color else "")
+        item.setForeground(QColor(_MARKER_HEX[new_color]) if new_color else QColor())
 
     def on_delete_selected(self) -> None:
         if not self.mailbox or not self.current_folder:
             return
-        checked_rows = [
-            row
+        checked_uids = [
+            uid
             for row in range(self.table.rowCount())
             if self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
+            for uid in [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)]
         ]
-        if not checked_rows:
+        if not checked_uids:
             QMessageBox.information(self, "Нечего удалять", "Отметьте галочками письма, которые нужно удалить.")
             return
 
-        uids = [self.current_summaries[row].uid for row in checked_rows]
-        confirm = QMessageBox.question(
-            self,
-            "Удалить письма",
-            f"Удалить выбранные письма ({len(uids)})? Это действие нельзя отменить.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
+        shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+        already_in_trash = self.trash_folder_name is not None and self.current_folder == self.trash_folder_name
+        permanent = shift_held or already_in_trash or not self.trash_folder_name
 
-        try:
-            self.mailbox.delete_messages(self.current_folder, uids)
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка удаления", str(exc))
-            return
+        if permanent:
+            confirm = QMessageBox.question(
+                self,
+                "Удалить безвозвратно",
+                f"Удалить выбранные письма насовсем ({len(checked_uids)})? Это действие нельзя отменить.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if confirm != QMessageBox.StandardButton.Yes:
+                return
+            try:
+                self.mailbox.delete_messages(self.current_folder, checked_uids)
+            except Exception as exc:
+                QMessageBox.critical(self, "Ошибка удаления", str(exc))
+                return
+            status_text = f"Удалено безвозвратно: {len(checked_uids)}"
+        else:
+            try:
+                self.mailbox.move_to_trash(self.current_folder, checked_uids, self.trash_folder_name)
+            except Exception as exc:
+                QMessageBox.critical(self, "Ошибка удаления", str(exc))
+                return
+            status_text = f"Перемещено в корзину: {len(checked_uids)}"
 
-        if self.selected_summary and self.selected_summary.uid in uids:
+        if self.selected_summary and self.selected_summary.uid in checked_uids:
             self._clear_reading_pane()
         try:
             summaries = self.mailbox.refresh_folder(self.current_folder)
@@ -563,14 +699,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Письма удалены, но обновить список не удалось", str(exc))
             return
         self._render_folder(summaries)
-        self.statusBar().showMessage(f"Удалено писем: {len(uids)}", 5000)
+        self.statusBar().showMessage(status_text, 5000)
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
         if not rows or not self.mailbox or not self.current_folder:
             return
-        row = rows[0].row()
-        summary = self.current_summaries[row]
+        summary = self._summary_for_row(rows[0].row())
+        if summary is None:
+            return
         self.selected_summary = summary
         try:
             content = self.mailbox.message_content(self.current_folder, summary.uid)
@@ -591,8 +728,10 @@ class MainWindow(QMainWindow):
         if not self.current_attachments:
             self.attachments_list.hide()
             return
+        icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
         for attachment in self.current_attachments:
-            self.attachments_list.addItem(f"Вложение: {attachment.filename} ({_format_size(attachment.size)})")
+            item = QListWidgetItem(icon, f"{attachment.filename} ({_format_size(attachment.size)})")
+            self.attachments_list.addItem(item)
         self.attachments_list.show()
 
     def on_save_attachment(self, item: QListWidgetItem) -> None:

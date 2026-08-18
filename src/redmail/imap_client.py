@@ -9,6 +9,20 @@ from imapclient import IMAPClient
 
 _HEADER_FIELDS = "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"
 
+# Флаг \Flagged ставим всегда вместе с цветом — так другие IMAP-клиенты
+# (Thunderbird, сам Outlook по IMAP) увидят письмо помеченным, даже если не
+# понимают наш собственный keyword с цветом. $-префикс — общепринятое
+# соглашение для нестандартных keyword-флагов (как $Forwarded, $MDNSent).
+MARKER_COLORS: dict[str, bytes] = {
+    "red": b"$RedMailRed",
+    "orange": b"$RedMailOrange",
+    "yellow": b"$RedMailYellow",
+    "green": b"$RedMailGreen",
+    "blue": b"$RedMailBlue",
+    "purple": b"$RedMailPurple",
+}
+_COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
+
 
 @dataclass
 class Account:
@@ -20,6 +34,12 @@ class Account:
 
 
 @dataclass
+class FolderInfo:
+    name: str
+    delimiter: str
+
+
+@dataclass
 class MessageSummary:
     uid: int
     subject: str
@@ -28,7 +48,7 @@ class MessageSummary:
     date: str
     message_id: str
     has_attachments: bool = False
-    flagged: bool = False
+    marker_color: str | None = None
     importance: str = "normal"  # "high" | "normal" | "low"
 
 
@@ -63,6 +83,7 @@ class ImapSession:
         self._client.login(account.username, account.password)
         self._selected_folder: str | None = None
         self._selected_exists = 0
+        self._raw_folders: list[tuple] = []
 
     def close(self) -> None:
         try:
@@ -76,12 +97,22 @@ class ImapSession:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    def list_folders(self) -> list[str]:
+    def list_folders(self) -> list[FolderInfo]:
+        # Сырой ответ запоминаем — из него же достаём папку "Корзина" в
+        # trash_folder(), без второго похода на сервер (find_special_folder
+        # библиотеки сам заново вызывает list_folders).
+        self._raw_folders = self._client.list_folders()
         return [
-            name
-            for flags, _delimiter, name in self._client.list_folders()
+            FolderInfo(name=name, delimiter=(delimiter or b"/").decode("ascii", errors="replace"))
+            for flags, delimiter, name in self._raw_folders
             if b"\\Noselect" not in flags
         ]
+
+    def trash_folder(self) -> str | None:
+        for flags, _delimiter, name in self._raw_folders:
+            if b"\\Trash" in flags:
+                return name
+        return None
 
     def folder_message_count(self, folder: str) -> int:
         """SELECT папку, вернуть общее число писем в ней (EXISTS).
@@ -130,14 +161,33 @@ class ImapSession:
         raw = response[uid][b"BODY[]"]
         return _extract_content(message_from_bytes(raw))
 
-    def set_flagged(self, folder: str, uid: int, flagged: bool) -> None:
+    def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         self._select(folder)
-        if flagged:
-            self._client.add_flags([uid], [b"\\Flagged"])
+        all_keywords = list(MARKER_COLORS.values())
+        if color is None:
+            self._client.remove_flags([uid], [b"\\Flagged", *all_keywords])
+            return
+        keyword = MARKER_COLORS[color]
+        others = [k for k in all_keywords if k != keyword]
+        if others:
+            self._client.remove_flags([uid], others)
+        self._client.add_flags([uid], [b"\\Flagged", keyword])
+
+    def move_messages(self, folder: str, uids: list[int], target_folder: str) -> None:
+        """Переносит письма в другую папку (например, в корзину) — атомарно,
+        если сервер поддерживает MOVE (RFC 6851), иначе COPY + удаление."""
+        if not uids:
+            return
+        self._select(folder)
+        if self._client.has_capability("MOVE"):
+            self._client.move(uids, target_folder)
         else:
-            self._client.remove_flags([uid], [b"\\Flagged"])
+            self._client.copy(uids, target_folder)
+            self._client.delete_messages(uids)
+            self._client.expunge()
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
+        """Безвозвратное удаление (Shift+Удалить, либо удаление из самой корзины)."""
         if not uids:
             return
         self._select(folder)
@@ -200,6 +250,7 @@ def _to_summary(data: dict) -> MessageSummary:
     sender_display, sender_email = _format_address(envelope.from_)
     message_id = envelope.message_id
     flags = data.get(b"FLAGS", ())
+    marker_color = next((_COLOR_BY_KEYWORD[f] for f in flags if f in _COLOR_BY_KEYWORD), None)
     return MessageSummary(
         uid=data[b"UID"],
         subject=_decode_subject(envelope.subject),
@@ -208,7 +259,7 @@ def _to_summary(data: dict) -> MessageSummary:
         date=envelope.date.strftime("%Y-%m-%d %H:%M") if envelope.date else "",
         message_id=message_id.decode("ascii", errors="replace") if message_id else "",
         has_attachments=_body_has_attachment(data[b"BODYSTRUCTURE"]) if b"BODYSTRUCTURE" in data else False,
-        flagged=b"\\Flagged" in flags,
+        marker_color=marker_color,
         importance=_parse_importance(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b"")),
     )
 

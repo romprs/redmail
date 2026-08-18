@@ -7,7 +7,18 @@ from pathlib import Path
 from redmail.imap_client import Attachment, MessageContent, MessageSummary
 from redmail.paths import app_dir
 
+# Поднимаем при любом изменении формы того, что кэшируется в messages
+# (новое поле и т.п.) — иначе старые строки молча остаются с значениями по
+# умолчанию (например, без скрепки) и никогда не обновляются сами, пока
+# папку не пересохранят по другой причине (см. save_folder_summaries).
+_SCHEMA_VERSION = 3
+
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS folders (
     account TEXT NOT NULL,
     folder TEXT NOT NULL,
@@ -26,7 +37,7 @@ CREATE TABLE IF NOT EXISTS messages (
     date TEXT NOT NULL,
     message_id TEXT NOT NULL,
     has_attachments INTEGER NOT NULL DEFAULT 0,
-    flagged INTEGER NOT NULL DEFAULT 0,
+    marker_color TEXT,
     importance TEXT NOT NULL DEFAULT 'normal',
     body TEXT,
     PRIMARY KEY (account, folder, uid)
@@ -42,11 +53,11 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 """
 
-# Столбцы добавились после первого релиза кэша — для баз, созданных раньше,
-# CREATE TABLE IF NOT EXISTS их не добавит, поэтому досоздаём миграцией.
+# Столбцы, добавленные после первого релиза кэша — CREATE TABLE IF NOT EXISTS
+# их для уже существующих баз не создаст, поэтому досоздаём миграцией.
 _MIGRATIONS = (
     "ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0",
-    "ALTER TABLE messages ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE messages ADD COLUMN marker_color TEXT",
     "ALTER TABLE messages ADD COLUMN importance TEXT NOT NULL DEFAULT 'normal'",
 )
 
@@ -65,6 +76,22 @@ def _connect() -> sqlite3.Connection:
             conn.execute(migration)
         except sqlite3.OperationalError:
             pass  # столбец уже есть
+
+    row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    if row is None or row[0] != str(_SCHEMA_VERSION):
+        # Формат закэшированных писем поменялся — старые строки не соответствуют
+        # текущим полям (например, "\\Gmail-скрепка" видна только там, где кэш
+        # уже пересчитан). Кэш — не источник истины, его безопасно стереть
+        # целиком и заново набрать с сервера.
+        conn.execute("DELETE FROM folders")
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM attachments")
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(_SCHEMA_VERSION),),
+        )
+        conn.commit()
     return conn
 
 
@@ -80,7 +107,7 @@ def get_folder_exists(account_key: str, folder: str) -> int | None:
 def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, flagged, importance "
+            "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance "
             "FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
             (account_key, folder),
         ).fetchall()
@@ -93,10 +120,10 @@ def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
             date=date,
             message_id=message_id,
             has_attachments=bool(has_attachments),
-            flagged=bool(flagged),
+            marker_color=marker_color,
             importance=importance,
         )
-        for uid, subject, sender, sender_email, date, message_id, has_attachments, flagged, importance in rows
+        for uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance in rows
     ]
 
 
@@ -123,17 +150,17 @@ def save_folder_summaries(
         conn.executemany(
             "INSERT INTO messages "
             "(account, folder, uid, position, subject, sender, sender_email, date, message_id, "
-            "has_attachments, flagged, importance) "
+            "has_attachments, marker_color, importance) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account, folder, uid) DO UPDATE SET "
             "position = excluded.position, subject = excluded.subject, sender = excluded.sender, "
             "sender_email = excluded.sender_email, date = excluded.date, message_id = excluded.message_id, "
-            "has_attachments = excluded.has_attachments, flagged = excluded.flagged, "
+            "has_attachments = excluded.has_attachments, marker_color = excluded.marker_color, "
             "importance = excluded.importance",
             [
                 (
                     account_key, folder, s.uid, position, s.subject, s.sender, s.sender_email, s.date,
-                    s.message_id, int(s.has_attachments), int(s.flagged), s.importance,
+                    s.message_id, int(s.has_attachments), s.marker_color, s.importance,
                 )
                 for position, s in enumerate(summaries)
             ],
@@ -141,11 +168,11 @@ def save_folder_summaries(
         conn.commit()
 
 
-def set_flagged(account_key: str, folder: str, uid: int, flagged: bool) -> None:
+def set_marker(account_key: str, folder: str, uid: int, color: str | None) -> None:
     with closing(_connect()) as conn:
         conn.execute(
-            "UPDATE messages SET flagged = ? WHERE account = ? AND folder = ? AND uid = ?",
-            (int(flagged), account_key, folder, uid),
+            "UPDATE messages SET marker_color = ? WHERE account = ? AND folder = ? AND uid = ?",
+            (color, account_key, folder, uid),
         )
         conn.commit()
 

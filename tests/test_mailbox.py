@@ -97,7 +97,7 @@ def test_message_content_cached_after_first_fetch(tmp_path: Path) -> None:
     assert first.text == second.text == "hello"
 
 
-def test_toggle_flag_updates_session_and_cache(tmp_path: Path) -> None:
+def test_set_marker_updates_session_and_cache(tmp_path: Path) -> None:
     db_path = tmp_path / "cache.sqlite3"
     session = MagicMock()
     session.folder_message_count.return_value = 1
@@ -106,11 +106,11 @@ def test_toggle_flag_updates_session_and_cache(tmp_path: Path) -> None:
     with patch("redmail.cache_store._db_path", return_value=db_path):
         mailbox = CachedMailbox(session, _account())
         mailbox.folder_summaries("INBOX")
-        mailbox.toggle_flag("INBOX", 1, True)
+        mailbox.set_marker("INBOX", 1, "green")
         cached = mailbox.folder_summaries("INBOX")
 
-    session.set_flagged.assert_called_once_with("INBOX", 1, True)
-    assert cached[0].flagged is True
+    session.set_marker.assert_called_once_with("INBOX", 1, "green")
+    assert cached[0].marker_color == "green"
 
 
 def test_delete_messages_updates_session_and_cache(tmp_path: Path) -> None:
@@ -126,6 +126,22 @@ def test_delete_messages_updates_session_and_cache(tmp_path: Path) -> None:
         cached = mailbox.folder_summaries("INBOX")
 
     session.delete_messages.assert_called_once_with("INBOX", [1])
+    assert [s.uid for s in cached] == [2]
+
+
+def test_move_to_trash_updates_session_and_cache(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 2
+    session.fetch_summaries.return_value = [_summary(1), _summary(2)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        mailbox.folder_summaries("INBOX")
+        mailbox.move_to_trash("INBOX", [1], "Trash")
+        cached = mailbox.folder_summaries("INBOX")
+
+    session.move_messages.assert_called_once_with("INBOX", [1], "Trash")
     assert [s.uid for s in cached] == [2]
 
 

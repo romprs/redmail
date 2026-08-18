@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 
 from imapclient.response_types import BodyData
 
-from redmail.imap_client import Account, ImapSession
+from redmail.imap_client import Account, FolderInfo, ImapSession
 
 _FETCH_FIELDS = ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"]
 
@@ -75,13 +75,45 @@ def test_list_folders_excludes_noselect_folders() -> None:
     fake_client.list_folders.return_value = [
         ((b"\\HasNoChildren",), b"/", "INBOX"),
         ((b"\\Noselect", b"\\HasChildren"), b"/", "[Gmail]"),
-        ((b"\\HasNoChildren",), b"/", "[Gmail]/Sent Mail"),
+        ((b"\\HasNoChildren", b"\\Trash"), b"/", "[Gmail]/Trash"),
     ]
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
-        folders = ImapSession(_account()).list_folders()
+        session = ImapSession(_account())
+        folders = session.list_folders()
 
-    assert folders == ["INBOX", "[Gmail]/Sent Mail"]
+    assert folders == [
+        FolderInfo(name="INBOX", delimiter="/"),
+        FolderInfo(name="[Gmail]/Trash", delimiter="/"),
+    ]
+
+
+def test_trash_folder_found_by_flag() -> None:
+    fake_client = MagicMock()
+    fake_client.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\Noselect", b"\\HasChildren"), b"/", "[Gmail]"),
+        ((b"\\HasNoChildren", b"\\Trash"), b"/", "[Gmail]/Trash"),
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.list_folders()
+        trash = session.trash_folder()
+
+    assert trash == "[Gmail]/Trash"
+
+
+def test_trash_folder_none_when_not_found() -> None:
+    fake_client = MagicMock()
+    fake_client.list_folders.return_value = [((b"\\HasNoChildren",), b"/", "INBOX")]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.list_folders()
+        trash = session.trash_folder()
+
+    assert trash is None
 
 
 def test_fetch_folder_summaries_parses_envelope() -> None:
@@ -108,7 +140,7 @@ def test_fetch_folder_summaries_parses_envelope() -> None:
     assert summary.date == "2026-08-17 10:30"
     assert summary.message_id == "<abc123@example.com>"
     assert summary.has_attachments is False
-    assert summary.flagged is False
+    assert summary.marker_color is None
     assert summary.importance == "normal"
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=False)
     # 3 письма в папке, лимит 1 — просим только последнее по номеру, без SEARCH.
@@ -169,7 +201,7 @@ def test_fetch_folder_summaries_reads_flags_attachment_and_importance() -> None:
         1: {
             b"ENVELOPE": envelope,
             b"UID": 9,
-            b"FLAGS": (b"\\Flagged", b"\\Seen"),
+            b"FLAGS": (b"\\Flagged", b"\\Seen", b"$RedMailRed"),
             b"BODYSTRUCTURE": bodystructure,
             b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]": b"Importance: high\r\n\r\n",
         }
@@ -179,7 +211,7 @@ def test_fetch_folder_summaries_reads_flags_attachment_and_importance() -> None:
         summary = ImapSession(_account()).fetch_folder_summaries()[0]
 
     assert summary.has_attachments is True
-    assert summary.flagged is True
+    assert summary.marker_color == "red"
     assert summary.importance == "high"
 
 
@@ -206,18 +238,73 @@ def test_fetch_folder_summaries_alternative_only_has_no_attachment() -> None:
     assert summary.has_attachments is False
 
 
-def test_set_flagged_adds_and_removes_flag() -> None:
+def test_set_marker_sets_color_and_flagged() -> None:
     fake_client = _client()
 
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         session = ImapSession(_account())
-        session.set_flagged("INBOX", 7, True)
-        session.set_flagged("INBOX", 7, False)
+        session.set_marker("INBOX", 7, "red")
 
-    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged"])
-    fake_client.remove_flags.assert_called_once_with([7], [b"\\Flagged"])
+    # Убираем другие цветные keyword'ы (на случай смены цвета) и ставим \Flagged + нужный.
+    fake_client.remove_flags.assert_called_once()
+    removed = fake_client.remove_flags.call_args[0][1]
+    assert b"$RedMailRed" not in removed
+    assert b"$RedMailBlue" in removed
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
     # Папка одна и та же — второй раз переселектить не должны.
     assert fake_client.select_folder.call_count == 1
+
+
+def test_set_marker_none_clears_flag_and_all_colors() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, None)
+
+    fake_client.add_flags.assert_not_called()
+    removed = fake_client.remove_flags.call_args[0][1]
+    assert b"\\Flagged" in removed
+    assert b"$RedMailRed" in removed
+    assert b"$RedMailBlue" in removed
+
+
+def test_move_messages_uses_move_when_supported() -> None:
+    fake_client = _client()
+    fake_client.has_capability.return_value = True
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.move_messages("INBOX", [1, 2], "Trash")
+
+    fake_client.move.assert_called_once_with([1, 2], "Trash")
+    fake_client.copy.assert_not_called()
+    fake_client.delete_messages.assert_not_called()
+
+
+def test_move_messages_falls_back_without_move_capability() -> None:
+    fake_client = _client()
+    fake_client.has_capability.return_value = False
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.move_messages("INBOX", [1, 2], "Trash")
+
+    fake_client.move.assert_not_called()
+    fake_client.copy.assert_called_once_with([1, 2], "Trash")
+    fake_client.delete_messages.assert_called_once_with([1, 2])
+    fake_client.expunge.assert_called_once()
+
+
+def test_move_messages_noop_for_empty_list() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.move_messages("INBOX", [], "Trash")
+
+    fake_client.move.assert_not_called()
+    fake_client.select_folder.assert_not_called()
 
 
 def test_delete_messages_flags_and_expunges() -> None:

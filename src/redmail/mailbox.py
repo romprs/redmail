@@ -50,9 +50,13 @@ class CachedMailbox:
         cache_store.save_message_content(self._account_key, folder, uid, content)
         return content
 
-    def toggle_flag(self, folder: str, uid: int, flagged: bool) -> None:
-        self.session.set_flagged(folder, uid, flagged)
-        cache_store.set_flagged(self._account_key, folder, uid, flagged)
+    def set_marker(self, folder: str, uid: int, color: str | None) -> None:
+        self.session.set_marker(folder, uid, color)
+        cache_store.set_marker(self._account_key, folder, uid, color)
+
+    def move_to_trash(self, folder: str, uids: list[int], trash_folder: str) -> None:
+        self.session.move_messages(folder, uids, trash_folder)
+        cache_store.delete_messages(self._account_key, folder, uids)
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         self.session.delete_messages(folder, uids)
