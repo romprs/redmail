@@ -156,10 +156,15 @@ class ImapSession:
         return self.fetch_summaries(limit)
 
     def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
+        return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))
+
+    def fetch_message_raw(self, folder: str, uid: int) -> bytes:
+        """Полный RFC 822 письма как есть — нужен для выгрузки в архив без
+        потерь (в отличие от fetch_message_content, который уже разобрал бы
+        текст/вложения и потерял бы всё остальное, например точные заголовки)."""
         self._select(folder)
         response = self._client.fetch([uid], ["BODY.PEEK[]"])
-        raw = response[uid][b"BODY[]"]
-        return extract_content(message_from_bytes(raw))
+        return response[uid][b"BODY[]"]
 
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         self._select(folder)

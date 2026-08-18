@@ -10,6 +10,7 @@ from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QIcon, QPa
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -41,6 +42,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from redmail import archive_store
 from redmail.config_store import (
     load_account,
     load_font_scale,
@@ -52,7 +54,7 @@ from redmail.config_store import (
     save_poll_interval_minutes,
 )
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageSummary
-from redmail.mailbox import CachedMailbox
+from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
 
 COL_CHECK = 0
@@ -79,6 +81,10 @@ _HIDDEN_PATH_SEGMENTS = {"[Gmail]", "[Google Mail]"}
 # Протокольное имя папки остаётся "INBOX" (это то, что уходит в IMAP-команды);
 # по-русски она подписывается иначе только в дереве папок.
 _DISPLAY_NAMES: dict[str, str] = {"INBOX": "Входящие"}
+
+# Ключ "источника" для узлов дерева папок живого ящика (см. UserRole ниже) —
+# отличает их от узлов открытых архивов, чей ключ — строковый путь к файлу.
+_LIVE_SOURCE_KEY = "__live__"
 
 _MARKER_ICON_SIZE = 16
 
@@ -315,6 +321,68 @@ class ComposeDialog(QDialog):
         return self.body_edit.toPlainText()
 
 
+class ArchiveTargetDialog(QDialog):
+    """Общий диалог выбора архива для выгрузки/импорта: архив (из уже
+    открытых, либо «выбрать/создать другой»), опционально папка внутри
+    архива, опционально копировать/переместить (для выгрузки из ящика)."""
+
+    def __init__(
+        self,
+        parent,
+        archive_names: dict[str, str],
+        *,
+        title: str,
+        ask_folder: bool = False,
+        default_folder: str = "",
+        ask_move_copy: bool = False,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+
+        self.archive_combo = QComboBox()
+        self._archive_keys: list[str] = list(archive_names.keys())
+        for key in self._archive_keys:
+            self.archive_combo.addItem(archive_names[key])
+        self.archive_combo.addItem("Открыть или создать другой архив…")
+        self._archive_keys.append("")
+
+        form = QFormLayout()
+        form.addRow("Архив", self.archive_combo)
+
+        self.folder_edit: QLineEdit | None = None
+        if ask_folder:
+            self.folder_edit = QLineEdit(default_folder)
+            form.addRow("Папка в архиве", self.folder_edit)
+
+        self.copy_radio: QRadioButton | None = None
+        self.move_radio: QRadioButton | None = None
+        if ask_move_copy:
+            self.copy_radio = QRadioButton("Копировать (оставить в ящике)")
+            self.move_radio = QRadioButton("Переместить (удалить из ящика после выгрузки)")
+            self.copy_radio.setChecked(True)
+            form.addRow(self.copy_radio)
+            form.addRow(self.move_radio)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def selected_archive_key(self) -> str:
+        return self._archive_keys[self.archive_combo.currentIndex()]
+
+    def folder_name(self) -> str:
+        return (self.folder_edit.text().strip() if self.folder_edit else "") or "Импорт"
+
+    def move(self) -> bool:
+        return bool(self.move_radio and self.move_radio.isChecked())
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -323,6 +391,10 @@ class MainWindow(QMainWindow):
 
         self.account: Account | None = None
         self.mailbox: CachedMailbox | None = None
+        self.account_root: QTreeWidgetItem | None = None
+        self.archives: dict[str, ArchiveSource] = {}
+        self.archive_tree_roots: dict[str, QTreeWidgetItem] = {}
+        self.active_source: CachedMailbox | ArchiveSource | None = None
         self.smtp_account: SmtpAccount | None = None
         self.trash_folder_name: str | None = None
         self.current_folder: str | None = None
@@ -424,6 +496,22 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
+        open_archive_action = QAction("Открыть архив…", self)
+        open_archive_action.triggered.connect(self.on_open_archive)
+        toolbar.addAction(open_archive_action)
+
+        import_action = QAction("Импортировать…", self)
+        import_action.setToolTip("Импортировать mbox/Maildir (Evolution) или .pst (Outlook) в архив")
+        import_action.triggered.connect(self.on_import)
+        toolbar.addAction(import_action)
+
+        archive_selected_action = QAction("В архив…", self)
+        archive_selected_action.setToolTip("Выгрузить отмеченные письма в архив (копия или перемещение)")
+        archive_selected_action.triggered.connect(self.on_archive_selected)
+        toolbar.addAction(archive_selected_action)
+
+        toolbar.addSeparator()
+
         settings_action = QAction("Параметры…", self)
         settings_action.triggered.connect(self.on_settings)
         toolbar.addAction(settings_action)
@@ -491,10 +579,17 @@ class MainWindow(QMainWindow):
         self._populate_folder_tree(folders)
 
     def _populate_folder_tree(self, folders: list[FolderInfo]) -> None:
-        self.folder_tree.clear()
+        # Только узел живого ящика пересоздаём — открытые архивы (отдельные
+        # top-level узлы) переподключение никак не затрагивает.
+        if self.account_root is not None:
+            index = self.folder_tree.indexOfTopLevelItem(self.account_root)
+            if index != -1:
+                self.folder_tree.takeTopLevelItem(index)
+
         root = QTreeWidgetItem([self.account.username])
         root.setFlags(root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-        self.folder_tree.addTopLevelItem(root)
+        self.folder_tree.insertTopLevelItem(0, root)
+        self.account_root = root
 
         nodes: dict[tuple[str, ...], QTreeWidgetItem] = {(): root}
         inbox_item: QTreeWidgetItem | None = None
@@ -513,7 +608,7 @@ class MainWindow(QMainWindow):
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
-            parent.setData(0, Qt.ItemDataRole.UserRole, info.name)
+            parent.setData(0, Qt.ItemDataRole.UserRole, (_LIVE_SOURCE_KEY, info.name))
             if first_selectable is None:
                 first_selectable = parent
             if info.name == "INBOX":
@@ -523,6 +618,204 @@ class MainWindow(QMainWindow):
         default_item = inbox_item or first_selectable
         if default_item is not None:
             self.folder_tree.setCurrentItem(default_item)
+
+    def on_open_archive(self) -> None:
+        dialog = QFileDialog(self, "Открыть или создать архив")
+        dialog.setNameFilter("Архивы RedMail (*.rmarchive)")
+        dialog.setAcceptMode(QFileDialog.AcceptMode.AcceptOpen)
+        dialog.setFileMode(QFileDialog.FileMode.AnyFile)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        paths = dialog.selectedFiles()
+        if not paths:
+            return
+        path = self._normalize_archive_path(paths[0])
+        source = self._attach_archive(path)
+        if source is not None:
+            self.folder_tree.setCurrentItem(self.archive_tree_roots[str(path)])
+
+    @staticmethod
+    def _normalize_archive_path(path_str: str) -> Path:
+        path = Path(path_str)
+        if path.suffix != ".rmarchive":
+            path = path.with_suffix(".rmarchive")
+        return path
+
+    def _prompt_new_archive_path(self) -> Path | None:
+        path_str, _ = QFileDialog.getSaveFileName(
+            self, "Создать архив", filter="Архивы RedMail (*.rmarchive)"
+        )
+        if not path_str:
+            return None
+        return self._normalize_archive_path(path_str)
+
+    def _attach_archive(self, path: Path) -> ArchiveSource | None:
+        key = str(path)
+        if key in self.archives:
+            return self.archives[key]
+        if path.exists() and not archive_store.is_archive_file(path):
+            QMessageBox.critical(self, "Не архив RedMail", f"Файл «{path}» — не архив RedMail.")
+            return None
+        try:
+            archive_store.create_archive(path)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось открыть архив", str(exc))
+            return None
+        source = ArchiveSource(path)
+        self.archives[key] = source
+        self._add_archive_to_tree(key, path)
+        return source
+
+    def _add_archive_to_tree(self, key: str, path: Path) -> None:
+        root = QTreeWidgetItem([path.stem])
+        root.setFlags(root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.folder_tree.addTopLevelItem(root)
+        self.archive_tree_roots[key] = root
+        self._refresh_archive_folders(key)
+        self.folder_tree.expandItem(root)
+
+    def _refresh_archive_folders(self, key: str) -> None:
+        root = self.archive_tree_roots.get(key)
+        source = self.archives.get(key)
+        if root is None or source is None:
+            return
+        root.takeChildren()
+        for folder_name in archive_store.list_folders(source.path):
+            node = QTreeWidgetItem([folder_name])
+            node.setData(0, Qt.ItemDataRole.UserRole, (key, folder_name))
+            root.addChild(node)
+
+    def _pick_archive_target(
+        self, *, title: str, ask_folder: bool = False, default_folder: str = "", ask_move_copy: bool = False
+    ) -> tuple[str, str, bool] | None:
+        archive_names = {key: Path(source.path).stem for key, source in self.archives.items()}
+        dialog = ArchiveTargetDialog(
+            self,
+            archive_names,
+            title=title,
+            ask_folder=ask_folder,
+            default_folder=default_folder,
+            ask_move_copy=ask_move_copy,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        archive_key = dialog.selected_archive_key()
+        if not archive_key:
+            new_path = self._prompt_new_archive_path()
+            if new_path is None:
+                return None
+            source = self._attach_archive(new_path)
+            if source is None:
+                return None
+            archive_key = str(new_path)
+        return archive_key, dialog.folder_name(), dialog.move()
+
+    def on_import(self) -> None:
+        menu = QMenu(self)
+        mbox_action = menu.addAction("mbox (Evolution/Thunderbird)…")
+        maildir_action = menu.addAction("Maildir (Evolution)…")
+        pst_action = menu.addAction(".pst (Outlook)…")
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        if chosen is mbox_action:
+            self._import_mbox_or_maildir(is_maildir=False)
+        elif chosen is maildir_action:
+            self._import_mbox_or_maildir(is_maildir=True)
+        else:
+            self._import_pst()
+
+    def _import_mbox_or_maildir(self, *, is_maildir: bool) -> None:
+        if is_maildir:
+            source_path_str = QFileDialog.getExistingDirectory(self, "Выбрать каталог Maildir")
+        else:
+            source_path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать mbox-файл")
+        if not source_path_str:
+            return
+
+        result = self._pick_archive_target(
+            title="Импорт Maildir" if is_maildir else "Импорт mbox", ask_folder=True, default_folder="Импорт"
+        )
+        if result is None:
+            return
+        archive_key, folder_name, _move = result
+        archive_path = self.archives[archive_key].path
+
+        try:
+            importer = archive_store.import_maildir if is_maildir else archive_store.import_mbox
+            count = importer(archive_path, Path(source_path_str), folder_name)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка импорта", str(exc))
+            return
+
+        self._refresh_archive_folders(archive_key)
+        self.statusBar().showMessage(f"Импортировано писем: {count}", 5000)
+
+    def _import_pst(self) -> None:
+        source_path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл .pst", filter="Outlook PST (*.pst)")
+        if not source_path_str:
+            return
+
+        result = self._pick_archive_target(title="Импорт .pst")
+        if result is None:
+            return
+        archive_key, _folder_name, _move = result
+        archive_path = self.archives[archive_key].path
+
+        try:
+            count = archive_store.import_pst(archive_path, Path(source_path_str))
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка импорта", str(exc))
+            return
+
+        self._refresh_archive_folders(archive_key)
+        self.statusBar().showMessage(f"Импортировано писем: {count}", 5000)
+
+    def on_archive_selected(self) -> None:
+        if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
+            QMessageBox.information(
+                self, "Недоступно", "Выгрузка в архив работает только из папок живого ящика."
+            )
+            return
+        checked_uids = self._checked_uids()
+        if not checked_uids:
+            QMessageBox.information(self, "Нечего выгружать", "Отметьте галочками письма для выгрузки в архив.")
+            return
+
+        result = self._pick_archive_target(
+            title="Выгрузить в архив",
+            ask_folder=True,
+            default_folder=_DISPLAY_NAMES.get(self.current_folder, self.current_folder),
+            ask_move_copy=True,
+        )
+        if result is None:
+            return
+        archive_key, folder_name, move = result
+        archive_path = self.archives[archive_key].path
+        source_folder = self.current_folder
+
+        exported = 0
+        try:
+            for uid in checked_uids:
+                raw = self.mailbox.message_raw(source_folder, uid)
+                archive_store.append_raw_message(archive_path, folder_name, raw)
+                exported += 1
+            if move:
+                self.mailbox.delete_messages(source_folder, checked_uids)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка выгрузки в архив", str(exc))
+            return
+
+        self._refresh_archive_folders(archive_key)
+        if move and self.active_source is self.mailbox and self.current_folder == source_folder:
+            try:
+                summaries = self.mailbox.refresh_folder(source_folder)
+            except Exception:
+                summaries = None
+            if summaries is not None:
+                self._render_folder(summaries)
+        verb = "Перемещено" if move else "Скопировано"
+        self.statusBar().showMessage(f"{verb} в архив: {exported}", 5000)
 
     def on_settings(self) -> None:
         dialog = SettingsDialog(
@@ -605,25 +898,30 @@ class MainWindow(QMainWindow):
         self._set_filter_column(current_column)
 
     def on_folder_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
-        if current is None or not self.mailbox:
+        if current is None:
             return
-        folder_name = current.data(0, Qt.ItemDataRole.UserRole)
-        if not folder_name:
-            return  # промежуточный узел иерархии, не настоящая папка
+        data = current.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return  # промежуточный узел иерархии (учётная запись/архив), не настоящая папка
+        source_key, folder_name = data
+        source = self.mailbox if source_key == _LIVE_SOURCE_KEY else self.archives.get(source_key)
+        if source is None:
+            return
+        self.active_source = source
         self.current_folder = folder_name
         self._clear_reading_pane()
         try:
-            summaries = self.mailbox.folder_summaries(folder_name)
+            summaries = source.folder_summaries(folder_name)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
         self._render_folder(summaries)
 
     def on_refresh(self) -> None:
-        if not self.mailbox or not self.current_folder:
+        if not self.active_source or not self.current_folder:
             return
         try:
-            summaries = self.mailbox.refresh_folder(self.current_folder)
+            summaries = self.active_source.refresh_folder(self.current_folder)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка обновления", str(exc))
             return
@@ -633,7 +931,8 @@ class MainWindow(QMainWindow):
     def _on_periodic_refresh(self) -> None:
         # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
         # чтобы не перебивать пользователя, если тот занят (например, пишет письмо).
-        if not self.mailbox or not self.current_folder:
+        # Архивы локальны и статичны — опрашивать их по таймеру незачем.
+        if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
         try:
             summaries = self.mailbox.refresh_folder(self.current_folder)
@@ -710,7 +1009,7 @@ class MainWindow(QMainWindow):
         return self.summaries_by_uid.get(uid)
 
     def on_table_item_clicked(self, item: QTableWidgetItem) -> None:
-        if item.column() != COL_FLAG or not self.mailbox or not self.current_folder:
+        if item.column() != COL_FLAG or not self.active_source or not self.current_folder:
             return
         summary = self._summary_for_row(item.row())
         if summary is None:
@@ -732,7 +1031,7 @@ class MainWindow(QMainWindow):
         new_color = None if chosen is none_action else action_colors[chosen]
 
         try:
-            self.mailbox.set_marker(self.current_folder, summary.uid, new_color)
+            self.active_source.set_marker(self.current_folder, summary.uid, new_color)
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось изменить маркер", str(exc))
             return
@@ -740,50 +1039,68 @@ class MainWindow(QMainWindow):
         summary.marker_color = new_color
         item.setIcon(_marker_icon(new_color) if new_color else QIcon())
 
-    def on_delete_selected(self) -> None:
-        if not self.mailbox or not self.current_folder:
-            return
-        checked_uids = [
-            uid
+    def _checked_uids(self) -> list[int]:
+        return [
+            self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
             for row in range(self.table.rowCount())
             if self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
-            for uid in [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)]
         ]
+
+    def on_delete_selected(self) -> None:
+        if not self.active_source or not self.current_folder:
+            return
+        checked_uids = self._checked_uids()
         if not checked_uids:
             QMessageBox.information(self, "Нечего удалять", "Отметьте галочками письма, которые нужно удалить.")
             return
 
-        shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
-        already_in_trash = self.trash_folder_name is not None and self.current_folder == self.trash_folder_name
-        permanent = shift_held or already_in_trash or not self.trash_folder_name
+        if self.active_source is self.mailbox:
+            shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
+            already_in_trash = self.trash_folder_name is not None and self.current_folder == self.trash_folder_name
+            permanent = shift_held or already_in_trash or not self.trash_folder_name
 
-        if permanent:
+            if permanent:
+                confirm = QMessageBox.question(
+                    self,
+                    "Удалить безвозвратно",
+                    f"Удалить выбранные письма насовсем ({len(checked_uids)})? Это действие нельзя отменить.",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if confirm != QMessageBox.StandardButton.Yes:
+                    return
+                try:
+                    self.mailbox.delete_messages(self.current_folder, checked_uids)
+                except Exception as exc:
+                    QMessageBox.critical(self, "Ошибка удаления", str(exc))
+                    return
+                status_text = f"Удалено безвозвратно: {len(checked_uids)}"
+            else:
+                try:
+                    self.mailbox.move_to_trash(self.current_folder, checked_uids, self.trash_folder_name)
+                except Exception as exc:
+                    QMessageBox.critical(self, "Ошибка удаления", str(exc))
+                    return
+                status_text = f"Перемещено в корзину: {len(checked_uids)}"
+        else:
             confirm = QMessageBox.question(
                 self,
-                "Удалить безвозвратно",
-                f"Удалить выбранные письма насовсем ({len(checked_uids)})? Это действие нельзя отменить.",
+                "Удалить из архива",
+                f"Удалить выбранные письма из архива насовсем ({len(checked_uids)})? Это действие нельзя отменить.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
             try:
-                self.mailbox.delete_messages(self.current_folder, checked_uids)
+                self.active_source.delete_messages(self.current_folder, checked_uids)
             except Exception as exc:
                 QMessageBox.critical(self, "Ошибка удаления", str(exc))
                 return
-            status_text = f"Удалено безвозвратно: {len(checked_uids)}"
-        else:
-            try:
-                self.mailbox.move_to_trash(self.current_folder, checked_uids, self.trash_folder_name)
-            except Exception as exc:
-                QMessageBox.critical(self, "Ошибка удаления", str(exc))
-                return
-            status_text = f"Перемещено в корзину: {len(checked_uids)}"
+            status_text = f"Удалено из архива: {len(checked_uids)}"
 
         if self.selected_summary and self.selected_summary.uid in checked_uids:
             self._clear_reading_pane()
         try:
-            summaries = self.mailbox.refresh_folder(self.current_folder)
+            summaries = self.active_source.refresh_folder(self.current_folder)
         except Exception as exc:
             QMessageBox.warning(self, "Письма удалены, но обновить список не удалось", str(exc))
             return
@@ -792,14 +1109,14 @@ class MainWindow(QMainWindow):
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
-        if not rows or not self.mailbox or not self.current_folder:
+        if not rows or not self.active_source or not self.current_folder:
             return
         summary = self._summary_for_row(rows[0].row())
         if summary is None:
             return
         self.selected_summary = summary
         try:
-            content = self.mailbox.message_content(self.current_folder, summary.uid)
+            content = self.active_source.message_content(self.current_folder, summary.uid)
         except Exception as exc:
             self.current_body = ""
             self.current_attachments = []
@@ -920,6 +1237,8 @@ class MainWindow(QMainWindow):
         self.poll_timer.stop()
         if self.mailbox:
             self.mailbox.close()
+        for archive in self.archives.values():
+            archive.close()
         for temp_dir in self._temp_attachment_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
         super().closeEvent(event)

@@ -107,6 +107,12 @@ def get_message_raw(path: Path, message_id: int) -> bytes:
     return row[0]
 
 
+def set_marker(path: Path, message_id: int, color: str | None) -> None:
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE messages SET marker_color = ? WHERE id = ?", (color, message_id))
+        conn.commit()
+
+
 def delete_messages(path: Path, message_ids: list[int]) -> None:
     if not message_ids:
         return

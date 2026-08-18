@@ -3,8 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+from email.message import EmailMessage
+
+from redmail import archive_store
 from redmail.imap_client import Account, MessageContent, MessageSummary
-from redmail.mailbox import CachedMailbox
+from redmail.mailbox import ArchiveSource, CachedMailbox
 
 
 def _account() -> Account:
@@ -167,8 +170,64 @@ def test_different_accounts_do_not_share_cache(tmp_path: Path) -> None:
     assert session_b.fetch_summaries.call_count == 1
 
 
+def test_message_raw_delegates_to_session_uncached(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.fetch_message_raw.return_value = b"raw bytes"
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        first = mailbox.message_raw("INBOX", 1)
+        second = mailbox.message_raw("INBOX", 1)
+
+    assert first == second == b"raw bytes"
+    assert session.fetch_message_raw.call_count == 2
+
+
 def test_close_delegates_to_session() -> None:
     session = MagicMock()
     mailbox = CachedMailbox(session, _account())
     mailbox.close()
     session.close.assert_called_once()
+
+
+def _archive_message(subject: str) -> bytes:
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = "a@example.com"
+    msg.set_content("тело")
+    return msg.as_bytes()
+
+
+def test_archive_source_same_protocol_as_cached_mailbox(tmp_path: Path) -> None:
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    archive_store.append_raw_message(archive_path, "F", _archive_message("A"))
+
+    source = ArchiveSource(archive_path)
+    summaries = source.folder_summaries("F")
+    assert len(summaries) == 1
+    assert summaries[0].subject == "A"
+
+    # refresh_folder — тот же результат, архив не ходит в сеть
+    assert source.refresh_folder("F")[0].subject == "A"
+
+    content = source.message_content("F", summaries[0].uid)
+    assert content.text.strip() == "тело"
+
+
+def test_archive_source_set_marker_and_delete(tmp_path: Path) -> None:
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    msg_id = archive_store.append_raw_message(archive_path, "F", _archive_message("A"))
+
+    source = ArchiveSource(archive_path)
+    source.set_marker("F", msg_id, "green")
+    assert source.folder_summaries("F")[0].marker_color == "green"
+
+    source.delete_messages("F", [msg_id])
+    assert source.folder_summaries("F") == []
+
+
+def test_archive_source_close_is_noop(tmp_path: Path) -> None:
+    ArchiveSource(tmp_path / "test.rmarchive").close()  # не должно падать
