@@ -13,6 +13,8 @@ _KEYRING_SERVICE = "redmail"
 
 
 _DEFAULT_POLL_INTERVAL_MINUTES = 5
+_DEFAULT_PANE_ORIENTATION = "vertical"
+_DEFAULT_FONT_SCALE = 1.0
 
 
 def _config_path() -> Path:
@@ -23,23 +25,58 @@ def _settings_path() -> Path:
     return app_dir() / "settings.json"
 
 
-def load_poll_interval_minutes() -> int:
+def _load_settings_dict() -> dict:
     path = _settings_path()
     if not path.exists():
-        return _DEFAULT_POLL_INTERVAL_MINUTES
+        return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return int(data.get("poll_interval_minutes", _DEFAULT_POLL_INTERVAL_MINUTES))
-    except (json.JSONDecodeError, TypeError, ValueError):
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+
+
+def _save_settings_dict(data: dict) -> None:
+    path = _settings_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_poll_interval_minutes() -> int:
+    try:
+        return int(_load_settings_dict().get("poll_interval_minutes", _DEFAULT_POLL_INTERVAL_MINUTES))
+    except (TypeError, ValueError):
         return _DEFAULT_POLL_INTERVAL_MINUTES
 
 
 def save_poll_interval_minutes(minutes: int) -> None:
-    path = _settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps({"poll_interval_minutes": minutes}, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    data = _load_settings_dict()
+    data["poll_interval_minutes"] = minutes
+    _save_settings_dict(data)
+
+
+def load_pane_orientation() -> str:
+    value = _load_settings_dict().get("pane_orientation", _DEFAULT_PANE_ORIENTATION)
+    return value if value in ("vertical", "horizontal") else _DEFAULT_PANE_ORIENTATION
+
+
+def save_pane_orientation(orientation: str) -> None:
+    data = _load_settings_dict()
+    data["pane_orientation"] = orientation
+    _save_settings_dict(data)
+
+
+def load_font_scale() -> float:
+    try:
+        value = float(_load_settings_dict().get("font_scale", _DEFAULT_FONT_SCALE))
+    except (TypeError, ValueError):
+        return _DEFAULT_FONT_SCALE
+    return value if 0.5 <= value <= 2.0 else _DEFAULT_FONT_SCALE
+
+
+def save_font_scale(scale: float) -> None:
+    data = _load_settings_dict()
+    data["font_scale"] = scale
+    _save_settings_dict(data)
 
 
 def save_account(account: Account, smtp: SmtpAccount | None) -> None:

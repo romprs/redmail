@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
+    QSlider,
     QSpinBox,
     QSplitter,
     QStatusBar,
@@ -40,8 +43,12 @@ from PySide6.QtWidgets import (
 
 from redmail.config_store import (
     load_account,
+    load_font_scale,
+    load_pane_orientation,
     load_poll_interval_minutes,
     save_account,
+    save_font_scale,
+    save_pane_orientation,
     save_poll_interval_minutes,
 )
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageSummary
@@ -55,6 +62,10 @@ COL_ATTACHMENT = 3
 COL_SENDER = 4
 COL_SUBJECT = 5
 COL_DATE = 6
+
+# Колонки, по которым имеет смысл искать текстом — по ним же переключается
+# фильтр, когда пользователь встаёт в соответствующую колонку/заголовок.
+_FILTER_COLUMNS: dict[int, str] = {COL_SENDER: "От кого", COL_SUBJECT: "Тема", COL_DATE: "Дата"}
 
 _FLAG_MARK = "⚑"
 _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
@@ -117,10 +128,21 @@ def _marker_icon(color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
     return QIcon(pixmap)
 
 
-class AccountDialog(QDialog):
-    def __init__(self, parent=None, *, account: Account | None = None, smtp: SmtpAccount | None = None):
+class SettingsDialog(QDialog):
+    """Один диалог на всё: учётная запись (было отдельным «Подключиться…»),
+    интервал проверки почты и расположение панели чтения."""
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        account: Account | None = None,
+        smtp: SmtpAccount | None = None,
+        poll_interval_minutes: int = 5,
+        pane_orientation: str = "vertical",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Учётная запись почты")
+        self.setWindowTitle("Параметры")
 
         self.host_edit = QLineEdit(account.host if account else "")
         self.port_edit = QSpinBox()
@@ -155,6 +177,25 @@ class AccountDialog(QDialog):
         smtp_group = QGroupBox("Исходящая почта (SMTP) — тот же логин и пароль")
         smtp_group.setLayout(smtp_form)
 
+        self.interval_edit = QSpinBox()
+        self.interval_edit.setRange(1, 180)
+        self.interval_edit.setSuffix(" мин.")
+        self.interval_edit.setValue(poll_interval_minutes)
+
+        self.orientation_vertical = QRadioButton("Список писем сверху, чтение снизу")
+        self.orientation_horizontal = QRadioButton("Список писем слева, чтение справа")
+        if pane_orientation == "horizontal":
+            self.orientation_horizontal.setChecked(True)
+        else:
+            self.orientation_vertical.setChecked(True)
+
+        general_form = QFormLayout()
+        general_form.addRow("Проверять почту каждые", self.interval_edit)
+        general_form.addRow("Панель чтения", self.orientation_vertical)
+        general_form.addRow("", self.orientation_horizontal)
+        general_group = QGroupBox("Общие")
+        general_group.setLayout(general_form)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -164,6 +205,7 @@ class AccountDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(imap_group)
         layout.addWidget(smtp_group)
+        layout.addWidget(general_group)
         layout.addWidget(buttons)
 
     def account(self) -> Account:
@@ -184,32 +226,11 @@ class AccountDialog(QDialog):
             use_ssl=self.smtp_ssl_check.isChecked(),
         )
 
-
-class SettingsDialog(QDialog):
-    def __init__(self, parent=None, *, poll_interval_minutes: int = 5):
-        super().__init__(parent)
-        self.setWindowTitle("Параметры")
-
-        self.interval_edit = QSpinBox()
-        self.interval_edit.setRange(1, 180)
-        self.interval_edit.setSuffix(" мин.")
-        self.interval_edit.setValue(poll_interval_minutes)
-
-        form = QFormLayout()
-        form.addRow("Проверять почту каждые", self.interval_edit)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(buttons)
-
     def poll_interval_minutes(self) -> int:
         return self.interval_edit.value()
+
+    def pane_orientation(self) -> str:
+        return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
 
 
 class ComposeDialog(QDialog):
@@ -311,14 +332,17 @@ class MainWindow(QMainWindow):
         self.current_attachments: list[Attachment] = []
         self.selected_summary: MessageSummary | None = None
         self.poll_interval_minutes = load_poll_interval_minutes()
+        self.pane_orientation = load_pane_orientation()
+        self.filter_column = COL_SUBJECT
         self._temp_attachment_dirs: list[Path] = []
+        self._base_font_point_size = QApplication.instance().font().pointSizeF() or 10.0
 
         self.folder_tree = QTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.currentItemChanged.connect(self.on_folder_item_changed)
 
         self.filter_edit = QLineEdit(self)
-        self.filter_edit.setPlaceholderText("Фильтр по теме или отправителю…")
+        self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
         self.filter_edit.textChanged.connect(self.on_filter_changed)
 
         self.table = QTableWidget(0, 7, self)
@@ -329,12 +353,14 @@ class MainWindow(QMainWindow):
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
+        header.sectionClicked.connect(self._set_filter_column)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self.on_message_selected)
         self.table.itemClicked.connect(self.on_table_item_clicked)
+        self.table.currentCellChanged.connect(self.on_current_cell_changed)
 
         table_container = QWidget(self)
         table_layout = QVBoxLayout(table_container)
@@ -359,15 +385,16 @@ class MainWindow(QMainWindow):
         reading_layout.addWidget(self.attachments_list)
         reading_layout.addWidget(self.reading_pane)
 
-        right_splitter = QSplitter(Qt.Orientation.Vertical, self)
-        right_splitter.addWidget(table_container)
-        right_splitter.addWidget(reading_container)
-        right_splitter.setStretchFactor(0, 2)
-        right_splitter.setStretchFactor(1, 1)
+        self.right_splitter = QSplitter(Qt.Orientation.Vertical, self)
+        self.right_splitter.addWidget(table_container)
+        self.right_splitter.addWidget(reading_container)
+        self.right_splitter.setStretchFactor(0, 2)
+        self.right_splitter.setStretchFactor(1, 1)
+        self._apply_pane_orientation()
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
         main_splitter.addWidget(self.folder_tree)
-        main_splitter.addWidget(right_splitter)
+        main_splitter.addWidget(self.right_splitter)
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([220, 980])
@@ -375,10 +402,6 @@ class MainWindow(QMainWindow):
 
         toolbar = QToolBar("Основная", self)
         self.addToolBar(toolbar)
-
-        connect_action = QAction("Подключиться…", self)
-        connect_action.triggered.connect(self.on_connect)
-        toolbar.addAction(connect_action)
 
         refresh_action = QAction("Обновить", self)
         refresh_action.triggered.connect(self.on_refresh)
@@ -406,6 +429,19 @@ class MainWindow(QMainWindow):
         toolbar.addAction(settings_action)
 
         self.setStatusBar(QStatusBar(self))
+
+        initial_font_scale = load_font_scale()
+        self.font_scale_label = QLabel(f"{round(initial_font_scale * 100)}%", self)
+        self.statusBar().addPermanentWidget(self.font_scale_label)
+        self.font_scale_slider = QSlider(Qt.Orientation.Horizontal, self)
+        self.font_scale_slider.setRange(50, 200)
+        self.font_scale_slider.setFixedWidth(120)
+        self.font_scale_slider.setToolTip("Масштаб шрифта")
+        self.font_scale_slider.setValue(round(initial_font_scale * 100))
+        self.font_scale_slider.valueChanged.connect(self.on_font_scale_preview)
+        self.font_scale_slider.sliderReleased.connect(self.on_font_scale_committed)
+        self.statusBar().addPermanentWidget(self.font_scale_slider)
+        self._apply_font_scale(initial_font_scale)
 
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._on_periodic_refresh)
@@ -488,34 +524,45 @@ class MainWindow(QMainWindow):
         if default_item is not None:
             self.folder_tree.setCurrentItem(default_item)
 
-    def on_connect(self) -> None:
-        saved = None
-        try:
-            saved = load_account()
-        except Exception:
-            pass
-        dialog = AccountDialog(self, account=saved[0] if saved else None, smtp=saved[1] if saved else None)
+    def on_settings(self) -> None:
+        dialog = SettingsDialog(
+            self,
+            account=self.account,
+            smtp=self.smtp_account,
+            poll_interval_minutes=self.poll_interval_minutes,
+            pane_orientation=self.pane_orientation,
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        account = dialog.account()
-        if not account.host or not account.username:
-            QMessageBox.warning(self, "Не хватает данных", "Укажите сервер IMAP и логин.")
+        self.poll_interval_minutes = dialog.poll_interval_minutes()
+        self.pane_orientation = dialog.pane_orientation()
+        try:
+            save_poll_interval_minutes(self.poll_interval_minutes)
+            save_pane_orientation(self.pane_orientation)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
+        self._restart_poll_timer()
+        self._apply_pane_orientation()
+
+        new_account = dialog.account()
+        if not new_account.host or not new_account.username:
             return
+        new_smtp = dialog.smtp_account()
+        new_smtp = new_smtp if new_smtp.host else None
+        if new_account == self.account and new_smtp == self.smtp_account:
+            return  # данные подключения не менялись — незачем переподключаться
 
         try:
-            session = ImapSession(account)
+            session = ImapSession(new_account)
             folders = session.list_folders()
         except Exception as exc:  # показываем пользователю любую ошибку подключения как есть
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
             return
-
-        smtp_account = dialog.smtp_account()
-        smtp_account = smtp_account if smtp_account.host else None
-        self._apply_connection(account, smtp_account, session, folders)
+        self._apply_connection(new_account, new_smtp, session, folders)
 
         try:
-            save_account(account, smtp_account)
+            save_account(new_account, new_smtp)
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -523,16 +570,39 @@ class MainWindow(QMainWindow):
                 f"Подключение работает, но запомнить его для следующего запуска не вышло: {exc}",
             )
 
-    def on_settings(self) -> None:
-        dialog = SettingsDialog(self, poll_interval_minutes=self.poll_interval_minutes)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self.poll_interval_minutes = dialog.poll_interval_minutes()
+    def _apply_pane_orientation(self) -> None:
+        orientation = (
+            Qt.Orientation.Horizontal if self.pane_orientation == "horizontal" else Qt.Orientation.Vertical
+        )
+        self.right_splitter.setOrientation(orientation)
+
+    def on_font_scale_preview(self, value: int) -> None:
+        self.font_scale_label.setText(f"{value}%")
+        self._apply_font_scale(value / 100)
+
+    def on_font_scale_committed(self) -> None:
         try:
-            save_poll_interval_minutes(self.poll_interval_minutes)
-        except Exception as exc:
-            QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
-        self._restart_poll_timer()
+            save_font_scale(self.font_scale_slider.value() / 100)
+        except Exception:
+            pass  # масштаб не запомнится между запусками — не критично
+
+    def _apply_font_scale(self, scale: float) -> None:
+        app = QApplication.instance()
+        font = app.font()
+        font.setPointSizeF(self._base_font_point_size * scale)
+        app.setFont(font)
+
+    def _set_filter_column(self, column: int) -> None:
+        if column not in _FILTER_COLUMNS:
+            return
+        self.filter_column = column
+        self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[column]}")
+        self.on_filter_changed(self.filter_edit.text())
+
+    def on_current_cell_changed(
+        self, current_row: int, current_column: int, _previous_row: int, _previous_column: int
+    ) -> None:
+        self._set_filter_column(current_column)
 
     def on_folder_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if current is None or not self.mailbox:
@@ -584,9 +654,8 @@ class MainWindow(QMainWindow):
             if not needle:
                 self.table.setRowHidden(row, False)
                 continue
-            sender = self.table.item(row, COL_SENDER).text().lower()
-            subject = self.table.item(row, COL_SUBJECT).text().lower()
-            self.table.setRowHidden(row, needle not in sender and needle not in subject)
+            value = self.table.item(row, self.filter_column).text().lower()
+            self.table.setRowHidden(row, needle not in value)
 
     def _render_folder(self, summaries: list[MessageSummary]) -> None:
         previously_selected_uid = self.selected_summary.uid if self.selected_summary else None

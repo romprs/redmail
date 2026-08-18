@@ -5,8 +5,12 @@ from unittest.mock import patch
 
 from redmail.config_store import (
     load_account,
+    load_font_scale,
+    load_pane_orientation,
     load_poll_interval_minutes,
     save_account,
+    save_font_scale,
+    save_pane_orientation,
     save_poll_interval_minutes,
 )
 from redmail.imap_client import Account
@@ -101,3 +105,57 @@ def test_poll_interval_survives_corrupt_file(tmp_path: Path) -> None:
     settings_file.write_text("not json", encoding="utf-8")
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         assert load_poll_interval_minutes() == 5
+
+
+def test_pane_orientation_defaults_to_vertical(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_pane_orientation() == "vertical"
+
+
+def test_pane_orientation_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_pane_orientation("horizontal")
+        assert load_pane_orientation() == "horizontal"
+
+
+def test_pane_orientation_rejects_unknown_value(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"pane_orientation": "diagonal"}', encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_pane_orientation() == "vertical"
+
+
+def test_font_scale_defaults_to_one(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_font_scale() == 1.0
+
+
+def test_font_scale_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_font_scale(1.25)
+        assert load_font_scale() == 1.25
+
+
+def test_font_scale_out_of_range_falls_back_to_default(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"font_scale": 9.0}', encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_font_scale() == 1.0
+
+
+def test_saving_one_setting_does_not_clobber_another(tmp_path: Path) -> None:
+    # Раньше save_* полностью перезаписывал файл настроек — второй вызов
+    # стирал бы всё, что сохранил первый.
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_poll_interval_minutes(20)
+        save_pane_orientation("horizontal")
+        save_font_scale(1.5)
+
+        assert load_poll_interval_minutes() == 20
+        assert load_pane_orientation() == "horizontal"
+        assert load_font_scale() == 1.5
