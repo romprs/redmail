@@ -159,7 +159,7 @@ class ImapSession:
         self._select(folder)
         response = self._client.fetch([uid], ["BODY.PEEK[]"])
         raw = response[uid][b"BODY[]"]
-        return _extract_content(message_from_bytes(raw))
+        return extract_content(message_from_bytes(raw))
 
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         self._select(folder)
@@ -201,7 +201,7 @@ class ImapSession:
             self._selected_folder = folder
 
 
-def _extract_content(message: Message) -> MessageContent:
+def extract_content(message: Message) -> MessageContent:
     if not message.is_multipart():
         if message.get_content_type() == "text/plain":
             return MessageContent(text=_decode_payload(message))
@@ -260,7 +260,7 @@ def _to_summary(data: dict) -> MessageSummary:
         message_id=message_id.decode("ascii", errors="replace") if message_id else "",
         has_attachments=_body_has_attachment(data[b"BODYSTRUCTURE"]) if b"BODYSTRUCTURE" in data else False,
         marker_color=marker_color,
-        importance=_parse_importance(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b"")),
+        importance=parse_importance(message_from_bytes(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b""))),
     )
 
 
@@ -290,10 +290,11 @@ def _disposition_is_attachment(fields) -> bool:
     return False
 
 
-def _parse_importance(raw: bytes) -> str:
-    if not raw or not raw.strip():
-        return "normal"
-    headers = message_from_bytes(raw)
+def parse_importance(headers: Message) -> str:
+    """Классифицирует важность письма по заголовкам Importance/X-Priority.
+
+    Публичная — используется и для IMAP (заголовки приходят отдельным полем
+    FETCH), и для archive_store (заголовки уже есть в разобранном письме)."""
     importance = (headers.get("Importance") or "").strip().lower()
     if importance in ("high", "urgent"):
         return "high"
