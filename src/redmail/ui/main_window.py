@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import mimetypes
+import shutil
+import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QCursor, QIcon, QPixmap
+from PySide6.QtCore import QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -63,6 +65,12 @@ _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно с�
 # служебная обёртка не нужна — реальную иерархию задаёт узел учётной записи.
 _HIDDEN_PATH_SEGMENTS = {"[Gmail]", "[Google Mail]"}
 
+# Протокольное имя папки остаётся "INBOX" (это то, что уходит в IMAP-команды);
+# по-русски она подписывается иначе только в дереве папок.
+_DISPLAY_NAMES: dict[str, str] = {"INBOX": "Входящие"}
+
+_MARKER_ICON_SIZE = 16
+
 _MARKER_LABELS: dict[str, str] = {
     "red": "Красный",
     "orange": "Оранжевый",
@@ -95,6 +103,18 @@ def _importance_mark(importance: str) -> str:
     if importance == "low":
         return "↓"
     return ""
+
+
+def _marker_icon(color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
+    pixmap = QPixmap(diameter, diameter)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(_MARKER_HEX[color]))
+    painter.drawEllipse(1, 1, diameter - 2, diameter - 2)
+    painter.end()
+    return QIcon(pixmap)
 
 
 class AccountDialog(QDialog):
@@ -291,6 +311,7 @@ class MainWindow(QMainWindow):
         self.current_attachments: list[Attachment] = []
         self.selected_summary: MessageSummary | None = None
         self.poll_interval_minutes = load_poll_interval_minutes()
+        self._temp_attachment_dirs: list[Path] = []
 
         self.folder_tree = QTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
@@ -308,6 +329,7 @@ class MainWindow(QMainWindow):
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
+        self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSortingEnabled(True)
@@ -322,7 +344,9 @@ class MainWindow(QMainWindow):
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(70)
-        self.attachments_list.itemDoubleClicked.connect(self.on_save_attachment)
+        self.attachments_list.itemDoubleClicked.connect(self.on_open_attachment)
+        self.attachments_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.attachments_list.customContextMenuRequested.connect(self.on_attachment_context_menu)
         self.attachments_list.hide()
 
         self.reading_pane = QPlainTextEdit(self)
@@ -449,7 +473,7 @@ class MainWindow(QMainWindow):
                 path = path + (part,)
                 node = nodes.get(path)
                 if node is None:
-                    node = QTreeWidgetItem([part])
+                    node = QTreeWidgetItem([_DISPLAY_NAMES.get(part, part)])
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
@@ -582,9 +606,9 @@ class MainWindow(QMainWindow):
             check_item.setData(Qt.ItemDataRole.UserRole, summary.uid)
             self.table.setItem(row, COL_CHECK, check_item)
 
-            flag_item = self._readonly_item(_FLAG_MARK if summary.marker_color else "")
+            flag_item = self._readonly_item("")
             if summary.marker_color:
-                flag_item.setForeground(QColor(_MARKER_HEX[summary.marker_color]))
+                flag_item.setIcon(_marker_icon(summary.marker_color))
             self.table.setItem(row, COL_FLAG, flag_item)
 
             self.table.setItem(row, COL_IMPORTANCE, self._readonly_item(_importance_mark(summary.importance)))
@@ -630,10 +654,7 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         action_colors: dict[QAction, str] = {}
         for color, label in _MARKER_LABELS.items():
-            action = menu.addAction(label)
-            pixmap = QPixmap(12, 12)
-            pixmap.fill(QColor(_MARKER_HEX[color]))
-            action.setIcon(QIcon(pixmap))
+            action = menu.addAction(_marker_icon(color), label)
             action_colors[action] = color
 
         chosen = menu.exec(QCursor.pos())
@@ -648,8 +669,7 @@ class MainWindow(QMainWindow):
             return
 
         summary.marker_color = new_color
-        item.setText(_FLAG_MARK if new_color else "")
-        item.setForeground(QColor(_MARKER_HEX[new_color]) if new_color else QColor())
+        item.setIcon(_marker_icon(new_color) if new_color else QIcon())
 
     def on_delete_selected(self) -> None:
         if not self.mailbox or not self.current_folder:
@@ -734,9 +754,32 @@ class MainWindow(QMainWindow):
             self.attachments_list.addItem(item)
         self.attachments_list.show()
 
-    def on_save_attachment(self, item: QListWidgetItem) -> None:
-        index = self.attachments_list.row(item)
-        attachment = self.current_attachments[index]
+    def on_open_attachment(self, item: QListWidgetItem) -> None:
+        attachment = self.current_attachments[self.attachments_list.row(item)]
+        try:
+            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_"))
+            temp_path = temp_dir / attachment.filename
+            temp_path.write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
+            return
+        self._temp_attachment_dirs.append(temp_dir)
+        # Открываем той программой, что у ОС зарегистрирована для этого типа
+        # файла — как двойной клик по файлу в файловом менеджере.
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+
+    def on_attachment_context_menu(self, pos) -> None:
+        item = self.attachments_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        save_action = menu.addAction("Сохранить как…")
+        chosen = menu.exec(self.attachments_list.mapToGlobal(pos))
+        if chosen is save_action:
+            self._save_attachment(item)
+
+    def _save_attachment(self, item: QListWidgetItem) -> None:
+        attachment = self.current_attachments[self.attachments_list.row(item)]
         path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", attachment.filename)
         if not path:
             return
@@ -808,4 +851,6 @@ class MainWindow(QMainWindow):
         self.poll_timer.stop()
         if self.mailbox:
             self.mailbox.close()
+        for temp_dir in self._temp_attachment_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
         super().closeEvent(event)
