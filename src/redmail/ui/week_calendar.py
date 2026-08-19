@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
 
@@ -13,19 +13,28 @@ from redmail.calendar_store import Event
 # позиционированы блоками по времени, а не строками плоского списка.
 
 _DAY_NAMES = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
-_EVENT_COLOR = "#3B6FB6"
+_ORGANIZER_COLOR = "#3B6FB6"  # мои встречи (я организатор)
+_ATTENDEE_COLOR = "#8B5CB6"  # встречи, куда меня пригласили
+_ALL_DAY_COLOR = "#7986CB"
 _TODAY_COLOR = "#1A73E8"
+_NOW_LINE_COLOR = "#E64A4A"
 
 
 def week_start_for(day: date) -> date:
     return day - timedelta(days=day.weekday())
 
 
+def _event_color(calendar_event: Event) -> str:
+    if calendar_event.all_day:
+        return _ALL_DAY_COLOR
+    return _ORGANIZER_COLOR if calendar_event.is_organizer else _ATTENDEE_COLOR
+
+
 class _EventBlock(QFrame):
     clicked = Signal(object)
     doubleClicked = Signal(object)
 
-    def __init__(self, calendar_event: Event, parent: QWidget | None = None):
+    def __init__(self, calendar_event: Event, parent: QWidget | None = None, *, pill: bool = False):
         super().__init__(parent)
         # ВАЖНО: не называть этот атрибут self.event — QWidget.event() уже
         # существует как виртуальный метод самого Qt (обрабатывает всю
@@ -34,20 +43,22 @@ class _EventBlock(QFrame):
         # недр Qt падает с "'Event' object is not callable". Поймано именно
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
-        self.setStyleSheet(
-            f"background-color: {_EVENT_COLOR}; border-radius: 4px;"
-        )
+        radius = "11px" if pill else "6px"
+        self.setStyleSheet(f"background-color: {_event_color(calendar_event)}; border-radius: {radius};")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(5, 2, 5, 2)
+        layout.setContentsMargins(7, 2, 7, 2)
         layout.setSpacing(0)
         start_local = calendar_event.dtstart.astimezone()
         time_text = "" if calendar_event.all_day else start_local.strftime("%H:%M")
         text = f"{time_text} {calendar_event.summary or '(без темы)'}".strip()
         label = QLabel(text, self)
         label.setStyleSheet("color: white; background: transparent;")
-        label.setWordWrap(True)
+        # Таблетке "весь день" перенос только мешает — узкая колонка и
+        # заголовок пары строк сминались в кашу; здесь одна строка,
+        # обрезанная по ширине, как в референсе.
+        label.setWordWrap(not pill)
         layout.addWidget(label)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -60,13 +71,15 @@ class _EventBlock(QFrame):
 
 
 class WeekHeaderWidget(QWidget):
-    """Строка дат над сеткой — не прокручивается вместе с часами."""
+    """Строка дат над сеткой — не прокручивается вместе с часами. Дата
+    сегодняшнего дня — залитый кружок, как в референсе пользователя."""
 
     TIME_AXIS_WIDTH = 52
+    _CIRCLE_DIAMETER = 28
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
-        self.setFixedHeight(36)
+        self.setFixedHeight(52)
         self._week_start = week_start_for(date.today())
 
     def set_week_start(self, week_start: date) -> None:
@@ -81,15 +94,28 @@ class WeekHeaderWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         col_w = self._day_column_width()
         today = date.today()
+        text_color = self.palette().windowText().color()
         for i, name in enumerate(_DAY_NAMES):
             day = self._week_start + timedelta(days=i)
             x = self.TIME_AXIS_WIDTH + i * col_w
-            rect = QRectF(x, 0, col_w, self.height())
-            if day == today:
-                painter.setPen(QColor(_TODAY_COLOR))
+            is_today = day == today
+
+            name_rect = QRectF(x, 2, col_w, 18)
+            painter.setPen(QColor(_TODAY_COLOR) if is_today else text_color)
+            painter.drawText(name_rect, Qt.AlignmentFlag.AlignCenter, name)
+
+            circle_rect = QRectF(
+                x + col_w / 2 - self._CIRCLE_DIAMETER / 2, 20, self._CIRCLE_DIAMETER, self._CIRCLE_DIAMETER
+            )
+            if is_today:
+                painter.setBrush(QColor(_TODAY_COLOR))
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(circle_rect)
+                painter.setPen(QColor("white"))
             else:
-                painter.setPen(self.palette().windowText().color())
-            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, f"{name} {day.day}")
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.setPen(text_color)
+            painter.drawText(circle_rect, Qt.AlignmentFlag.AlignCenter, str(day.day))
         painter.end()
 
 
@@ -137,7 +163,7 @@ class AllDayRowWidget(QWidget):
             stack_by_day[day_index] = row + 1
             max_stack = max(max_stack, row + 1)
 
-            block = _EventBlock(ev, self)
+            block = _EventBlock(ev, self, pill=True)
             x = self.TIME_AXIS_WIDTH + day_index * col_w
             block.setGeometry(int(x) + 2, row * (row_height + 2), int(col_w) - 4, row_height)
             block.clicked.connect(self.eventClicked.emit)
@@ -163,6 +189,12 @@ class WeekGridWidget(QWidget):
         self._week_start = week_start_for(date.today())
         self._events: list[Event] = []
         self._blocks: list[_EventBlock] = []
+
+        # Красная линия "сейчас" должна сама сдвигаться, пока приложение
+        # открыто — минутной точности достаточно, не гоняем чаще раза в минуту.
+        self._now_timer = QTimer(self)
+        self._now_timer.timeout.connect(self.update)
+        self._now_timer.start(60_000)
 
     def set_week(self, week_start: date, timed_events: list[Event]) -> None:
         self._week_start = week_start
@@ -236,5 +268,15 @@ class WeekGridWidget(QWidget):
             highlight.setAlpha(18)
             x = self.TIME_AXIS_WIDTH + today_index * col_w
             painter.fillRect(QRectF(x, 0, col_w, self.height()), highlight)
+
+            now = datetime.now()
+            now_y = (now.hour * 60 + now.minute) / 60 * self.HOUR_HEIGHT
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            now_pen = QPen(QColor(_NOW_LINE_COLOR))
+            now_pen.setWidth(2)
+            painter.setPen(now_pen)
+            painter.setBrush(QColor(_NOW_LINE_COLOR))
+            painter.drawEllipse(QRectF(x - 4, now_y - 4, 8, 8))
+            painter.drawLine(int(x), int(now_y), int(x + col_w), int(now_y))
 
         painter.end()

@@ -6,10 +6,11 @@ import tempfile
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QDateTime, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QDate, QDateTime, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
@@ -101,6 +102,13 @@ _PARTICIPATION_LABELS: dict[str, str] = {
     "needs-action": "Ещё не ответил(а)",
 }
 _REPLY_VERBS: dict[str, str] = {"accepted": "Принято", "declined": "Отклонено", "tentative": "Под вопросом"}
+
+# Не полагаемся на locale-зависимый strftime("%B") — на разных системах
+# (Windows-разработка/RED OS) он может отдать разное, вплоть до английского.
+_MONTH_NAMES = (
+    "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+    "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
+)
 
 _MARKER_ICON_SIZE = 16
 
@@ -615,23 +623,27 @@ class MainWindow(QMainWindow):
         self.calendar_week_start = week_start_for(date.today())
         self.selected_calendar_event: calendar_store.Event | None = None
         self._calendar_scrolled_to_now = False
+        self.calendar_show_events = True
 
-        self.calendar_week_label = QLabel(self)
-        self.calendar_week_label.setStyleSheet("font-weight: 600;")
+        self.calendar_month_label = QLabel(self)
+        self.calendar_month_label.setStyleSheet("font-weight: 600; font-size: 13pt;")
+        self.calendar_view_combo = QComboBox(self)
+        self.calendar_view_combo.addItem("Неделя")  # день/месяц пока не реализованы
+        self.calendar_view_combo.setMinimumWidth(90)
 
         calendar_toolbar = QToolBar("Календарь", self)
+        today_action = QAction("Сегодня", self)
+        today_action.triggered.connect(self.on_calendar_today)
+        calendar_toolbar.addAction(today_action)
         prev_week_action = QAction("‹", self)
         prev_week_action.setToolTip("Предыдущая неделя")
         prev_week_action.triggered.connect(self.on_calendar_prev_week)
         calendar_toolbar.addAction(prev_week_action)
-        today_action = QAction("Сегодня", self)
-        today_action.triggered.connect(self.on_calendar_today)
-        calendar_toolbar.addAction(today_action)
         next_week_action = QAction("›", self)
         next_week_action.setToolTip("Следующая неделя")
         next_week_action.triggered.connect(self.on_calendar_next_week)
         calendar_toolbar.addAction(next_week_action)
-        calendar_toolbar.addWidget(self.calendar_week_label)
+        calendar_toolbar.addWidget(self.calendar_month_label)
         calendar_toolbar.addSeparator()
         new_event_action = QAction("Новая встреча…", self)
         new_event_action.triggered.connect(self.on_new_event)
@@ -643,6 +655,29 @@ class MainWindow(QMainWindow):
         calendar_refresh_action = QAction("Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
+        calendar_toolbar.addWidget(self.calendar_view_combo)
+
+        # Левая панель: мини-календарь для быстрого перехода к неделе +
+        # список "календарей" — пока фактически один локальный, но чекбокс
+        # реально скрывает/показывает события, а не просто для вида.
+        self.calendar_mini_picker = QCalendarWidget(self)
+        self.calendar_mini_picker.setGridVisible(False)
+        self.calendar_mini_picker.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.calendar_mini_picker.clicked.connect(self.on_calendar_mini_picker_clicked)
+
+        self.calendar_show_checkbox = QCheckBox("Мои встречи", self)
+        self.calendar_show_checkbox.setChecked(True)
+        self.calendar_show_checkbox.toggled.connect(self.on_calendar_visibility_toggled)
+        calendars_group = QGroupBox("Мои календари", self)
+        calendars_group_layout = QVBoxLayout(calendars_group)
+        calendars_group_layout.addWidget(self.calendar_show_checkbox)
+
+        calendar_sidebar = QWidget(self)
+        calendar_sidebar.setFixedWidth(240)
+        sidebar_layout = QVBoxLayout(calendar_sidebar)
+        sidebar_layout.addWidget(self.calendar_mini_picker)
+        sidebar_layout.addWidget(calendars_group)
+        sidebar_layout.addStretch(1)
 
         self.calendar_week_header = WeekHeaderWidget(self)
         self.calendar_all_day_row = AllDayRowWidget(self)
@@ -658,14 +693,21 @@ class MainWindow(QMainWindow):
         calendar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._calendar_scroll = calendar_scroll
 
+        calendar_main = QWidget(self)
+        calendar_main_layout = QVBoxLayout(calendar_main)
+        calendar_main_layout.setContentsMargins(0, 0, 0, 0)
+        calendar_main_layout.setSpacing(0)
+        calendar_main_layout.addWidget(calendar_toolbar)
+        calendar_main_layout.addWidget(self.calendar_week_header)
+        calendar_main_layout.addWidget(self.calendar_all_day_row)
+        calendar_main_layout.addWidget(calendar_scroll)
+
         calendar_page = QWidget(self)
-        calendar_layout = QVBoxLayout(calendar_page)
+        calendar_layout = QHBoxLayout(calendar_page)
         calendar_layout.setContentsMargins(0, 0, 0, 0)
         calendar_layout.setSpacing(0)
-        calendar_layout.addWidget(calendar_toolbar)
-        calendar_layout.addWidget(self.calendar_week_header)
-        calendar_layout.addWidget(self.calendar_all_day_row)
-        calendar_layout.addWidget(calendar_scroll)
+        calendar_layout.addWidget(calendar_sidebar)
+        calendar_layout.addWidget(calendar_main, 1)
 
         self.pages = QStackedWidget(self)
         self.pages.addWidget(main_splitter)  # 0: почта
@@ -1566,16 +1608,31 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Не удалось загрузить календарь", str(exc))
             return
         events = [e for e in events if e.status != "cancelled"]
+        if not self.calendar_show_events:
+            events = []
         timed_events = [e for e in events if not e.all_day]
         all_day_events = [e for e in events if e.all_day]
 
-        end_label = self.calendar_week_start + timedelta(days=6)
-        self.calendar_week_label.setText(
-            f"{self.calendar_week_start.strftime('%d.%m')} – {end_label.strftime('%d.%m.%Y')}"
-        )
+        # Неделя может задевать два месяца — подписываем по четвергу этой
+        # недели (тот же принцип, что и у номера недели ISO: у какого
+        # месяца больше дней в неделе, тот и "её" месяц).
+        anchor = self.calendar_week_start + timedelta(days=3)
+        self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
         self.calendar_week_header.set_week_start(self.calendar_week_start)
         self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
         self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
+        self.calendar_mini_picker.setSelectedDate(
+            QDate(self.calendar_week_start.year, self.calendar_week_start.month, self.calendar_week_start.day)
+        )
+
+    def on_calendar_mini_picker_clicked(self, qdate: QDate) -> None:
+        picked = date(qdate.year(), qdate.month(), qdate.day())
+        self.calendar_week_start = week_start_for(picked)
+        self.refresh_calendar_view()
+
+    def on_calendar_visibility_toggled(self, checked: bool) -> None:
+        self.calendar_show_events = checked
+        self.refresh_calendar_view()
 
     def _on_calendar_event_clicked(self, event: calendar_store.Event) -> None:
         self.selected_calendar_event = event
