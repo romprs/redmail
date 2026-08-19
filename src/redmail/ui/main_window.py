@@ -3,14 +3,16 @@ from __future__ import annotations
 import mimetypes
 import shutil
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, QUrl
-from PySide6.QtGui import QAction, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
+from PySide6.QtCore import QDateTime, QSize, Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDateTimeEdit,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -31,6 +33,7 @@ from PySide6.QtWidgets import (
     QSlider,
     QSpinBox,
     QSplitter,
+    QStackedWidget,
     QStatusBar,
     QStyle,
     QTableWidget,
@@ -392,6 +395,102 @@ class ArchiveTargetDialog(QDialog):
         return bool(self.move_radio and self.move_radio.isChecked())
 
 
+_RECURRENCE_OPTIONS: list[tuple[str, str | None]] = [
+    ("Не повторяется", None),
+    ("Каждый день", "FREQ=DAILY"),
+    ("Каждую неделю", "FREQ=WEEKLY"),
+    ("Каждый месяц", "FREQ=MONTHLY"),
+    ("Каждый год", "FREQ=YEARLY"),
+]
+
+
+class EventDialog(QDialog):
+    """Создание встречи и редактирование своей — тот же диалог: правка
+    существующей организованной встречи это и есть перенос (см.
+    MainWindow._save_event_from_dialog: SEQUENCE растёт, участникам уходит
+    обновлённый REQUEST)."""
+
+    def __init__(self, parent=None, *, event: calendar_store.Event | None = None, my_email: str = ""):
+        super().__init__(parent)
+        self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
+        self.resize(480, 420)
+
+        self.summary_edit = QLineEdit(event.summary if event else "")
+        self.location_edit = QLineEdit(event.location if event else "")
+        other_attendees = [a.email for a in event.attendees if a.email != my_email] if event else []
+        self.attendees_edit = QLineEdit(", ".join(other_attendees))
+        self.attendees_edit.setPlaceholderText("Участники через запятую (необязательно)")
+        self.description_edit = QPlainTextEdit(event.description if event else "")
+
+        default_start = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        start_local = event.dtstart.astimezone() if event else default_start
+        end_local = event.dtend.astimezone() if event else start_local + timedelta(hours=1)
+
+        self.start_edit = QDateTimeEdit(QDateTime(start_local.date(), start_local.time()), self)
+        self.start_edit.setCalendarPopup(True)
+        self.start_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
+        self.end_edit = QDateTimeEdit(QDateTime(end_local.date(), end_local.time()), self)
+        self.end_edit.setCalendarPopup(True)
+        self.end_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
+
+        self.recurrence_combo = QComboBox(self)
+        for label, value in _RECURRENCE_OPTIONS:
+            self.recurrence_combo.addItem(label, value)
+        if event and event.recurrence_rule:
+            index = self.recurrence_combo.findData(event.recurrence_rule)
+            self.recurrence_combo.setCurrentIndex(index if index >= 0 else 0)
+
+        form = QFormLayout()
+        form.addRow("Тема", self.summary_edit)
+        form.addRow("Начало", self.start_edit)
+        form.addRow("Окончание", self.end_edit)
+        form.addRow("Повтор", self.recurrence_combo)
+        form.addRow("Место", self.location_edit)
+        form.addRow("Участники", self.attendees_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Описание", self))
+        layout.addWidget(self.description_edit)
+        layout.addWidget(buttons)
+
+    def summary(self) -> str:
+        return self.summary_edit.text().strip()
+
+    def location(self) -> str:
+        return self.location_edit.text().strip()
+
+    def description(self) -> str:
+        return self.description_edit.toPlainText()
+
+    def attendee_emails(self) -> list[str]:
+        return [addr.strip() for addr in self.attendees_edit.text().split(",") if addr.strip()]
+
+    def start_utc(self) -> datetime:
+        return self._utc(self.start_edit.dateTime())
+
+    def end_utc(self) -> datetime:
+        return self._utc(self.end_edit.dateTime())
+
+    @staticmethod
+    def _utc(value: QDateTime) -> datetime:
+        # QDateTimeEdit показывает местное время; интерпретируем как local
+        # wall-clock и переводим в UTC для хранения (naive.astimezone() без
+        # аргументов трактует наивное время как системный часовой пояс).
+        date, time = value.date(), value.time()
+        local = datetime(date.year(), date.month(), date.day(), time.hour(), time.minute()).astimezone()
+        return local.astimezone(timezone.utc)
+
+    def recurrence_rule(self) -> str | None:
+        return self.recurrence_combo.currentData()
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -502,10 +601,57 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([220, 980])
-        self.setCentralWidget(main_splitter)
+
+        self.calendar_events_by_row: list[calendar_store.Event] = []
+        self.calendar_table = QTableWidget(0, 4, self)
+        self.calendar_table.setHorizontalHeaderLabels(["Когда", "Тема", "Место", "Участие"])
+        self.calendar_table.verticalHeader().setVisible(False)
+        self.calendar_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.calendar_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.calendar_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.calendar_table.itemDoubleClicked.connect(self.on_calendar_item_double_clicked)
+
+        calendar_toolbar = QToolBar("Календарь", self)
+        new_event_action = QAction("Новая встреча…", self)
+        new_event_action.triggered.connect(self.on_new_event)
+        calendar_toolbar.addAction(new_event_action)
+        cancel_event_action = QAction("Отменить встречу", self)
+        cancel_event_action.setToolTip("Только для встреч, которые организовали вы сами")
+        cancel_event_action.triggered.connect(self.on_cancel_event)
+        calendar_toolbar.addAction(cancel_event_action)
+        calendar_refresh_action = QAction("Обновить", self)
+        calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
+        calendar_toolbar.addAction(calendar_refresh_action)
+
+        calendar_page = QWidget(self)
+        calendar_layout = QVBoxLayout(calendar_page)
+        calendar_layout.setContentsMargins(0, 0, 0, 0)
+        calendar_layout.addWidget(calendar_toolbar)
+        calendar_layout.addWidget(self.calendar_table)
+
+        self.pages = QStackedWidget(self)
+        self.pages.addWidget(main_splitter)  # 0: почта
+        self.pages.addWidget(calendar_page)  # 1: календарь
+        self.setCentralWidget(self.pages)
 
         toolbar = QToolBar("Основная", self)
         self.addToolBar(toolbar)
+
+        mode_group = QActionGroup(self)
+        mode_group.setExclusive(True)
+        self.mail_mode_action = QAction("Почта", self)
+        self.mail_mode_action.setCheckable(True)
+        self.mail_mode_action.setChecked(True)
+        self.mail_mode_action.triggered.connect(lambda: self.pages.setCurrentIndex(0))
+        self.calendar_mode_action = QAction("Календарь", self)
+        self.calendar_mode_action.setCheckable(True)
+        self.calendar_mode_action.triggered.connect(self._show_calendar_page)
+        mode_group.addAction(self.mail_mode_action)
+        mode_group.addAction(self.calendar_mode_action)
+        toolbar.addAction(self.mail_mode_action)
+        toolbar.addAction(self.calendar_mode_action)
+
+        toolbar.addSeparator()
 
         refresh_action = QAction("Обновить", self)
         refresh_action.triggered.connect(self.on_refresh)
@@ -1262,6 +1408,154 @@ class MainWindow(QMainWindow):
         for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
             button.setEnabled(False)
         self.statusBar().showMessage(f"Ответ на приглашение отправлен: {verb.lower()}", 5000)
+
+    def _show_calendar_page(self) -> None:
+        self.pages.setCurrentIndex(1)
+        self.refresh_calendar_view()
+
+    def refresh_calendar_view(self) -> None:
+        # Локальный календарь ничего не опрашивает по сети — "Обновить"
+        # здесь просто перечитывает файл (например, после того как в
+        # почте были приняты новые приглашения).
+        now = datetime.now(timezone.utc)
+        events = calendar_store.list_events(
+            self.calendar_path, start=now - timedelta(days=7), end=now + timedelta(days=60)
+        )
+        events = [e for e in events if e.status != "cancelled"]
+        self.calendar_events_by_row = events
+
+        self.calendar_table.setRowCount(len(events))
+        for row, event in enumerate(events):
+            self.calendar_table.setItem(row, 0, QTableWidgetItem(self._format_event_time(event)))
+            self.calendar_table.setItem(row, 1, QTableWidgetItem(event.summary or "(без темы)"))
+            self.calendar_table.setItem(row, 2, QTableWidgetItem(event.location))
+            status_text = "Организатор" if event.is_organizer else _PARTICIPATION_LABELS.get(
+                event.my_participation, event.my_participation
+            )
+            self.calendar_table.setItem(row, 3, QTableWidgetItem(status_text))
+
+    def on_calendar_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        event = self.calendar_events_by_row[item.row()]
+        if not event.is_organizer:
+            details = (
+                f"{self._format_event_time(event)}\n{event.location}\n\n{event.description}\n\n"
+                f"Организатор: {event.organizer_name or event.organizer_email}\n"
+                f"Моё участие: {_PARTICIPATION_LABELS.get(event.my_participation, event.my_participation)}"
+            )
+            QMessageBox.information(self, event.summary or "(без темы)", details)
+            return
+        dialog = EventDialog(self, event=event, my_email=self.account.username if self.account else "")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_event_from_dialog(dialog, existing=event)
+
+    def on_new_event(self) -> None:
+        if not self.account:
+            QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
+            return
+        dialog = EventDialog(self, my_email=self.account.username)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_event_from_dialog(dialog, existing=None)
+
+    def _save_event_from_dialog(self, dialog: EventDialog, *, existing: calendar_store.Event | None) -> None:
+        start = dialog.start_utc()
+        end = dialog.end_utc()
+        if end <= start:
+            QMessageBox.warning(self, "Некорректное время", "Окончание должно быть позже начала.")
+            return
+
+        attendee_emails = dialog.attendee_emails()
+        event = calendar_store.Event(
+            uid=existing.uid if existing else calendar_store.new_uid(),
+            summary=dialog.summary() or "(без темы)",
+            description=dialog.description(),
+            location=dialog.location(),
+            dtstart=start,
+            dtend=end,
+            organizer_email=self.account.username,
+            organizer_name=self.account.username,
+            is_organizer=True,
+            my_participation="accepted",
+            sequence=(existing.sequence + 1) if existing else 0,
+            recurrence_rule=dialog.recurrence_rule(),
+            attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
+        )
+        calendar_store.save_event(self.calendar_path, event)
+
+        if attendee_emails:
+            if not self.smtp_account:
+                QMessageBox.warning(
+                    self,
+                    "Встреча сохранена, но не разослана",
+                    "Событие сохранено локально, но SMTP не настроен — приглашения участникам не отправлены.",
+                )
+            else:
+                ics = itip.build_request_ics(event, self.account.username, self.account.username)
+                message = OutgoingMessage(
+                    sender=self.account.username,
+                    to=attendee_emails,
+                    subject=f"Приглашение: {event.summary}",
+                    body=f"Вас приглашают на встречу «{event.summary}».\n{self._format_event_time(event)}",
+                    attachments=[
+                        OutgoingAttachment(
+                            filename="invite.ics",
+                            content_type="text/calendar",
+                            payload=ics,
+                            content_type_params={"method": "REQUEST"},
+                        )
+                    ],
+                )
+                try:
+                    send_message(self.smtp_account, message)
+                except Exception as exc:
+                    QMessageBox.critical(self, "Встреча сохранена, но не разослана", str(exc))
+
+        self.refresh_calendar_view()
+
+    def on_cancel_event(self) -> None:
+        rows = self.calendar_table.selectionModel().selectedRows()
+        if not rows:
+            return
+        event = self.calendar_events_by_row[rows[0].row()]
+        if not event.is_organizer:
+            QMessageBox.information(
+                self, "Недоступно", "Отменить можно только встречу, которую организовали вы сами."
+            )
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Отменить встречу",
+            f"Отменить «{event.summary}» и уведомить участников?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        attendee_emails = [a.email for a in event.attendees]
+        if attendee_emails and self.smtp_account:
+            ics = itip.build_cancel_ics(event, self.account.username, self.account.username)
+            message = OutgoingMessage(
+                sender=self.account.username,
+                to=attendee_emails,
+                subject=f"Отменено: {event.summary}",
+                body=f"Встреча «{event.summary}» отменена.",
+                attachments=[
+                    OutgoingAttachment(
+                        filename="cancel.ics",
+                        content_type="text/calendar",
+                        payload=ics,
+                        content_type_params={"method": "CANCEL"},
+                    )
+                ],
+            )
+            try:
+                send_message(self.smtp_account, message)
+            except Exception as exc:
+                QMessageBox.warning(self, "Не удалось уведомить участников", str(exc))
+
+        calendar_store.delete_event(self.calendar_path, event.uid)
+        self.refresh_calendar_view()
 
     def _refresh_attachments_list(self) -> None:
         self.attachments_list.clear()
