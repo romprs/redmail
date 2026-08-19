@@ -14,6 +14,16 @@ BuildRequires:  python3-pip
 
 Requires:       python3 >= 3.9
 
+# Всё под /opt/redmail/venv — сторонние pip-пакеты (в основном PySide6),
+# не наш код. rpm's brp-mangle-shebangs требует, чтобы каждый исполняемый
+# файл с #!/usr/bin/env python имел явную версию (python3), и падает с
+# ошибкой на файлах вроде PySide6/scripts/pyside_tool.py, которые мы не
+# редактируем и которые не нужно запускать напрямую (они библиотечные,
+# не наши точки входа — единственная реальная точка входа, venv/bin/redmail,
+# уже правильно переписана вручную в %%install). Исключаем весь venv из
+# этой проверки вместо того, чтобы точечно чинить вендоренные файлы.
+%global __brp_mangle_shebangs_exclude_from ^/opt/redmail/venv/.*$
+
 %description
 RedMail — почтовый клиент для Linux (RED OS 8), функциональный аналог
 Microsoft Outlook: почта по IMAP/SMTP, локальные архивы писем (свой
