@@ -45,6 +45,14 @@ python3 -m venv %{buildroot}/opt/redmail/venv
 %{buildroot}/opt/redmail/venv/bin/pip install --no-cache-dir --upgrade pip wheel
 %{buildroot}/opt/redmail/venv/bin/pip install --no-cache-dir %{_builddir}/%{name}-%{version}
 
+# pip пишет шебанги (bin/pip, bin/redmail, bin/pyside6-*, ...) и
+# pyvenv.cfg (строка command=) с ТЕКУЩИМ путём venv — то есть с путём
+# сборки (%{buildroot}/...), а не с финальным путём установки
+# (/opt/redmail/venv). check-buildroot иначе обрывает сборку, найдя путь
+# сборки внутри установленных файлов; замена ниже убирает этот префикс.
+find %{buildroot}/opt/redmail/venv -type f \( -name "pyvenv.cfg" -o -path "*/bin/*" \) -exec \
+    sed -i "s|%{buildroot}||g" {} \;
+
 mkdir -p %{buildroot}%{_bindir}
 ln -s /opt/redmail/venv/bin/redmail %{buildroot}%{_bindir}/redmail
 
