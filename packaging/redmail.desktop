@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=RedMail
+GenericName=Почтовый клиент
+Comment=Почта, архивы и календарь — аналог Outlook
+Exec=/usr/bin/redmail
+Icon=mail-client
+Terminal=false
+Categories=Network;Email;Office;
+StartupNotify=true
