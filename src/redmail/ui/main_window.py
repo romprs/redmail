@@ -3,7 +3,7 @@ from __future__ import annotations
 import mimetypes
 import shutil
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QDateTime, QSize, Qt, QTimer, QUrl
@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -62,6 +63,7 @@ from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, Me
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+from redmail.ui.week_calendar import AllDayRowWidget, WeekGridWidget, WeekHeaderWidget, week_start_for
 
 COL_CHECK = 0
 COL_FLAG = 1
@@ -610,16 +612,27 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([220, 980])
 
-        self.calendar_events_by_row: list[calendar_store.Event] = []
-        self.calendar_table = QTableWidget(0, 4, self)
-        self.calendar_table.setHorizontalHeaderLabels(["Когда", "Тема", "Место", "Участие"])
-        self.calendar_table.verticalHeader().setVisible(False)
-        self.calendar_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.calendar_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.calendar_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.calendar_table.itemDoubleClicked.connect(self.on_calendar_item_double_clicked)
+        self.calendar_week_start = week_start_for(date.today())
+        self.selected_calendar_event: calendar_store.Event | None = None
+        self._calendar_scrolled_to_now = False
+
+        self.calendar_week_label = QLabel(self)
+        self.calendar_week_label.setStyleSheet("font-weight: 600;")
 
         calendar_toolbar = QToolBar("Календарь", self)
+        prev_week_action = QAction("‹", self)
+        prev_week_action.setToolTip("Предыдущая неделя")
+        prev_week_action.triggered.connect(self.on_calendar_prev_week)
+        calendar_toolbar.addAction(prev_week_action)
+        today_action = QAction("Сегодня", self)
+        today_action.triggered.connect(self.on_calendar_today)
+        calendar_toolbar.addAction(today_action)
+        next_week_action = QAction("›", self)
+        next_week_action.setToolTip("Следующая неделя")
+        next_week_action.triggered.connect(self.on_calendar_next_week)
+        calendar_toolbar.addAction(next_week_action)
+        calendar_toolbar.addWidget(self.calendar_week_label)
+        calendar_toolbar.addSeparator()
         new_event_action = QAction("Новая встреча…", self)
         new_event_action.triggered.connect(self.on_new_event)
         calendar_toolbar.addAction(new_event_action)
@@ -631,11 +644,28 @@ class MainWindow(QMainWindow):
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
 
+        self.calendar_week_header = WeekHeaderWidget(self)
+        self.calendar_all_day_row = AllDayRowWidget(self)
+        self.calendar_all_day_row.eventClicked.connect(self._on_calendar_event_clicked)
+        self.calendar_all_day_row.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
+        self.calendar_week_grid = WeekGridWidget(self)
+        self.calendar_week_grid.eventClicked.connect(self._on_calendar_event_clicked)
+        self.calendar_week_grid.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
+
+        calendar_scroll = QScrollArea(self)
+        calendar_scroll.setWidget(self.calendar_week_grid)
+        calendar_scroll.setWidgetResizable(True)
+        calendar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._calendar_scroll = calendar_scroll
+
         calendar_page = QWidget(self)
         calendar_layout = QVBoxLayout(calendar_page)
         calendar_layout.setContentsMargins(0, 0, 0, 0)
+        calendar_layout.setSpacing(0)
         calendar_layout.addWidget(calendar_toolbar)
-        calendar_layout.addWidget(self.calendar_table)
+        calendar_layout.addWidget(self.calendar_week_header)
+        calendar_layout.addWidget(self.calendar_all_day_row)
+        calendar_layout.addWidget(calendar_scroll)
 
         self.pages = QStackedWidget(self)
         self.pages.addWidget(main_splitter)  # 0: почта
@@ -1501,37 +1531,57 @@ class MainWindow(QMainWindow):
     def _show_calendar_page(self) -> None:
         self.pages.setCurrentIndex(1)
         self.refresh_calendar_view()
+        if not self._calendar_scrolled_to_now:
+            self._calendar_scrolled_to_now = True
+            self._calendar_scroll.verticalScrollBar().setValue(self.calendar_week_grid.scroll_position_for_now())
+
+    def on_calendar_prev_week(self) -> None:
+        self.calendar_week_start -= timedelta(days=7)
+        self.refresh_calendar_view()
+
+    def on_calendar_next_week(self) -> None:
+        self.calendar_week_start += timedelta(days=7)
+        self.refresh_calendar_view()
+
+    def on_calendar_today(self) -> None:
+        self.calendar_week_start = week_start_for(date.today())
+        self.refresh_calendar_view()
 
     def refresh_calendar_view(self) -> None:
         # Локальный календарь ничего не опрашивает по сети — "Обновить"
         # здесь просто перечитывает файл (например, после того как в
         # почте были приняты новые приглашения).
-        now = datetime.now(timezone.utc)
+        week_start_date = self.calendar_week_start
+        week_start_local = datetime(
+            week_start_date.year, week_start_date.month, week_start_date.day
+        ).astimezone()
+        window_start = week_start_local.astimezone(timezone.utc)
+        window_end = (week_start_local + timedelta(days=7)).astimezone(timezone.utc)
         try:
-            events = calendar_store.list_events(
-                self.calendar_path, start=now - timedelta(days=7), end=now + timedelta(days=60)
-            )
+            events = calendar_store.list_events(self.calendar_path, start=window_start, end=window_end)
         except Exception as exc:
-            # Без этого исключение из слота Qt тихо проглатывалось — таблица
+            # Без этого исключение из слота Qt тихо проглатывалось — сетка
             # просто оставалась пустой без единого сообщения об ошибке
             # (так был найден баг миграции схемы calendar.rmcal).
             QMessageBox.critical(self, "Не удалось загрузить календарь", str(exc))
             return
         events = [e for e in events if e.status != "cancelled"]
-        self.calendar_events_by_row = events
+        timed_events = [e for e in events if not e.all_day]
+        all_day_events = [e for e in events if e.all_day]
 
-        self.calendar_table.setRowCount(len(events))
-        for row, event in enumerate(events):
-            self.calendar_table.setItem(row, 0, QTableWidgetItem(self._format_event_time(event)))
-            self.calendar_table.setItem(row, 1, QTableWidgetItem(event.summary or "(без темы)"))
-            self.calendar_table.setItem(row, 2, QTableWidgetItem(event.location))
-            status_text = "Организатор" if event.is_organizer else _PARTICIPATION_LABELS.get(
-                event.my_participation, event.my_participation
-            )
-            self.calendar_table.setItem(row, 3, QTableWidgetItem(status_text))
+        end_label = self.calendar_week_start + timedelta(days=6)
+        self.calendar_week_label.setText(
+            f"{self.calendar_week_start.strftime('%d.%m')} – {end_label.strftime('%d.%m.%Y')}"
+        )
+        self.calendar_week_header.set_week_start(self.calendar_week_start)
+        self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
+        self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
 
-    def on_calendar_item_double_clicked(self, item: QTableWidgetItem) -> None:
-        event = self.calendar_events_by_row[item.row()]
+    def _on_calendar_event_clicked(self, event: calendar_store.Event) -> None:
+        self.selected_calendar_event = event
+
+    def _on_calendar_event_double_clicked(self, event: calendar_store.Event) -> None:
+        self.selected_calendar_event = event
         if not event.is_organizer:
             details = (
                 f"{self._format_event_time(event)}\n{event.location}\n\n{event.description}\n\n"
@@ -1610,10 +1660,10 @@ class MainWindow(QMainWindow):
         self.refresh_calendar_view()
 
     def on_cancel_event(self) -> None:
-        rows = self.calendar_table.selectionModel().selectedRows()
-        if not rows:
+        event = self.selected_calendar_event
+        if event is None:
+            QMessageBox.information(self, "Нечего отменять", "Выберите встречу в сетке (клик по блоку).")
             return
-        event = self.calendar_events_by_row[rows[0].row()]
         if not event.is_organizer:
             QMessageBox.information(
                 self, "Недоступно", "Отменить можно только встречу, которую организовали вы сами."
@@ -1651,6 +1701,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Не удалось уведомить участников", str(exc))
 
         calendar_store.delete_event(self.calendar_path, event.uid)
+        self.selected_calendar_event = None
         self.refresh_calendar_view()
 
     def _refresh_attachments_list(self) -> None:
