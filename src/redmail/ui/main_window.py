@@ -829,6 +829,7 @@ class MainWindow(QMainWindow):
         self.calendar_week_grid = WeekGridWidget(self)
         self.calendar_week_grid.eventClicked.connect(self._on_calendar_event_clicked)
         self.calendar_week_grid.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
+        self.calendar_week_grid.eventDragRescheduled.connect(self.on_calendar_event_drag_rescheduled)
 
         calendar_scroll = QScrollArea(self)
         calendar_scroll.setWidget(self.calendar_week_grid)
@@ -1814,36 +1815,75 @@ class MainWindow(QMainWindow):
             attachments=list(dialog.attachments),
         )
         calendar_store.save_event(self.calendar_path, event)
-
-        if attendee_emails:
-            if not self.smtp_account:
-                QMessageBox.warning(
-                    self,
-                    "Встреча сохранена, но не разослана",
-                    "Событие сохранено локально, но SMTP не настроен — приглашения участникам не отправлены.",
-                )
-            else:
-                ics = itip.build_request_ics(event, self.account.username, self.account.username)
-                message = OutgoingMessage(
-                    sender=self.account.username,
-                    to=attendee_emails,
-                    subject=f"Приглашение: {event.summary}",
-                    body=f"Вас приглашают на встречу «{event.summary}».\n{_format_event_time(event)}",
-                    attachments=[
-                        OutgoingAttachment(
-                            filename="invite.ics",
-                            content_type="text/calendar",
-                            payload=ics,
-                            content_type_params={"method": "REQUEST"},
-                        )
-                    ],
-                )
-                try:
-                    send_message(self.smtp_account, message)
-                except Exception as exc:
-                    QMessageBox.critical(self, "Встреча сохранена, но не разослана", str(exc))
-
+        self._send_request_to_attendees(event, subject_prefix="Приглашение", body_prefix="Вас приглашают на встречу")
         self.refresh_calendar_view()
+
+    def _send_request_to_attendees(self, event: calendar_store.Event, *, subject_prefix: str, body_prefix: str) -> None:
+        """Общая часть для «создали/изменили встречу» и «перенесли
+        перетаскиванием» — обе ветки должны разослать один и тот же
+        обновлённый REQUEST (SEQUENCE уже увеличен к этому моменту)."""
+        attendee_emails = [a.email for a in event.attendees]
+        if not attendee_emails:
+            return
+        if not self.smtp_account:
+            QMessageBox.warning(
+                self,
+                "Встреча сохранена, но не разослана",
+                "Событие сохранено локально, но SMTP не настроен — приглашения участникам не отправлены.",
+            )
+            return
+        ics = itip.build_request_ics(event, self.account.username, self.account.username)
+        message = OutgoingMessage(
+            sender=self.account.username,
+            to=attendee_emails,
+            subject=f"{subject_prefix}: {event.summary}",
+            body=f"{body_prefix} «{event.summary}».\n{_format_event_time(event)}",
+            attachments=[
+                OutgoingAttachment(
+                    filename="invite.ics",
+                    content_type="text/calendar",
+                    payload=ics,
+                    content_type_params={"method": "REQUEST"},
+                )
+            ],
+        )
+        try:
+            send_message(self.smtp_account, message)
+        except Exception as exc:
+            QMessageBox.critical(self, "Встреча сохранена, но не разослана", str(exc))
+
+    def on_calendar_event_drag_rescheduled(
+        self, event: calendar_store.Event, day_delta: int, minute_delta: int
+    ) -> None:
+        # Перетаскивание доступно только для своих встреч (см.
+        # _EventBlock._draggable), но событие в сигнале — снимок с момента
+        # начала перетаскивания; на всякий случай проверяем ещё раз перед
+        # тем, как от чужого имени разослать письмо всем участникам.
+        if not event.is_organizer:
+            self.refresh_calendar_view()
+            return
+
+        delta = timedelta(days=day_delta, minutes=minute_delta)
+        new_start = event.dtstart + delta
+        new_end = event.dtend + delta
+        when_text = new_start.astimezone().strftime("%d.%m.%Y %H:%M")
+        confirm = QMessageBox.question(
+            self,
+            "Перенести встречу",
+            f"Перенести «{event.summary}» на {when_text} и уведомить участников?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self.refresh_calendar_view()  # вернуть блок на исходное место
+            return
+
+        updated = calendar_store.reschedule_event(self.calendar_path, event.uid, new_start, new_end)
+        if updated is None:
+            self.refresh_calendar_view()
+            return
+        self._send_request_to_attendees(updated, subject_prefix="Перенесено", body_prefix="Встреча перенесена:")
+        self.refresh_calendar_view()
+        self.statusBar().showMessage(f"Перенесено: «{updated.summary}» → {when_text}", 5000)
 
     def on_cancel_event(self) -> None:
         event = self.selected_calendar_event

@@ -30,9 +30,16 @@ def _event_color(calendar_event: Event) -> str:
     return _ORGANIZER_COLOR if calendar_event.is_organizer else _ATTENDEE_COLOR
 
 
+_DRAG_THRESHOLD_PX = 6
+
+
 class _EventBlock(QFrame):
     clicked = Signal(object)
     doubleClicked = Signal(object)
+    # (calendar_event, geometry-до-перетаскивания, geometry-после) — считать
+    # день/минуты переноса из разницы геометрий удобнее делать в сетке,
+    # которая уже знает ширину колонки/масштаб часа, а не здесь.
+    dragFinished = Signal(object, object, object)
 
     def __init__(self, calendar_event: Event, parent: QWidget | None = None, *, pill: bool = False):
         super().__init__(parent)
@@ -46,6 +53,15 @@ class _EventBlock(QFrame):
         radius = "11px" if pill else "6px"
         self.setStyleSheet(f"background-color: {_event_color(calendar_event)}; border-radius: {radius};")
         self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        # Перетаскивать можно только свои встречи (я организатор) — чужие
+        # переносить нечем: у участника нет права менять чужое время, только
+        # отвечать на приглашение (см. invite bar в почте).
+        self._draggable = calendar_event.is_organizer and not calendar_event.all_day
+        self._drag_start_mouse = None
+        self._drag_start_geom = None
+        self._dragging = False
+        self._suppress_click = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(7, 2, 7, 2)
@@ -62,10 +78,40 @@ class _EventBlock(QFrame):
         layout.addWidget(label)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
-        self.clicked.emit(self.calendar_event)
+        if event.button() == Qt.MouseButton.LeftButton and self._draggable:
+            self._drag_start_mouse = event.globalPosition().toPoint()
+            self._drag_start_geom = self.geometry()
+        self._dragging = False
         super().mousePressEvent(event)
 
+    def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._drag_start_mouse is None:
+            super().mouseMoveEvent(event)
+            return
+        delta = event.globalPosition().toPoint() - self._drag_start_mouse
+        if not self._dragging and delta.manhattanLength() > _DRAG_THRESHOLD_PX:
+            self._dragging = True
+            self.raise_()
+        if self._dragging:
+            self.move(self._drag_start_geom.topLeft() + delta)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if self._dragging:
+            self._dragging = False
+            self.dragFinished.emit(self.calendar_event, self._drag_start_geom, self.geometry())
+        elif self._suppress_click:
+            self._suppress_click = False
+        else:
+            self.clicked.emit(self.calendar_event)
+        self._drag_start_mouse = None
+        super().mouseReleaseEvent(event)
+
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Qt шлёт Press-Release-DoubleClick-Release на двойной клик — без
+        # этого второй Release снова дошёл бы до "else" в mouseReleaseEvent
+        # и породил бы лишний clicked поверх doubleClicked.
+        self._suppress_click = True
         self.doubleClicked.emit(self.calendar_event)
         super().mouseDoubleClickEvent(event)
 
@@ -180,8 +226,13 @@ class WeekGridWidget(QWidget):
 
     HOUR_HEIGHT = 48
     TIME_AXIS_WIDTH = WeekHeaderWidget.TIME_AXIS_WIDTH
+    _SNAP_MINUTES = 15
     eventClicked = Signal(object)
     eventDoubleClicked = Signal(object)
+    # (calendar_event, day_delta, minute_delta) — сколько дней/минут
+    # перенесли перетаскиванием; сама запись в calendar_store и рассылка
+    # обновления — забота MainWindow (там есть SMTP-аккаунт).
+    eventDragRescheduled = Signal(object, int, int)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -231,9 +282,21 @@ class WeekGridWidget(QWidget):
             block.setGeometry(int(x) + 2, int(y), int(col_w) - 4, max(20, int(h)))
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
+            block.dragFinished.connect(self._on_block_drag_finished)
             block.show()
             self._blocks.append(block)
         self.update()
+
+    def _on_block_drag_finished(self, calendar_event: Event, old_geom, new_geom) -> None:
+        col_w = self._day_column_width()
+        day_delta = round((new_geom.x() - old_geom.x()) / col_w)
+        minutes_per_pixel = 60 / self.HOUR_HEIGHT
+        raw_minute_delta = (new_geom.y() - old_geom.y()) * minutes_per_pixel
+        minute_delta = round(raw_minute_delta / self._SNAP_MINUTES) * self._SNAP_MINUTES
+        if day_delta == 0 and minute_delta == 0:
+            self._relayout()  # перетащили и отпустили почти на том же месте — просто вернуть на место
+            return
+        self.eventDragRescheduled.emit(calendar_event, day_delta, minute_delta)
 
     def scroll_position_for_now(self) -> int:
         now = datetime.now()
