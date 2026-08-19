@@ -6,15 +6,17 @@ import re
 import shutil
 import tempfile
 from datetime import date, datetime, timedelta, timezone
+from email.utils import parseaddr
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QDateTime, QSize, Qt, QTimer, QUrl
+from PySide6.QtCore import QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDateTimeEdit,
     QDialog,
     QDialogButtonBox,
@@ -50,7 +52,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redmail import archive_store, calendar_store, itip
+from redmail import archive_store, calendar_store, contact_store, itip
 from redmail.config_store import (
     load_account,
     load_font_scale,
@@ -164,6 +166,59 @@ def _format_event_time(event: calendar_store.Event) -> str:
     if start_local.date() == end_local.date():
         return f"{start_local.strftime('%d.%m.%Y %H:%M')}–{end_local.strftime('%H:%M')}"
     return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
+
+
+def _contact_candidates(contacts: list[contact_store.Contact]) -> list[str]:
+    candidates = []
+    for contact in contacts:
+        for email in contact.emails:
+            candidates.append(f"{contact.display_name} <{email}>" if contact.display_name else email)
+    return candidates
+
+
+def _parse_recipient_list(text: str) -> list[str]:
+    """Достаёт голые адреса из поля через запятую — элементы могут быть как
+    просто email, так и "Имя <email>" (так автодополнение по контактам
+    вставляет выбранный вариант; email.utils.parseaddr понимает оба)."""
+    return [addr for raw in text.split(",") if (addr := parseaddr(raw.strip())[1])]
+
+
+def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_store.Contact]) -> QCompleter:
+    """Автодополнение по адресной книге для поля со списком адресов через
+    запятую. Обычный line_edit.setCompleter() достраивал бы ВСЁ поле
+    целиком по одному совпадению — здесь достраивается только текущий
+    (последний) сегмент после запятой, остальные не трогаются."""
+    completer = QCompleter(_contact_candidates(contacts), line_edit)
+    completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+    completer.setFilterMode(Qt.MatchFlag.MatchContains)
+    completer.setWidget(line_edit)
+
+    def insert_completion(text: str) -> None:
+        content = line_edit.text()
+        cursor_pos = line_edit.cursorPosition()
+        last_comma = content.rfind(",", 0, cursor_pos)
+        prefix_start = last_comma + 1
+        new_text = content[:prefix_start].rstrip()
+        if new_text:
+            new_text += ", "
+        new_text += text
+        rest = content[cursor_pos:]
+        line_edit.setText(new_text + rest)
+        line_edit.setCursorPosition(len(new_text))
+
+    def update_prefix(text: str) -> None:
+        cursor_pos = line_edit.cursorPosition()
+        last_comma = text.rfind(",", 0, cursor_pos)
+        prefix = text[last_comma + 1 : cursor_pos].strip()
+        if prefix:
+            completer.setCompletionPrefix(prefix)
+            completer.complete()
+        else:
+            completer.popup().hide()
+
+    completer.activated.connect(insert_completion)
+    line_edit.textEdited.connect(update_prefix)
+    return completer
 
 
 def _importance_mark(importance: str) -> str:
@@ -300,6 +355,7 @@ class ComposeDialog(QDialog):
         to: str = "",
         subject: str = "",
         body: str = "",
+        contacts: list[contact_store.Contact] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -308,6 +364,8 @@ class ComposeDialog(QDialog):
 
         self.to_edit = QLineEdit(to)
         self.to_edit.setPlaceholderText("Через запятую, если получателей несколько")
+        if contacts:
+            _install_recipient_completer(self.to_edit, contacts)
         self.subject_edit = QLineEdit(subject)
         self.body_edit = QPlainTextEdit(body)
 
@@ -364,7 +422,7 @@ class ComposeDialog(QDialog):
         del self.attachments[row]
 
     def recipients(self) -> list[str]:
-        return [addr.strip() for addr in self.to_edit.text().split(",") if addr.strip()]
+        return _parse_recipient_list(self.to_edit.text())
 
     def subject(self) -> str:
         return self.subject_edit.text().strip()
@@ -450,7 +508,14 @@ class EventDialog(QDialog):
     MainWindow._save_event_from_dialog: SEQUENCE растёт, участникам уходит
     обновлённый REQUEST)."""
 
-    def __init__(self, parent=None, *, event: calendar_store.Event | None = None, my_email: str = ""):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        event: calendar_store.Event | None = None,
+        my_email: str = "",
+        contacts: list[contact_store.Contact] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
         self.resize(480, 480)
@@ -461,6 +526,8 @@ class EventDialog(QDialog):
         other_attendees = [a.email for a in event.attendees if a.email != my_email] if event else []
         self.attendees_edit = QLineEdit(", ".join(other_attendees))
         self.attendees_edit.setPlaceholderText("Участники через запятую (необязательно)")
+        if contacts:
+            _install_recipient_completer(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
 
         default_start = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -545,7 +612,7 @@ class EventDialog(QDialog):
         return self.description_edit.toPlainText()
 
     def attendee_emails(self) -> list[str]:
-        return [addr.strip() for addr in self.attendees_edit.text().split(",") if addr.strip()]
+        return _parse_recipient_list(self.attendees_edit.text())
 
     def start_utc(self) -> datetime:
         return self._utc(self.start_edit.dateTime())
@@ -650,6 +717,50 @@ class EventDetailsDialog(QDialog):
         super().closeEvent(event)
 
 
+class ContactDialog(QDialog):
+    def __init__(self, parent=None, *, contact: contact_store.Contact | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Изменить контакт" if contact else "Новый контакт")
+        self.resize(420, 380)
+        self._contact = contact
+
+        self.name_edit = QLineEdit(contact.display_name if contact else "")
+        self.emails_edit = QLineEdit(", ".join(contact.emails) if contact else "")
+        self.emails_edit.setPlaceholderText("Через запятую, если несколько")
+        self.phone_edit = QLineEdit(contact.phone if contact else "")
+        self.org_edit = QLineEdit(contact.organization if contact else "")
+        self.notes_edit = QPlainTextEdit(contact.notes if contact else "")
+
+        form = QFormLayout()
+        form.addRow("Имя", self.name_edit)
+        form.addRow("Email", self.emails_edit)
+        form.addRow("Телефон", self.phone_edit)
+        form.addRow("Организация", self.org_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Заметки", self))
+        layout.addWidget(self.notes_edit)
+        layout.addWidget(buttons)
+
+    def to_contact(self) -> contact_store.Contact:
+        return contact_store.Contact(
+            id=self._contact.id if self._contact else None,
+            uid=self._contact.uid if self._contact else "",
+            display_name=self.name_edit.text().strip(),
+            emails=[e.strip() for e in self.emails_edit.text().split(",") if e.strip()],
+            phone=self.phone_edit.text().strip(),
+            organization=self.org_edit.text().strip(),
+            notes=self.notes_edit.toPlainText(),
+        )
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -680,7 +791,10 @@ class MainWindow(QMainWindow):
         # Один локальный календарь на пользователя (не на учётную запись —
         # как и почтовый кэш, это просто локальное состояние приложения).
         self.calendar_path = app_dir() / "calendar.rmcal"
+        self.contacts_path = app_dir() / "contacts.rmcontacts"
         self.current_invite: itip.IncomingInvite | None = None
+        self.selected_contact: contact_store.Contact | None = None
+        self._contacts_by_row: list[contact_store.Contact] = []
 
         self.folder_tree = QTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
@@ -707,6 +821,8 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self.on_message_selected)
         self.table.itemClicked.connect(self.on_table_item_clicked)
         self.table.currentCellChanged.connect(self.on_current_cell_changed)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.on_mail_table_context_menu)
 
         table_container = QWidget(self)
         table_layout = QVBoxLayout(table_container)
@@ -853,9 +969,42 @@ class MainWindow(QMainWindow):
         calendar_layout.addWidget(calendar_sidebar)
         calendar_layout.addWidget(calendar_main, 1)
 
+        # --- Контакты ---
+        self.contacts_table = QTableWidget(0, 4, self)
+        self.contacts_table.setHorizontalHeaderLabels(["Имя", "Email", "Телефон", "Организация"])
+        self.contacts_table.verticalHeader().setVisible(False)
+        self.contacts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.contacts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.contacts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.contacts_table.itemSelectionChanged.connect(self.on_contact_selection_changed)
+        self.contacts_table.itemDoubleClicked.connect(self.on_contact_double_clicked)
+
+        contacts_toolbar = QToolBar("Контакты", self)
+        new_contact_action = QAction("Новый контакт…", self)
+        new_contact_action.triggered.connect(self.on_new_contact)
+        contacts_toolbar.addAction(new_contact_action)
+        import_contacts_action = QAction("Импортировать…", self)
+        import_contacts_action.setToolTip("Импортировать vCard (.vcf) или CSV (экспорт из Outlook)")
+        import_contacts_action.triggered.connect(self.on_import_contacts)
+        contacts_toolbar.addAction(import_contacts_action)
+        delete_contact_action = QAction("Удалить", self)
+        delete_contact_action.triggered.connect(self.on_delete_contact)
+        contacts_toolbar.addAction(delete_contact_action)
+        contacts_refresh_action = QAction("Обновить", self)
+        contacts_refresh_action.triggered.connect(self.refresh_contacts_view)
+        contacts_toolbar.addAction(contacts_refresh_action)
+
+        contacts_page = QWidget(self)
+        contacts_layout = QVBoxLayout(contacts_page)
+        contacts_layout.setContentsMargins(0, 0, 0, 0)
+        contacts_layout.setSpacing(0)
+        contacts_layout.addWidget(contacts_toolbar)
+        contacts_layout.addWidget(self.contacts_table)
+
         self.pages = QStackedWidget(self)
         self.pages.addWidget(main_splitter)  # 0: почта
         self.pages.addWidget(calendar_page)  # 1: календарь
+        self.pages.addWidget(contacts_page)  # 2: контакты
         self.setCentralWidget(self.pages)
 
         toolbar = QToolBar("Основная", self)
@@ -870,10 +1019,15 @@ class MainWindow(QMainWindow):
         self.calendar_mode_action = QAction("Календарь", self)
         self.calendar_mode_action.setCheckable(True)
         self.calendar_mode_action.triggered.connect(self._show_calendar_page)
+        self.contacts_mode_action = QAction("Контакты", self)
+        self.contacts_mode_action.setCheckable(True)
+        self.contacts_mode_action.triggered.connect(self._show_contacts_page)
         mode_group.addAction(self.mail_mode_action)
         mode_group.addAction(self.calendar_mode_action)
+        mode_group.addAction(self.contacts_mode_action)
         toolbar.addAction(self.mail_mode_action)
         toolbar.addAction(self.calendar_mode_action)
+        toolbar.addAction(self.contacts_mode_action)
 
         toolbar.addSeparator()
 
@@ -1483,6 +1637,41 @@ class MainWindow(QMainWindow):
         uid = self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
         return self.summaries_by_uid.get(uid)
 
+    def on_mail_table_context_menu(self, pos) -> None:
+        item = self.table.itemAt(pos)
+        if item is None:
+            return
+        summary = self._summary_for_row(item.row())
+        if summary is None:
+            return
+        menu = QMenu(self)
+        add_contact_action = menu.addAction("Добавить отправителя в контакты…")
+        chosen = menu.exec(self.table.mapToGlobal(pos))
+        if chosen is not add_contact_action:
+            return
+
+        existing = None
+        if summary.sender_email:
+            try:
+                existing = contact_store.find_by_email(self.contacts_path, summary.sender_email)
+            except Exception:
+                existing = None
+        if existing is not None:
+            dialog = ContactDialog(self, contact=existing)
+        else:
+            prefilled = contact_store.Contact(
+                display_name=summary.sender, emails=[summary.sender_email] if summary.sender_email else []
+            )
+            dialog = ContactDialog(self, contact=prefilled)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            contact_store.save_contact(self.contacts_path, dialog.to_contact())
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить контакт", str(exc))
+            return
+        self.statusBar().showMessage(f"Сохранено в контактах: {dialog.name_edit.text()}", 5000)
+
     def on_table_item_clicked(self, item: QTableWidgetItem) -> None:
         if item.column() != COL_FLAG or not self.active_source or not self.current_folder:
             return
@@ -1776,7 +1965,9 @@ class MainWindow(QMainWindow):
         if not event.is_organizer:
             EventDetailsDialog(self, event).exec()
             return
-        dialog = EventDialog(self, event=event, my_email=self.account.username if self.account else "")
+        dialog = EventDialog(
+            self, event=event, my_email=self.account.username if self.account else "", contacts=self._load_contacts()
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=event)
@@ -1785,10 +1976,109 @@ class MainWindow(QMainWindow):
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
-        dialog = EventDialog(self, my_email=self.account.username)
+        dialog = EventDialog(self, my_email=self.account.username, contacts=self._load_contacts())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=None)
+
+    def _load_contacts(self) -> list[contact_store.Contact]:
+        try:
+            return contact_store.list_contacts(self.contacts_path)
+        except Exception:
+            return []
+
+    def _show_contacts_page(self) -> None:
+        self.pages.setCurrentIndex(2)
+        self.refresh_contacts_view()
+
+    def refresh_contacts_view(self) -> None:
+        try:
+            contacts = contact_store.list_contacts(self.contacts_path)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось загрузить контакты", str(exc))
+            return
+        self._contacts_by_row = contacts
+        self.contacts_table.setRowCount(len(contacts))
+        for row, contact in enumerate(contacts):
+            self.contacts_table.setItem(row, 0, QTableWidgetItem(contact.display_name))
+            self.contacts_table.setItem(row, 1, QTableWidgetItem(", ".join(contact.emails)))
+            self.contacts_table.setItem(row, 2, QTableWidgetItem(contact.phone))
+            self.contacts_table.setItem(row, 3, QTableWidgetItem(contact.organization))
+
+    def on_contact_selection_changed(self) -> None:
+        rows = self.contacts_table.selectionModel().selectedRows()
+        self.selected_contact = self._contacts_by_row[rows[0].row()] if rows else None
+
+    def on_contact_double_clicked(self, item: QTableWidgetItem) -> None:
+        contact = self._contacts_by_row[item.row()]
+        dialog = ContactDialog(self, contact=contact)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            contact_store.save_contact(self.contacts_path, dialog.to_contact())
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить контакт", str(exc))
+            return
+        self.refresh_contacts_view()
+
+    def on_new_contact(self) -> None:
+        dialog = ContactDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_contact = dialog.to_contact()
+        if not new_contact.display_name and not new_contact.emails:
+            return  # пустая форма — нечего сохранять
+        try:
+            contact_store.save_contact(self.contacts_path, new_contact)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить контакт", str(exc))
+            return
+        self.refresh_contacts_view()
+
+    def on_delete_contact(self) -> None:
+        if self.selected_contact is None:
+            QMessageBox.information(self, "Нечего удалять", "Выберите контакт в списке.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Удалить контакт",
+            f"Удалить «{self.selected_contact.display_name}» из адресной книги?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        contact_store.delete_contact(self.contacts_path, self.selected_contact.id)
+        self.selected_contact = None
+        self.refresh_contacts_view()
+
+    def on_import_contacts(self) -> None:
+        menu = QMenu(self)
+        vcard_action = menu.addAction("vCard (.vcf)…")
+        csv_action = menu.addAction("CSV (экспорт из Outlook)…")
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+
+        if chosen is vcard_action:
+            path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл vCard", filter="vCard (*.vcf)")
+            importer = contact_store.import_vcard
+        elif chosen is csv_action:
+            path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать CSV-файл", filter="CSV (*.csv)")
+            importer = contact_store.import_csv
+        else:
+            return
+        if not path_str:
+            return
+
+        try:
+            data = Path(path_str).read_bytes()
+            count = importer(self.contacts_path, data)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка импорта", str(exc))
+            return
+
+        self.refresh_contacts_view()
+        self.statusBar().showMessage(f"Импортировано контактов: {count}", 5000)
 
     def _save_event_from_dialog(self, dialog: EventDialog, *, existing: calendar_store.Event | None) -> None:
         start = dialog.start_utc()
@@ -1985,7 +2275,7 @@ class MainWindow(QMainWindow):
                 "Сначала подключитесь и укажите сервер SMTP в настройках учётной записи.",
             )
             return
-        dialog = ComposeDialog(self, title="Новое письмо")
+        dialog = ComposeDialog(self, title="Новое письмо", contacts=self._load_contacts())
         self._exec_compose(dialog)
 
     def on_reply(self) -> None:
@@ -2006,7 +2296,9 @@ class MainWindow(QMainWindow):
         quoted = "\n".join(f"> {line}" for line in self.current_body.splitlines())
         body = f"\n\n{quote_header}\n{quoted}"
 
-        dialog = ComposeDialog(self, title="Ответить", to=summary.sender_email, subject=subject, body=body)
+        dialog = ComposeDialog(
+            self, title="Ответить", to=summary.sender_email, subject=subject, body=body, contacts=self._load_contacts()
+        )
         self._exec_compose(dialog, in_reply_to=summary.message_id or None)
 
     def _exec_compose(self, dialog: ComposeDialog, *, in_reply_to: str | None = None) -> None:
