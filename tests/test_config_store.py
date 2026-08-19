@@ -6,10 +6,12 @@ from unittest.mock import patch
 from redmail.config_store import (
     load_account,
     load_font_scale,
+    load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
     save_account,
     save_font_scale,
+    save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
 )
@@ -159,3 +161,23 @@ def test_saving_one_setting_does_not_clobber_another(tmp_path: Path) -> None:
         assert load_poll_interval_minutes() == 20
         assert load_pane_orientation() == "horizontal"
         assert load_font_scale() == 1.5
+
+
+def test_open_archives_defaults_to_empty(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_open_archives() == []
+
+
+def test_open_archives_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_open_archives(["C:/a.rmarchive", "C:/b.rmarchive"])
+        assert load_open_archives() == ["C:/a.rmarchive", "C:/b.rmarchive"]
+
+
+def test_open_archives_survives_corrupt_or_wrong_shaped_value(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"open_archives": "not-a-list"}', encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_open_archives() == []

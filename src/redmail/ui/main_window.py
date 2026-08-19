@@ -49,10 +49,12 @@ from redmail import archive_store, calendar_store, itip
 from redmail.config_store import (
     load_account,
     load_font_scale,
+    load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
     save_account,
     save_font_scale,
+    save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
 )
@@ -99,6 +101,10 @@ _PARTICIPATION_LABELS: dict[str, str] = {
 _REPLY_VERBS: dict[str, str] = {"accepted": "Принято", "declined": "Отклонено", "tentative": "Под вопросом"}
 
 _MARKER_ICON_SIZE = 16
+
+# Значение self.marker_filter для "показать письма с любым маркером,
+# независимо от цвета" — отличается от None (фильтр по маркеру выключен).
+_ANY_MARKER_FILTER = "_any"
 
 _MARKER_LABELS: dict[str, str] = {
     "red": "Красный",
@@ -514,6 +520,7 @@ class MainWindow(QMainWindow):
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
         self.filter_column = COL_SUBJECT
+        self.marker_filter: str | None = None
         self._temp_attachment_dirs: list[Path] = []
         self._base_font_point_size = QApplication.instance().font().pointSizeF() or 10.0
 
@@ -532,6 +539,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
+        self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
@@ -714,9 +722,31 @@ class MainWindow(QMainWindow):
         self._restart_poll_timer()
 
         QTimer.singleShot(0, self._restore_saved_account)
+        QTimer.singleShot(0, self._restore_saved_archives)
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
+
+    def _restore_saved_archives(self) -> None:
+        try:
+            saved_paths = load_open_archives()
+        except Exception:
+            saved_paths = []
+        missing: list[str] = []
+        for path_str in saved_paths:
+            path = Path(path_str)
+            if not path.exists():
+                missing.append(path_str)
+                continue
+            self._attach_archive(path, persist=False)
+        if missing:
+            self.statusBar().showMessage(
+                f"Не найдены на диске и пропущены: {len(missing)} архив(ов)", 8000
+            )
+        # Если какие-то из сохранённых архивов пропали — не переписывать их
+        # молча из списка навсегда (файл может быть на временно отключённом
+        # диске); список на диске поправится сам при следующем "Открыть
+        # архив…"/создании, а не будет тихо усечён прямо на старте.
 
     def _restore_saved_account(self) -> None:
         try:
@@ -827,7 +857,7 @@ class MainWindow(QMainWindow):
             return None
         return self._normalize_archive_path(path_str)
 
-    def _attach_archive(self, path: Path) -> ArchiveSource | None:
+    def _attach_archive(self, path: Path, *, persist: bool = True) -> ArchiveSource | None:
         key = str(path)
         if key in self.archives:
             return self.archives[key]
@@ -842,7 +872,15 @@ class MainWindow(QMainWindow):
         source = ArchiveSource(path)
         self.archives[key] = source
         self._add_archive_to_tree(key, path)
+        if persist:
+            self._save_open_archives()
         return source
+
+    def _save_open_archives(self) -> None:
+        try:
+            save_open_archives(list(self.archives.keys()))
+        except Exception:
+            pass  # список открытых архивов не запомнится между запусками — не критично
 
     def _add_archive_to_tree(self, key: str, path: Path) -> None:
         root = QTreeWidgetItem([path.stem])
@@ -1064,11 +1102,48 @@ class MainWindow(QMainWindow):
         app.setFont(font)
 
     def _set_filter_column(self, column: int) -> None:
+        if column == COL_FLAG:
+            self._open_marker_filter_menu()
+            return
         if column not in _FILTER_COLUMNS:
             return
         self.filter_column = column
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[column]}")
         self.on_filter_changed(self.filter_edit.text())
+
+    def _open_marker_filter_menu(self) -> None:
+        menu = QMenu(self)
+        all_action = menu.addAction("Все письма")
+        any_action = menu.addAction("С любым маркером")
+        menu.addSeparator()
+        color_actions: dict[QAction, str] = {}
+        for color, label in _MARKER_LABELS.items():
+            action = menu.addAction(_marker_icon(color), label)
+            color_actions[action] = color
+
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        if chosen is all_action:
+            self.marker_filter = None
+        elif chosen is any_action:
+            self.marker_filter = _ANY_MARKER_FILTER
+        else:
+            self.marker_filter = color_actions[chosen]
+        self._update_marker_filter_indicator()
+        self.on_filter_changed(self.filter_edit.text())
+
+    def _update_marker_filter_indicator(self) -> None:
+        header_item = self.table.horizontalHeaderItem(COL_FLAG)
+        if self.marker_filter is None:
+            header_item.setIcon(QIcon())
+            header_item.setToolTip("Клик — фильтр по маркеру")
+        elif self.marker_filter == _ANY_MARKER_FILTER:
+            header_item.setIcon(QIcon())
+            header_item.setToolTip("Фильтр: письма с любым маркером (клик — изменить)")
+        else:
+            header_item.setIcon(_marker_icon(self.marker_filter))
+            header_item.setToolTip(f"Фильтр: {_MARKER_LABELS[self.marker_filter]} (клик — изменить)")
 
     def on_current_cell_changed(
         self, current_row: int, current_column: int, _previous_row: int, _previous_column: int
@@ -1130,11 +1205,15 @@ class MainWindow(QMainWindow):
     def on_filter_changed(self, text: str) -> None:
         needle = text.strip().lower()
         for row in range(self.table.rowCount()):
-            if not needle:
-                self.table.setRowHidden(row, False)
-                continue
-            value = self.table.item(row, self.filter_column).text().lower()
-            self.table.setRowHidden(row, needle not in value)
+            visible = True
+            if needle:
+                value = self.table.item(row, self.filter_column).text().lower()
+                visible = needle in value
+            if visible and self.marker_filter is not None:
+                summary = self._summary_for_row(row)
+                marker = summary.marker_color if summary else None
+                visible = marker is not None if self.marker_filter == _ANY_MARKER_FILTER else marker == self.marker_filter
+            self.table.setRowHidden(row, not visible)
 
     def _render_folder(self, summaries: list[MessageSummary]) -> None:
         previously_selected_uid = self.selected_summary.uid if self.selected_summary else None

@@ -79,6 +79,17 @@ def save_font_scale(scale: float) -> None:
     _save_settings_dict(data)
 
 
+def load_open_archives() -> list[str]:
+    value = _load_settings_dict().get("open_archives", [])
+    return [str(p) for p in value] if isinstance(value, list) else []
+
+
+def save_open_archives(paths: list[str]) -> None:
+    data = _load_settings_dict()
+    data["open_archives"] = paths
+    _save_settings_dict(data)
+
+
 def save_account(account: Account, smtp: SmtpAccount | None) -> None:
     """Сохраняет настройки подключения. Пароль — не в этом файле, а в keyring."""
     path = _config_path()
