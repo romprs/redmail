@@ -24,6 +24,15 @@ Requires:       python3 >= 3.9
 # этой проверки вместо того, чтобы точечно чинить вендоренные файлы.
 %global __brp_mangle_shebangs_exclude_from ^/opt/redmail/venv/.*$
 
+# Автосканер зависимостей rpm просматривает КАЖДЫЙ .so под venv, включая
+# Qt-плагины, которые redmail не грузит (Qt SQL под Oracle/Firebird/Mimer
+# и т.п.) — и на них ловятся жёсткие Requires: на клиентские библиотеки
+# этих СУБД, которых на системе никогда не будет и не нужно. Всё под
+# /opt/redmail/venv самодостаточно (все свои зависимости внутри того же
+# пакета), поэтому автогенерацию зависимостей для него отключаем целиком.
+%global __requires_exclude_from ^/opt/redmail/venv/.*$
+%global __provides_exclude_from ^/opt/redmail/venv/.*$
+
 %description
 RedMail — почтовый клиент для Linux (RED OS 8), функциональный аналог
 Microsoft Outlook: почта по IMAP/SMTP, локальные архивы писем (свой
