@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+
+from dateutil.rrule import rrulestr
 
 # Свой формат: один файл SQLite на календарь — та же идея, что у архива
 # писем (archive_store.py). Сервер календаря (Exchange/VK Mail) не нужен:
@@ -37,13 +39,15 @@ CREATE TABLE IF NOT EXISTS events (
     status TEXT NOT NULL DEFAULT 'confirmed',
     my_participation TEXT NOT NULL DEFAULT 'needs-action',
     attendees TEXT NOT NULL DEFAULT '[]',
+    recurrence_rule TEXT,
     raw_ics BLOB
 );
 """
 
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
-    "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, raw_ics"
+    "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
+    "recurrence_rule, raw_ics"
 )
 
 
@@ -71,6 +75,7 @@ class Event:
     status: str = "confirmed"  # confirmed | tentative | cancelled
     my_participation: str = "needs-action"
     attendees: list[Attendee] = field(default_factory=list)
+    recurrence_rule: str | None = None  # значение RRULE (RFC 5545), напр. "FREQ=DAILY"
     raw_ics: bytes | None = None
 
 
@@ -124,29 +129,66 @@ def _row_to_event(row) -> Event:
         status=row[12],
         my_participation=row[13],
         attendees=[Attendee(**a) for a in json.loads(row[14])],
-        raw_ics=row[15],
+        recurrence_rule=row[15],
+        raw_ics=row[16],
     )
 
 
 def list_events(path: Path, start: datetime | None = None, end: datetime | None = None) -> list[Event]:
     """События, пересекающиеся с полуинтервалом [start, end) (обе границы
-    опциональны). Без границ — все события, отсортированные по началу."""
+    опциональны). Повторяющиеся события (recurrence_rule) раскрываются в
+    отдельные экземпляры внутри окна ТОЛЬКО когда заданы обе границы —
+    без верхней границы разворачивать бесконечное RRULE (FREQ=DAILY без
+    COUNT/UNTIL) было бы некуда, поэтому в этом случае возвращается только
+    хранимый первый экземпляр как есть."""
     create_calendar(path)
     query = f"SELECT {_COLUMNS} FROM events"
-    clauses = []
+    clauses: list[str] = []
     params: list[str] = []
+
     if end is not None:
-        clauses.append("dtstart < ?")
-        params.append(end.isoformat())
-    if start is not None:
-        clauses.append("dtend > ?")
+        if start is not None:
+            # Хранится только первый экземпляр серии — она может пересекать
+            # окно, даже если этот самый первый экземпляр был давно, поэтому
+            # для повторяющихся проверяем только dtstart < end.
+            clauses.append("((dtstart < ? AND dtend > ?) OR (recurrence_rule IS NOT NULL AND dtstart < ?))")
+            params.extend([end.isoformat(), start.isoformat(), end.isoformat()])
+        else:
+            clauses.append("dtstart < ?")
+            params.append(end.isoformat())
+    elif start is not None:
+        clauses.append("(dtend > ? OR recurrence_rule IS NOT NULL)")
         params.append(start.isoformat())
+
     if clauses:
         query += " WHERE " + " AND ".join(clauses)
     query += " ORDER BY dtstart"
     with closing(_connect(path)) as conn:
         rows = conn.execute(query, params).fetchall()
-    return [_row_to_event(row) for row in rows]
+    events = [_row_to_event(row) for row in rows]
+
+    if start is None or end is None:
+        return events
+    return _expand_recurring(events, start, end)
+
+
+def _expand_recurring(events: list[Event], start: datetime, end: datetime) -> list[Event]:
+    expanded: list[Event] = []
+    for event in events:
+        if not event.recurrence_rule:
+            expanded.append(event)
+            continue
+        duration = event.dtend - event.dtstart
+        try:
+            rule = rrulestr(f"RRULE:{event.recurrence_rule}", dtstart=event.dtstart)
+            occurrences = rule.between(start, end, inc=True)
+        except (ValueError, TypeError):
+            expanded.append(event)  # неразбираемое правило — не теряем событие целиком
+            continue
+        for occurrence_start in occurrences:
+            expanded.append(replace(event, dtstart=occurrence_start, dtend=occurrence_start + duration))
+    expanded.sort(key=lambda e: e.dtstart)
+    return expanded
 
 
 def get_event(path: Path, uid: str) -> Event | None:
@@ -163,14 +205,15 @@ def save_event(path: Path, event: Event) -> None:
     with closing(_connect(path)) as conn:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
-            "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, raw_ics) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
+            "recurrence_rule, raw_ics) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
             "organizer_email=excluded.organizer_email, organizer_name=excluded.organizer_name, "
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
-            "attendees=excluded.attendees, raw_ics=excluded.raw_ics",
+            "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, raw_ics=excluded.raw_ics",
             (
                 event.uid,
                 event.sequence,
@@ -186,6 +229,7 @@ def save_event(path: Path, event: Event) -> None:
                 event.status,
                 event.my_participation,
                 json.dumps([a.__dict__ for a in event.attendees], ensure_ascii=False),
+                event.recurrence_rule,
                 event.raw_ics,
             ),
         )

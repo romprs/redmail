@@ -166,6 +166,50 @@ def test_apply_reply_missing_event_returns_none(tmp_path: Path) -> None:
     assert calendar_store.apply_reply(path, "nope", "a@example.com", "accepted") is None
 
 
+def test_list_events_expands_recurring_event_within_window(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    daily = _event("daily@redmail", start_hour=9)
+    daily.recurrence_rule = "FREQ=DAILY"
+    calendar_store.save_event(path, daily)
+
+    window_start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    window_end = datetime(2026, 9, 4, tzinfo=timezone.utc)
+    occurrences = calendar_store.list_events(path, start=window_start, end=window_end)
+
+    assert [e.dtstart.day for e in occurrences] == [1, 2, 3]
+    assert all(e.uid == "daily@redmail" for e in occurrences)
+    # Продолжительность экземпляра сохраняется такой же, как у исходного.
+    assert all(e.dtend - e.dtstart == timedelta(hours=1) for e in occurrences)
+
+
+def test_list_events_finds_recurring_series_whose_first_occurrence_is_before_window(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    daily = _event("daily@redmail", start_hour=9)
+    daily.dtstart = datetime(2026, 1, 1, 9, tzinfo=timezone.utc)
+    daily.dtend = daily.dtstart + timedelta(hours=1)
+    daily.recurrence_rule = "FREQ=DAILY"
+    calendar_store.save_event(path, daily)
+
+    # Серия началась в январе, но ежедневно продолжается — сентябрьское
+    # окно всё равно должно найти в нём экземпляры.
+    occurrences = calendar_store.list_events(
+        path, start=datetime(2026, 9, 1, tzinfo=timezone.utc), end=datetime(2026, 9, 2, tzinfo=timezone.utc)
+    )
+    assert len(occurrences) == 1
+    assert occurrences[0].dtstart == datetime(2026, 9, 1, 9, tzinfo=timezone.utc)
+
+
+def test_list_events_without_bounds_does_not_expand_recurring_event(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    daily = _event("daily@redmail")
+    daily.recurrence_rule = "FREQ=DAILY"
+    calendar_store.save_event(path, daily)
+
+    all_events = calendar_store.list_events(path)
+    assert len(all_events) == 1
+    assert all_events[0].dtstart == daily.dtstart
+
+
 def test_all_day_event_round_trip(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcal"
     start = datetime(2026, 9, 1, tzinfo=timezone.utc)

@@ -80,6 +80,9 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
 
     replying_attendee_email = attendees[0].email if method == "REPLY" and attendees else ""
 
+    rrule_prop = vevent.get("RRULE")
+    recurrence_rule = rrule_prop.to_ical().decode("ascii") if rrule_prop is not None else None
+
     event = Event(
         uid=str(vevent.get("UID", "")),
         sequence=int(vevent.get("SEQUENCE", 0)),
@@ -89,6 +92,7 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
         dtstart=dtstart,
         dtend=dtend,
         all_day=all_day,
+        recurrence_rule=recurrence_rule,
         organizer_email=organizer_email,
         organizer_name=organizer_name,
         is_organizer=bool(my_email) and organizer_email.lower() == my_email.lower(),
@@ -153,6 +157,8 @@ def _build(method: str, event: Event, *, organizer_email: str, organizer_name: s
     else:
         vevent.add("dtstart", event.dtstart)
         vevent.add("dtend", event.dtend)
+    if event.recurrence_rule:
+        vevent.add("rrule", icalendar.vRecur.from_ical(event.recurrence_rule))
 
     organizer = icalendar.vCalAddress(f"mailto:{organizer_email}")
     organizer.params["CN"] = organizer_name or organizer_email

@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
+from pathlib import Path
 
 import icalendar
 import pytest
 
 from redmail import itip
 from redmail.calendar_store import Attendee, Event
+
+_FIXTURES = Path(__file__).parent / "fixtures"
 
 
 def _event() -> Event:
@@ -92,7 +95,40 @@ def test_find_calendar_part_locates_ics_attachment() -> None:
     assert invite.event.uid == "e1@redmail"
 
 
+def test_recurring_event_round_trips_rrule() -> None:
+    event = _event()
+    event.recurrence_rule = "FREQ=DAILY"
+    ics = itip.build_request_ics(event, "organizer@example.com", "Организатор")
+    invite = itip.parse_invite(ics, my_email="me@example.com")
+    assert invite.event.recurrence_rule == "FREQ=DAILY"
+
+
+def test_non_recurring_event_has_no_rrule() -> None:
+    ics = itip.build_request_ics(_event(), "organizer@example.com", "Организатор")
+    invite = itip.parse_invite(ics, my_email="me@example.com")
+    assert invite.event.recurrence_rule is None
+
+
 def test_find_calendar_part_returns_none_without_ics() -> None:
     message = EmailMessage()
     message.set_content("Просто письмо без приглашения")
     assert itip.find_calendar_part(message) is None
+
+
+def test_parses_real_google_calendar_invite() -> None:
+    # Настоящее приглашение, присланное Google Calendar (не нашим build_*)
+    # romprs@gmail.com -> romprs1@gmail.com, захвачено при живой проверке
+    # 2026-08-19. TZID=America/Los_Angeles с отдельным VTIMEZONE-блоком
+    # (не голый Z-UTC) плюс RRULE:FREQ=DAILY — оба реальных источника риска,
+    # которые синтетические тесты сборки/разбора могли не поймать.
+    ics = (_FIXTURES / "google_calendar_invite.ics").read_bytes()
+    invite = itip.parse_invite(ics, my_email="romprs1@gmail.com")
+
+    assert invite.method == "REQUEST"
+    assert invite.event.uid == "5g4sfsprqgihngf95j0l646rar@google.com"
+    assert invite.event.organizer_email == "romprs@gmail.com"
+    assert invite.event.recurrence_rule == "FREQ=DAILY"
+    # 05:30 America/Los_Angeles 21 авг 2026 = 12:30 UTC (PDT, UTC-7).
+    assert invite.event.dtstart == datetime(2026, 8, 21, 12, 30, tzinfo=timezone.utc)
+    emails = {a.email for a in invite.event.attendees}
+    assert emails == {"romprs1@gmail.com", "romprs@gmail.com"}

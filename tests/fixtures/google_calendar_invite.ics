@@ -1,0 +1,51 @@
+BEGIN:VCALENDAR
+PRODID:-//Google Inc//Google Calendar 70.9054//EN
+VERSION:2.0
+CALSCALE:GREGORIAN
+METHOD:REQUEST
+BEGIN:VTIMEZONE
+TZID:America/Los_Angeles
+X-LIC-LOCATION:America/Los_Angeles
+BEGIN:DAYLIGHT
+TZOFFSETFROM:-0800
+TZOFFSETTO:-0700
+TZNAME:PDT
+DTSTART:19700308T020000
+RRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU
+END:DAYLIGHT
+BEGIN:STANDARD
+TZOFFSETFROM:-0700
+TZOFFSETTO:-0800
+TZNAME:PST
+DTSTART:19701101T020000
+RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+DTSTART;TZID=America/Los_Angeles:20260821T053000
+DTEND;TZID=America/Los_Angeles:20260821T063000
+RRULE:FREQ=DAILY
+DTSTAMP:20260819T105231Z
+ORGANIZER:mailto:romprs@gmail.com
+UID:5g4sfsprqgihngf95j0l646rar@google.com
+ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=NEEDS-ACTION;RSVP=
+ TRUE;CN=romprs1@gmail.com;X-NUM-GUESTS=0:mailto:romprs1@gmail.com
+ATTENDEE;CUTYPE=INDIVIDUAL;ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED;RSVP=TRUE
+ ;X-NUM-GUESTS=0:mailto:romprs@gmail.com
+X-GOOGLE-CONFERENCE:https://meet.google.com/ojn-ospt-nim
+X-MICROSOFT-CDO-OWNERAPPTID:-457282140
+CREATED:20260819T105157Z
+DESCRIPTION:тестк  <a href="http://192.168.0.50/Client/#/">http://192.168.0
+ .50/Client/#/</a>\n\n-::~:~::~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:
+ ~:~:~:~:~:~:~:~:~:~:~:~:~::~:~::-\nJoin with Google Meet: https://meet.goog
+ le.com/ojn-ospt-nim\n\nLearn more about Meet at: https://support.google.com
+ /a/users/answer/9282720\n\nPlease do not edit this section.\n-::~:~::~:~:~:
+ ~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~:~::~:~::-
+LAST-MODIFIED:20260819T105229Z
+LOCATION:https://meet.google.com/ojn-ospt-nim
+SEQUENCE:0
+STATUS:CONFIRMED
+SUMMARY:
+TRANSP:OPAQUE
+END:VEVENT
+END:VCALENDAR
