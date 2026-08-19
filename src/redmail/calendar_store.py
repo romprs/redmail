@@ -15,7 +15,17 @@ from dateutil.rrule import rrulestr
 # в закрытой корпоративной среде без CalDAV/EWS-доступа события хранятся
 # локально, а встречи/ответы/переносы передаются через обычную почту как
 # .ics-вложения (iTIP, RFC 5546) — см. itip.py.
-_FORMAT_VERSION = 1
+#
+# В отличие от почтового кэша (cache_store.py), при смене схемы этот файл
+# НЕЛЬЗЯ просто стирать и пересобирать — это единственная копия локально
+# принятых приглашений и созданных пользователем встреч, а не что-то
+# регенерируемое с сервера. Поэтому новые поля добавляются через
+# ALTER TABLE-миграции (см. _MIGRATIONS), а не через wipe-on-mismatch.
+_FORMAT_VERSION = 2
+
+# Столбцы, добавленные после первого релиза — CREATE TABLE IF NOT EXISTS их
+# для уже существующих файлов не создаст, поэтому досоздаём миграцией.
+_MIGRATIONS = ("ALTER TABLE events ADD COLUMN recurrence_rule TEXT",)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -86,19 +96,27 @@ def new_uid() -> str:
 def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
+    for migration in _MIGRATIONS:
+        try:
+            conn.execute(migration)
+        except sqlite3.OperationalError:
+            pass  # столбец уже есть
+    conn.commit()
     return conn
 
 
 def create_calendar(path: Path) -> None:
-    """Создаёт пустой файл календаря. Не трогает уже существующий по этому пути."""
+    """Создаёт пустой файл календаря, либо доводит уже существующий (в т.ч.
+    записанный старой версией приложения) до текущей схемы — миграции уже
+    применены в _connect() выше, здесь только фиксируем текущую версию."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(_connect(path)) as conn:
-        row = conn.execute("SELECT value FROM meta WHERE key = 'format_version'").fetchone()
-        if row is None:
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('format_version', ?)", (str(_FORMAT_VERSION),)
-            )
-            conn.commit()
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('format_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (str(_FORMAT_VERSION),),
+        )
+        conn.commit()
 
 
 def is_calendar_file(path: Path) -> bool:

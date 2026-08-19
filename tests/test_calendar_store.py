@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -208,6 +209,58 @@ def test_list_events_without_bounds_does_not_expand_recurring_event(tmp_path: Pa
     all_events = calendar_store.list_events(path)
     assert len(all_events) == 1
     assert all_events[0].dtstart == daily.dtstart
+
+
+def test_opening_pre_recurrence_schema_file_migrates_in_place(tmp_path: Path) -> None:
+    # Реальный баг, пойманный на живой проверке: файл calendar.rmcal,
+    # записанный до появления recurrence_rule, при первом же вызове
+    # list_events() падал с "no such column: recurrence_rule" — событие
+    # было на диске, но ничего не отображалось (исключение из слота Qt
+    # тихо проглатывалось, без видимой ошибки). Календарь — не кэш, стирать
+    # его при смене схемы, как cache_store.py, нельзя: только миграция.
+    path = tmp_path / "old.rmcal"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            uid TEXT NOT NULL UNIQUE,
+            sequence INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            location TEXT NOT NULL DEFAULT '',
+            dtstart TEXT NOT NULL,
+            dtend TEXT NOT NULL,
+            all_day INTEGER NOT NULL DEFAULT 0,
+            organizer_email TEXT NOT NULL DEFAULT '',
+            organizer_name TEXT NOT NULL DEFAULT '',
+            is_organizer INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'confirmed',
+            my_participation TEXT NOT NULL DEFAULT 'needs-action',
+            attendees TEXT NOT NULL DEFAULT '[]',
+            raw_ics BLOB
+        );
+        """
+    )
+    conn.execute("INSERT INTO meta (key, value) VALUES ('format_version', '1')")
+    conn.execute(
+        "INSERT INTO events (uid, summary, dtstart, dtend) VALUES (?, ?, ?, ?)",
+        ("old-event@redmail", "Старое событие", "2026-09-01T10:00:00+00:00", "2026-09-01T11:00:00+00:00"),
+    )
+    conn.commit()
+    conn.close()
+
+    events = calendar_store.list_events(path)  # не должно бросить OperationalError
+
+    assert len(events) == 1
+    assert events[0].uid == "old-event@redmail"
+    assert events[0].summary == "Старое событие"
+    assert events[0].recurrence_rule is None
+
+    # save_event после миграции работает как обычно, старые данные не потерялись.
+    calendar_store.save_event(path, _event("new-event@redmail"))
+    assert {e.uid for e in calendar_store.list_events(path)} == {"old-event@redmail", "new-event@redmail"}
 
 
 def test_all_day_event_round_trip(tmp_path: Path) -> None:

@@ -1321,6 +1321,16 @@ class MainWindow(QMainWindow):
         except Exception:
             return  # повреждённый или непонятный .ics — просто не показываем панель
 
+        try:
+            self._apply_invite_to_calendar(invite)
+        except Exception as exc:
+            # Не проглатывать молча — иначе панель приглашения просто не
+            # появляется без единого следа, почему (так уже терялось видимое
+            # состояние календаря один раз — см. миграцию схемы в
+            # calendar_store.py).
+            QMessageBox.critical(self, "Не удалось обработать приглашение", str(exc))
+
+    def _apply_invite_to_calendar(self, invite: itip.IncomingInvite) -> None:
         if invite.method == "REQUEST":
             event = calendar_store.apply_invite(self.calendar_path, "REQUEST", invite.event)
             self.current_invite = invite
@@ -1418,9 +1428,16 @@ class MainWindow(QMainWindow):
         # здесь просто перечитывает файл (например, после того как в
         # почте были приняты новые приглашения).
         now = datetime.now(timezone.utc)
-        events = calendar_store.list_events(
-            self.calendar_path, start=now - timedelta(days=7), end=now + timedelta(days=60)
-        )
+        try:
+            events = calendar_store.list_events(
+                self.calendar_path, start=now - timedelta(days=7), end=now + timedelta(days=60)
+            )
+        except Exception as exc:
+            # Без этого исключение из слота Qt тихо проглатывалось — таблица
+            # просто оставалась пустой без единого сообщения об ошибке
+            # (так был найден баг миграции схемы calendar.rmcal).
+            QMessageBox.critical(self, "Не удалось загрузить календарь", str(exc))
+            return
         events = [e for e in events if e.status != "cancelled"]
         self.calendar_events_by_row = events
 
