@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        1%{?dist}
+Release:        2%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -83,5 +83,12 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Aug 20 2026 RedMail dev <noreply@example.com> - 0.0.1-2
+- Календарь: недельная сетка (даты в кружках, линия "сейчас", drag-перенос
+  с рассылкой участникам), вложения к событиям, кликабельные ссылки
+- Адресная книга: локальное хранилище, импорт vCard/CSV, автодополнение
+  в письмах и встречах, "добавить отправителя в контакты"
+- Фильтр писем по цвету маркера; открытые архивы переживают перезапуск
+
 * Wed Aug 19 2026 RedMail dev <noreply@example.com> - 0.0.1-1
 - Первая сборка: почта (IMAP/SMTP, кэш, архивы), календарь (события, iTIP-приглашения/ответы/переносы, повторы)
