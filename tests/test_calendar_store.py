@@ -6,6 +6,7 @@ from pathlib import Path
 
 from redmail import calendar_store
 from redmail.calendar_store import Attendee, Event
+from redmail.imap_client import Attachment
 
 
 def _event(uid: str = "e1@redmail", start_hour: int = 10) -> Event:
@@ -261,6 +262,65 @@ def test_opening_pre_recurrence_schema_file_migrates_in_place(tmp_path: Path) ->
     # save_event после миграции работает как обычно, старые данные не потерялись.
     calendar_store.save_event(path, _event("new-event@redmail"))
     assert {e.uid for e in calendar_store.list_events(path)} == {"old-event@redmail", "new-event@redmail"}
+
+
+def test_save_and_get_event_round_trips_attachments(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.attachments = [
+        Attachment(filename="agenda.pdf", content_type="application/pdf", payload=b"%PDF-fake-bytes"),
+        Attachment(filename="notes.txt", content_type="text/plain", payload=b"some notes"),
+    ]
+    calendar_store.save_event(path, event)
+
+    fetched = calendar_store.get_event(path, "e1@redmail")
+    assert fetched is not None
+    assert [a.filename for a in fetched.attachments] == ["agenda.pdf", "notes.txt"]
+    assert fetched.attachments[0].payload == b"%PDF-fake-bytes"
+    assert fetched.attachments[0].content_type == "application/pdf"
+
+
+def test_save_event_replaces_attachments_not_appends(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.attachments = [Attachment(filename="v1.txt", content_type="text/plain", payload=b"old")]
+    calendar_store.save_event(path, event)
+
+    event.attachments = [Attachment(filename="v2.txt", content_type="text/plain", payload=b"new")]
+    calendar_store.save_event(path, event)
+
+    fetched = calendar_store.get_event(path, "e1@redmail")
+    assert [a.filename for a in fetched.attachments] == ["v2.txt"]
+
+
+def test_event_without_attachments_round_trips_empty_list(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    fetched = calendar_store.get_event(path, "e1@redmail")
+    assert fetched.attachments == []
+
+
+def test_delete_event_also_deletes_attachments(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.attachments = [Attachment(filename="a.txt", content_type="text/plain", payload=b"x")]
+    calendar_store.save_event(path, event)
+    calendar_store.delete_event(path, "e1@redmail")
+
+    with sqlite3.connect(path) as conn:
+        remaining = conn.execute("SELECT COUNT(*) FROM event_attachments WHERE event_uid = ?", ("e1@redmail",)).fetchone()
+    assert remaining[0] == 0
+
+
+def test_list_events_includes_attachments(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.attachments = [Attachment(filename="a.txt", content_type="text/plain", payload=b"x")]
+    calendar_store.save_event(path, event)
+
+    events = calendar_store.list_events(path)
+    assert len(events) == 1
+    assert events[0].attachments[0].filename == "a.txt"
 
 
 def test_all_day_event_round_trip(tmp_path: Path) -> None:

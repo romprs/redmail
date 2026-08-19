@@ -9,6 +9,7 @@ import pytest
 
 from redmail import itip
 from redmail.calendar_store import Attendee, Event
+from redmail.imap_client import Attachment
 
 _FIXTURES = Path(__file__).parent / "fixtures"
 
@@ -107,6 +108,40 @@ def test_non_recurring_event_has_no_rrule() -> None:
     ics = itip.build_request_ics(_event(), "organizer@example.com", "Организатор")
     invite = itip.parse_invite(ics, my_email="me@example.com")
     assert invite.event.recurrence_rule is None
+
+
+def test_request_round_trips_attachments() -> None:
+    event = _event()
+    event.attachments = [
+        Attachment(filename="agenda.pdf", content_type="application/pdf", payload=b"%PDF-fake-bytes"),
+    ]
+    ics = itip.build_request_ics(event, "organizer@example.com", "Организатор")
+    invite = itip.parse_invite(ics, my_email="me@example.com")
+
+    assert len(invite.event.attachments) == 1
+    attachment = invite.event.attachments[0]
+    assert attachment.filename == "agenda.pdf"
+    assert attachment.content_type == "application/pdf"
+    assert attachment.payload == b"%PDF-fake-bytes"
+
+
+def test_event_without_attachments_parses_empty_list() -> None:
+    ics = itip.build_request_ics(_event(), "organizer@example.com", "Организатор")
+    invite = itip.parse_invite(ics, my_email="me@example.com")
+    assert invite.event.attachments == []
+
+
+def test_uri_attach_is_skipped_not_crashed_on() -> None:
+    # Внешняя ссылка вместо встроенного файла (ATTACH:https://...) —
+    # реальный, RFC-валидный случай; не должен падать, просто не вложение.
+    ics = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nMETHOD:REQUEST\r\n"
+        b"BEGIN:VEVENT\r\nUID:x@example.com\r\nSUMMARY:Test\r\n"
+        b"DTSTART:20260101T100000Z\r\nATTACH:https://example.com/file.pdf\r\n"
+        b"END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    invite = itip.parse_invite(ics, my_email="me@example.com")
+    assert invite.event.attachments == []
 
 
 def test_find_calendar_part_returns_none_without_ics() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.message import Message
@@ -7,6 +8,7 @@ from email.message import Message
 import icalendar
 
 from redmail.calendar_store import Attendee, Event
+from redmail.imap_client import Attachment
 
 # iTIP (RFC 5546) поверх обычной почты — единственный способ приглашений/
 # ответов/переносов, который одинаково работает через Exchange, VK Mail и
@@ -83,6 +85,10 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
     rrule_prop = vevent.get("RRULE")
     recurrence_rule = rrule_prop.to_ical().decode("ascii") if rrule_prop is not None else None
 
+    attachments = [
+        a for i, prop in enumerate(_as_list(vevent.get("ATTACH"))) if (a := _attachment_from_prop(prop, i))
+    ]
+
     event = Event(
         uid=str(vevent.get("UID", "")),
         sequence=int(vevent.get("SEQUENCE", 0)),
@@ -99,6 +105,7 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
         status="cancelled" if method == "CANCEL" else "confirmed",
         my_participation=my_participation,
         attendees=attendees,
+        attachments=attachments,
         raw_ics=ics_bytes,
     )
     return IncomingInvite(method=method, event=event, replying_attendee_email=replying_attendee_email)
@@ -172,6 +179,12 @@ def _build(method: str, event: Event, *, organizer_email: str, organizer_name: s
         addr.params["RSVP"] = "TRUE" if method == "REQUEST" else "FALSE"
         vevent.add("attendee", addr, encode=0)
 
+    for attachment in event.attachments:
+        attach_prop = icalendar.vBinary(attachment.payload)
+        attach_prop.params["FMTTYPE"] = attachment.content_type
+        attach_prop.params["X-FILENAME"] = attachment.filename
+        vevent.add("attach", attach_prop, encode=0)
+
     cal.add_component(vevent)
     return cal.to_ical()
 
@@ -197,6 +210,21 @@ def _address_email(prop) -> str:
 
 def _address_name(prop) -> str:
     return str(prop.params.get("CN", "")) if hasattr(prop, "params") else ""
+
+
+def _attachment_from_prop(prop, index: int) -> Attachment | None:
+    # ATTACH бывает и внешней ссылкой (URI), а не встроенным файлом — тогда
+    # icalendar отдаёт не vBinary, а обычную строку/vUri; такие пропускаем
+    # (нечего скачивать/показывать как вложение без похода в сеть).
+    if not isinstance(prop, icalendar.vBinary):
+        return None
+    try:
+        payload = base64.b64decode(prop.to_ical())
+    except (ValueError, TypeError):
+        return None
+    filename = str(prop.params.get("X-FILENAME") or prop.params.get("FILENAME") or f"attachment-{index + 1}")
+    content_type = str(prop.params.get("FMTTYPE", "application/octet-stream"))
+    return Attachment(filename=filename, content_type=content_type, payload=payload)
 
 
 def _to_utc(value) -> datetime:

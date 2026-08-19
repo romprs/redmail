@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import html
 import mimetypes
+import re
 import shutil
 import tempfile
 from datetime import date, datetime, timedelta, timezone
@@ -40,6 +42,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QTextBrowser,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -140,6 +143,27 @@ def _format_size(num_bytes: int) -> str:
     if num_bytes < 1024 * 1024:
         return f"{num_bytes / 1024:.0f} КБ"
     return f"{num_bytes / (1024 * 1024):.1f} МБ"
+
+
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
+
+
+def _linkify(text: str) -> str:
+    """HTML-экранирует текст и оборачивает http(s)-ссылки в <a href>, чтобы
+    их можно было открыть кликом в QTextBrowser."""
+    escaped = html.escape(text)
+    linked = _URL_PATTERN.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', escaped)
+    return linked.replace("\n", "<br>")
+
+
+def _format_event_time(event: calendar_store.Event) -> str:
+    start_local = event.dtstart.astimezone()
+    end_local = event.dtend.astimezone()
+    if event.all_day:
+        return f"{start_local.strftime('%d.%m.%Y')} (весь день)"
+    if start_local.date() == end_local.date():
+        return f"{start_local.strftime('%d.%m.%Y %H:%M')}–{end_local.strftime('%H:%M')}"
+    return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
 
 
 def _importance_mark(importance: str) -> str:
@@ -429,7 +453,8 @@ class EventDialog(QDialog):
     def __init__(self, parent=None, *, event: calendar_store.Event | None = None, my_email: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
-        self.resize(480, 420)
+        self.resize(480, 480)
+        self.attachments: list[Attachment] = list(event.attachments) if event else []
 
         self.summary_edit = QLineEdit(event.summary if event else "")
         self.location_edit = QLineEdit(event.location if event else "")
@@ -464,6 +489,20 @@ class EventDialog(QDialog):
         form.addRow("Место", self.location_edit)
         form.addRow("Участники", self.attendees_edit)
 
+        self.attachments_list = QListWidget(self)
+        self.attachments_list.setMaximumHeight(70)
+        for attachment in self.attachments:
+            self.attachments_list.addItem(f"{attachment.filename} ({_format_size(attachment.size)})")
+
+        attach_button = QPushButton("Прикрепить файл…", self)
+        attach_button.clicked.connect(self._on_attach)
+        remove_button = QPushButton("Убрать", self)
+        remove_button.clicked.connect(self._on_remove_attachment)
+        attach_row = QHBoxLayout()
+        attach_row.addWidget(attach_button)
+        attach_row.addWidget(remove_button)
+        attach_row.addStretch(1)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -474,7 +513,27 @@ class EventDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(QLabel("Описание", self))
         layout.addWidget(self.description_edit)
+        layout.addLayout(attach_row)
+        layout.addWidget(self.attachments_list)
         layout.addWidget(buttons)
+
+    def _on_attach(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
+        for path in paths:
+            data = Path(path).read_bytes()
+            content_type, _ = mimetypes.guess_type(path)
+            attachment = Attachment(
+                filename=Path(path).name, content_type=content_type or "application/octet-stream", payload=data
+            )
+            self.attachments.append(attachment)
+            self.attachments_list.addItem(f"{attachment.filename} ({_format_size(len(data))})")
+
+    def _on_remove_attachment(self) -> None:
+        row = self.attachments_list.currentRow()
+        if row < 0:
+            return
+        self.attachments_list.takeItem(row)
+        del self.attachments[row]
 
     def summary(self) -> str:
         return self.summary_edit.text().strip()
@@ -505,6 +564,90 @@ class EventDialog(QDialog):
 
     def recurrence_rule(self) -> str | None:
         return self.recurrence_combo.currentData()
+
+
+class EventDetailsDialog(QDialog):
+    """Просмотр встречи, которую организовал не я — только смотреть (моё
+    участие меняется кнопками в почте, не здесь), но со ссылками
+    кликабельными и вложениями открываемыми/сохраняемыми, как в письме."""
+
+    def __init__(self, parent, event: calendar_store.Event):
+        super().__init__(parent)
+        self.setWindowTitle(event.summary or "(без темы)")
+        self.resize(420, 380)
+        self.event = event
+        self._temp_dirs: list[Path] = []
+
+        info = QTextBrowser(self)
+        info.setOpenExternalLinks(True)
+        parts = [f"<b>{html.escape(event.summary or '(без темы)')}</b><br>{_format_event_time(event)}"]
+        if event.location:
+            parts.append(html.escape(event.location))
+        parts.append(f"Организатор: {html.escape(event.organizer_name or event.organizer_email)}")
+        parts.append(
+            f"Моё участие: {html.escape(_PARTICIPATION_LABELS.get(event.my_participation, event.my_participation))}"
+        )
+        if event.description:
+            parts.append("")
+            parts.append(_linkify(event.description))
+        info.setHtml("<br>".join(parts))
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info)
+
+        if event.attachments:
+            layout.addWidget(QLabel("Вложения", self))
+            self.attachments_list = QListWidget(self)
+            self.attachments_list.setMaximumHeight(90)
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_FileIcon)
+            for attachment in event.attachments:
+                self.attachments_list.addItem(
+                    QListWidgetItem(icon, f"{attachment.filename} ({_format_size(attachment.size)})")
+                )
+            self.attachments_list.itemDoubleClicked.connect(self._open_attachment)
+            self.attachments_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.attachments_list.customContextMenuRequested.connect(self._attachment_context_menu)
+            layout.addWidget(self.attachments_list)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
+
+    def _open_attachment(self, item: QListWidgetItem) -> None:
+        attachment = self.event.attachments[self.attachments_list.row(item)]
+        try:
+            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_event_"))
+            temp_path = temp_dir / attachment.filename
+            temp_path.write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
+            return
+        self._temp_dirs.append(temp_dir)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+
+    def _attachment_context_menu(self, pos) -> None:
+        item = self.attachments_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        save_action = menu.addAction("Сохранить как…")
+        chosen = menu.exec(self.attachments_list.mapToGlobal(pos))
+        if chosen is not save_action:
+            return
+        attachment = self.event.attachments[self.attachments_list.row(item)]
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", attachment.filename)
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось сохранить", str(exc))
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        for temp_dir in self._temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        super().closeEvent(event)
 
 
 class MainWindow(QMainWindow):
@@ -1485,7 +1628,7 @@ class MainWindow(QMainWindow):
         if invite.method == "REQUEST":
             event = calendar_store.apply_invite(self.calendar_path, "REQUEST", invite.event)
             self.current_invite = invite
-            when = self._format_event_time(event)
+            when = _format_event_time(event)
             text = f"Приглашение: «{event.summary}» — {when}"
             if event.location:
                 text += f", {event.location}"
@@ -1518,16 +1661,6 @@ class MainWindow(QMainWindow):
             for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
                 button.setEnabled(False)
             self.invite_bar.show()
-
-    @staticmethod
-    def _format_event_time(event: calendar_store.Event) -> str:
-        start_local = event.dtstart.astimezone()
-        end_local = event.dtend.astimezone()
-        if event.all_day:
-            return f"{start_local.strftime('%d.%m.%Y')} (весь день)"
-        if start_local.date() == end_local.date():
-            return f"{start_local.strftime('%d.%m.%Y %H:%M')}–{end_local.strftime('%H:%M')}"
-        return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
 
     def on_invite_response(self, participation: str) -> None:
         if self.current_invite is None or not self.account:
@@ -1640,12 +1773,7 @@ class MainWindow(QMainWindow):
     def _on_calendar_event_double_clicked(self, event: calendar_store.Event) -> None:
         self.selected_calendar_event = event
         if not event.is_organizer:
-            details = (
-                f"{self._format_event_time(event)}\n{event.location}\n\n{event.description}\n\n"
-                f"Организатор: {event.organizer_name or event.organizer_email}\n"
-                f"Моё участие: {_PARTICIPATION_LABELS.get(event.my_participation, event.my_participation)}"
-            )
-            QMessageBox.information(self, event.summary or "(без темы)", details)
+            EventDetailsDialog(self, event).exec()
             return
         dialog = EventDialog(self, event=event, my_email=self.account.username if self.account else "")
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -1683,6 +1811,7 @@ class MainWindow(QMainWindow):
             sequence=(existing.sequence + 1) if existing else 0,
             recurrence_rule=dialog.recurrence_rule(),
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
+            attachments=list(dialog.attachments),
         )
         calendar_store.save_event(self.calendar_path, event)
 
@@ -1699,7 +1828,7 @@ class MainWindow(QMainWindow):
                     sender=self.account.username,
                     to=attendee_emails,
                     subject=f"Приглашение: {event.summary}",
-                    body=f"Вас приглашают на встречу «{event.summary}».\n{self._format_event_time(event)}",
+                    body=f"Вас приглашают на встречу «{event.summary}».\n{_format_event_time(event)}",
                     attachments=[
                         OutgoingAttachment(
                             filename="invite.ics",

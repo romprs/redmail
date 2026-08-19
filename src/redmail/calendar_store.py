@@ -10,6 +10,8 @@ from uuid import uuid4
 
 from dateutil.rrule import rrulestr
 
+from redmail.imap_client import Attachment
+
 # Свой формат: один файл SQLite на календарь — та же идея, что у архива
 # писем (archive_store.py). Сервер календаря (Exchange/VK Mail) не нужен:
 # в закрытой корпоративной среде без CalDAV/EWS-доступа события хранятся
@@ -52,6 +54,13 @@ CREATE TABLE IF NOT EXISTS events (
     recurrence_rule TEXT,
     raw_ics BLOB
 );
+
+CREATE TABLE IF NOT EXISTS event_attachments (
+    event_uid TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    content_type TEXT NOT NULL,
+    payload BLOB NOT NULL
+);
 """
 
 _COLUMNS = (
@@ -86,6 +95,7 @@ class Event:
     my_participation: str = "needs-action"
     attendees: list[Attendee] = field(default_factory=list)
     recurrence_rule: str | None = None  # значение RRULE (RFC 5545), напр. "FREQ=DAILY"
+    attachments: list[Attachment] = field(default_factory=list)
     raw_ics: bytes | None = None
 
 
@@ -130,7 +140,7 @@ def is_calendar_file(path: Path) -> bool:
     return row is not None
 
 
-def _row_to_event(row) -> Event:
+def _row_to_event(conn: sqlite3.Connection, row) -> Event:
     return Event(
         id=row[0],
         uid=row[1],
@@ -148,8 +158,25 @@ def _row_to_event(row) -> Event:
         my_participation=row[13],
         attendees=[Attendee(**a) for a in json.loads(row[14])],
         recurrence_rule=row[15],
+        attachments=_load_attachments(conn, row[1]),
         raw_ics=row[16],
     )
+
+
+def _load_attachments(conn: sqlite3.Connection, uid: str) -> list[Attachment]:
+    rows = conn.execute(
+        "SELECT filename, content_type, payload FROM event_attachments WHERE event_uid = ?", (uid,)
+    ).fetchall()
+    return [Attachment(filename=r[0], content_type=r[1], payload=r[2]) for r in rows]
+
+
+def _save_attachments(conn: sqlite3.Connection, uid: str, attachments: list[Attachment]) -> None:
+    conn.execute("DELETE FROM event_attachments WHERE event_uid = ?", (uid,))
+    for attachment in attachments:
+        conn.execute(
+            "INSERT INTO event_attachments (event_uid, filename, content_type, payload) VALUES (?, ?, ?, ?)",
+            (uid, attachment.filename, attachment.content_type, attachment.payload),
+        )
 
 
 def list_events(path: Path, start: datetime | None = None, end: datetime | None = None) -> list[Event]:
@@ -183,7 +210,7 @@ def list_events(path: Path, start: datetime | None = None, end: datetime | None 
     query += " ORDER BY dtstart"
     with closing(_connect(path)) as conn:
         rows = conn.execute(query, params).fetchall()
-    events = [_row_to_event(row) for row in rows]
+        events = [_row_to_event(conn, row) for row in rows]
 
     if start is None or end is None:
         return events
@@ -213,7 +240,7 @@ def get_event(path: Path, uid: str) -> Event | None:
     create_calendar(path)
     with closing(_connect(path)) as conn:
         row = conn.execute(f"SELECT {_COLUMNS} FROM events WHERE uid = ?", (uid,)).fetchone()
-    return _row_to_event(row) if row else None
+        return _row_to_event(conn, row) if row else None
 
 
 def save_event(path: Path, event: Event) -> None:
@@ -251,12 +278,14 @@ def save_event(path: Path, event: Event) -> None:
                 event.raw_ics,
             ),
         )
+        _save_attachments(conn, event.uid, event.attachments)
         conn.commit()
 
 
 def delete_event(path: Path, uid: str) -> None:
     with closing(_connect(path)) as conn:
         conn.execute("DELETE FROM events WHERE uid = ?", (uid,))
+        conn.execute("DELETE FROM event_attachments WHERE event_uid = ?", (uid,))
         conn.commit()
 
 
