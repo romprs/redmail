@@ -996,7 +996,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Почтовый клиент RED OS — прототип")
-        self.resize(1200, 640)
+        self.resize(1200, 760)  # выше умолчание помогает и календарной сетке, и списку писем; реальный размер запоминается между запусками
 
         self.account: Account | None = None
         self.mailbox: CachedMailbox | None = None
