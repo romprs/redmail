@@ -563,6 +563,34 @@ def test_fetch_message_content_extracts_inline_cid_image_not_as_attachment() -> 
     assert payload == b"fake-png-bytes"
 
 
+def test_fetch_message_content_decodes_rfc2047_attachment_filename() -> None:
+    # Некоторые сервера (встречалось от Exchange) кодируют имя файла в
+    # заголовке Content-Disposition через RFC 2047, а не RFC 2231 —
+    # email.message.get_filename() такое не декодирует сам.
+    raw = (
+        b"From: ivan@example.com\r\n"
+        b"Content-Type: multipart/mixed; boundary=XYZ\r\n"
+        b"\r\n"
+        b"--XYZ\r\n"
+        b"Content-Type: text/plain\r\n"
+        b"\r\n"
+        b"body\r\n"
+        b"--XYZ\r\n"
+        b"Content-Type: application/octet-stream\r\n"
+        b'Content-Disposition: attachment; filename="=?UTF-8?B?0YLQtdGB0YIudHh0?="\r\n'
+        b"\r\n"
+        b"filedata\r\n"
+        b"--XYZ--\r\n"
+    )
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert content.attachments[0].filename == "тест.txt"
+
+
 def test_fetch_message_content_keeps_inline_calendar_part_without_disposition() -> None:
     # Не все серверы ставят Content-Disposition: attachment/filename на
     # text/calendar-часть приглашения (RFC 5546 этого не требует) — раньше

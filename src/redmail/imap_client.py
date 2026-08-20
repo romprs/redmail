@@ -262,7 +262,7 @@ def extract_content(message: Message) -> MessageContent:
         if part.is_multipart():
             continue
 
-        filename = part.get_filename()
+        filename = _decode_filename(part.get_filename())
         content_type = part.get_content_type()
         content_id = (part.get("Content-Id") or "").strip().strip("<>")
 
@@ -301,10 +301,21 @@ def extract_content(message: Message) -> MessageContent:
 
 def _calendar_attachment(part: Message) -> Attachment:
     return Attachment(
-        filename=part.get_filename() or "invite.ics",
+        filename=_decode_filename(part.get_filename()) or "invite.ics",
         content_type="text/calendar",
         payload=part.get_payload(decode=True) or b"",
     )
+
+
+def _decode_filename(filename: str | None) -> str | None:
+    """get_filename() отдаёт значение как есть — некоторые сервера (в т.ч.
+    встречалось от Exchange) кодируют имя файла в RFC 2047 (=?utf-8?B?...?=)
+    вместо RFC 2231, которое email.message понимает само. Без декодирования
+    имя вложения показывалось бы пользователю нечитаемой кодированной
+    строкой вместо настоящего имени файла."""
+    if not filename or "=?" not in filename:
+        return filename
+    return _decode_rfc2047(filename.encode("ascii", errors="replace"))
 
 
 def _decode_payload(part: Message) -> str:
