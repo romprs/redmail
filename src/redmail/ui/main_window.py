@@ -911,6 +911,10 @@ class MainWindow(QMainWindow):
         cancel_event_action.setToolTip("Только для встреч, которые организовали вы сами")
         cancel_event_action.triggered.connect(self.on_cancel_event)
         calendar_toolbar.addAction(cancel_event_action)
+        import_ics_action = QAction("Импортировать .ics…", self)
+        import_ics_action.setToolTip("Загрузить выгрузку календаря (VK Mail, Google, Outlook)")
+        import_ics_action.triggered.connect(self.on_import_ics)
+        calendar_toolbar.addAction(import_ics_action)
         calendar_refresh_action = QAction("Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
@@ -1942,6 +1946,19 @@ class MainWindow(QMainWindow):
     def on_calendar_today(self) -> None:
         self.calendar_week_start = week_start_for(date.today())
         self.refresh_calendar_view()
+
+    def on_import_ics(self) -> None:
+        path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл .ics", filter="iCalendar (*.ics)")
+        if not path_str:
+            return
+        try:
+            data = Path(path_str).read_bytes()
+            count = itip.import_ics(self.calendar_path, data, self.account.username if self.account else "")
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка импорта", str(exc))
+            return
+        self.refresh_calendar_view()
+        self.statusBar().showMessage(f"Импортировано событий: {count}", 5000)
 
     def refresh_calendar_view(self) -> None:
         # Локальный календарь ничего не опрашивает по сети — "Обновить"

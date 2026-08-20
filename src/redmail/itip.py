@@ -4,10 +4,12 @@ import base64
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from email.message import Message
+from pathlib import Path
 
 import icalendar
 
-from redmail.calendar_store import Attendee, Event
+from redmail import calendar_store
+from redmail.calendar_store import Attendee, Event, new_uid
 from redmail.imap_client import Attachment
 
 # iTIP (RFC 5546) поверх обычной почты — единственный способ приглашений/
@@ -61,6 +63,41 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
     if vevent is None:
         raise NotAnInviteError("В .ics нет VEVENT")
 
+    event = _event_from_vevent(vevent, method, my_email, ics_bytes)
+    replying_attendee_email = event.attendees[0].email if method == "REPLY" and event.attendees else ""
+    return IncomingInvite(method=method, event=event, replying_attendee_email=replying_attendee_email)
+
+
+def parse_ics_events(ics_bytes: bytes, my_email: str) -> list[Event]:
+    """Разбирает ВСЕ VEVENT из .ics — экспорт целого календаря (несколько
+    встреч без METHOD:, в отличие от одиночного приглашения), например
+    файл, выгруженный из VK Mail/Google/Outlook через "Экспорт календаря".
+    Записи, которые не удалось разобрать (битые/неполные), пропускаются —
+    одна плохая запись не должна срывать импорт всего файла."""
+    cal = icalendar.Calendar.from_ical(ics_bytes)
+    method = str(cal.get("method", "PUBLISH")).upper()
+    events: list[Event] = []
+    for component in cal.walk():
+        if component.name != "VEVENT":
+            continue
+        try:
+            events.append(_event_from_vevent(component, method, my_email, None))
+        except (KeyError, ValueError):
+            continue
+    return events
+
+
+def import_ics(path: Path, ics_bytes: bytes, my_email: str = "") -> int:
+    """Импортирует все события из .ics-файла (выгрузка целого календаря
+    внешней системой — например, "Экспорт" из VK Mail/Google/Outlook, а
+    не одиночное приглашение) в локальный calendar_store."""
+    events = parse_ics_events(ics_bytes, my_email)
+    for event in events:
+        calendar_store.save_event(path, event)
+    return len(events)
+
+
+def _event_from_vevent(vevent, method: str, my_email: str, raw_ics: bytes | None) -> Event:
     dtstart_value = vevent["DTSTART"].dt
     all_day = not isinstance(dtstart_value, datetime) and isinstance(dtstart_value, date)
     dtstart = _to_utc(dtstart_value)
@@ -80,8 +117,6 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
         if my_email and email_addr.lower() == my_email.lower():
             my_participation = partstat
 
-    replying_attendee_email = attendees[0].email if method == "REPLY" and attendees else ""
-
     rrule_prop = vevent.get("RRULE")
     recurrence_rule = rrule_prop.to_ical().decode("ascii") if rrule_prop is not None else None
 
@@ -89,8 +124,9 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
         a for i, prop in enumerate(_as_list(vevent.get("ATTACH"))) if (a := _attachment_from_prop(prop, i))
     ]
 
-    event = Event(
-        uid=str(vevent.get("UID", "")),
+    uid = str(vevent.get("UID", "")) or new_uid()
+    return Event(
+        uid=uid,
         sequence=int(vevent.get("SEQUENCE", 0)),
         summary=str(vevent.get("SUMMARY", "")),
         description=str(vevent.get("DESCRIPTION", "")),
@@ -101,14 +137,13 @@ def parse_invite(ics_bytes: bytes, my_email: str) -> IncomingInvite:
         recurrence_rule=recurrence_rule,
         organizer_email=organizer_email,
         organizer_name=organizer_name,
-        is_organizer=bool(my_email) and organizer_email.lower() == my_email.lower(),
+        is_organizer=bool(my_email) and bool(organizer_email) and organizer_email.lower() == my_email.lower(),
         status="cancelled" if method == "CANCEL" else "confirmed",
         my_participation=my_participation,
         attendees=attendees,
         attachments=attachments,
-        raw_ics=ics_bytes,
+        raw_ics=raw_ics,
     )
-    return IncomingInvite(method=method, event=event, replying_attendee_email=replying_attendee_email)
 
 
 def build_request_ics(event: Event, organizer_email: str, organizer_name: str) -> bytes:

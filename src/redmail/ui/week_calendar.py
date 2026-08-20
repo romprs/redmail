@@ -320,26 +320,37 @@ class WeekGridWidget(QWidget):
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        grid_color = self.palette().mid().color()
-        pen = QPen(grid_color)
-        painter.setPen(pen)
+        # Раньше подписи часов рисовались тем же бледным пером, что и сами
+        # линии сетки (palette().mid() — по жалобе "часы плохо видно" на
+        # реальном мониторе это оказалось действительно едва различимо).
+        # Линии — по-прежнему приглушённые, подписи — контрастным текстом.
+        # Полупрозрачный текстовый цвет вместо palette().mid() — тот на
+        # некоторых системных темах оказывается почти не виден на фоне сетки.
+        text_color = self.palette().windowText().color()
+        grid_color = QColor(text_color)
+        grid_color.setAlpha(60)
+        grid_pen = QPen(grid_color)
 
         col_w = self._day_column_width()
         today_index = (date.today() - self._week_start).days
 
+        painter.setPen(grid_pen)
         for hour in range(25):
             y = hour * self.HOUR_HEIGHT
             painter.drawLine(self.TIME_AXIS_WIDTH, y, self.width(), y)
-            if hour < 24:
-                painter.drawText(
-                    QRectF(0, y + 2, self.TIME_AXIS_WIDTH - 6, self.HOUR_HEIGHT),
-                    Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
-                    f"{hour:02d}:00",
-                )
 
         for i in range(8):
             x = self.TIME_AXIS_WIDTH + i * col_w
             painter.drawLine(int(x), 0, int(x), self.height())
+
+        painter.setPen(text_color)
+        for hour in range(24):
+            y = hour * self.HOUR_HEIGHT
+            painter.drawText(
+                QRectF(0, y + 2, self.TIME_AXIS_WIDTH - 6, self.HOUR_HEIGHT),
+                Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
+                f"{hour:02d}:00",
+            )
 
         if 0 <= today_index < 7:
             highlight = QColor(_TODAY_COLOR)

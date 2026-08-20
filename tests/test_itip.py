@@ -167,3 +167,65 @@ def test_parses_real_google_calendar_invite() -> None:
     assert invite.event.dtstart == datetime(2026, 8, 21, 12, 30, tzinfo=timezone.utc)
     emails = {a.email for a in invite.event.attendees}
     assert emails == {"romprs1@gmail.com", "romprs@gmail.com"}
+
+
+def _bare_vevent_ics(uid: str, summary: str, start: datetime) -> bytes:
+    # Экспорт целого календаря — VCALENDAR с несколькими VEVENT и БЕЗ
+    # METHOD: (в отличие от одиночного приглашения) — так реально выглядит
+    # выгрузка "Экспорт календаря" из VK Mail/Google/Outlook.
+    return (
+        f"BEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:{summary}\r\n"
+        f"DTSTART:{start.strftime('%Y%m%dT%H%M%SZ')}\r\n"
+        f"DTEND:{(start + timedelta(hours=1)).strftime('%Y%m%dT%H%M%SZ')}\r\nEND:VEVENT\r\n"
+    ).encode()
+
+
+def test_parse_ics_events_reads_multiple_events_without_method() -> None:
+    start1 = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    start2 = datetime(2026, 9, 2, 14, tzinfo=timezone.utc)
+    body = _bare_vevent_ics("a@calendar", "Событие 1", start1) + _bare_vevent_ics("b@calendar", "Событие 2", start2)
+    ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + body + b"END:VCALENDAR\r\n"
+
+    events = itip.parse_ics_events(ics, my_email="me@example.com")
+
+    assert len(events) == 2
+    assert {e.uid for e in events} == {"a@calendar", "b@calendar"}
+    assert {e.summary for e in events} == {"Событие 1", "Событие 2"}
+
+
+def test_parse_ics_events_skips_bad_entries_not_whole_file() -> None:
+    good = _bare_vevent_ics("ok@calendar", "Нормальное", datetime(2026, 9, 1, 10, tzinfo=timezone.utc))
+    bad = b"BEGIN:VEVENT\r\nUID:bad@calendar\r\nSUMMARY:No DTSTART at all\r\nEND:VEVENT\r\n"
+    ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + bad + good + b"END:VCALENDAR\r\n"
+
+    events = itip.parse_ics_events(ics, my_email="me@example.com")
+
+    assert len(events) == 1
+    assert events[0].uid == "ok@calendar"
+
+
+def test_parse_ics_events_assigns_uid_when_missing() -> None:
+    ics = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nSUMMARY:No UID at all\r\n"
+        b"DTSTART:20260901T100000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    events = itip.parse_ics_events(ics, my_email="me@example.com")
+    assert len(events) == 1
+    assert events[0].uid  # непустой, сгенерированный
+
+
+def test_import_ics_saves_events_to_calendar_store(tmp_path: Path) -> None:
+    from redmail import calendar_store
+
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + _bare_vevent_ics(
+        "imported@calendar", "Импортированное", start
+    ) + b"END:VCALENDAR\r\n"
+
+    cal_path = tmp_path / "test.rmcal"
+    count = itip.import_ics(cal_path, ics, my_email="me@example.com")
+
+    assert count == 1
+    stored = calendar_store.get_event(cal_path, "imported@calendar")
+    assert stored is not None
+    assert stored.summary == "Импортированное"
