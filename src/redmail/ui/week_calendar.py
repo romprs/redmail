@@ -37,6 +37,12 @@ def month_grid_range(anchor: date) -> tuple[date, date]:
 
 
 def _event_color(calendar_event: Event) -> str:
+    # Ручной цвет (см. референс VK Mail — "Цвет события") имеет приоритет
+    # над автоцветом по роли; автоцвет остаётся по умолчанию для событий,
+    # где цвет никогда не задавали (включая все существующие до этой
+    # возможности).
+    if calendar_event.color:
+        return calendar_event.color
     if calendar_event.all_day:
         return _ALL_DAY_COLOR
     return _ORGANIZER_COLOR if calendar_event.is_organizer else _ATTENDEE_COLOR

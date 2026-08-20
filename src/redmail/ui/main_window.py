@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import math
 import mimetypes
 import re
 import shutil
@@ -10,8 +11,22 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPixmap, QTextDocument
+from PySide6.QtCore import QByteArray, QDate, QDateTime, QPointF, QRectF, QSize, Qt, QStringListModel, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPixmap,
+    QTextDocument,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
@@ -304,16 +319,20 @@ def _importance_mark(importance: str) -> str:
     return ""
 
 
-def _marker_icon(color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
+def _dot_icon(hex_color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
     pixmap = QPixmap(diameter, diameter)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     painter.setPen(Qt.PenStyle.NoPen)
-    painter.setBrush(QColor(_MARKER_HEX[color]))
+    painter.setBrush(QColor(hex_color))
     painter.drawEllipse(1, 1, diameter - 2, diameter - 2)
     painter.end()
     return QIcon(pixmap)
+
+
+def _marker_icon(color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
+    return _dot_icon(_MARKER_HEX[color], diameter)
 
 
 _AVATAR_COLORS = ("#E53935", "#FB8C00", "#43A047", "#1E88E5", "#8E24AA", "#00897B", "#D81B60", "#6D4C41")
@@ -350,6 +369,76 @@ def _avatar_pixmap(letter: str, color: str, size: int = 24) -> QPixmap:
 def _attendee_avatar_letter(name: str, email: str) -> str:
     source = (name or email or "?").strip()
     return source[0] if source else "?"
+
+
+_ICON_COLOR = "#5f6368"
+_EVENT_COLOR_PALETTE: tuple[tuple[str, str], ...] = (
+    ("Синий", "#3B6FB6"),
+    ("Фиолетовый", "#8B5CB6"),
+    ("Зелёный", "#2E7D32"),
+    ("Оранжевый", "#E8710A"),
+    ("Красный", "#D93025"),
+    ("Бирюзовый", "#00897B"),
+)
+
+
+def _calendar_icon(kind: str, size: int = 16) -> QIcon:
+    """Простые монохромные значки для компактных строк в диалоге события
+    (референс VK Mail — значок слева от каждого поля вместо подписи).
+    Рисуются сами, а не берутся из системной темы/эмодзи-шрифта — на этой
+    платформе уже был найден пробел в покрытии эмодзи-шрифтом (см.
+    маркеры/аватарки), рисованные QPainter-иконки от этого не зависят."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(_ICON_COLOR))
+    pen.setWidthF(1.3)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    m = size * 0.14
+    r = size - 2 * m
+    cx, cy = size / 2, size / 2
+
+    if kind == "time":
+        painter.drawEllipse(QRectF(m, m, r, r))
+        painter.drawLine(QPointF(cx, cy), QPointF(cx, cy - r * 0.32))
+        painter.drawLine(QPointF(cx, cy), QPointF(cx + r * 0.22, cy + r * 0.06))
+    elif kind == "repeat":
+        rect = QRectF(m, m, r, r)
+        painter.drawArc(rect, 25 * 16, 260 * 16)
+        angle = math.radians(25)
+        ax = cx + (r / 2) * math.cos(angle)
+        ay = cy - (r / 2) * math.sin(angle)
+        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPolygon([QPointF(ax - 3.2, ay - 0.8), QPointF(ax + 1.6, ay - 3.6), QPointF(ax + 0.8, ay + 3.0)])
+    elif kind == "people":
+        painter.drawEllipse(QRectF(size * 0.30, size * 0.16, size * 0.36, size * 0.36))
+        painter.drawArc(QRectF(size * 0.06, size * 0.52, size * 0.84, size * 0.5), 0, 180 * 16)
+    elif kind == "location":
+        path = QPainterPath()
+        path.moveTo(cx, size * 0.88)
+        path.cubicTo(size * 0.16, size * 0.55, size * 0.16, size * 0.14, cx, size * 0.12)
+        path.cubicTo(size * 0.84, size * 0.14, size * 0.84, size * 0.55, cx, size * 0.88)
+        painter.drawPath(path)
+        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(cx - size * 0.10, size * 0.27, size * 0.20, size * 0.20))
+    elif kind == "description":
+        for frac, shorten in ((0.28, 0.0), (0.5, 0.0), (0.72, size * 0.25)):
+            y = m + frac * r
+            painter.drawLine(QPointF(m, y), QPointF(size - m - shorten, y))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _icon_label(kind: str, parent: QWidget | None = None) -> QLabel:
+    label = QLabel(parent)
+    label.setPixmap(_calendar_icon(kind).pixmap(16, 16))
+    label.setFixedWidth(22)
+    label.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop)
+    return label
 
 
 class SettingsDialog(QDialog):
@@ -679,27 +768,33 @@ class EventDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
-        self.resize(480, 480)
+        self.resize(460, 560)
         self.attachments: list[Attachment] = list(event.attachments) if event else []
+        self._color = event.color if event else None
 
         self.summary_edit = QLineEdit(event.summary if event else "")
+        self.summary_edit.setPlaceholderText("Придумайте название")
+        summary_font = self.summary_edit.font()
+        summary_font.setPointSize(summary_font.pointSize() + 3)
+        self.summary_edit.setFont(summary_font)
+
         self.location_edit = QLineEdit(event.location if event else "")
+        self.location_edit.setPlaceholderText("Укажите место")
         self._contacts = contacts or []
 
         other_attendees = [a.email for a in event.attendees if a.email != my_email] if event else []
         self.attendees_edit = QLineEdit(", ".join(other_attendees))
-        self.attendees_edit.setPlaceholderText("Участники через запятую (необязательно)")
+        self.attendees_edit.setPlaceholderText("Выберите участников")
         if contacts:
             _install_recipient_completer(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
+        self.description_edit.setPlaceholderText("Добавьте описание")
+        self.description_edit.setFixedHeight(70)
 
         attendees_address_book_button = QPushButton("Адресная книга…", self)
         attendees_address_book_button.clicked.connect(
             lambda: _open_contact_picker(self, self.attendees_edit, self._contacts)
         )
-        attendees_row = QHBoxLayout()
-        attendees_row.addWidget(self.attendees_edit)
-        attendees_row.addWidget(attendees_address_book_button)
 
         fallback_start = default_start or (
             datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
@@ -726,14 +821,9 @@ class EventDialog(QDialog):
             index = self.recurrence_combo.findData(event.recurrence_rule)
             self.recurrence_combo.setCurrentIndex(index if index >= 0 else 0)
 
-        form = QFormLayout()
-        form.addRow("Тема", self.summary_edit)
-        form.addRow("Начало", self.start_edit)
-        form.addRow("Окончание", self.end_edit)
-        form.addRow("", self.all_day_check)
-        form.addRow("Повтор", self.recurrence_combo)
-        form.addRow("Место", self.location_edit)
-        form.addRow("Участники", attendees_row)
+        self.color_button = QPushButton(self)
+        self.color_button.clicked.connect(self._open_color_menu)
+        self._apply_color_button_style()
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(70)
@@ -744,24 +834,97 @@ class EventDialog(QDialog):
         attach_button.clicked.connect(self._on_attach)
         remove_button = QPushButton("Убрать", self)
         remove_button.clicked.connect(self._on_remove_attachment)
-        attach_row = QHBoxLayout()
-        attach_row.addWidget(attach_button)
-        attach_row.addWidget(remove_button)
-        attach_row.addStretch(1)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # Компактные строки "значок слева + поле" вместо подписанных полей
+        # QFormLayout — так выглядит попап создания события в референсе
+        # (VK Mail): "Придумайте название" присланный пользователем.
+        time_row = QHBoxLayout()
+        time_row.addWidget(_icon_label("time", self))
+        time_row.addWidget(self.start_edit)
+        time_row.addWidget(QLabel("—", self))
+        time_row.addWidget(self.end_edit)
+        time_row.addWidget(self.all_day_check)
+        time_row.addStretch(1)
+
+        repeat_row = QHBoxLayout()
+        repeat_row.addWidget(_icon_label("repeat", self))
+        repeat_row.addWidget(self.recurrence_combo)
+        repeat_row.addStretch(1)
+
+        attendees_row = QHBoxLayout()
+        attendees_row.addWidget(_icon_label("people", self))
+        attendees_row.addWidget(self.attendees_edit)
+        attendees_row.addWidget(attendees_address_book_button)
+
+        location_row = QHBoxLayout()
+        location_row.addWidget(_icon_label("location", self))
+        location_row.addWidget(self.location_edit)
+
+        description_row = QHBoxLayout()
+        description_row.addWidget(_icon_label("description", self))
+        description_row.addWidget(self.description_edit)
+
+        attach_row = QHBoxLayout()
+        attach_row.addSpacing(22)
+        attach_row.addWidget(attach_button)
+        attach_row.addWidget(remove_button)
+        attach_row.addStretch(1)
+
+        attachments_list_row = QHBoxLayout()
+        attachments_list_row.addSpacing(22)
+        attachments_list_row.addWidget(self.attachments_list)
+
+        color_row = QHBoxLayout()
+        color_row.addSpacing(22)
+        color_row.addWidget(self.color_button)
+        color_row.addStretch(1)
+
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(QLabel("Описание", self))
-        layout.addWidget(self.description_edit)
+        layout.addWidget(self.summary_edit)
+        layout.addLayout(time_row)
+        layout.addLayout(repeat_row)
+        layout.addLayout(attendees_row)
+        layout.addLayout(location_row)
+        layout.addLayout(description_row)
         layout.addLayout(attach_row)
-        layout.addWidget(self.attachments_list)
+        layout.addLayout(attachments_list_row)
+        layout.addLayout(color_row)
         layout.addWidget(buttons)
+
+    def _apply_color_button_style(self) -> None:
+        if self._color:
+            swatch = self._color
+            label_text = next((name for name, hexval in _EVENT_COLOR_PALETTE if hexval == self._color), "Цвет события")
+        else:
+            swatch = "#3B6FB6"  # тот же синий, что и автоцвет организатора в week_calendar.py
+            label_text = "Цвет события (авто)"
+        self.color_button.setText(f"● {label_text} ▾")
+        self.color_button.setStyleSheet(f"QPushButton {{ color: {swatch}; font-weight: 600; }}")
+
+    def _open_color_menu(self) -> None:
+        menu = QMenu(self)
+        auto_action = menu.addAction("Авто (по роли)")
+        menu.addSeparator()
+        color_actions = {}
+        for name, hexval in _EVENT_COLOR_PALETTE:
+            action = menu.addAction(_dot_icon(hexval), name)
+            color_actions[action] = hexval
+        chosen = menu.exec(QCursor.pos())
+        if chosen is None:
+            return
+        self._color = None if chosen is auto_action else color_actions[chosen]
+        self._apply_color_button_style()
+
+    def color(self) -> str | None:
+        return self._color
 
     def _on_attach(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
@@ -2719,6 +2882,7 @@ class MainWindow(QMainWindow):
             my_participation="accepted",
             sequence=(existing.sequence + 1) if existing else 0,
             recurrence_rule=dialog.recurrence_rule(),
+            color=dialog.color(),
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
             attachments=list(dialog.attachments),
         )

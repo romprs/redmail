@@ -48,6 +48,19 @@ def test_get_event_missing_returns_none(tmp_path: Path) -> None:
     assert calendar_store.get_event(path, "nope") is None
 
 
+def test_color_defaults_to_none_and_round_trips(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    assert event.color is None
+    calendar_store.save_event(path, event)
+    assert calendar_store.get_event(path, event.uid).color is None
+
+    colored = _event(uid="e2@redmail")
+    colored.color = "#8E24AA"
+    calendar_store.save_event(path, colored)
+    assert calendar_store.get_event(path, "e2@redmail").color == "#8E24AA"
+
+
 def test_save_event_upserts_by_uid(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcal"
     event = _event()

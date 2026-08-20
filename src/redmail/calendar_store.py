@@ -27,7 +27,10 @@ _FORMAT_VERSION = 2
 
 # Столбцы, добавленные после первого релиза — CREATE TABLE IF NOT EXISTS их
 # для уже существующих файлов не создаст, поэтому досоздаём миграцией.
-_MIGRATIONS = ("ALTER TABLE events ADD COLUMN recurrence_rule TEXT",)
+_MIGRATIONS = (
+    "ALTER TABLE events ADD COLUMN recurrence_rule TEXT",
+    "ALTER TABLE events ADD COLUMN color TEXT",
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -52,6 +55,7 @@ CREATE TABLE IF NOT EXISTS events (
     my_participation TEXT NOT NULL DEFAULT 'needs-action',
     attendees TEXT NOT NULL DEFAULT '[]',
     recurrence_rule TEXT,
+    color TEXT,
     raw_ics BLOB
 );
 
@@ -66,7 +70,7 @@ CREATE TABLE IF NOT EXISTS event_attachments (
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
     "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-    "recurrence_rule, raw_ics"
+    "recurrence_rule, color, raw_ics"
 )
 
 
@@ -95,6 +99,7 @@ class Event:
     my_participation: str = "needs-action"
     attendees: list[Attendee] = field(default_factory=list)
     recurrence_rule: str | None = None  # значение RRULE (RFC 5545), напр. "FREQ=DAILY"
+    color: str | None = None  # ручной цвет события (#RRGGBB); None — автоцвет по роли (организатор/участник)
     attachments: list[Attachment] = field(default_factory=list)
     raw_ics: bytes | None = None
 
@@ -158,8 +163,9 @@ def _row_to_event(conn: sqlite3.Connection, row) -> Event:
         my_participation=row[13],
         attendees=[Attendee(**a) for a in json.loads(row[14])],
         recurrence_rule=row[15],
+        color=row[16],
         attachments=_load_attachments(conn, row[1]),
-        raw_ics=row[16],
+        raw_ics=row[17],
     )
 
 
@@ -251,14 +257,15 @@ def save_event(path: Path, event: Event) -> None:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-            "recurrence_rule, raw_ics) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recurrence_rule, color, raw_ics) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
             "organizer_email=excluded.organizer_email, organizer_name=excluded.organizer_name, "
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
-            "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, raw_ics=excluded.raw_ics",
+            "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
+            "raw_ics=excluded.raw_ics",
             (
                 event.uid,
                 event.sequence,
@@ -275,6 +282,7 @@ def save_event(path: Path, event: Event) -> None:
                 event.my_participation,
                 json.dumps([a.__dict__ for a in event.attendees], ensure_ascii=False),
                 event.recurrence_rule,
+                event.color,
                 event.raw_ics,
             ),
         )
