@@ -584,6 +584,7 @@ class EventDialog(QDialog):
         event: calendar_store.Event | None = None,
         my_email: str = "",
         contacts: list[contact_store.Contact] | None = None,
+        default_start: datetime | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
@@ -609,8 +610,10 @@ class EventDialog(QDialog):
         attendees_row.addWidget(self.attendees_edit)
         attendees_row.addWidget(attendees_address_book_button)
 
-        default_start = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-        start_local = event.dtstart.astimezone() if event else default_start
+        fallback_start = default_start or (
+            datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        )
+        start_local = event.dtstart.astimezone() if event else fallback_start
         end_local = event.dtend.astimezone() if event else start_local + timedelta(hours=1)
 
         self.start_edit = QDateTimeEdit(QDateTime(start_local.date(), start_local.time()), self)
@@ -888,7 +891,13 @@ class MainWindow(QMainWindow):
         self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Stretch)
+        # Тема — Interactive, а не Stretch: Qt не даёт вручную тянуть границу
+        # у Stretch-колонки, а пользователю нужно было именно это (жалоба:
+        # "не могу изменить ширину колонки тема"). Ширина по умолчанию —
+        # просто разумная стартовая, реальная запоминается между запусками
+        # через _restore_window_state()/mail_columns_state.
+        header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(COL_SUBJECT, 320)
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
@@ -1027,10 +1036,14 @@ class MainWindow(QMainWindow):
         self.calendar_all_day_row = AllDayRowWidget(self)
         self.calendar_all_day_row.eventClicked.connect(self._on_calendar_event_clicked)
         self.calendar_all_day_row.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
+        self.calendar_all_day_row.eventContextMenuRequested.connect(self.on_calendar_event_context_menu)
         self.calendar_week_grid = WeekGridWidget(self)
         self.calendar_week_grid.eventClicked.connect(self._on_calendar_event_clicked)
         self.calendar_week_grid.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
         self.calendar_week_grid.eventDragRescheduled.connect(self.on_calendar_event_drag_rescheduled)
+        self.calendar_week_grid.eventContextMenuRequested.connect(self.on_calendar_event_context_menu)
+        self.calendar_week_grid.emptySlotClicked.connect(self.on_calendar_empty_slot_clicked)
+        self.calendar_week_grid.emptySlotContextMenuRequested.connect(self.on_calendar_empty_slot_context_menu)
 
         calendar_scroll = QScrollArea(self)
         calendar_scroll.setWidget(self.calendar_week_grid)
@@ -1626,7 +1639,18 @@ class MainWindow(QMainWindow):
     def on_current_cell_changed(
         self, current_row: int, current_column: int, _previous_row: int, _previous_column: int
     ) -> None:
-        self._set_filter_column(current_column)
+        # Только переключение активной колонки текстового фильтра — не
+        # трогаем колонку маркера здесь. Раньше это шло через тот же
+        # _set_filter_column(), что и клик по ЗАГОЛОВКУ, а для COL_FLAG это
+        # открывает всплывающее меню фильтра по цвету; из-за этого клик по
+        # ячейке маркера в строке письма (чтобы поставить маркер САМОМУ
+        # письму, см. on_table_item_clicked/_open_marker_menu) сначала
+        # открывал не то меню, и приходилось кликать дважды.
+        if current_column not in _FILTER_COLUMNS:
+            return
+        self.filter_column = current_column
+        self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[current_column]}")
+        self.on_filter_changed(self.filter_edit.text())
 
     def on_folder_item_changed(self, current: QTreeWidgetItem | None, _previous: QTreeWidgetItem | None) -> None:
         if current is None:
@@ -2151,11 +2175,55 @@ class MainWindow(QMainWindow):
             return
         self._save_event_from_dialog(dialog, existing=event)
 
-    def on_new_event(self) -> None:
+    def on_new_event(self, *, default_start: datetime | None = None) -> None:
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
-        dialog = EventDialog(self, my_email=self.account.username, contacts=self._load_contacts())
+        dialog = EventDialog(
+            self, my_email=self.account.username, contacts=self._load_contacts(), default_start=default_start
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_event_from_dialog(dialog, existing=None)
+
+    def on_calendar_empty_slot_clicked(self, day: date, minutes: int) -> None:
+        self.on_new_event(default_start=self._slot_to_datetime(day, minutes))
+
+    def on_calendar_empty_slot_context_menu(self, day: date, minutes: int, global_pos) -> None:
+        menu = QMenu(self)
+        new_action = menu.addAction("Новое событие…")
+        chosen = menu.exec(global_pos)
+        if chosen is new_action:
+            self.on_new_event(default_start=self._slot_to_datetime(day, minutes))
+
+    @staticmethod
+    def _slot_to_datetime(day: date, minutes: int) -> datetime:
+        return datetime(day.year, day.month, day.day, minutes // 60, minutes % 60).astimezone()
+
+    def on_calendar_event_context_menu(self, event: calendar_store.Event, global_pos) -> None:
+        self.selected_calendar_event = event
+        self._apply_calendar_selection_highlight()
+        menu = QMenu(self)
+        open_action = menu.addAction("Изменить" if event.is_organizer else "Просмотреть")
+        copy_action = menu.addAction("Копировать")
+        cancel_action = None
+        if event.is_organizer:
+            menu.addSeparator()
+            cancel_action = menu.addAction("Отменить встречу")
+        chosen = menu.exec(global_pos)
+        if chosen is open_action:
+            self._on_calendar_event_double_clicked(event)
+        elif chosen is copy_action:
+            self.on_copy_event(event)
+        elif chosen is not None and chosen is cancel_action:
+            self.on_cancel_event()
+
+    def on_copy_event(self, event: calendar_store.Event) -> None:
+        if not self.account:
+            QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
+            return
+        dialog = EventDialog(self, event=event, my_email=self.account.username, contacts=self._load_contacts())
+        dialog.setWindowTitle("Копия встречи")
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=None)

@@ -40,6 +40,7 @@ class _EventBlock(QFrame):
     # день/минуты переноса из разницы геометрий удобнее делать в сетке,
     # которая уже знает ширину колонки/масштаб часа, а не здесь.
     dragFinished = Signal(object, object, object)
+    contextMenuRequested = Signal(object, object)  # (calendar_event, global_pos)
 
     def __init__(self, calendar_event: Event, parent: QWidget | None = None, *, pill: bool = False):
         super().__init__(parent)
@@ -108,6 +109,9 @@ class _EventBlock(QFrame):
             self.clicked.emit(self.calendar_event)
         self._drag_start_mouse = None
         super().mouseReleaseEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self.contextMenuRequested.emit(self.calendar_event, event.globalPos())
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
         # Qt шлёт Press-Release-DoubleClick-Release на двойной клик — без
@@ -187,6 +191,7 @@ class AllDayRowWidget(QWidget):
     TIME_AXIS_WIDTH = WeekHeaderWidget.TIME_AXIS_WIDTH
     eventClicked = Signal(object)
     eventDoubleClicked = Signal(object)
+    eventContextMenuRequested = Signal(object, object)  # (calendar_event, global_pos)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -229,6 +234,7 @@ class AllDayRowWidget(QWidget):
             block.setGeometry(int(x) + 2, row * (row_height + 2), int(col_w) - 4, row_height)
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
+            block.contextMenuRequested.connect(self.eventContextMenuRequested.emit)
             block.show()
             self._blocks.append(block)
 
@@ -244,10 +250,17 @@ class WeekGridWidget(QWidget):
     _SNAP_MINUTES = 15
     eventClicked = Signal(object)
     eventDoubleClicked = Signal(object)
+    eventContextMenuRequested = Signal(object, object)  # (calendar_event, global_pos)
     # (calendar_event, day_delta, minute_delta) — сколько дней/минут
     # перенесли перетаскиванием; сама запись в calendar_store и рассылка
     # обновления — забота MainWindow (там есть SMTP-аккаунт).
     eventDragRescheduled = Signal(object, int, int)
+    # Клик/правый клик по ПУСТОМУ месту сетки (не по событию — блоки
+    # событий перехватывают свои события мыши сами, сюда попадают только
+    # клики мимо них) — день + минуты от полуночи, чтобы создать встречу
+    # прямо на этом месте, как в Google Calendar/Outlook.
+    emptySlotClicked = Signal(object, int)  # (date, minutes_from_midnight)
+    emptySlotContextMenuRequested = Signal(object, int, object)  # (date, minutes, global_pos)
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -298,9 +311,41 @@ class WeekGridWidget(QWidget):
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
             block.dragFinished.connect(self._on_block_drag_finished)
+            block.contextMenuRequested.connect(self.eventContextMenuRequested.emit)
             block.show()
             self._blocks.append(block)
         self.update()
+
+    def _slot_at(self, pos) -> tuple[date, int] | None:
+        """Переводит точку в координатах виджета в (день, минуты от
+        полуночи, округлённые до 15 минут) — используется и для создания
+        события кликом по пустому месту сетки, и для контекстного меню там
+        же. Возвращает None вне часовой сетки (например, клик по оси времени
+        слева)."""
+        if pos.x() < self.TIME_AXIS_WIDTH:
+            return None
+        col_w = self._day_column_width()
+        day_index = int((pos.x() - self.TIME_AXIS_WIDTH) / col_w)
+        if not (0 <= day_index < 7):
+            return None
+        minutes = max(0, min(24 * 60 - self._SNAP_MINUTES, int(pos.y() / self.HOUR_HEIGHT * 60)))
+        minutes = round(minutes / self._SNAP_MINUTES) * self._SNAP_MINUTES
+        return self._week_start + timedelta(days=day_index), minutes
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # Клики по самим событиям сюда не долетают — их обрабатывает
+        # _EventBlock (дочерний виджет) сам; сюда попадают только клики
+        # мимо блоков, то есть по пустому месту сетки.
+        if event.button() == Qt.MouseButton.LeftButton:
+            slot = self._slot_at(event.position().toPoint())
+            if slot is not None:
+                self.emptySlotClicked.emit(*slot)
+        super().mousePressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
+        slot = self._slot_at(event.pos())
+        if slot is not None:
+            self.emptySlotContextMenuRequested.emit(slot[0], slot[1], event.globalPos())
 
     def _on_block_drag_finished(self, calendar_event: Event, old_geom, new_geom) -> None:
         col_w = self._day_column_width()
