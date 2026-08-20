@@ -225,6 +225,63 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
     return completer
 
 
+class ContactPickerDialog(QDialog):
+    """Явный выбор адресов из адресной книги списком. Автодополнение по мере
+    набора в поле «Кому»/«Участники» уже было, но по отзыву с реального
+    использования оказалось незаметным — эта кнопка даёт то же самое явно."""
+
+    def __init__(self, parent, contacts: list[contact_store.Contact]):
+        super().__init__(parent)
+        self.setWindowTitle("Адресная книга")
+        self.resize(380, 420)
+
+        self.filter_edit = QLineEdit(self)
+        self.filter_edit.setPlaceholderText("Поиск по имени или email")
+        self.filter_edit.textChanged.connect(self._apply_filter)
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        for candidate in _contact_candidates(contacts):
+            self.list_widget.addItem(candidate)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.filter_edit)
+        layout.addWidget(self.list_widget)
+        layout.addWidget(buttons)
+
+    def _apply_filter(self, text: str) -> None:
+        needle = text.strip().lower()
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def selected_candidates(self) -> list[str]:
+        return [item.text() for item in self.list_widget.selectedItems()]
+
+
+def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_store.Contact]) -> None:
+    if not contacts:
+        QMessageBox.information(parent, "Адресная книга", "Адресная книга пуста — сначала добавьте контакты.")
+        return
+    dialog = ContactPickerDialog(parent, contacts)
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return
+    picked = dialog.selected_candidates()
+    if not picked:
+        return
+    existing = [p.strip() for p in line_edit.text().split(",") if p.strip()]
+    for candidate in picked:
+        if candidate not in existing:
+            existing.append(candidate)
+    line_edit.setText(", ".join(existing))
+
+
 def _importance_mark(importance: str) -> str:
     if importance == "high":
         return "!"
@@ -366,6 +423,8 @@ class ComposeDialog(QDialog):
         self.resize(560, 460)
         self.attachments: list[OutgoingAttachment] = []
 
+        self._contacts = contacts or []
+
         self.to_edit = QLineEdit(to)
         self.to_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
@@ -373,8 +432,14 @@ class ComposeDialog(QDialog):
         self.subject_edit = QLineEdit(subject)
         self.body_edit = QPlainTextEdit(body)
 
+        address_book_button = QPushButton("Адресная книга…", self)
+        address_book_button.clicked.connect(lambda: _open_contact_picker(self, self.to_edit, self._contacts))
+        to_row = QHBoxLayout()
+        to_row.addWidget(self.to_edit)
+        to_row.addWidget(address_book_button)
+
         form = QFormLayout()
-        form.addRow("Кому", self.to_edit)
+        form.addRow("Кому", to_row)
         form.addRow("Тема", self.subject_edit)
 
         self.attachments_list = QListWidget()
@@ -527,12 +592,22 @@ class EventDialog(QDialog):
 
         self.summary_edit = QLineEdit(event.summary if event else "")
         self.location_edit = QLineEdit(event.location if event else "")
+        self._contacts = contacts or []
+
         other_attendees = [a.email for a in event.attendees if a.email != my_email] if event else []
         self.attendees_edit = QLineEdit(", ".join(other_attendees))
         self.attendees_edit.setPlaceholderText("Участники через запятую (необязательно)")
         if contacts:
             _install_recipient_completer(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
+
+        attendees_address_book_button = QPushButton("Адресная книга…", self)
+        attendees_address_book_button.clicked.connect(
+            lambda: _open_contact_picker(self, self.attendees_edit, self._contacts)
+        )
+        attendees_row = QHBoxLayout()
+        attendees_row.addWidget(self.attendees_edit)
+        attendees_row.addWidget(attendees_address_book_button)
 
         default_start = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
         start_local = event.dtstart.astimezone() if event else default_start
@@ -558,7 +633,7 @@ class EventDialog(QDialog):
         form.addRow("Окончание", self.end_edit)
         form.addRow("Повтор", self.recurrence_combo)
         form.addRow("Место", self.location_edit)
-        form.addRow("Участники", self.attendees_edit)
+        form.addRow("Участники", attendees_row)
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(70)
