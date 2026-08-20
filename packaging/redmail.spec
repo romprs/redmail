@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        5%{?dist}
+Release:        6%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
