@@ -269,10 +269,20 @@ def _import_pst_folder(conn: sqlite3.Connection, folder, path_prefix: str) -> in
     return count
 
 
+def _sanitize_header_value(value: str) -> str:
+    """message_from_bytes() без явной политики использует compat32, который
+    отдаёт значения заголовков как есть — включая необёрнутые переводы
+    строк из многострочных (folded) заголовков. Строгая политика
+    EmailMessage по умолчанию такое не принимает ("Header values may not
+    contain linefeed..."). Найдено на реальном PST-файле — часть писем в
+    нём падала именно на этом при импорте To/Cc/Message-Id."""
+    return " ".join(str(value).split())
+
+
 def _pst_message_to_raw(message) -> bytes:
     email_message = EmailMessage()
-    email_message["Subject"] = message.get_subject() or ""
-    email_message["From"] = message.get_sender_name() or ""
+    email_message["Subject"] = _sanitize_header_value(message.get_subject() or "")
+    email_message["From"] = _sanitize_header_value(message.get_sender_name() or "")
 
     delivery_time = message.get_delivery_time()
     if delivery_time is not None:
@@ -280,13 +290,21 @@ def _pst_message_to_raw(message) -> bytes:
 
     transport_headers = message.get_transport_headers()
     if transport_headers:
-        # Письмо реально пришло по почте — там уже есть настоящий Message-Id
-        # и полный набор заголовков; переносим то, чего нет в EmailMessage.
+        # Письмо реально пришло по почте — там уже есть настоящие заголовки.
+        # Найдено на реальном PST: MAPI-свойство "имя отправителя"
+        # (get_sender_name) иногда хранит RFC2047-имя ОБРЕЗАННЫМ (похоже,
+        # PST/MAPI не сворачивает несколько encoded-word кусков в одно
+        # свойство так же, как это делает настоящий заголовок письма) — в
+        # то время как то же имя в самом заголовке From: из
+        # transport_headers сворачивается (folding) корректно и
+        # разбирается полностью. Поэтому From (и Subject туда же, для
+        # единообразия) берём из настоящих заголовков, когда они есть.
         parsed_headers = message_from_bytes(transport_headers.encode("utf-8", errors="replace"))
-        for header in ("Message-Id", "To", "Cc"):
+        for header in ("Message-Id", "To", "Cc", "From", "Subject"):
             value = parsed_headers.get(header)
             if value:
-                email_message[header] = value
+                del email_message[header]
+                email_message[header] = _sanitize_header_value(value)
 
     body = message.get_plain_text_body()
     if not body:
