@@ -702,6 +702,11 @@ class EventDialog(QDialog):
         self.end_edit.setCalendarPopup(True)
         self.end_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
 
+        self.all_day_check = QCheckBox("Весь день", self)
+        self.all_day_check.setChecked(event.all_day if event else False)
+        self.all_day_check.toggled.connect(self._on_all_day_toggled)
+        self._on_all_day_toggled(self.all_day_check.isChecked())
+
         self.recurrence_combo = QComboBox(self)
         for label, value in _RECURRENCE_OPTIONS:
             self.recurrence_combo.addItem(label, value)
@@ -713,6 +718,7 @@ class EventDialog(QDialog):
         form.addRow("Тема", self.summary_edit)
         form.addRow("Начало", self.start_edit)
         form.addRow("Окончание", self.end_edit)
+        form.addRow("", self.all_day_check)
         form.addRow("Повтор", self.recurrence_combo)
         form.addRow("Место", self.location_edit)
         form.addRow("Участники", attendees_row)
@@ -792,6 +798,18 @@ class EventDialog(QDialog):
 
     def recurrence_rule(self) -> str | None:
         return self.recurrence_combo.currentData()
+
+    def all_day(self) -> bool:
+        return self.all_day_check.isChecked()
+
+    def _on_all_day_toggled(self, checked: bool) -> None:
+        # "Весь день" — время суток не имеет значения, только даты; прячем
+        # часы/минуты в отображении, чтобы это было видно, а не только
+        # угадывалось по галочке (жалоба на референс: "нет возможности
+        # выбрать весь день" — раньше такого переключателя не было вовсе).
+        fmt = "dd.MM.yyyy" if checked else "dd.MM.yyyy HH:mm"
+        self.start_edit.setDisplayFormat(fmt)
+        self.end_edit.setDisplayFormat(fmt)
 
 
 class EventDetailsDialog(QDialog):
@@ -2576,6 +2594,22 @@ class MainWindow(QMainWindow):
     def _save_event_from_dialog(self, dialog: EventDialog, *, existing: calendar_store.Event | None) -> None:
         start = dialog.start_utc()
         end = dialog.end_utc()
+        all_day = dialog.all_day()
+        if all_day:
+            # "Весь день" — время суток из полей не важно (оно скрыто в
+            # интерфейсе); границы всегда полночь-в-полночь по местному
+            # времени, и минимум сутки, даже если начало/конец выбраны
+            # на один день (иначе end<=start и ниже сработала бы проверка).
+            start = start.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+            end_local_date = end.astimezone().date()
+            start_local_date = start.astimezone().date()
+            if end_local_date <= start_local_date:
+                end_local_date = start_local_date + timedelta(days=1)
+            end = (
+                datetime(end_local_date.year, end_local_date.month, end_local_date.day)
+                .astimezone()
+                .astimezone(timezone.utc)
+            )
         if end <= start:
             QMessageBox.warning(self, "Некорректное время", "Окончание должно быть позже начала.")
             return
@@ -2588,6 +2622,7 @@ class MainWindow(QMainWindow):
             location=dialog.location(),
             dtstart=start,
             dtend=end,
+            all_day=all_day,
             organizer_email=self.account.username,
             organizer_name=self.account.username,
             is_organizer=True,
