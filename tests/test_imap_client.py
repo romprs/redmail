@@ -5,6 +5,7 @@ from email.header import Header
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from imapclient.exceptions import IMAPClientError
 from imapclient.response_types import BodyData
 
 from redmail.imap_client import Account, FolderInfo, ImapSession
@@ -245,11 +246,13 @@ def test_set_marker_sets_color_and_flagged() -> None:
         session = ImapSession(_account())
         session.set_marker("INBOX", 7, "red")
 
-    # Убираем другие цветные keyword'ы (на случай смены цвета) и ставим \Flagged + нужный.
-    fake_client.remove_flags.assert_called_once()
-    removed = fake_client.remove_flags.call_args[0][1]
-    assert b"$RedMailRed" not in removed
-    assert b"$RedMailBlue" in removed
+    # Убираем другие цветные keyword'ы (на случай смены цвета) по одному —
+    # см. test_set_marker_tolerates_server_rejecting_one_keyword ниже, почему
+    # не разом — и ставим \Flagged + нужный.
+    removed_flags = [call.args[1][0] for call in fake_client.remove_flags.call_args_list]
+    assert b"$RedMailRed" not in removed_flags
+    assert b"$RedMailBlue" in removed_flags
+    assert len(removed_flags) == 5  # все цвета, кроме red
     fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
     # Папка одна и та же — второй раз переселектить не должны.
     assert fake_client.select_folder.call_count == 1
@@ -263,10 +266,48 @@ def test_set_marker_none_clears_flag_and_all_colors() -> None:
         session.set_marker("INBOX", 7, None)
 
     fake_client.add_flags.assert_not_called()
-    removed = fake_client.remove_flags.call_args[0][1]
-    assert b"\\Flagged" in removed
-    assert b"$RedMailRed" in removed
-    assert b"$RedMailBlue" in removed
+    removed_flags = [call.args[1][0] for call in fake_client.remove_flags.call_args_list]
+    assert b"\\Flagged" in removed_flags
+    assert b"$RedMailRed" in removed_flags
+    assert b"$RedMailBlue" in removed_flags
+
+
+def test_set_marker_tolerates_server_rejecting_one_keyword() -> None:
+    # Реальный корпоративный сервер (VK Mail) отвечает "BAD [PARSE] Unable
+    # to parse flag" на STORE с несколькими нашими keyword-флагами разом —
+    # похоже, произвольные keyword'ы там вообще не разрешены. Один
+    # отклонённый remove_flags не должен мешать остальным.
+    fake_client = _client()
+    fake_client.remove_flags.side_effect = [
+        IMAPClientError("BAD [PARSE] Unable to parse flag"),
+        None,
+        None,
+        None,
+        None,
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, "red")  # не должно бросить исключение
+
+    assert fake_client.remove_flags.call_count == 5
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
+
+
+def test_set_marker_falls_back_to_plain_flagged_when_server_rejects_keyword() -> None:
+    # Если сервер вообще не поддерживает произвольные keyword-флаги (не
+    # только remove, но и add) — хотя бы стандартный \Flagged должен
+    # выставиться, а не упасть ошибкой на весь маркер целиком.
+    fake_client = _client()
+    fake_client.add_flags.side_effect = [IMAPClientError("BAD [PARSE] Unable to parse flag"), None]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, "red")  # не должно бросить исключение
+
+    assert fake_client.add_flags.call_count == 2
+    fake_client.add_flags.assert_any_call([7], [b"\\Flagged", b"$RedMailRed"])
+    fake_client.add_flags.assert_any_call([7], [b"\\Flagged"])
 
 
 def test_move_messages_uses_move_when_supported() -> None:

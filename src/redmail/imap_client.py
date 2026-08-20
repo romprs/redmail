@@ -6,6 +6,7 @@ from email.header import decode_header
 from email.message import Message
 
 from imapclient import IMAPClient
+from imapclient.exceptions import IMAPClientError
 
 _HEADER_FIELDS = "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"
 
@@ -167,16 +168,37 @@ class ImapSession:
         return response[uid][b"BODY[]"]
 
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
+        """Ставит/снимает \\Flagged + наш цветной keyword-флаг.
+
+        Gmail принимает произвольные keyword-флаги без вопросов, но
+        реальный корпоративный сервер (обнаружено на VK Mail) отвечает
+        "BAD [PARSE] Unable to parse flag" на STORE с несколькими нашими
+        keyword'ами разом — по всей видимости, сервер не разрешает
+        произвольные (не объявленные в PERMANENTFLAGS) keyword-флаги
+        вообще. Поэтому: (1) снимаем/ставим keyword'ы по одному, а не
+        разом — один отклонённый не должен мешать остальным; (2) если
+        сервер в принципе не принимает цветной keyword, тихо откатываемся
+        на стандартный \\Flagged, чтобы разметка не ломалась полностью
+        из-за того, что сервер не умеет в цвета."""
         self._select(folder)
         all_keywords = list(MARKER_COLORS.values())
         if color is None:
-            self._client.remove_flags([uid], [b"\\Flagged", *all_keywords])
+            self._remove_flags_best_effort(uid, [b"\\Flagged", *all_keywords])
             return
         keyword = MARKER_COLORS[color]
         others = [k for k in all_keywords if k != keyword]
-        if others:
-            self._client.remove_flags([uid], others)
-        self._client.add_flags([uid], [b"\\Flagged", keyword])
+        self._remove_flags_best_effort(uid, others)
+        try:
+            self._client.add_flags([uid], [b"\\Flagged", keyword])
+        except IMAPClientError:
+            self._client.add_flags([uid], [b"\\Flagged"])
+
+    def _remove_flags_best_effort(self, uid: int, flags: list[bytes]) -> None:
+        for flag in flags:
+            try:
+                self._client.remove_flags([uid], [flag])
+            except IMAPClientError:
+                pass  # флаг и так не поддерживается/не был установлен — не критично
 
     def move_messages(self, folder: str, uids: list[int], target_folder: str) -> None:
         """Переносит письма в другую папку (например, в корзину) — атомарно,
