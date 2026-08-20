@@ -829,6 +829,7 @@ class EventDialog(QDialog):
         self.attachments_list.setMaximumHeight(70)
         for attachment in self.attachments:
             self.attachments_list.addItem(f"{attachment.filename} ({_format_size(attachment.size)})")
+        self.attachments_list.setVisible(bool(self.attachments))
 
         attach_button = QPushButton("Прикрепить файл…", self)
         attach_button.clicked.connect(self._on_attach)
@@ -936,6 +937,7 @@ class EventDialog(QDialog):
             )
             self.attachments.append(attachment)
             self.attachments_list.addItem(f"{attachment.filename} ({_format_size(len(data))})")
+        self.attachments_list.setVisible(bool(self.attachments))
 
     def _on_remove_attachment(self) -> None:
         row = self.attachments_list.currentRow()
@@ -943,6 +945,7 @@ class EventDialog(QDialog):
             return
         self.attachments_list.takeItem(row)
         del self.attachments[row]
+        self.attachments_list.setVisible(bool(self.attachments))
 
     def summary(self) -> str:
         return self.summary_edit.text().strip()
