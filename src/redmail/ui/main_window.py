@@ -1182,6 +1182,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addStretch(1)
 
         self.calendar_selected_day: date | None = None
+        self._mini_picker_target_day: date | None = None
         self.calendar_week_header = WeekHeaderWidget(self)
         self.calendar_week_header.dayClicked.connect(self.on_calendar_day_clicked)
         self.calendar_all_day_row = AllDayRowWidget(self)
@@ -2388,8 +2389,13 @@ class MainWindow(QMainWindow):
         self.calendar_week_header.set_week_start(self.calendar_week_start)
         self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
         self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
+        # Раньше здесь всегда подставлялся понедельник недели — если
+        # пользователь кликал в мини-календаре не по понедельнику (например,
+        # 21.08 — пятница), тот же refresh_calendar_view() тут же откатывал
+        # выделение обратно на 17.08 и день визуально "не выбирался".
+        highlighted_day = self._mini_picker_target_day or self.calendar_week_start
         self.calendar_mini_picker.setSelectedDate(
-            QDate(self.calendar_week_start.year, self.calendar_week_start.month, self.calendar_week_start.day)
+            QDate(highlighted_day.year, highlighted_day.month, highlighted_day.day)
         )
         self._apply_calendar_selection_highlight()
 
@@ -2401,7 +2407,14 @@ class MainWindow(QMainWindow):
     def on_calendar_mini_picker_clicked(self, qdate: QDate) -> None:
         picked = date(qdate.year(), qdate.month(), qdate.day())
         self.calendar_week_start = week_start_for(picked)
-        self.refresh_calendar_view()
+        self.calendar_selected_day = picked
+        self.calendar_week_header.set_selected_day(picked)
+        self.calendar_week_grid.set_selected_day(picked)
+        self._mini_picker_target_day = picked
+        try:
+            self.refresh_calendar_view()
+        finally:
+            self._mini_picker_target_day = None
 
     def on_calendar_visibility_toggled(self, checked: bool) -> None:
         self.calendar_show_events = checked
