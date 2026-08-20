@@ -53,7 +53,8 @@ class _EventBlock(QFrame):
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
         self._color = _event_color(calendar_event)
-        self._radius = "11px" if pill else "6px"
+        self._radius = "11px" if pill else "4px"
+        self._pill = pill
         self._selected = False
         self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -74,7 +75,8 @@ class _EventBlock(QFrame):
         time_text = "" if calendar_event.all_day else start_local.strftime("%H:%M")
         text = f"{time_text} {calendar_event.summary or '(без темы)'}".strip()
         label = QLabel(text, self)
-        label.setStyleSheet("color: white; background: transparent;")
+        text_color = "white" if pill else "#202124"
+        label.setStyleSheet(f"color: {text_color}; background: transparent; font-size: 11px;")
         # Таблетке "весь день" перенос только мешает — узкая колонка и
         # заголовок пары строк сминались в кашу; здесь одна строка,
         # обрезанная по ширине, как в референсе.
@@ -130,10 +132,25 @@ class _EventBlock(QFrame):
         self._apply_style()
 
     def _apply_style(self) -> None:
-        border = "2px solid white" if self._selected else "1px solid transparent"
-        self.setStyleSheet(
-            f"background-color: {self._color}; border-radius: {self._radius}; border: {border};"
-        )
+        # Карточка события в сетке — светлый фон с цветной полосой слева и
+        # тёмным текстом, а не сплошная заливка цветом: так выглядят
+        # события в референсе (VK Mail), в отличие от прежнего сплошного
+        # цветного блока с белым текстом. Таблетки "весь день" — маленькие
+        # плашки, там сплошная заливка читается лучше (компактно, мало
+        # текста), поэтому для них старый стиль сохранён.
+        if self._selected:
+            outline = "2px solid #1A73E8"
+        else:
+            outline = "1px solid #dadce0" if not self._pill else "1px solid transparent"
+        if self._pill:
+            self.setStyleSheet(
+                f"background-color: {self._color}; border-radius: {self._radius}; border: {outline};"
+            )
+        else:
+            self.setStyleSheet(
+                f"background-color: #ffffff; border-radius: {self._radius}; border: {outline}; "
+                f"border-left: 4px solid {self._color};"
+            )
 
 
 class WeekHeaderWidget(QWidget):

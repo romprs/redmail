@@ -5,12 +5,13 @@ import mimetypes
 import re
 import shutil
 import tempfile
+import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPixmap, QTextDocument
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QFont, QIcon, QImage, QPainter, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
@@ -301,6 +302,42 @@ def _marker_icon(color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
     painter.drawEllipse(1, 1, diameter - 2, diameter - 2)
     painter.end()
     return QIcon(pixmap)
+
+
+_AVATAR_COLORS = ("#E53935", "#FB8C00", "#43A047", "#1E88E5", "#8E24AA", "#00897B", "#D81B60", "#6D4C41")
+
+
+def _avatar_color(text: str) -> str:
+    """Цвет кружка-аватара участника — детерминированный по email/имени,
+    чтобы у одного и того же человека всегда был один и тот же цвет (как
+    в референсе VK Mail), а не менялся между открытиями. Встроенный hash()
+    для строк рандомизирован по процессам (PYTHONHASHSEED) — не годится,
+    цвет "плавал" бы при каждом перезапуске приложения."""
+    digest = zlib.crc32(text.encode("utf-8"))
+    return _AVATAR_COLORS[digest % len(_AVATAR_COLORS)]
+
+
+def _avatar_pixmap(letter: str, color: str, size: int = 24) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(0, 0, size, size)
+    painter.setPen(QColor("white"))
+    font = QFont()
+    font.setPixelSize(int(size * 0.5))
+    font.setBold(True)
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, letter.upper())
+    painter.end()
+    return pixmap
+
+
+def _attendee_avatar_letter(name: str, email: str) -> str:
+    source = (name or email or "?").strip()
+    return source[0] if source else "?"
 
 
 class SettingsDialog(QDialog):
@@ -758,28 +795,55 @@ class EventDialog(QDialog):
 
 
 class EventDetailsDialog(QDialog):
-    """Просмотр встречи, которую организовал не я — только смотреть (моё
-    участие меняется кнопками в почте, не здесь), но со ссылками
-    кликабельными и вложениями открываемыми/сохраняемыми, как в письме."""
+    """Просмотр встречи, которую организовал не я — со ссылками кликабельными
+    и вложениями открываемыми/сохраняемыми, как в письме, плюс участники
+    (с аватарками и статусом ответа, как в референсе VK Mail) и кнопки
+    "Иду/Не иду/Может быть" прямо здесь — раньше участие можно было
+    поменять только через приглашение в почте, что неудобно, если письмо
+    уже прочитано/не под рукой."""
 
     def __init__(self, parent, event: calendar_store.Event):
         super().__init__(parent)
         self.setWindowTitle(event.summary or "(без темы)")
-        self.resize(420, 380)
+        self.resize(440, 460)
         self.event = event
         self._temp_dirs: list[Path] = []
+        self.chosen_participation: str | None = None
+        self.copy_requested = False
 
         info = QTextBrowser(self)
         info.setOpenExternalLinks(True)
         parts = [f"<b>{html.escape(event.summary or '(без темы)')}</b><br>{_format_event_time(event)}"]
         if event.location:
             parts.append(html.escape(event.location))
-        parts.append(f"Организатор: {html.escape(event.organizer_name or event.organizer_email)}")
+
+        avatar_index = 0
+        attendee_rows = []
+
+        def _avatar_row(name: str, email: str, suffix: str) -> str:
+            nonlocal avatar_index
+            letter = _attendee_avatar_letter(name, email)
+            color = _avatar_color(email or name)
+            url = f"avatar://{avatar_index}"
+            info.document().addResource(
+                QTextDocument.ResourceType.ImageResource, QUrl(url), _avatar_pixmap(letter, color)
+            )
+            avatar_index += 1
+            display = html.escape(name or email)
+            return f'<tr><td><img src="{url}"></td><td>&nbsp;{display}{suffix}</td></tr>'
+
+        organizer_display = event.organizer_name or event.organizer_email
+        attendee_rows.append(_avatar_row(organizer_display, event.organizer_email, " — организатор"))
+        for attendee in event.attendees:
+            label = _PARTICIPATION_LABELS.get(attendee.participation, "")
+            suffix = f" — {label}" if attendee.participation != "needs-action" else ""
+            attendee_rows.append(_avatar_row(attendee.name, attendee.email, suffix))
+        parts.append("<b>Участники</b><table cellspacing=\"4\">" + "".join(attendee_rows) + "</table>")
+
         parts.append(
             f"Моё участие: {html.escape(_PARTICIPATION_LABELS.get(event.my_participation, event.my_participation))}"
         )
         if event.description:
-            parts.append("")
             parts.append(_linkify(event.description))
         info.setHtml("<br>".join(parts))
 
@@ -800,10 +864,34 @@ class EventDetailsDialog(QDialog):
             self.attachments_list.customContextMenuRequested.connect(self._attachment_context_menu)
             layout.addWidget(self.attachments_list)
 
+        rsvp_row = QHBoxLayout()
+        going_button = QPushButton("Иду", self)
+        not_going_button = QPushButton("Не иду", self)
+        maybe_button = QPushButton("Может быть", self)
+        going_button.clicked.connect(lambda: self._respond("accepted"))
+        not_going_button.clicked.connect(lambda: self._respond("declined"))
+        maybe_button.clicked.connect(lambda: self._respond("tentative"))
+        rsvp_row.addWidget(going_button)
+        rsvp_row.addWidget(not_going_button)
+        rsvp_row.addWidget(maybe_button)
+        rsvp_row.addStretch(1)
+        copy_button = QPushButton("Копировать событие", self)
+        copy_button.clicked.connect(self._request_copy)
+        rsvp_row.addWidget(copy_button)
+        layout.addLayout(rsvp_row)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
         buttons.rejected.connect(self.reject)
         buttons.accepted.connect(self.accept)
         layout.addWidget(buttons)
+
+    def _respond(self, participation: str) -> None:
+        self.chosen_participation = participation
+        self.accept()
+
+    def _request_copy(self) -> None:
+        self.copy_requested = True
+        self.accept()
 
     def _open_attachment(self, item: QListWidgetItem) -> None:
         attachment = self.event.attachments[self.attachments_list.row(item)]
@@ -2162,15 +2250,37 @@ class MainWindow(QMainWindow):
     def on_invite_response(self, participation: str) -> None:
         if self.current_invite is None or not self.account:
             return
+        event = self._respond_to_invite(self.current_invite.event.uid, participation)
+        if event is None:
+            return
+        self.current_invite = None
+        self.invite_label.setText(f"«{event.summary}» — {_PARTICIPATION_LABELS[participation]}")
+        for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+            button.setEnabled(False)
+        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {_REPLY_VERBS[participation].lower()}", 5000)
+
+    def on_calendar_rsvp(self, event: calendar_store.Event, participation: str) -> None:
+        """То же самое, что on_invite_response, но для встречи, открытой
+        прямо из календаря (EventDetailsDialog), а не из панели приглашения
+        в почте — раньше поменять участие можно было только через письмо."""
+        updated = self._respond_to_invite(event.uid, participation)
+        if updated is None:
+            return
+        self.selected_calendar_event = updated
+        self.refresh_calendar_view()
+        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {_REPLY_VERBS[participation].lower()}", 5000)
+
+    def _respond_to_invite(self, uid: str, participation: str) -> calendar_store.Event | None:
+        if not self.account:
+            return None
         if not self.smtp_account:
             QMessageBox.warning(
                 self, "Нет исходящей почты", "Укажите сервер SMTP в настройках, чтобы ответить на приглашение."
             )
-            return
-        uid = self.current_invite.event.uid
+            return None
         event = calendar_store.set_my_participation(self.calendar_path, uid, participation)
         if event is None:
-            return
+            return None
 
         ics = itip.build_reply_ics(event, self.account.username, self.account.username, participation)
         verb = _REPLY_VERBS[participation]
@@ -2192,13 +2302,8 @@ class MainWindow(QMainWindow):
             send_message(self.smtp_account, message)
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось отправить ответ", str(exc))
-            return
-
-        self.current_invite = None
-        self.invite_label.setText(f"«{event.summary}» — {_PARTICIPATION_LABELS[participation]}")
-        for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
-            button.setEnabled(False)
-        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {verb.lower()}", 5000)
+            return None
+        return event
 
     def _show_calendar_page(self) -> None:
         self.pages.setCurrentIndex(1)
@@ -2291,7 +2396,12 @@ class MainWindow(QMainWindow):
         self.selected_calendar_event = event
         self._apply_calendar_selection_highlight()
         if not event.is_organizer:
-            EventDetailsDialog(self, event).exec()
+            dialog = EventDetailsDialog(self, event)
+            if dialog.exec() == QDialog.DialogCode.Accepted:
+                if dialog.chosen_participation is not None:
+                    self.on_calendar_rsvp(event, dialog.chosen_participation)
+                elif dialog.copy_requested:
+                    self.on_copy_event(event)
             return
         dialog = EventDialog(
             self, event=event, my_email=self.account.username if self.account else "", contacts=self._load_contacts()
