@@ -838,13 +838,14 @@ class EventDetailsDialog(QDialog):
             label = _PARTICIPATION_LABELS.get(attendee.participation, "")
             suffix = f" — {label}" if attendee.participation != "needs-action" else ""
             attendee_rows.append(_avatar_row(attendee.name, attendee.email, suffix))
-        parts.append("<b>Участники</b><table cellspacing=\"4\">" + "".join(attendee_rows) + "</table>")
-
+        parts.append(
+            "<br><b>Участники</b><table cellspacing=\"4\">" + "".join(attendee_rows) + "</table>"
+        )
         parts.append(
             f"Моё участие: {html.escape(_PARTICIPATION_LABELS.get(event.my_participation, event.my_participation))}"
         )
         if event.description:
-            parts.append(_linkify(event.description))
+            parts.append("<br>" + _linkify(event.description))
         info.setHtml("<br>".join(parts))
 
         layout = QVBoxLayout(self)
