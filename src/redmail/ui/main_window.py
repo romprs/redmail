@@ -1218,8 +1218,19 @@ class MainWindow(QMainWindow):
     def _restore_saved_account(self) -> None:
         try:
             saved = load_account()
-        except Exception:
-            saved = None
+        except Exception as exc:
+            # Отличаем от штатного "пароля в хранилище нет" (load_account
+            # сам возвращает None в этом случае, без исключения) — сюда
+            # попадает поломка самого хранилища секретов (например, при
+            # запуске без сессионной шины D-Bus keyring выдаёт
+            # NoKeyringError). Раньше это тихо проглатывалось, и
+            # пользователю казалось, что все настройки исчезли без причины.
+            QMessageBox.warning(
+                self,
+                "Не удалось получить сохранённые данные входа",
+                f"Хранилище паролей недоступно: {exc}\n\nПодключитесь заново вручную.",
+            )
+            return
         if not saved:
             return
         account, smtp_account = saved
