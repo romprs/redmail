@@ -518,6 +518,51 @@ def test_fetch_message_content_extracts_attachment() -> None:
     assert attachment.size == len(b"file-bytes-here")
 
 
+def test_fetch_message_content_html_alternative_populates_html_field() -> None:
+    from email.message import EmailMessage
+
+    built = EmailMessage()
+    built["From"] = "ivan@example.com"
+    built["Subject"] = "HTML letter"
+    built.set_content("plain fallback")
+    built.add_alternative("<p>Hello <b>world</b></p>", subtype="html")
+    raw = built.as_bytes()
+
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert content.text.strip() == "plain fallback"
+    assert "<b>world</b>" in content.html
+
+
+def test_fetch_message_content_extracts_inline_cid_image_not_as_attachment() -> None:
+    from email.message import EmailMessage
+
+    built = EmailMessage()
+    built["From"] = "ivan@example.com"
+    built["Subject"] = "With inline image"
+    built.set_content("plain fallback")
+    built.add_alternative('<p>hi</p><img src="cid:img1">', subtype="html")
+    html_part = built.get_payload()[1]
+    html_part.add_related(b"fake-png-bytes", maintype="image", subtype="png", cid="<img1>")
+    raw = built.as_bytes()
+
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert content.attachments == []  # встроенная картинка — не отдельное вложение
+    assert "img1" in content.inline_images
+    content_type, payload = content.inline_images["img1"]
+    assert content_type == "image/png"
+    assert payload == b"fake-png-bytes"
+
+
 def test_fetch_message_content_keeps_inline_calendar_part_without_disposition() -> None:
     # Не все серверы ставят Content-Disposition: attachment/filename на
     # text/calendar-часть приглашения (RFC 5546 этого не требует) — раньше

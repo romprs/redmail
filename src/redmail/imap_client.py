@@ -69,6 +69,10 @@ class Attachment:
 class MessageContent:
     text: str
     attachments: list[Attachment] = field(default_factory=list)
+    html: str = ""
+    # Content-Id (без угловых скобок) -> (content_type, данные) — картинки,
+    # встроенные в HTML через <img src="cid:...">, а не обычные вложения.
+    inline_images: dict[str, tuple[str, bytes]] = field(default_factory=dict)
 
 
 class ImapSession:
@@ -240,13 +244,19 @@ def extract_content(message: Message) -> MessageContent:
     if not message.is_multipart():
         if message.get_content_type() == "text/plain":
             return MessageContent(text=_decode_payload(message))
+        if message.get_content_type() == "text/html":
+            return MessageContent(
+                text="(письмо в формате HTML — предпросмотр текста недоступен)",
+                html=_decode_payload(message),
+            )
         if message.get_content_type() == "text/calendar":
             return MessageContent(text="", attachments=[_calendar_attachment(message)])
         return MessageContent(text="(письмо в формате HTML — предпросмотр текста недоступен)")
 
     text: str | None = None
-    html_seen = False
+    html: str | None = None
     attachments: list[Attachment] = []
+    inline_images: dict[str, tuple[str, bytes]] = {}
 
     for part in message.walk():
         if part.is_multipart():
@@ -254,6 +264,15 @@ def extract_content(message: Message) -> MessageContent:
 
         filename = part.get_filename()
         content_type = part.get_content_type()
+        content_id = (part.get("Content-Id") or "").strip().strip("<>")
+
+        # Картинка со своим Content-Id — то, на что ссылается <img
+        # src="cid:..."> в HTML-теле, а не отдельное вложение для скачивания
+        # (даже если у неё есть имя файла и/или Content-Disposition).
+        if content_id and content_type.startswith("image/"):
+            inline_images[content_id] = (content_type, part.get_payload(decode=True) or b"")
+            continue
+
         # text/calendar (RFC 5546 iTIP-приглашение) сохраняем как вложение
         # всегда — не только когда отправитель явно проставил
         # Content-Disposition: attachment/filename (не все серверы это
@@ -271,13 +290,13 @@ def extract_content(message: Message) -> MessageContent:
 
         if content_type == "text/plain" and text is None:
             text = _decode_payload(part)
-        elif content_type == "text/html":
-            html_seen = True
+        elif content_type == "text/html" and html is None:
+            html = _decode_payload(part)
 
     if text is None:
-        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html_seen else "(нет текстового содержимого)"
+        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html is not None else "(нет текстового содержимого)"
 
-    return MessageContent(text=text, attachments=attachments)
+    return MessageContent(text=text, attachments=attachments, html=html or "", inline_images=inline_images)
 
 
 def _calendar_attachment(part: Message) -> Attachment:

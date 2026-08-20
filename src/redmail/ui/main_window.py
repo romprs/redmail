@@ -10,7 +10,7 @@ from email.utils import parseaddr
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
-from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QImage, QPainter, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
@@ -910,7 +910,8 @@ class MainWindow(QMainWindow):
         table_layout.addWidget(self.table)
 
         self.attachments_list = QListWidget(self)
-        self.attachments_list.setMaximumHeight(70)
+        self.attachments_list.setMaximumHeight(110)
+        self.attachments_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.attachments_list.itemDoubleClicked.connect(self.on_open_attachment)
         self.attachments_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.attachments_list.customContextMenuRequested.connect(self.on_attachment_context_menu)
@@ -933,8 +934,9 @@ class MainWindow(QMainWindow):
             invite_layout.addWidget(button)
         self.invite_bar.hide()
 
-        self.reading_pane = QPlainTextEdit(self)
+        self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
+        self.reading_pane.setOpenExternalLinks(True)
         self.reading_pane.setPlaceholderText("Выберите письмо, чтобы увидеть текст")
 
         reading_container = QWidget(self)
@@ -1903,12 +1905,31 @@ class MainWindow(QMainWindow):
             return
         self.current_body = content.text
         self.current_attachments = content.attachments
-        self.reading_pane.setPlainText(content.text)
+        self._render_body(content)
         self._update_invite_bar(content)
         self._refresh_attachments_list()
 
         if not summary.is_read:
             self._set_message_read(rows[0].row(), summary, True)
+
+    def _render_body(self, content: MessageContent) -> None:
+        """HTML-письма показываем как есть (с внедрёнными картинками из
+        cid:-вложений через addResource — без этого <img src="cid:..."> не
+        отрисуется); письма с обычным текстом — тоже через setHtml, но
+        экранированным и с активными ссылками (_linkify), чтобы голые
+        http(s)-ссылки в теле письма были кликабельны, как и в HTML-версии.
+        Внешние (не cid:) картинки Qt сам не подгружает — не течём в сеть
+        на отрисовку письма."""
+        document = self.reading_pane.document()
+        document.clear()
+        for content_id, (_content_type, payload) in content.inline_images.items():
+            image = QImage.fromData(payload)
+            if not image.isNull():
+                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
+        if content.html:
+            self.reading_pane.setHtml(content.html)
+        else:
+            self.reading_pane.setHtml(_linkify(content.text))
 
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
         try:
