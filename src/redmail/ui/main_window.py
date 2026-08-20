@@ -75,7 +75,14 @@ from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, Me
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
-from redmail.ui.week_calendar import AllDayRowWidget, WeekGridWidget, WeekHeaderWidget, week_start_for
+from redmail.ui.week_calendar import (
+    AllDayRowWidget,
+    MonthGridWidget,
+    WeekGridWidget,
+    WeekHeaderWidget,
+    month_grid_range,
+    week_start_for,
+)
 
 COL_CHECK = 0
 COL_FLAG = 1
@@ -120,6 +127,11 @@ _MONTH_NAMES = (
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
 )
+
+def _shift_month(anchor: date, delta: int) -> date:
+    total = anchor.year * 12 + (anchor.month - 1) + delta
+    return date(total // 12, total % 12 + 1, 1)
+
 
 _MARKER_ICON_SIZE = 16
 
@@ -1125,9 +1137,13 @@ class MainWindow(QMainWindow):
 
         self.calendar_month_label = QLabel(self)
         self.calendar_month_label.setStyleSheet("font-weight: 600; font-size: 13pt;")
+        self.calendar_view_mode = "week"  # "week" | "month" — "день" пока не реализован
+        self.calendar_month_anchor = date.today().replace(day=1)
         self.calendar_view_combo = QComboBox(self)
-        self.calendar_view_combo.addItem("Неделя")  # день/месяц пока не реализованы
+        self.calendar_view_combo.addItem("Неделя")
+        self.calendar_view_combo.addItem("Месяц")
         self.calendar_view_combo.setMinimumWidth(90)
+        self.calendar_view_combo.currentTextChanged.connect(self.on_calendar_view_mode_changed)
 
         calendar_toolbar = QToolBar("Календарь", self)
         today_action = QAction("Сегодня", self)
@@ -1203,14 +1219,31 @@ class MainWindow(QMainWindow):
         calendar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._calendar_scroll = calendar_scroll
 
+        week_view = QWidget(self)
+        week_view_layout = QVBoxLayout(week_view)
+        week_view_layout.setContentsMargins(0, 0, 0, 0)
+        week_view_layout.setSpacing(0)
+        week_view_layout.addWidget(self.calendar_week_header)
+        week_view_layout.addWidget(self.calendar_all_day_row)
+        week_view_layout.addWidget(calendar_scroll)
+
+        self.calendar_month_grid = MonthGridWidget(self)
+        self.calendar_month_grid.eventClicked.connect(self._on_calendar_event_clicked)
+        self.calendar_month_grid.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
+        self.calendar_month_grid.eventContextMenuRequested.connect(self.on_calendar_event_context_menu)
+        self.calendar_month_grid.dayClicked.connect(self.on_calendar_month_day_clicked)
+        self.calendar_month_grid.dayDoubleClicked.connect(self.on_calendar_month_day_double_clicked)
+
+        self.calendar_view_stack = QStackedWidget(self)
+        self.calendar_view_stack.addWidget(week_view)
+        self.calendar_view_stack.addWidget(self.calendar_month_grid)
+
         calendar_main = QWidget(self)
         calendar_main_layout = QVBoxLayout(calendar_main)
         calendar_main_layout.setContentsMargins(0, 0, 0, 0)
         calendar_main_layout.setSpacing(0)
         calendar_main_layout.addWidget(calendar_toolbar)
-        calendar_main_layout.addWidget(self.calendar_week_header)
-        calendar_main_layout.addWidget(self.calendar_all_day_row)
-        calendar_main_layout.addWidget(calendar_scroll)
+        calendar_main_layout.addWidget(self.calendar_view_stack)
 
         calendar_page = QWidget(self)
         calendar_layout = QHBoxLayout(calendar_page)
@@ -2333,16 +2366,41 @@ class MainWindow(QMainWindow):
             self._calendar_scroll.verticalScrollBar().setValue(self.calendar_week_grid.scroll_position_for_now())
 
     def on_calendar_prev_week(self) -> None:
-        self.calendar_week_start -= timedelta(days=7)
+        if self.calendar_view_mode == "month":
+            self.calendar_month_anchor = _shift_month(self.calendar_month_anchor, -1)
+        else:
+            self.calendar_week_start -= timedelta(days=7)
         self.refresh_calendar_view()
 
     def on_calendar_next_week(self) -> None:
-        self.calendar_week_start += timedelta(days=7)
+        if self.calendar_view_mode == "month":
+            self.calendar_month_anchor = _shift_month(self.calendar_month_anchor, 1)
+        else:
+            self.calendar_week_start += timedelta(days=7)
         self.refresh_calendar_view()
 
     def on_calendar_today(self) -> None:
         self.calendar_week_start = week_start_for(date.today())
+        self.calendar_month_anchor = date.today().replace(day=1)
         self.refresh_calendar_view()
+
+    def on_calendar_view_mode_changed(self, text: str) -> None:
+        self.calendar_view_mode = "month" if text == "Месяц" else "week"
+        self.calendar_view_stack.setCurrentIndex(1 if self.calendar_view_mode == "month" else 0)
+        self.refresh_calendar_view()
+
+    def on_calendar_month_day_clicked(self, day: date) -> None:
+        self.calendar_selected_day = day
+        self.calendar_month_grid.set_selected_day(day)
+
+    def on_calendar_month_day_double_clicked(self, day: date) -> None:
+        # Двойной клик по дню в месячном виде — перейти к недельному виду,
+        # показывающему этот день (в месячном виде время не выбрать, только
+        # дату; для создания/просмотра события с точным временем нужна
+        # неделя).
+        self.calendar_week_start = week_start_for(day)
+        self.calendar_selected_day = day
+        self.calendar_view_combo.setCurrentText("Неделя")
 
     def on_import_ics(self) -> None:
         path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл .ics", filter="iCalendar (*.ics)")
@@ -2361,12 +2419,17 @@ class MainWindow(QMainWindow):
         # Локальный календарь ничего не опрашивает по сети — "Обновить"
         # здесь просто перечитывает файл (например, после того как в
         # почте были приняты новые приглашения).
-        week_start_date = self.calendar_week_start
-        week_start_local = datetime(
-            week_start_date.year, week_start_date.month, week_start_date.day
+        if self.calendar_view_mode == "month":
+            window_start_date, window_end_date = month_grid_range(self.calendar_month_anchor)
+        else:
+            window_start_date = self.calendar_week_start
+            window_end_date = self.calendar_week_start + timedelta(days=7)
+        window_start_local = datetime(
+            window_start_date.year, window_start_date.month, window_start_date.day
         ).astimezone()
-        window_start = week_start_local.astimezone(timezone.utc)
-        window_end = (week_start_local + timedelta(days=7)).astimezone(timezone.utc)
+        window_end_local = datetime(window_end_date.year, window_end_date.month, window_end_date.day).astimezone()
+        window_start = window_start_local.astimezone(timezone.utc)
+        window_end = window_end_local.astimezone(timezone.utc)
         try:
             events = calendar_store.list_events(self.calendar_path, start=window_start, end=window_end)
         except Exception as exc:
@@ -2378,22 +2441,32 @@ class MainWindow(QMainWindow):
         events = [e for e in events if e.status != "cancelled"]
         if not self.calendar_show_events:
             events = []
-        timed_events = [e for e in events if not e.all_day]
-        all_day_events = [e for e in events if e.all_day]
 
-        # Неделя может задевать два месяца — подписываем по четвергу этой
-        # недели (тот же принцип, что и у номера недели ISO: у какого
-        # месяца больше дней в неделе, тот и "её" месяц).
-        anchor = self.calendar_week_start + timedelta(days=3)
-        self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
-        self.calendar_week_header.set_week_start(self.calendar_week_start)
-        self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
-        self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
-        # Раньше здесь всегда подставлялся понедельник недели — если
-        # пользователь кликал в мини-календаре не по понедельнику (например,
-        # 21.08 — пятница), тот же refresh_calendar_view() тут же откатывал
-        # выделение обратно на 17.08 и день визуально "не выбирался".
-        highlighted_day = self._mini_picker_target_day or self.calendar_week_start
+        if self.calendar_view_mode == "month":
+            self.calendar_month_label.setText(
+                f"{_MONTH_NAMES[self.calendar_month_anchor.month - 1]} {self.calendar_month_anchor.year}"
+            )
+            self.calendar_month_grid.set_month(self.calendar_month_anchor, events)
+            self.calendar_month_grid.set_selected_day(self.calendar_selected_day)
+            highlighted_day = self._mini_picker_target_day or self.calendar_selected_day or self.calendar_month_anchor
+        else:
+            timed_events = [e for e in events if not e.all_day]
+            all_day_events = [e for e in events if e.all_day]
+            # Неделя может задевать два месяца — подписываем по четвергу этой
+            # недели (тот же принцип, что и у номера недели ISO: у какого
+            # месяца больше дней в неделе, тот и "её" месяц).
+            anchor = self.calendar_week_start + timedelta(days=3)
+            self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
+            self.calendar_week_header.set_week_start(self.calendar_week_start)
+            self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
+            self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
+            # Раньше здесь всегда подставлялся понедельник недели — если
+            # пользователь кликал в мини-календаре не по понедельнику
+            # (например, 21.08 — пятница), тот же refresh_calendar_view()
+            # тут же откатывал выделение обратно на 17.08 и день визуально
+            # "не выбирался".
+            highlighted_day = self._mini_picker_target_day or self.calendar_week_start
+
         self.calendar_mini_picker.setSelectedDate(
             QDate(highlighted_day.year, highlighted_day.month, highlighted_day.day)
         )
@@ -2401,15 +2474,19 @@ class MainWindow(QMainWindow):
 
     def _apply_calendar_selection_highlight(self) -> None:
         selected_uid = self.selected_calendar_event.uid if self.selected_calendar_event else None
-        for block in (*self.calendar_week_grid._blocks, *self.calendar_all_day_row._blocks):
+        all_blocks = (*self.calendar_week_grid._blocks, *self.calendar_all_day_row._blocks, *self.calendar_month_grid.blocks)
+        for block in all_blocks:
             block.set_selected(selected_uid is not None and block.calendar_event.uid == selected_uid)
 
     def on_calendar_mini_picker_clicked(self, qdate: QDate) -> None:
         picked = date(qdate.year(), qdate.month(), qdate.day())
-        self.calendar_week_start = week_start_for(picked)
         self.calendar_selected_day = picked
         self.calendar_week_header.set_selected_day(picked)
         self.calendar_week_grid.set_selected_day(picked)
+        if self.calendar_view_mode == "month":
+            self.calendar_month_anchor = picked.replace(day=1)
+        else:
+            self.calendar_week_start = week_start_for(picked)
         self._mini_picker_target_day = picked
         try:
             self.refresh_calendar_view()

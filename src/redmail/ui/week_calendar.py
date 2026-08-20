@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
-from PySide6.QtWidgets import QFrame, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from redmail.calendar_store import Event
 
@@ -23,6 +23,17 @@ _SELECTED_DAY_COLOR = "#34A853"
 
 def week_start_for(day: date) -> date:
     return day - timedelta(days=day.weekday())
+
+
+def month_grid_range(anchor: date) -> tuple[date, date]:
+    """(начало, конец-исключая) 6-недельной сетки месяца, содержащего
+    `anchor` — начинается с понедельника той недели, куда попадает 1-е
+    число, всегда ровно 42 дня (6 строк × 7 дней), как в Google
+    Calendar/Outlook — не только "чистые" дни месяца, чтобы сетка не
+    прыгала по высоте от месяца к месяцу."""
+    first_of_month = anchor.replace(day=1)
+    grid_start = week_start_for(first_of_month)
+    return grid_start, grid_start + timedelta(days=42)
 
 
 def _event_color(calendar_event: Event) -> str:
@@ -475,3 +486,170 @@ class WeekGridWidget(QWidget):
             painter.drawLine(int(x), int(now_y), int(x + col_w), int(now_y))
 
         painter.end()
+
+
+_MONTH_CELL_MAX_EVENTS = 3
+
+
+class MonthCellWidget(QFrame):
+    """Одна ячейка сетки месяца: число + до нескольких компактных "таблеток"
+    событий (переиспользует _EventBlock в pill-режиме — та же логика
+    клика/двойного клика/контекстного меню, что и в недельной сетке, без
+    дублирования)."""
+
+    dayClicked = Signal(object)  # date — клик по пустому месту ячейки
+    dayDoubleClicked = Signal(object)  # date — двойной клик: перейти к неделе с этим днём
+    eventClicked = Signal(object)
+    eventDoubleClicked = Signal(object)
+    eventContextMenuRequested = Signal(object, object)
+
+    def __init__(self, day: date, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.day = day
+        self._in_month = True
+        self._is_today = False
+        self._is_selected = False
+        self._event_blocks: list[_EventBlock] = []
+        self.setMinimumHeight(84)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        self.day_label = QLabel(str(day.day), self)
+        self.day_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+
+        self.events_layout = QVBoxLayout()
+        self.events_layout.setContentsMargins(0, 0, 0, 0)
+        self.events_layout.setSpacing(1)
+
+        self.more_label = QLabel("", self)
+        self.more_label.setStyleSheet("color: #5f6368; font-size: 10px; background: transparent;")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(3, 2, 3, 2)
+        layout.setSpacing(1)
+        layout.addWidget(self.day_label)
+        layout.addLayout(self.events_layout)
+        layout.addWidget(self.more_label)
+        layout.addStretch(1)
+
+        self._apply_style()
+
+    def set_state(self, *, in_month: bool, is_today: bool, is_selected: bool) -> None:
+        self._in_month = in_month
+        self._is_today = is_today
+        self._is_selected = is_selected
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        bg = "#ffffff" if self._in_month else "#f8f9fa"
+        border = f"2px solid {_SELECTED_DAY_COLOR}" if self._is_selected else "1px solid #e0e0e0"
+        self.setStyleSheet(f"MonthCellWidget {{ background-color: {bg}; border: {border}; }}")
+        if self._is_today:
+            self.day_label.setStyleSheet(
+                f"background: {_TODAY_COLOR}; color: white; border-radius: 9px; "
+                f"font-weight: 600; padding: 0px 5px; max-width: 18px;"
+            )
+        else:
+            color = "#202124" if self._in_month else "#9aa0a6"
+            self.day_label.setStyleSheet(f"color: {color}; background: transparent;")
+
+    def set_events(self, events: list[Event]) -> None:
+        for block in self._event_blocks:
+            block.deleteLater()
+        self._event_blocks = []
+        visible = events[:_MONTH_CELL_MAX_EVENTS]
+        for ev in visible:
+            block = _EventBlock(ev, self, pill=True)
+            block.setFixedHeight(15)
+            block.clicked.connect(self.eventClicked.emit)
+            block.doubleClicked.connect(self.eventDoubleClicked.emit)
+            block.contextMenuRequested.connect(self.eventContextMenuRequested.emit)
+            self.events_layout.addWidget(block)
+            self._event_blocks.append(block)
+        extra = len(events) - len(visible)
+        self.more_label.setText(f"+{extra} ещё" if extra > 0 else "")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.dayClicked.emit(self.day)
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self.dayDoubleClicked.emit(self.day)
+        super().mouseDoubleClickEvent(event)
+
+
+class MonthGridWidget(QWidget):
+    """Вид "Месяц" — сетка 6×7 (всегда 6 недель, см. month_grid_range), в
+    каждой ячейке компактный список событий этого дня."""
+
+    eventClicked = Signal(object)
+    eventDoubleClicked = Signal(object)
+    eventContextMenuRequested = Signal(object, object)
+    dayClicked = Signal(object)
+    dayDoubleClicked = Signal(object)
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._month_anchor = date.today().replace(day=1)
+        self._events: list[Event] = []
+        self._selected_day: date | None = None
+        self._cells: list[MonthCellWidget] = []
+
+        grid = QGridLayout(self)
+        grid.setSpacing(2)
+        grid.setContentsMargins(4, 4, 4, 4)
+
+        for col, name in enumerate(_DAY_NAMES):
+            header = QLabel(name, self)
+            header.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            header.setStyleSheet("font-weight: 600; color: #5f6368;")
+            grid.addWidget(header, 0, col)
+
+        for row in range(6):
+            for col in range(7):
+                cell = MonthCellWidget(date.today(), self)
+                cell.eventClicked.connect(self.eventClicked.emit)
+                cell.eventDoubleClicked.connect(self.eventDoubleClicked.emit)
+                cell.eventContextMenuRequested.connect(self.eventContextMenuRequested.emit)
+                cell.dayClicked.connect(self.dayClicked.emit)
+                cell.dayDoubleClicked.connect(self.dayDoubleClicked.emit)
+                grid.addWidget(cell, row + 1, col)
+                self._cells.append(cell)
+
+        for col in range(7):
+            grid.setColumnStretch(col, 1)
+        for row in range(1, 7):
+            grid.setRowStretch(row, 1)
+
+    @property
+    def blocks(self) -> list[_EventBlock]:
+        return [block for cell in self._cells for block in cell._event_blocks]
+
+    def set_month(self, month_anchor: date, events: list[Event]) -> None:
+        self._month_anchor = month_anchor.replace(day=1)
+        self._events = events
+        self._relayout()
+
+    def set_selected_day(self, day: date | None) -> None:
+        self._selected_day = day
+        self._relayout()
+
+    def _relayout(self) -> None:
+        grid_start, _grid_end = month_grid_range(self._month_anchor)
+        today = date.today()
+        events_by_day: dict[date, list[Event]] = {}
+        for ev in self._events:
+            day = ev.dtstart.astimezone().date()
+            events_by_day.setdefault(day, []).append(ev)
+
+        for i, cell in enumerate(self._cells):
+            day = grid_start + timedelta(days=i)
+            cell.day = day
+            cell.day_label.setText(str(day.day))
+            cell.set_state(
+                in_month=(day.month == self._month_anchor.month),
+                is_today=(day == today),
+                is_selected=(day == self._selected_day),
+            )
+            day_events = sorted(events_by_day.get(day, []), key=lambda e: (not e.all_day, e.dtstart))
+            cell.set_events(day_events)
