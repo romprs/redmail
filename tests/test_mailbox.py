@@ -200,6 +200,19 @@ def test_message_raw_delegates_to_session_uncached(tmp_path: Path) -> None:
     assert session.fetch_message_raw.call_count == 2
 
 
+def test_search_uids_delegates_to_session_uncached(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.search_uids.return_value = [3, 7]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        uids = mailbox.search_uids("INBOX", before=None)
+
+    assert uids == [3, 7]
+    session.search_uids.assert_called_once_with("INBOX", before=None)
+
+
 def test_close_delegates_to_session() -> None:
     session = MagicMock()
     mailbox = CachedMailbox(session, _account())

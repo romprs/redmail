@@ -56,6 +56,12 @@ class CachedMailbox:
         """Не кэшируется — нужен только для разового экспорта в архив."""
         return self.session.fetch_message_raw(folder, uid)
 
+    def search_uids(self, folder: str, *, before=None) -> list[int]:
+        """Не кэшируется — используется только для массовой выгрузки папки
+        в архив (вся папка / всё до даты), где важна полная папка на
+        сервере, а не то, что сейчас в локальном кэше сводок."""
+        return self.session.search_uids(folder, before=before)
+
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         self.session.set_marker(folder, uid, color)
         cache_store.set_marker(self._account_key, folder, uid, color)

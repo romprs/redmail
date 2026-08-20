@@ -161,6 +161,16 @@ class ImapSession:
         self.folder_message_count(folder)
         return self.fetch_summaries(limit)
 
+    def search_uids(self, folder: str, *, before=None) -> list[int]:
+        """UID всех писем папки (или только тех, что старше даты `before`) —
+        в отличие от fetch_summaries/fetch_folder_summaries это не
+        ограничено последними `limit` письмами: нужно для массовой
+        выгрузки в архив (вся папка / всё до даты), где важна ПОЛНАЯ папка,
+        а не то, что сейчас показано в таблице."""
+        self._select(folder)
+        criteria = ["BEFORE", before.strftime("%d-%b-%Y")] if before else "ALL"
+        return list(self._client.search(criteria))
+
     def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
         return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))
 

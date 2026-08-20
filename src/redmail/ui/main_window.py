@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QCompleter,
+    QDateEdit,
     QDateTimeEdit,
     QDialog,
     QDialogButtonBox,
@@ -498,6 +499,47 @@ class ComposeDialog(QDialog):
 
     def body(self) -> str:
         return self.body_edit.toPlainText()
+
+
+class ArchiveFolderScopeDialog(QDialog):
+    """Что выгружать при архивировании ЦЕЛОЙ папки: всё целиком или только
+    всё старше выбранной даты (жалоба: "в архив можно убрать письма, но не
+    папку целиком или частично, например всё до определённой даты")."""
+
+    def __init__(self, parent, folder_display_name: str):
+        super().__init__(parent)
+        self.setWindowTitle("Архивировать папку")
+
+        self.info_label = QLabel(f"Папка: {folder_display_name}", self)
+
+        self.whole_radio = QRadioButton("Всю папку целиком", self)
+        self.before_radio = QRadioButton("Всё старше указанной даты", self)
+        self.whole_radio.setChecked(True)
+
+        self.date_edit = QDateEdit(QDate.currentDate().addMonths(-1), self)
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("dd.MM.yyyy")
+        self.date_edit.setEnabled(False)
+        self.before_radio.toggled.connect(self.date_edit.setEnabled)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.info_label)
+        layout.addWidget(self.whole_radio)
+        layout.addWidget(self.before_radio)
+        layout.addWidget(self.date_edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def before_date(self) -> date | None:
+        if not self.before_radio.isChecked():
+            return None
+        qd = self.date_edit.date()
+        return date(qd.year(), qd.month(), qd.day())
 
 
 class ArchiveTargetDialog(QDialog):
@@ -1166,6 +1208,11 @@ class MainWindow(QMainWindow):
         archive_selected_action.triggered.connect(self.on_archive_selected)
         toolbar.addAction(archive_selected_action)
 
+        archive_folder_action = QAction("Архивировать папку…", self)
+        archive_folder_action.setToolTip("Выгрузить в архив всю папку целиком или всё старше выбранной даты")
+        archive_folder_action.triggered.connect(self.on_archive_folder)
+        toolbar.addAction(archive_folder_action)
+
         toolbar.addSeparator()
 
         settings_action = QAction("Параметры…", self)
@@ -1513,6 +1560,74 @@ class MainWindow(QMainWindow):
                 self.mailbox.delete_messages(source_folder, checked_uids)
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка выгрузки в архив", str(exc))
+            return
+
+        self._refresh_archive_folders(archive_key)
+        if move and self.active_source is self.mailbox and self.current_folder == source_folder:
+            try:
+                summaries = self.mailbox.refresh_folder(source_folder)
+            except Exception:
+                summaries = None
+            if summaries is not None:
+                self._render_folder(summaries)
+        verb = "Перемещено" if move else "Скопировано"
+        self.statusBar().showMessage(f"{verb} в архив: {exported}", 5000)
+
+    def on_archive_folder(self) -> None:
+        if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
+            QMessageBox.information(
+                self, "Недоступно", "Выгрузка в архив работает только из папок живого ящика."
+            )
+            return
+
+        source_folder = self.current_folder
+        scope_dialog = ArchiveFolderScopeDialog(self, _DISPLAY_NAMES.get(source_folder, source_folder))
+        if scope_dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        before = scope_dialog.before_date()
+
+        try:
+            uids = self.mailbox.search_uids(source_folder, before=before)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка поиска писем", str(exc))
+            return
+        if not uids:
+            QMessageBox.information(self, "Нечего выгружать", "В папке нет подходящих писем.")
+            return
+
+        result = self._pick_archive_target(
+            title="Выгрузить папку в архив",
+            ask_folder=True,
+            default_folder=_DISPLAY_NAMES.get(source_folder, source_folder),
+            ask_move_copy=True,
+        )
+        if result is None:
+            return
+        archive_key, folder_name, move = result
+
+        scope_text = f"всё старше {before.strftime('%d.%m.%Y')}" if before else "всю папку целиком"
+        confirm = QMessageBox.question(
+            self,
+            "Архивировать папку",
+            f"{'Переместить' if move else 'Скопировать'} в архив {scope_text} ({len(uids)} писем)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        archive_path = self.archives[archive_key].path
+        exported = 0
+        try:
+            for uid in uids:
+                raw = self.mailbox.message_raw(source_folder, uid)
+                archive_store.append_raw_message(archive_path, folder_name, raw)
+                exported += 1
+            if move:
+                self.mailbox.delete_messages(source_folder, uids)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Ошибка выгрузки в архив", f"{exc}\n\nВыгружено до сбоя: {exported} из {len(uids)}."
+            )
             return
 
         self._refresh_archive_folders(archive_key)

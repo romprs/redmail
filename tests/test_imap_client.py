@@ -518,6 +518,30 @@ def test_fetch_message_content_extracts_attachment() -> None:
     assert attachment.size == len(b"file-bytes-here")
 
 
+def test_search_uids_all() -> None:
+    fake_client = _client()
+    fake_client.search.return_value = [1, 2, 3]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        uids = ImapSession(_account()).search_uids("INBOX")
+
+    assert uids == [1, 2, 3]
+    fake_client.search.assert_called_once_with("ALL")
+
+
+def test_search_uids_before_date() -> None:
+    from datetime import date
+
+    fake_client = _client()
+    fake_client.search.return_value = [5]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        uids = ImapSession(_account()).search_uids("INBOX", before=date(2026, 1, 15))
+
+    assert uids == [5]
+    fake_client.search.assert_called_once_with(["BEFORE", "15-Jan-2026"])
+
+
 def test_fetch_message_content_html_alternative_populates_html_field() -> None:
     from email.message import EmailMessage
 
