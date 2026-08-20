@@ -1032,7 +1032,9 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(calendars_group)
         sidebar_layout.addStretch(1)
 
+        self.calendar_selected_day: date | None = None
         self.calendar_week_header = WeekHeaderWidget(self)
+        self.calendar_week_header.dayClicked.connect(self.on_calendar_day_clicked)
         self.calendar_all_day_row = AllDayRowWidget(self)
         self.calendar_all_day_row.eventClicked.connect(self._on_calendar_event_clicked)
         self.calendar_all_day_row.eventDoubleClicked.connect(self._on_calendar_event_double_clicked)
@@ -1945,7 +1947,15 @@ class MainWindow(QMainWindow):
         self._refresh_attachments_list()
 
         if not summary.is_read:
-            self._set_message_read(rows[0].row(), summary, True)
+            # Отложено на следующий цикл событий: сама отметка "прочитано"
+            # на сервере — это блокирующий сетевой запрос (STORE), и раньше
+            # он выполнялся прямо здесь, ДО того как письмо успевало
+            # отрисоваться — на реальной корпоративной сети с заметной
+            # задержкой это ощущалось как "переключение между письмами
+            # тормозит" при каждом непрочитанном письме. Так письмо сначала
+            # показывается, а запрос уходит следом.
+            row = rows[0].row()
+            QTimer.singleShot(0, lambda: self._set_message_read(row, summary, True))
 
     def _render_body(self, content: MessageContent) -> None:
         """HTML-письма показываем как есть (с внедрёнными картинками из
@@ -2179,12 +2189,22 @@ class MainWindow(QMainWindow):
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
+        if default_start is None and self.calendar_selected_day is not None:
+            # Кнопка "Новое событие" на панели — если пользователь кликом
+            # выбрал день в шапке календаря, событие по умолчанию ставим
+            # туда, а не всегда на "сейчас+час".
+            default_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
         dialog = EventDialog(
             self, my_email=self.account.username, contacts=self._load_contacts(), default_start=default_start
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=None)
+
+    def on_calendar_day_clicked(self, day: date) -> None:
+        self.calendar_selected_day = day
+        self.calendar_week_header.set_selected_day(day)
+        self.calendar_week_grid.set_selected_day(day)
 
     def on_calendar_empty_slot_clicked(self, day: date, minutes: int) -> None:
         self.on_new_event(default_start=self._slot_to_datetime(day, minutes))

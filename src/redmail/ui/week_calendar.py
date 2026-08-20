@@ -18,6 +18,7 @@ _ATTENDEE_COLOR = "#8B5CB6"  # встречи, куда меня приглас�
 _ALL_DAY_COLOR = "#7986CB"
 _TODAY_COLOR = "#1A73E8"
 _NOW_LINE_COLOR = "#E64A4A"
+_SELECTED_DAY_COLOR = "#34A853"
 
 
 def week_start_for(day: date) -> date:
@@ -141,18 +142,39 @@ class WeekHeaderWidget(QWidget):
 
     TIME_AXIS_WIDTH = 52
     _CIRCLE_DIAMETER = 28
+    # Клик по дате в шапке — "выбрать день" (жалоба: "в календаре нет
+    # возможности выбрать день"): подсвечивает колонку в сетке и становится
+    # днём по умолчанию для кнопки "Новое событие" на панели инструментов.
+    dayClicked = Signal(object)  # date
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self.setFixedHeight(52)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
         self._week_start = week_start_for(date.today())
+        self._selected_day: date | None = None
 
     def set_week_start(self, week_start: date) -> None:
         self._week_start = week_start
         self.update()
 
+    def set_selected_day(self, day: date | None) -> None:
+        self._selected_day = day
+        self.update()
+
     def _day_column_width(self) -> float:
         return max(1.0, (self.width() - self.TIME_AXIS_WIDTH) / 7)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        x = event.position().x()
+        if x >= self.TIME_AXIS_WIDTH:
+            day_index = int((x - self.TIME_AXIS_WIDTH) / self._day_column_width())
+            if 0 <= day_index < 7:
+                self.dayClicked.emit(self._week_start + timedelta(days=day_index))
+        super().mousePressEvent(event)
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
@@ -177,6 +199,13 @@ class WeekHeaderWidget(QWidget):
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawEllipse(circle_rect)
                 painter.setPen(QColor("white"))
+            elif day == self._selected_day:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                pen = QPen(QColor(_SELECTED_DAY_COLOR))
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawEllipse(circle_rect)
+                painter.setPen(text_color)
             else:
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(text_color)
@@ -268,6 +297,7 @@ class WeekGridWidget(QWidget):
         self._week_start = week_start_for(date.today())
         self._events: list[Event] = []
         self._blocks: list[_EventBlock] = []
+        self._selected_day: date | None = None
 
         # Красная линия "сейчас" должна сама сдвигаться, пока приложение
         # открыто — минутной точности достаточно, не гоняем чаще раза в минуту.
@@ -279,6 +309,10 @@ class WeekGridWidget(QWidget):
         self._week_start = week_start
         self._events = timed_events
         self._relayout()
+
+    def set_selected_day(self, day: date | None) -> None:
+        self._selected_day = day
+        self.update()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
@@ -396,6 +430,13 @@ class WeekGridWidget(QWidget):
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
                 f"{hour:02d}:00",
             )
+
+        selected_index = (self._selected_day - self._week_start).days if self._selected_day else -1
+        if 0 <= selected_index < 7 and selected_index != today_index:
+            selected_highlight = QColor(_SELECTED_DAY_COLOR)
+            selected_highlight.setAlpha(18)
+            sx = self.TIME_AXIS_WIDTH + selected_index * col_w
+            painter.fillRect(QRectF(sx, 0, col_w, self.height()), selected_highlight)
 
         if 0 <= today_index < 7:
             highlight = QColor(_TODAY_COLOR)
