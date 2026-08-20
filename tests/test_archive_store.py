@@ -62,6 +62,7 @@ def test_append_and_list_messages(tmp_path: Path) -> None:
     assert summary.sender == "Иван"
     assert summary.sender_email == "ivan@example.com"
     assert summary.has_attachments is True
+    assert summary.is_read is True  # архив — уже разобранная почта
 
     content = archive_store.get_message_content(archive_path, new_id)
     assert content.text.strip() == "Текст письма"

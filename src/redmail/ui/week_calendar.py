@@ -50,8 +50,10 @@ class _EventBlock(QFrame):
         # недр Qt падает с "'Event' object is not callable". Поймано именно
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
-        radius = "11px" if pill else "6px"
-        self.setStyleSheet(f"background-color: {_event_color(calendar_event)}; border-radius: {radius};")
+        self._color = _event_color(calendar_event)
+        self._radius = "11px" if pill else "6px"
+        self._selected = False
+        self._apply_style()
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Перетаскивать можно только свои встречи (я организатор) — чужие
@@ -114,6 +116,19 @@ class _EventBlock(QFrame):
         self._suppress_click = True
         self.doubleClicked.emit(self.calendar_event)
         super().mouseDoubleClickEvent(event)
+
+    def set_selected(self, selected: bool) -> None:
+        # Раньше "Отменить встречу" действовал на self.selected_calendar_event
+        # без какой-либо видимой подсветки — пользователь не мог понять,
+        # какое событие сейчас выбрано. Белая рамка — видимый маркер выбора.
+        self._selected = selected
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        border = "2px solid white" if self._selected else "1px solid transparent"
+        self.setStyleSheet(
+            f"background-color: {self._color}; border-radius: {self._radius}; border: {border};"
+        )
 
 
 class WeekHeaderWidget(QWidget):

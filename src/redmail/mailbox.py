@@ -60,6 +60,10 @@ class CachedMailbox:
         self.session.set_marker(folder, uid, color)
         cache_store.set_marker(self._account_key, folder, uid, color)
 
+    def set_read(self, folder: str, uid: int, read: bool) -> None:
+        self.session.set_read(folder, uid, read)
+        cache_store.set_read(self._account_key, folder, uid, read)
+
     def move_to_trash(self, folder: str, uids: list[int], trash_folder: str) -> None:
         self.session.move_messages(folder, uids, trash_folder)
         cache_store.delete_messages(self._account_key, folder, uids)
@@ -92,6 +96,9 @@ class ArchiveSource:
 
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         archive_store.set_marker(self.path, uid, color)
+
+    def set_read(self, folder: str, uid: int, read: bool) -> None:
+        pass  # архив всегда "прочитан" (см. folder_summaries) — переключать нечего
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         archive_store.delete_messages(self.path, uids)

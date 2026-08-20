@@ -11,7 +11,7 @@ from redmail.paths import app_dir
 # (новое поле и т.п.) — иначе старые строки молча остаются с значениями по
 # умолчанию (например, без скрепки) и никогда не обновляются сами, пока
 # папку не пересохранят по другой причине (см. save_folder_summaries).
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS messages (
     has_attachments INTEGER NOT NULL DEFAULT 0,
     marker_color TEXT,
     importance TEXT NOT NULL DEFAULT 'normal',
+    is_read INTEGER NOT NULL DEFAULT 0,
     body TEXT,
     PRIMARY KEY (account, folder, uid)
 );
@@ -59,6 +60,7 @@ _MIGRATIONS = (
     "ALTER TABLE messages ADD COLUMN has_attachments INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE messages ADD COLUMN marker_color TEXT",
     "ALTER TABLE messages ADD COLUMN importance TEXT NOT NULL DEFAULT 'normal'",
+    "ALTER TABLE messages ADD COLUMN is_read INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -107,8 +109,8 @@ def get_folder_exists(account_key: str, folder: str) -> int | None:
 def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance "
-            "FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
+            "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, "
+            "importance, is_read FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
             (account_key, folder),
         ).fetchall()
     return [
@@ -122,8 +124,10 @@ def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
             has_attachments=bool(has_attachments),
             marker_color=marker_color,
             importance=importance,
+            is_read=bool(is_read),
         )
-        for uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance in rows
+        for uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance, is_read
+        in rows
     ]
 
 
@@ -150,17 +154,17 @@ def save_folder_summaries(
         conn.executemany(
             "INSERT INTO messages "
             "(account, folder, uid, position, subject, sender, sender_email, date, message_id, "
-            "has_attachments, marker_color, importance) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "has_attachments, marker_color, importance, is_read) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account, folder, uid) DO UPDATE SET "
             "position = excluded.position, subject = excluded.subject, sender = excluded.sender, "
             "sender_email = excluded.sender_email, date = excluded.date, message_id = excluded.message_id, "
             "has_attachments = excluded.has_attachments, marker_color = excluded.marker_color, "
-            "importance = excluded.importance",
+            "importance = excluded.importance, is_read = excluded.is_read",
             [
                 (
                     account_key, folder, s.uid, position, s.subject, s.sender, s.sender_email, s.date,
-                    s.message_id, int(s.has_attachments), s.marker_color, s.importance,
+                    s.message_id, int(s.has_attachments), s.marker_color, s.importance, int(s.is_read),
                 )
                 for position, s in enumerate(summaries)
             ],
@@ -173,6 +177,15 @@ def set_marker(account_key: str, folder: str, uid: int, color: str | None) -> No
         conn.execute(
             "UPDATE messages SET marker_color = ? WHERE account = ? AND folder = ? AND uid = ?",
             (color, account_key, folder, uid),
+        )
+        conn.commit()
+
+
+def set_read(account_key: str, folder: str, uid: int, read: bool) -> None:
+    with closing(_connect()) as conn:
+        conn.execute(
+            "UPDATE messages SET is_read = ? WHERE account = ? AND folder = ? AND uid = ?",
+            (int(read), account_key, folder, uid),
         )
         conn.commit()
 

@@ -51,6 +51,7 @@ class MessageSummary:
     has_attachments: bool = False
     marker_color: str | None = None
     importance: str = "normal"  # "high" | "normal" | "low"
+    is_read: bool = False
 
 
 @dataclass
@@ -166,6 +167,13 @@ class ImapSession:
         self._select(folder)
         response = self._client.fetch([uid], ["BODY.PEEK[]"])
         return response[uid][b"BODY[]"]
+
+    def set_read(self, folder: str, uid: int, read: bool) -> None:
+        self._select(folder)
+        if read:
+            self._client.add_flags([uid], [b"\\Seen"])
+        else:
+            self._client.remove_flags([uid], [b"\\Seen"])
 
     def set_marker(self, folder: str, uid: int, color: str | None) -> None:
         """Ставит/снимает \\Flagged + наш цветной keyword-флаг.
@@ -302,6 +310,7 @@ def _to_summary(data: dict) -> MessageSummary:
         has_attachments=_body_has_attachment(data[b"BODYSTRUCTURE"]) if b"BODYSTRUCTURE" in data else False,
         marker_color=marker_color,
         importance=parse_importance(message_from_bytes(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b""))),
+        is_read=b"\\Seen" in flags,
     )
 
 

@@ -90,6 +90,7 @@ def list_messages(path: Path, folder: str) -> list[MessageSummary]:
         MessageSummary(
             uid=row[0], subject=row[1], sender=row[2], sender_email=row[3], date=row[4], message_id=row[5],
             has_attachments=bool(row[6]), marker_color=row[7], importance=row[8],
+            is_read=True,  # архив — уже разобранная почта, не показываем "непрочитанным" вечно
         )
         for row in rows
     ]

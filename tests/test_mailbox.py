@@ -116,6 +116,22 @@ def test_set_marker_updates_session_and_cache(tmp_path: Path) -> None:
     assert cached[0].marker_color == "green"
 
 
+def test_set_read_updates_session_and_cache(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    session = MagicMock()
+    session.folder_message_count.return_value = 1
+    session.fetch_summaries.return_value = [_summary(1)]
+
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        mailbox = CachedMailbox(session, _account())
+        mailbox.folder_summaries("INBOX")
+        mailbox.set_read("INBOX", 1, True)
+        cached = mailbox.folder_summaries("INBOX")
+
+    session.set_read.assert_called_once_with("INBOX", 1, True)
+    assert cached[0].is_read is True
+
+
 def test_delete_messages_updates_session_and_cache(tmp_path: Path) -> None:
     db_path = tmp_path / "cache.sqlite3"
     session = MagicMock()
@@ -231,3 +247,7 @@ def test_archive_source_set_marker_and_delete(tmp_path: Path) -> None:
 
 def test_archive_source_close_is_noop(tmp_path: Path) -> None:
     ArchiveSource(tmp_path / "test.rmarchive").close()  # не должно падать
+
+
+def test_archive_source_set_read_is_noop(tmp_path: Path) -> None:
+    ArchiveSource(tmp_path / "test.rmarchive").set_read("F", 1, False)  # не должно падать

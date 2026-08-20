@@ -214,6 +214,36 @@ def test_fetch_folder_summaries_reads_flags_attachment_and_importance() -> None:
     assert summary.has_attachments is True
     assert summary.marker_color == "red"
     assert summary.importance == "high"
+    assert summary.is_read is True
+
+
+def test_fetch_folder_summaries_no_seen_flag_is_unread() -> None:
+    envelope = SimpleNamespace(
+        subject=None, from_=[_address(None, b"a", b"example.com")], date=None, message_id=None
+    )
+    fake_client = _client(exists=1)
+    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"UID": 9, b"FLAGS": (b"\\Flagged",)}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summary = ImapSession(_account()).fetch_folder_summaries()[0]
+
+    assert summary.is_read is False
+
+
+def test_set_read_adds_seen_flag() -> None:
+    fake_client = _client()
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        ImapSession(_account()).set_read("INBOX", 7, True)
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Seen"])
+    fake_client.remove_flags.assert_not_called()
+
+
+def test_set_read_removes_seen_flag() -> None:
+    fake_client = _client()
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        ImapSession(_account()).set_read("INBOX", 7, False)
+    fake_client.remove_flags.assert_called_once_with([7], [b"\\Seen"])
+    fake_client.add_flags.assert_not_called()
 
 
 def test_fetch_folder_summaries_alternative_only_has_no_attachment() -> None:

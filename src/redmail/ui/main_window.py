@@ -1612,8 +1612,16 @@ class MainWindow(QMainWindow):
             self.table.setItem(
                 row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
             )
-            self.table.setItem(row, COL_SENDER, QTableWidgetItem(summary.sender))
-            self.table.setItem(row, COL_SUBJECT, QTableWidgetItem(summary.subject))
+            sender_item = QTableWidgetItem(summary.sender)
+            subject_item = QTableWidgetItem(summary.subject)
+            if not summary.is_read:
+                # Непрочитанное — жирным, как в любом другом почтовом клиенте.
+                bold_font = sender_item.font()
+                bold_font.setBold(True)
+                sender_item.setFont(bold_font)
+                subject_item.setFont(bold_font)
+            self.table.setItem(row, COL_SENDER, sender_item)
+            self.table.setItem(row, COL_SUBJECT, subject_item)
             self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
         self.table.setSortingEnabled(True)
 
@@ -1645,8 +1653,16 @@ class MainWindow(QMainWindow):
         if summary is None:
             return
         menu = QMenu(self)
+        toggle_read_action = menu.addAction(
+            "Отметить как непрочитанное" if summary.is_read else "Отметить как прочитанное"
+        )
+        menu.addSeparator()
         add_contact_action = menu.addAction("Добавить отправителя в контакты…")
         chosen = menu.exec(self.table.mapToGlobal(pos))
+
+        if chosen is toggle_read_action:
+            self._set_message_read(item.row(), summary, not summary.is_read)
+            return
         if chosen is not add_contact_action:
             return
 
@@ -1795,6 +1811,21 @@ class MainWindow(QMainWindow):
         self.reading_pane.setPlainText(content.text)
         self._update_invite_bar(content)
         self._refresh_attachments_list()
+
+        if not summary.is_read:
+            self._set_message_read(rows[0].row(), summary, True)
+
+    def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
+        try:
+            self.active_source.set_read(self.current_folder, summary.uid, read)
+        except Exception:
+            pass  # необязательная операция — письмо и так уже открыто/помечено локально
+        summary.is_read = read
+        for col in (COL_SENDER, COL_SUBJECT):
+            item = self.table.item(row, col)
+            font = item.font()
+            font.setBold(not read)
+            item.setFont(font)
 
     def _update_invite_bar(self, content: MessageContent) -> None:
         calendar_part = next((a for a in content.attachments if a.content_type == "text/calendar"), None)
@@ -1947,6 +1978,12 @@ class MainWindow(QMainWindow):
         self.calendar_mini_picker.setSelectedDate(
             QDate(self.calendar_week_start.year, self.calendar_week_start.month, self.calendar_week_start.day)
         )
+        self._apply_calendar_selection_highlight()
+
+    def _apply_calendar_selection_highlight(self) -> None:
+        selected_uid = self.selected_calendar_event.uid if self.selected_calendar_event else None
+        for block in (*self.calendar_week_grid._blocks, *self.calendar_all_day_row._blocks):
+            block.set_selected(selected_uid is not None and block.calendar_event.uid == selected_uid)
 
     def on_calendar_mini_picker_clicked(self, qdate: QDate) -> None:
         picked = date(qdate.year(), qdate.month(), qdate.day())
@@ -1959,9 +1996,11 @@ class MainWindow(QMainWindow):
 
     def _on_calendar_event_clicked(self, event: calendar_store.Event) -> None:
         self.selected_calendar_event = event
+        self._apply_calendar_selection_highlight()
 
     def _on_calendar_event_double_clicked(self, event: calendar_store.Event) -> None:
         self.selected_calendar_event = event
+        self._apply_calendar_selection_highlight()
         if not event.is_organizer:
             EventDetailsDialog(self, event).exec()
             return

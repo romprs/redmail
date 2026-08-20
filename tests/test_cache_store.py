@@ -9,12 +9,12 @@ from redmail.imap_client import Attachment, MessageContent, MessageSummary
 
 def _summary(
     uid: int, subject: str, *, has_attachments: bool = False, marker_color: str | None = None,
-    importance: str = "normal",
+    importance: str = "normal", is_read: bool = False,
 ) -> MessageSummary:
     return MessageSummary(
         uid=uid, subject=subject, sender="Ivan", sender_email="ivan@example.com", date="2026-08-18 10:00",
         message_id=f"<{uid}@example.com>", has_attachments=has_attachments, marker_color=marker_color,
-        importance=importance,
+        importance=importance, is_read=is_read,
     )
 
 
@@ -110,6 +110,25 @@ def test_set_marker_none_clears_cached_summary(tmp_path: Path) -> None:
         cached = cache_store.get_folder_summaries("acc", "INBOX")
 
     assert cached[0].marker_color is None
+
+
+def test_is_read_round_trips_through_save_and_get(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 1, [_summary(1, "A", is_read=True)])
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+
+    assert cached[0].is_read is True
+
+
+def test_set_read_updates_cached_summary(tmp_path: Path) -> None:
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 1, [_summary(1, "A", is_read=False)])
+        cache_store.set_read("acc", "INBOX", 1, True)
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+
+    assert cached[0].is_read is True
 
 
 def test_delete_messages_removes_from_cache(tmp_path: Path) -> None:
