@@ -6,14 +6,18 @@ from unittest.mock import patch
 from redmail.config_store import (
     load_account,
     load_font_scale,
+    load_mail_columns_state,
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
+    load_window_geometry,
     save_account,
     save_font_scale,
+    save_mail_columns_state,
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
+    save_window_geometry,
 )
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
@@ -161,6 +165,27 @@ def test_saving_one_setting_does_not_clobber_another(tmp_path: Path) -> None:
         assert load_poll_interval_minutes() == 20
         assert load_pane_orientation() == "horizontal"
         assert load_font_scale() == 1.5
+
+
+def test_window_geometry_defaults_to_none(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_window_geometry() is None
+
+
+def test_window_geometry_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_window_geometry(b"\x00\x01\xff\xfe binary geometry blob")
+        assert load_window_geometry() == b"\x00\x01\xff\xfe binary geometry blob"
+
+
+def test_mail_columns_state_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_mail_columns_state() is None
+        save_mail_columns_state(b"\x00columns\xff")
+        assert load_mail_columns_state() == b"\x00columns\xff"
 
 
 def test_open_archives_defaults_to_empty(tmp_path: Path) -> None:

@@ -9,7 +9,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QDate, QDateTime, QSize, Qt, QStringListModel, QTimer, QUrl
 from PySide6.QtGui import QAction, QActionGroup, QColor, QCursor, QDesktopServices, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -56,14 +56,18 @@ from redmail import archive_store, calendar_store, contact_store, itip
 from redmail.config_store import (
     load_account,
     load_font_scale,
+    load_mail_columns_state,
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
+    load_window_geometry,
     save_account,
     save_font_scale,
+    save_mail_columns_state,
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
+    save_window_geometry,
 )
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
@@ -1097,6 +1101,18 @@ class MainWindow(QMainWindow):
 
         QTimer.singleShot(0, self._restore_saved_account)
         QTimer.singleShot(0, self._restore_saved_archives)
+        self._restore_window_state()
+
+    def _restore_window_state(self) -> None:
+        try:
+            geometry = load_window_geometry()
+            if geometry:
+                self.restoreGeometry(QByteArray(geometry))
+            columns_state = load_mail_columns_state()
+            if columns_state:
+                self.table.horizontalHeader().restoreState(QByteArray(columns_state))
+        except Exception:
+            pass  # сохранённое расположение не подошло (например, число колонок изменилось) — не критично
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
@@ -2390,4 +2406,9 @@ class MainWindow(QMainWindow):
             archive.close()
         for temp_dir in self._temp_attachment_dirs:
             shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            save_window_geometry(bytes(self.saveGeometry()))
+            save_mail_columns_state(bytes(self.table.horizontalHeader().saveState()))
+        except Exception:
+            pass  # расположение окна/колонок не запомнится между запусками — не критично
         super().closeEvent(event)

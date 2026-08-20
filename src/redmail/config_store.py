@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -77,6 +78,28 @@ def save_font_scale(scale: float) -> None:
     data = _load_settings_dict()
     data["font_scale"] = scale
     _save_settings_dict(data)
+
+
+def load_window_geometry() -> bytes | None:
+    value = _load_settings_dict().get("window_geometry")
+    return base64.b64decode(value) if value else None
+
+
+def save_window_geometry(data: bytes) -> None:
+    settings = _load_settings_dict()
+    settings["window_geometry"] = base64.b64encode(data).decode("ascii")
+    _save_settings_dict(settings)
+
+
+def load_mail_columns_state() -> bytes | None:
+    value = _load_settings_dict().get("mail_columns_state")
+    return base64.b64decode(value) if value else None
+
+
+def save_mail_columns_state(data: bytes) -> None:
+    settings = _load_settings_dict()
+    settings["mail_columns_state"] = base64.b64encode(data).decode("ascii")
+    _save_settings_dict(settings)
 
 
 def load_open_archives() -> list[str]:
