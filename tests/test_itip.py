@@ -193,6 +193,31 @@ def test_parse_ics_events_reads_multiple_events_without_method() -> None:
     assert {e.summary for e in events} == {"Событие 1", "Событие 2"}
 
 
+def test_parse_ics_events_reads_status_property() -> None:
+    # Реальная выгрузка целого календаря из VK Mail (не одиночное
+    # приглашение, поэтому METHOD: отсутствует) несёт статус каждой встречи
+    # в STATUS: — из 174 реальных событий 154 были TENTATIVE. Раньше
+    # STATUS: вообще не читался, и все такие события тихо становились
+    # "confirmed". Синтетический, но структурно тот же случай (без реальных
+    # корпоративных данных из присланного файла).
+    def vevent(uid: str, status: str) -> bytes:
+        return (
+            f"BEGIN:VEVENT\r\nUID:{uid}\r\nSUMMARY:S\r\nSTATUS:{status}\r\n"
+            f"DTSTART:20260901T100000Z\r\nDTEND:20260901T110000Z\r\nEND:VEVENT\r\n"
+        ).encode()
+
+    ics = (
+        b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n"
+        + vevent("a", "TENTATIVE")
+        + vevent("b", "CONFIRMED")
+        + vevent("c", "CANCELLED")
+        + b"END:VCALENDAR\r\n"
+    )
+
+    events = {e.uid: e.status for e in itip.parse_ics_events(ics, my_email="me@example.com")}
+    assert events == {"a": "tentative", "b": "confirmed", "c": "cancelled"}
+
+
 def test_parse_ics_events_skips_bad_entries_not_whole_file() -> None:
     good = _bare_vevent_ics("ok@calendar", "Нормальное", datetime(2026, 9, 1, 10, tzinfo=timezone.utc))
     bad = b"BEGIN:VEVENT\r\nUID:bad@calendar\r\nSUMMARY:No DTSTART at all\r\nEND:VEVENT\r\n"

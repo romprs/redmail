@@ -125,6 +125,20 @@ def _event_from_vevent(vevent, method: str, my_email: str, raw_ics: bytes | None
     ]
 
     uid = str(vevent.get("UID", "")) or new_uid()
+
+    # Реальный экспорт целого календаря (в отличие от одиночного iTIP-
+    # приглашения) не несёт METHOD:, зато почти всегда несёт свой STATUS:
+    # на каждой встрече (в реальном файле VK Mail — 154 из 174 событий
+    # TENTATIVE) — раньше это вообще не читалось, и все такие события
+    # тихо превращались в "confirmed".
+    status_prop = str(vevent.get("STATUS", "")).upper()
+    if method == "CANCEL" or status_prop == "CANCELLED":
+        status = "cancelled"
+    elif status_prop == "TENTATIVE":
+        status = "tentative"
+    else:
+        status = "confirmed"
+
     return Event(
         uid=uid,
         sequence=int(vevent.get("SEQUENCE", 0)),
@@ -138,7 +152,7 @@ def _event_from_vevent(vevent, method: str, my_email: str, raw_ics: bytes | None
         organizer_email=organizer_email,
         organizer_name=organizer_name,
         is_organizer=bool(my_email) and bool(organizer_email) and organizer_email.lower() == my_email.lower(),
-        status="cancelled" if method == "CANCEL" else "confirmed",
+        status=status,
         my_participation=my_participation,
         attendees=attendees,
         attachments=attachments,
