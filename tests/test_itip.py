@@ -53,6 +53,19 @@ def test_parse_invite_detects_organizer_is_me() -> None:
     assert invite.event.is_organizer is True
 
 
+def test_build_caldav_ics_has_no_method_property() -> None:
+    # METHOD (iTIP, RFC 5546) — только для приглашений по почте; обычное
+    # хранимое на CalDAV-сервере событие (RFC 4791) не должно его нести.
+    ics = itip.build_caldav_ics(_event(), "organizer@example.com", "Организатор")
+    cal = icalendar.Calendar.from_ical(ics)
+    assert cal.get("method") is None
+
+    events = itip.parse_ics_events(ics, my_email="me@example.com")
+    assert len(events) == 1
+    assert events[0].uid == "e1@redmail"
+    assert events[0].summary == "Совещание по проекту"
+
+
 def test_build_cancel_sets_method_and_status() -> None:
     ics = itip.build_cancel_ics(_event(), "organizer@example.com", "Организатор")
     invite = itip.parse_invite(ics, my_email="me@example.com")

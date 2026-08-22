@@ -69,9 +69,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redmail import archive_store, calendar_store, contact_store, itip
+from redmail import archive_store, calendar_store, caldav_sync, contact_store, itip
 from redmail.config_store import (
     load_account,
+    load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
     load_open_archives,
@@ -79,6 +80,7 @@ from redmail.config_store import (
     load_poll_interval_minutes,
     load_window_geometry,
     save_account,
+    save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
     save_open_archives,
@@ -453,6 +455,7 @@ class SettingsDialog(QDialog):
         smtp: SmtpAccount | None = None,
         poll_interval_minutes: int = 5,
         pane_orientation: str = "vertical",
+        caldav_url: str = "",
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -509,6 +512,13 @@ class SettingsDialog(QDialog):
         general_group = QGroupBox("Общие")
         general_group.setLayout(general_form)
 
+        self.caldav_url_edit = QLineEdit(caldav_url)
+        self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/ (необязательно)")
+        caldav_form = QFormLayout()
+        caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
+        caldav_group = QGroupBox("Календарь (CalDAV) — логин и пароль те же, что для IMAP выше")
+        caldav_group.setLayout(caldav_form)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -519,6 +529,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(imap_group)
         layout.addWidget(smtp_group)
         layout.addWidget(general_group)
+        layout.addWidget(caldav_group)
         layout.addWidget(buttons)
 
     def account(self) -> Account:
@@ -544,6 +555,9 @@ class SettingsDialog(QDialog):
 
     def pane_orientation(self) -> str:
         return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
+
+    def caldav_url(self) -> str:
+        return self.caldav_url_edit.text().strip()
 
 
 class ComposeDialog(QDialog):
@@ -1192,6 +1206,7 @@ class MainWindow(QMainWindow):
         self.selected_summary: MessageSummary | None = None
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
+        self.caldav_url = load_caldav_url()
         self.filter_column = COL_SUBJECT
         self.marker_filter: str | None = None
         self._temp_attachment_dirs: list[Path] = []
@@ -1339,6 +1354,10 @@ class MainWindow(QMainWindow):
         calendar_refresh_action = QAction("Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
+        caldav_sync_action = QAction("Синхронизировать с CalDAV", self)
+        caldav_sync_action.setToolTip("Адрес сервера — в Параметрах. Логин/пароль — от почты.")
+        caldav_sync_action.triggered.connect(self.on_caldav_sync)
+        calendar_toolbar.addAction(caldav_sync_action)
         calendar_toolbar.addWidget(self.calendar_view_combo)
 
         # Левая панель: мини-календарь для быстрого перехода к неделе +
@@ -1955,15 +1974,18 @@ class MainWindow(QMainWindow):
             smtp=self.smtp_account,
             poll_interval_minutes=self.poll_interval_minutes,
             pane_orientation=self.pane_orientation,
+            caldav_url=self.caldav_url,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
         self.poll_interval_minutes = dialog.poll_interval_minutes()
         self.pane_orientation = dialog.pane_orientation()
+        self.caldav_url = dialog.caldav_url()
         try:
             save_poll_interval_minutes(self.poll_interval_minutes)
             save_pane_orientation(self.pane_orientation)
+            save_caldav_url(self.caldav_url)
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
         self._restart_poll_timer()
@@ -2580,6 +2602,75 @@ class MainWindow(QMainWindow):
             return
         self.refresh_calendar_view()
         self.statusBar().showMessage(f"Импортировано событий: {count}", 5000)
+
+    def on_caldav_sync(self) -> None:
+        """Ручная синхронизация по кнопке — не по таймеру. Сервер ни разу
+        не проверялся вживую (закрытая корпоративная сеть, доступа отсюда
+        нет), поэтому автоматический фоновый опрос пока не включаем —
+        только явный запуск, чтобы первые реальные проблемы были видны
+        сразу пользователю, а не тихо повторялись каждые несколько минут."""
+        if not self.account:
+            QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
+            return
+        if not self.caldav_url:
+            QMessageBox.information(
+                self, "CalDAV не настроен", "Укажите адрес CalDAV-сервера в Параметрах (раздел «Календарь»)."
+            )
+            return
+
+        try:
+            session = caldav_sync.CalDavSession(
+                caldav_sync.CalDavAccount(
+                    url=self.caldav_url, username=self.account.username, password=self.account.password
+                )
+            )
+        except caldav_sync.CalDavSyncError as exc:
+            QMessageBox.critical(self, "Ошибка CalDAV", str(exc))
+            return
+
+        window_start = datetime.now(timezone.utc) - timedelta(days=30)
+        window_end = datetime.now(timezone.utc) + timedelta(days=180)
+
+        # Сначала отправляем локальные изменения (свои встречи), потом
+        # забираем с сервера — если сделать наоборот, свежая локальная
+        # правка, ещё не отправленная, могла бы затереться устаревшей
+        # версией с сервера при получении.
+        pushed = 0
+        try:
+            local_events = calendar_store.list_events(self.calendar_path, start=window_start, end=window_end)
+            for event in local_events:
+                if event.is_organizer and event.status != "cancelled":
+                    session.push_event(event, self.account.username, self.account.username)
+                    pushed += 1
+        except caldav_sync.CalDavSyncError as exc:
+            QMessageBox.critical(self, "Ошибка отправки на CalDAV", str(exc))
+            session.close()
+            return
+
+        pulled = 0
+        try:
+            server_events = session.fetch_events(window_start, window_end, self.account.username)
+            for event in server_events:
+                # CalDAV-сервер ничего не знает о наших полях, которых нет
+                # в стандартном iCalendar (ручной цвет события) и может не
+                # хранить произвольные вложения — не даём синхронизации
+                # тихо стереть то, что есть только локально.
+                existing_local = calendar_store.get_event(self.calendar_path, event.uid)
+                if existing_local:
+                    if not event.attachments and existing_local.attachments:
+                        event.attachments = existing_local.attachments
+                    if not event.color and existing_local.color:
+                        event.color = existing_local.color
+                calendar_store.save_event(self.calendar_path, event)
+                pulled += 1
+        except caldav_sync.CalDavSyncError as exc:
+            QMessageBox.critical(self, "Ошибка получения с CalDAV", str(exc))
+            session.close()
+            return
+
+        session.close()
+        self.refresh_calendar_view()
+        self.statusBar().showMessage(f"CalDAV: отправлено {pushed}, получено {pulled}", 7000)
 
     def refresh_calendar_view(self) -> None:
         # Локальный календарь ничего не опрашивает по сети — "Обновить"

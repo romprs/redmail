@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from redmail.config_store import (
     load_account,
+    load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
     load_open_archives,
@@ -12,6 +13,7 @@ from redmail.config_store import (
     load_poll_interval_minutes,
     load_window_geometry,
     save_account,
+    save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
     save_open_archives,
@@ -186,6 +188,19 @@ def test_mail_columns_state_round_trip(tmp_path: Path) -> None:
         assert load_mail_columns_state() is None
         save_mail_columns_state(b"\x00columns\xff")
         assert load_mail_columns_state() == b"\x00columns\xff"
+
+
+def test_caldav_url_defaults_to_empty(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_caldav_url() == ""
+
+
+def test_caldav_url_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_caldav_url("https://calendar.example.corp/caldav/")
+        assert load_caldav_url() == "https://calendar.example.corp/caldav/"
 
 
 def test_open_archives_defaults_to_empty(tmp_path: Path) -> None:

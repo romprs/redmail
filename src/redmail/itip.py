@@ -172,6 +172,14 @@ def build_cancel_ics(event: Event, organizer_email: str, organizer_name: str) ->
     )
 
 
+def build_caldav_ics(event: Event, organizer_email: str, organizer_name: str) -> bytes:
+    """Объект календаря для PUT на CalDAV-сервер — это не приглашение по
+    почте (METHOD:REQUEST/CANCEL из RFC 5546), а обычное хранимое событие,
+    поэтому без верхнеуровневого iTIP METHOD (см. RFC 4791 — CalDAV сам по
+    себе не про METHOD, это только для scheduling-сообщений)."""
+    return _build(None, event, organizer_email=organizer_email, organizer_name=organizer_name, status=event.status.upper())
+
+
 def build_reply_ics(event: Event, attendee_email: str, attendee_name: str, participation: str) -> bytes:
     cal = _new_calendar("REPLY")
     vevent = icalendar.Event()
@@ -195,7 +203,7 @@ def build_reply_ics(event: Event, attendee_email: str, attendee_name: str, parti
     return cal.to_ical()
 
 
-def _build(method: str, event: Event, *, organizer_email: str, organizer_name: str, status: str) -> bytes:
+def _build(method: str | None, event: Event, *, organizer_email: str, organizer_name: str, status: str) -> bytes:
     cal = _new_calendar(method)
     vevent = icalendar.Event()
     vevent.add("uid", event.uid)
@@ -238,11 +246,12 @@ def _build(method: str, event: Event, *, organizer_email: str, organizer_name: s
     return cal.to_ical()
 
 
-def _new_calendar(method: str) -> icalendar.Calendar:
+def _new_calendar(method: str | None) -> icalendar.Calendar:
     cal = icalendar.Calendar()
     cal.add("prodid", "-//RedMail//RU")
     cal.add("version", "2.0")
-    cal.add("method", method)
+    if method:
+        cal.add("method", method)
     return cal
 
 

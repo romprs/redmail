@@ -66,6 +66,21 @@ def save_pane_orientation(orientation: str) -> None:
     _save_settings_dict(data)
 
 
+def load_caldav_url() -> str:
+    """Адрес CalDAV-сервера — вводится пользователем вручную (закрытая
+    корпоративная сеть, автоопределить неоткуда), логин/пароль берутся из
+    уже подключённого почтового аккаунта (тот же keyring, отдельно не
+    хранятся)."""
+    value = _load_settings_dict().get("caldav_url", "")
+    return value if isinstance(value, str) else ""
+
+
+def save_caldav_url(url: str) -> None:
+    data = _load_settings_dict()
+    data["caldav_url"] = url
+    _save_settings_dict(data)
+
+
 def load_font_scale() -> float:
     try:
         value = float(_load_settings_dict().get("font_scale", _DEFAULT_FONT_SCALE))
