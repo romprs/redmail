@@ -85,6 +85,44 @@ def test_send_message_multiple_recipients() -> None:
     assert sent["To"] == "a@example.com, b@example.com"
 
 
+def test_send_message_sets_cc_and_bcc_headers() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(
+            sender="ivan@example.com",
+            to=["a@example.com"],
+            subject="S",
+            body="B",
+            cc=["cc1@example.com", "cc2@example.com"],
+            bcc=["secret@example.com"],
+        )
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    assert sent["Cc"] == "cc1@example.com, cc2@example.com"
+    # Сам заголовок Bcc реально вырезается smtplib.send_message() при
+    # отправке (см. его исходники) — здесь проверяем только то, что мы
+    # его выставили, а не поведение stdlib.
+    assert sent["Bcc"] == "secret@example.com"
+
+
+def test_send_message_without_cc_bcc_omits_headers() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(sender="ivan@example.com", to=["a@example.com"], subject="S", body="B")
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    assert sent["Cc"] is None
+    assert sent["Bcc"] is None
+
+
 def test_send_message_with_attachment() -> None:
     fake_client = MagicMock()
     fake_client.__enter__.return_value = fake_client

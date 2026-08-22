@@ -570,11 +570,12 @@ class ComposeDialog(QDialog):
         subject: str = "",
         body: str = "",
         contacts: list[contact_store.Contact] | None = None,
+        attachments: list[OutgoingAttachment] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(560, 460)
-        self.attachments: list[OutgoingAttachment] = []
+        self.attachments: list[OutgoingAttachment] = list(attachments) if attachments else []
 
         self._contacts = contacts or []
 
@@ -587,16 +588,36 @@ class ComposeDialog(QDialog):
 
         address_book_button = QPushButton("Адресная книга…", self)
         address_book_button.clicked.connect(lambda: _open_contact_picker(self, self.to_edit, self._contacts))
+        cc_bcc_button = QPushButton("Копия/Скрытая копия", self)
+        cc_bcc_button.setFlat(True)
+        cc_bcc_button.clicked.connect(self._show_cc_bcc)
         to_row = QHBoxLayout()
         to_row.addWidget(self.to_edit)
         to_row.addWidget(address_book_button)
+        to_row.addWidget(cc_bcc_button)
+
+        self.cc_edit = QLineEdit(self)
+        self.cc_edit.setPlaceholderText("Через запятую, если получателей несколько")
+        if contacts:
+            _install_recipient_completer(self.cc_edit, contacts)
+        self.bcc_edit = QLineEdit(self)
+        self.bcc_edit.setPlaceholderText("Через запятую, если получателей несколько")
+        if contacts:
+            _install_recipient_completer(self.bcc_edit, contacts)
 
         form = QFormLayout()
         form.addRow("Кому", to_row)
+        self._cc_row_label = "Копия"
+        form.addRow("Копия", self.cc_edit)
+        form.addRow("Скрытая копия", self.bcc_edit)
         form.addRow("Тема", self.subject_edit)
+        self._form = form
+        self._show_cc_bcc_fields(False)
 
         self.attachments_list = QListWidget()
         self.attachments_list.setMaximumHeight(70)
+        for attachment in self.attachments:
+            self.attachments_list.addItem(f"{attachment.filename} ({_format_size(len(attachment.payload))})")
 
         attach_button = QPushButton("Прикрепить файл…")
         attach_button.clicked.connect(self._on_attach)
@@ -622,6 +643,19 @@ class ComposeDialog(QDialog):
         layout.addWidget(self.attachments_list)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
+
+    def _show_cc_bcc(self) -> None:
+        self._show_cc_bcc_fields(True)
+
+    def _show_cc_bcc_fields(self, visible: bool) -> None:
+        self._form.setRowVisible(self.cc_edit, visible)
+        self._form.setRowVisible(self.bcc_edit, visible)
+
+    def cc_recipients(self) -> list[str]:
+        return _parse_recipient_list(self.cc_edit.text())
+
+    def bcc_recipients(self) -> list[str]:
+        return _parse_recipient_list(self.bcc_edit.text())
 
     def _on_attach(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
@@ -1543,6 +1577,10 @@ class MainWindow(QMainWindow):
         reply_action = QAction("Ответить", self)
         reply_action.triggered.connect(self.on_reply)
         toolbar.addAction(reply_action)
+
+        forward_action = QAction("Переслать", self)
+        forward_action.triggered.connect(self.on_forward)
+        toolbar.addAction(forward_action)
 
         delete_action = QAction("Удалить", self)
         delete_action.setToolTip("В корзину. Shift+Удалить — безвозвратно.")
@@ -3210,6 +3248,49 @@ class MainWindow(QMainWindow):
         )
         self._exec_compose(dialog, in_reply_to=summary.message_id or None)
 
+    def on_forward(self) -> None:
+        if not self.smtp_account:
+            QMessageBox.warning(
+                self,
+                "Нет исходящей почты",
+                "Сначала подключитесь и укажите сервер SMTP в настройках учётной записи.",
+            )
+            return
+        if not self.selected_summary or not self.active_source or not self.current_folder:
+            QMessageBox.warning(self, "Нет письма", "Выберите письмо, которое хотите переслать.")
+            return
+
+        summary = self.selected_summary
+        try:
+            content = self.active_source.message_content(self.current_folder, summary.uid)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
+            return
+
+        subject = summary.subject if summary.subject.lower().startswith("fwd:") else f"Fwd: {summary.subject}"
+        forward_header = (
+            f"---------- Пересланное сообщение ----------\n"
+            f"От: {summary.sender} <{summary.sender_email}>\n"
+            f"Дата: {summary.date}\n"
+            f"Тема: {summary.subject}\n"
+        )
+        body = f"\n\n{forward_header}\n{content.text}"
+
+        dialog = ComposeDialog(
+            self,
+            title="Переслать",
+            subject=subject,
+            body=body,
+            contacts=self._load_contacts(),
+            attachments=[
+                OutgoingAttachment(
+                    filename=a.filename, content_type=a.content_type, payload=a.payload
+                )
+                for a in content.attachments
+            ],
+        )
+        self._exec_compose(dialog)
+
     def _exec_compose(self, dialog: ComposeDialog, *, in_reply_to: str | None = None) -> None:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3222,6 +3303,8 @@ class MainWindow(QMainWindow):
         message = OutgoingMessage(
             sender=self.account.username,
             to=recipients,
+            cc=dialog.cc_recipients(),
+            bcc=dialog.bcc_recipients(),
             subject=dialog.subject(),
             body=dialog.body(),
             in_reply_to=in_reply_to,

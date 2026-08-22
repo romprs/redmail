@@ -32,6 +32,8 @@ class OutgoingMessage:
     to: list[str]
     subject: str
     body: str
+    cc: list[str] = field(default_factory=list)
+    bcc: list[str] = field(default_factory=list)
     in_reply_to: str | None = None
     references: list[str] = field(default_factory=list)
     attachments: list[OutgoingAttachment] = field(default_factory=list)
@@ -41,6 +43,14 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
     email_message = EmailMessage()
     email_message["From"] = message.sender
     email_message["To"] = ", ".join(message.to)
+    if message.cc:
+        email_message["Cc"] = ", ".join(message.cc)
+    if message.bcc:
+        # smtplib.send_message() сам добавляет адреса из Bcc в список
+        # получателей SMTP-конверта и одновременно вырезает сам заголовок
+        # Bcc из фактически передаваемого письма (см. исходники smtplib) —
+        # получателям Bcc не виден друг друга и остальным получателям.
+        email_message["Bcc"] = ", ".join(message.bcc)
     email_message["Subject"] = message.subject
     if message.in_reply_to:
         email_message["In-Reply-To"] = message.in_reply_to
