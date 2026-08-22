@@ -24,6 +24,13 @@ MARKER_COLORS: dict[str, bytes] = {
 }
 _COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
 
+# Сентинел по умолчанию для set_marker(previous_color=...) — отличает "вызывающий
+# код не знает текущий маркер" (безопасный медленный путь: снять все
+# возможные keyword'ы) от "previous_color=None" (точно знает, что маркера не
+# было — снимать нечего). Спутать их означало бы на реальном сервере либо
+# лишние round trip'ы, либо оставленный висеть старый keyword.
+UNKNOWN_MARKER = object()
+
 
 @dataclass
 class Account:
@@ -189,7 +196,7 @@ class ImapSession:
         else:
             self._client.remove_flags([uid], [b"\\Seen"])
 
-    def set_marker(self, folder: str, uid: int, color: str | None) -> None:
+    def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         """Ставит/снимает \\Flagged + наш цветной keyword-флаг.
 
         Gmail принимает произвольные keyword-флаги без вопросов, но
@@ -201,15 +208,32 @@ class ImapSession:
         разом — один отклонённый не должен мешать остальным; (2) если
         сервер в принципе не принимает цветной keyword, тихо откатываемся
         на стандартный \\Flagged, чтобы разметка не ломалась полностью
-        из-за того, что сервер не умеет в цвета."""
+        из-за того, что сервер не умеет в цвета.
+
+        `previous_color` — если вызывающий код уже знает текущий маркер
+        (обычно да — он же его и показывает в таблице), снимаем ТОЛЬКО
+        этот один keyword вместо того, чтобы вслепую пытаться снять все
+        6 возможных цветов на каждую смену маркера. На реальном сервере с
+        заметной сетевой задержкой это была разница между 1-2 round trip'ами
+        и 6 (жалоба: "маркер на письмах устанавливается очень долго").
+        Если previous_color не передан — поведение как раньше (безопасный,
+        но медленный вариант "снять всё возможное")."""
+        if previous_color is not UNKNOWN_MARKER and previous_color == color:
+            return  # уже в нужном состоянии — нечего менять, даже SELECT не нужен
         self._select(folder)
         all_keywords = list(MARKER_COLORS.values())
+        if previous_color is UNKNOWN_MARKER:
+            to_remove = list(all_keywords)
+        elif previous_color is None:
+            to_remove = []  # маркера не было — снимать нечего, кроме самого нового keyword'а ниже не нужно
+        else:
+            to_remove = [MARKER_COLORS[previous_color]]
+
         if color is None:
-            self._remove_flags_best_effort(uid, [b"\\Flagged", *all_keywords])
+            self._remove_flags_best_effort(uid, [b"\\Flagged", *to_remove])
             return
         keyword = MARKER_COLORS[color]
-        others = [k for k in all_keywords if k != keyword]
-        self._remove_flags_best_effort(uid, others)
+        self._remove_flags_best_effort(uid, [k for k in to_remove if k != keyword])
         try:
             self._client.add_flags([uid], [b"\\Flagged", keyword])
         except IMAPClientError:

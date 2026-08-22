@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 from email.message import EmailMessage
 
 from redmail import archive_store
-from redmail.imap_client import Account, MessageContent, MessageSummary
+from redmail.imap_client import UNKNOWN_MARKER, Account, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
 
 
@@ -112,7 +112,7 @@ def test_set_marker_updates_session_and_cache(tmp_path: Path) -> None:
         mailbox.set_marker("INBOX", 1, "green")
         cached = mailbox.folder_summaries("INBOX")
 
-    session.set_marker.assert_called_once_with("INBOX", 1, "green")
+    session.set_marker.assert_called_once_with("INBOX", 1, "green", previous_color=UNKNOWN_MARKER)
     assert cached[0].marker_color == "green"
 
 

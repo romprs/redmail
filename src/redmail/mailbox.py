@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from redmail import archive_store, cache_store
-from redmail.imap_client import Account, ImapSession, MessageContent, MessageSummary
+from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageSummary
 
 
 class CachedMailbox:
@@ -62,8 +62,8 @@ class CachedMailbox:
         сервере, а не то, что сейчас в локальном кэше сводок."""
         return self.session.search_uids(folder, before=before)
 
-    def set_marker(self, folder: str, uid: int, color: str | None) -> None:
-        self.session.set_marker(folder, uid, color)
+    def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
+        self.session.set_marker(folder, uid, color, previous_color=previous_color)
         cache_store.set_marker(self._account_key, folder, uid, color)
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:
@@ -100,7 +100,7 @@ class ArchiveSource:
     def message_content(self, folder: str, uid: int) -> MessageContent:
         return archive_store.get_message_content(self.path, uid)
 
-    def set_marker(self, folder: str, uid: int, color: str | None) -> None:
+    def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         archive_store.set_marker(self.path, uid, color)
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:

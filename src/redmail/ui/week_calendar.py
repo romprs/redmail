@@ -89,7 +89,16 @@ class _EventBlock(QFrame):
         layout.setContentsMargins(7, 2, 7, 2)
         layout.setSpacing(0)
         start_local = calendar_event.dtstart.astimezone()
-        time_text = "" if calendar_event.all_day else start_local.strftime("%H:%M")
+        end_local = calendar_event.dtend.astimezone()
+        if calendar_event.all_day:
+            time_text = ""
+        elif pill:
+            time_text = start_local.strftime("%H:%M")  # компактная таблетка — только начало, как в референсе
+        else:
+            # Полная карточка в недельной сетке — начало-конец, как в
+            # референсе ("08:30-10:45 Собрание"); раньше показывалось
+            # только начало, продолжительность была не видна.
+            time_text = f"{start_local.strftime('%H:%M')}-{end_local.strftime('%H:%M')}"
         text = f"{time_text} {calendar_event.summary or '(без темы)'}".strip()
         label = QLabel(text, self)
         text_color = "white" if pill else "#202124"

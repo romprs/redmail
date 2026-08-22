@@ -324,6 +324,45 @@ def test_set_marker_tolerates_server_rejecting_one_keyword() -> None:
     fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
 
 
+def test_set_marker_with_known_previous_color_only_removes_that_one() -> None:
+    # Раньше каждая смена маркера вслепую пыталась снять все 6 возможных
+    # цветов — на сервере с заметной сетевой задержкой это была жалоба
+    # "маркер устанавливается очень долго". Когда previous_color известен
+    # (обычно да — он же и отображается в таблице), снимать нужно только
+    # его, не все остальные.
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, "red", previous_color="blue")
+
+    fake_client.remove_flags.assert_called_once_with([7], [b"$RedMailBlue"])
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
+
+
+def test_set_marker_with_no_previous_color_skips_removal_entirely() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, "red", previous_color=None)
+
+    fake_client.remove_flags.assert_not_called()
+    fake_client.add_flags.assert_called_once_with([7], [b"\\Flagged", b"$RedMailRed"])
+
+
+def test_set_marker_same_color_is_a_noop() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.set_marker("INBOX", 7, "red", previous_color="red")
+
+    fake_client.remove_flags.assert_not_called()
+    fake_client.add_flags.assert_not_called()
+    fake_client.select_folder.assert_not_called()
+
+
 def test_set_marker_falls_back_to_plain_flagged_when_server_rejects_keyword() -> None:
     # Если сервер вообще не поддерживает произвольные keyword-флаги (не
     # только remove, но и add) — хотя бы стандартный \Flagged должен

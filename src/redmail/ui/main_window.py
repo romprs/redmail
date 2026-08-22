@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QDate, QDateTime, QPointF, QRectF, QSize, Qt, QStringListModel, QTimer, QUrl
+from PySide6.QtCore import QByteArray, QDate, QDateTime, QPointF, QRectF, QSize, Qt, QStringListModel, QTime, QTimer, QUrl
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -861,11 +861,22 @@ class EventDialog(QDialog):
         # Компактные строки "значок слева + поле" вместо подписанных полей
         # QFormLayout — так выглядит попап создания события в референсе
         # (VK Mail): "Придумайте название" присланный пользователем.
+        start_time_button = QPushButton("▾", self)
+        start_time_button.setFixedWidth(22)
+        start_time_button.setToolTip("Выбрать время из списка")
+        start_time_button.clicked.connect(lambda: self._open_time_menu(self.start_edit, start_time_button))
+        end_time_button = QPushButton("▾", self)
+        end_time_button.setFixedWidth(22)
+        end_time_button.setToolTip("Выбрать время из списка")
+        end_time_button.clicked.connect(lambda: self._open_time_menu(self.end_edit, end_time_button))
+
         time_row = QHBoxLayout()
         time_row.addWidget(_icon_label("time", self))
         time_row.addWidget(self.start_edit)
+        time_row.addWidget(start_time_button)
         time_row.addWidget(QLabel("—", self))
         time_row.addWidget(self.end_edit)
+        time_row.addWidget(end_time_button)
         time_row.addWidget(self.all_day_check)
         time_row.addStretch(1)
 
@@ -913,6 +924,26 @@ class EventDialog(QDialog):
         layout.addLayout(attachments_list_row)
         layout.addLayout(color_row)
         layout.addWidget(buttons)
+
+    def _open_time_menu(self, target_edit: QDateTimeEdit, anchor_button: QPushButton) -> None:
+        # Быстрый выбор времени списком (шаг 30 минут) — Qt не даёт
+        # QDateTimeEdit всплывающий выбор времени "из коробки" (только
+        # календарь для даты), а вручную набирать время неудобно (жалоба:
+        # "время в событии всё ещё набирается вручную — нет выбора").
+        # Сам QDateTimeEdit по-прежнему можно набрать/прокрутить вручную —
+        # это меню лишь более быстрый путь, не замена.
+        menu = QMenu(self)
+        for hour in range(24):
+            for minute in (0, 30):
+                label = f"{hour:02d}:{minute:02d}"
+                action = menu.addAction(label)
+                action.setData((hour, minute))
+        chosen = menu.exec(anchor_button.mapToGlobal(anchor_button.rect().bottomLeft()))
+        if chosen is None:
+            return
+        hour, minute = chosen.data()
+        current = target_edit.dateTime()
+        target_edit.setDateTime(QDateTime(current.date(), QTime(hour, minute)))
 
     def _apply_color_button_style(self) -> None:
         if self._color:
@@ -2289,7 +2320,9 @@ class MainWindow(QMainWindow):
         new_color = None if chosen is none_action else action_colors[chosen]
 
         try:
-            self.active_source.set_marker(self.current_folder, summary.uid, new_color)
+            self.active_source.set_marker(
+                self.current_folder, summary.uid, new_color, previous_color=summary.marker_color
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось изменить маркер", str(exc))
             return
