@@ -121,6 +121,9 @@ class ImapSession:
             if b"\\Noselect" not in flags
         ]
 
+    def create_folder(self, name: str) -> None:
+        self._client.create_folder(name)
+
     def trash_folder(self) -> str | None:
         for flags, _delimiter, name in self._raw_folders:
             if b"\\Trash" in flags:

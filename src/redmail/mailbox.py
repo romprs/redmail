@@ -71,7 +71,12 @@ class CachedMailbox:
         cache_store.set_read(self._account_key, folder, uid, read)
 
     def move_to_trash(self, folder: str, uids: list[int], trash_folder: str) -> None:
-        self.session.move_messages(folder, uids, trash_folder)
+        self.move_to_folder(folder, uids, trash_folder)
+
+    def move_to_folder(self, folder: str, uids: list[int], target_folder: str) -> None:
+        """Общий переезд писем в любую папку (не только корзину) — так же
+        используется при ручном применении правил сортировки почты."""
+        self.session.move_messages(folder, uids, target_folder)
         cache_store.delete_messages(self._account_key, folder, uids)
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:

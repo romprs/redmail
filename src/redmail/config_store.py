@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import keyring
@@ -78,6 +79,37 @@ def load_caldav_url() -> str:
 def save_caldav_url(url: str) -> None:
     data = _load_settings_dict()
     data["caldav_url"] = url
+    _save_settings_dict(data)
+
+
+@dataclass
+class MailRule:
+    field: str  # "from" | "subject"
+    contains: str
+    target_folder: str
+
+
+def load_mail_rules() -> list[MailRule]:
+    """Правила сортировки почты по подпапкам — применяются только вручную
+    (кнопка "Применить правила"), не автоматически при поступлении письма:
+    сервер (VK Mail/Exchange) ещё ни разу не тестировался вживую с этой
+    функцией, тихая автоматическая раскладка почты без возможности сверить
+    результат — больший риск, чем явное действие пользователя."""
+    raw = _load_settings_dict().get("mail_rules", [])
+    if not isinstance(raw, list):
+        return []
+    rules = []
+    for item in raw:
+        try:
+            rules.append(MailRule(field=item["field"], contains=item["contains"], target_folder=item["target_folder"]))
+        except (TypeError, KeyError):
+            continue  # повреждённая запись — пропускаем, не валим всю загрузку
+    return rules
+
+
+def save_mail_rules(rules: list[MailRule]) -> None:
+    data = _load_settings_dict()
+    data["mail_rules"] = [asdict(rule) for rule in rules]
     _save_settings_dict(data)
 
 

@@ -4,10 +4,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from redmail.config_store import (
+    MailRule,
     load_account,
     load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
+    load_mail_rules,
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
@@ -16,6 +18,7 @@ from redmail.config_store import (
     save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
+    save_mail_rules,
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
@@ -201,6 +204,34 @@ def test_caldav_url_round_trip(tmp_path: Path) -> None:
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         save_caldav_url("https://calendar.example.corp/caldav/")
         assert load_caldav_url() == "https://calendar.example.corp/caldav/"
+
+
+def test_mail_rules_default_to_empty(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_mail_rules() == []
+
+
+def test_mail_rules_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    rules = [
+        MailRule(field="from", contains="ozon.ru", target_folder="Реклама"),
+        MailRule(field="subject", contains="счёт", target_folder="Бухгалтерия"),
+    ]
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_mail_rules(rules)
+        assert load_mail_rules() == rules
+
+
+def test_mail_rules_skips_corrupt_entries(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        '{"mail_rules": [{"field": "from", "contains": "x"}, {"field": "subject", "contains": "y", "target_folder": "Z"}]}',
+        encoding="utf-8",
+    )
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        rules = load_mail_rules()
+    assert rules == [MailRule(field="subject", contains="y", target_folder="Z")]
 
 
 def test_open_archives_defaults_to_empty(tmp_path: Path) -> None:

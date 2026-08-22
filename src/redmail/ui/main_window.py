@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -71,10 +72,12 @@ from PySide6.QtWidgets import (
 
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, itip
 from redmail.config_store import (
+    MailRule,
     load_account,
     load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
+    load_mail_rules,
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
@@ -83,6 +86,7 @@ from redmail.config_store import (
     save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
+    save_mail_rules,
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
@@ -687,6 +691,123 @@ class ComposeDialog(QDialog):
         return self.body_edit.toPlainText()
 
 
+class MailRuleEditDialog(QDialog):
+    _FIELDS = (("from", "От кого"), ("subject", "Тема"))
+
+    def __init__(self, parent, folder_names: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Новое правило")
+
+        self.field_combo = QComboBox(self)
+        for value, label in self._FIELDS:
+            self.field_combo.addItem(label, value)
+        self.contains_edit = QLineEdit(self)
+        self.contains_edit.setPlaceholderText("Часть адреса или темы, регистр не важен")
+        self.folder_combo = QComboBox(self)
+        self.folder_combo.addItems(folder_names)
+        self.folder_combo.setEditable(True)  # папка может ещё не существовать на момент создания правила
+
+        form = QFormLayout()
+        form.addRow("Если", self.field_combo)
+        form.addRow("Содержит", self.contains_edit)
+        form.addRow("Переместить в", self.folder_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def to_rule(self) -> MailRule:
+        return MailRule(
+            field=self.field_combo.currentData(),
+            contains=self.contains_edit.text().strip(),
+            target_folder=self.folder_combo.currentText().strip(),
+        )
+
+
+class MailRulesDialog(QDialog):
+    """Правила сортировки почты по подпапкам — жалоба из реального
+    пилота ("нет сортировки писем по подпапкам (разбор по правилам) и
+    создание этих папок"), явно отложенная пользователем на отдельный
+    раунд после мелких фиксов. Применяются только вручную (кнопка
+    "Применить правила" на панели) — сервер ни разу не проверялся вживую
+    с этой функцией, автоматическая тихая раскладка почты при получении
+    была бы больше риском, чем пользой на первом этапе."""
+
+    _FIELD_LABELS = dict(MailRuleEditDialog._FIELDS)
+
+    def __init__(self, parent, rules: list[MailRule], folder_names: list[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Правила сортировки почты")
+        self.resize(520, 360)
+        self._rules = list(rules)
+        self._folder_names = folder_names
+
+        info_label = QLabel(
+            "Правила применяются только вручную — кнопкой «Применить правила» к письмам "
+            "текущей папки, не автоматически при получении.",
+            self,
+        )
+        info_label.setWordWrap(True)
+
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["Поле", "Содержит", "Папка"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._refresh_table()
+
+        add_button = QPushButton("Добавить…", self)
+        add_button.clicked.connect(self._on_add)
+        remove_button = QPushButton("Удалить", self)
+        remove_button.clicked.connect(self._on_remove)
+        button_row = QHBoxLayout()
+        button_row.addWidget(add_button)
+        button_row.addWidget(remove_button)
+        button_row.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.rejected.connect(self.accept)
+        buttons.accepted.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(info_label)
+        layout.addLayout(button_row)
+        layout.addWidget(self.table)
+        layout.addWidget(buttons)
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self._rules))
+        for row, rule in enumerate(self._rules):
+            self.table.setItem(row, 0, QTableWidgetItem(self._FIELD_LABELS.get(rule.field, rule.field)))
+            self.table.setItem(row, 1, QTableWidgetItem(rule.contains))
+            self.table.setItem(row, 2, QTableWidgetItem(rule.target_folder))
+
+    def _on_add(self) -> None:
+        dialog = MailRuleEditDialog(self, self._folder_names)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        rule = dialog.to_rule()
+        if not rule.contains or not rule.target_folder:
+            return
+        self._rules.append(rule)
+        self._refresh_table()
+
+    def _on_remove(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        del self._rules[row]
+        self._refresh_table()
+
+    def rules(self) -> list[MailRule]:
+        return self._rules
+
+
 class ArchiveFolderScopeDialog(QDialog):
     """Что выгружать при архивировании ЦЕЛОЙ папки: всё целиком или только
     всё старше выбранной даты (жалоба: "в архив можно убрать письма, но не
@@ -1272,6 +1393,7 @@ class MainWindow(QMainWindow):
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
         self.caldav_url = load_caldav_url()
+        self.mail_rules: list[MailRule] = load_mail_rules()
         self.filter_column = COL_SUBJECT
         self.marker_filter: str | None = None
         self._temp_attachment_dirs: list[Path] = []
@@ -1288,6 +1410,9 @@ class MainWindow(QMainWindow):
         self.folder_tree = QTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.currentItemChanged.connect(self.on_folder_item_changed)
+        self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.folder_tree.customContextMenuRequested.connect(self.on_folder_tree_context_menu)
+        self._folder_delimiter = "/"
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
@@ -1608,6 +1733,16 @@ class MainWindow(QMainWindow):
         archive_folder_action.triggered.connect(self.on_archive_folder)
         toolbar.addAction(archive_folder_action)
 
+        mail_rules_action = QAction("Правила…", self)
+        mail_rules_action.setToolTip("Правила сортировки писем по папкам (применяются вручную)")
+        mail_rules_action.triggered.connect(self.on_mail_rules)
+        toolbar.addAction(mail_rules_action)
+
+        apply_rules_action = QAction("Применить правила", self)
+        apply_rules_action.setToolTip("Разложить письма текущей папки по правилам")
+        apply_rules_action.triggered.connect(self.on_apply_mail_rules)
+        toolbar.addAction(apply_rules_action)
+
         toolbar.addSeparator()
 
         settings_action = QAction("Параметры…", self)
@@ -1740,6 +1875,7 @@ class MainWindow(QMainWindow):
 
         for info in folders:
             delimiter = info.delimiter or "/"
+            self._folder_delimiter = delimiter
             parts = [p for p in info.name.split(delimiter) if p not in _HIDDEN_PATH_SEGMENTS] or [info.name]
             path: tuple[str, ...] = ()
             parent = root
@@ -1968,6 +2104,59 @@ class MainWindow(QMainWindow):
         verb = "Перемещено" if move else "Скопировано"
         self.statusBar().showMessage(f"{verb} в архив: {exported}", 5000)
 
+    def on_mail_rules(self) -> None:
+        folder_names = []
+        if self.mailbox:
+            try:
+                folder_names = [info.name for info in self.mailbox.session.list_folders()]
+            except Exception:
+                folder_names = []
+        dialog = MailRulesDialog(self, self.mail_rules, folder_names)
+        dialog.exec()
+        self.mail_rules = dialog.rules()
+        try:
+            save_mail_rules(self.mail_rules)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось сохранить правила", str(exc))
+
+    def on_apply_mail_rules(self) -> None:
+        if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
+            QMessageBox.information(self, "Недоступно", "Применение правил работает только в папках живого ящика.")
+            return
+        if not self.mail_rules:
+            QMessageBox.information(self, "Нет правил", "Сначала добавьте хотя бы одно правило (кнопка «Правила…»).")
+            return
+
+        source_folder = self.current_folder
+        moves: dict[str, list[int]] = {}
+        for summary in self.current_summaries:
+            for rule in self.mail_rules:
+                haystack = summary.sender_email if rule.field == "from" else summary.subject
+                if rule.contains.lower() in (haystack or "").lower():
+                    moves.setdefault(rule.target_folder, []).append(summary.uid)
+                    break  # первое подходящее правило — не проверяем остальные для этого письма
+        if not moves:
+            self.statusBar().showMessage("Правила не подошли ни к одному письму в этой папке", 5000)
+            return
+
+        moved_total = 0
+        try:
+            for target_folder, uids in moves.items():
+                self.mailbox.move_to_folder(source_folder, uids, target_folder)
+                moved_total += len(uids)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Ошибка применения правил", f"{exc}\n\nПеремещено до сбоя: {moved_total}."
+            )
+
+        try:
+            summaries = self.mailbox.refresh_folder(source_folder)
+        except Exception:
+            summaries = None
+        if summaries is not None:
+            self._render_folder(summaries)
+        self.statusBar().showMessage(f"По правилам перемещено писем: {moved_total}", 5000)
+
     def on_archive_folder(self) -> None:
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             QMessageBox.information(
@@ -2186,6 +2375,40 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
         self._render_folder(summaries)
+
+    def on_folder_tree_context_menu(self, pos) -> None:
+        item = self.folder_tree.itemAt(pos)
+        if item is None or not self.account or not self.mailbox:
+            return
+        # Только для живого ящика — у архивов своя (плоская) структура папок
+        # без создания через сервер, и IMAP-иерархия им не подходит.
+        is_root = item is self.account_root
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        is_live_folder = bool(data) and data[0] == _LIVE_SOURCE_KEY
+        if not is_root and not is_live_folder:
+            return
+
+        menu = QMenu(self)
+        create_action = menu.addAction("Создать папку…" if is_root else "Создать вложенную папку…")
+        chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
+        if chosen is not create_action:
+            return
+
+        parent_path = "" if is_root else data[1]
+        name, ok = QInputDialog.getText(self, "Новая папка", "Название папки:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        full_name = f"{parent_path}{self._folder_delimiter}{name}" if parent_path else name
+        try:
+            self.mailbox.session.create_folder(full_name)
+            folders = self.mailbox.session.list_folders()
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось создать папку", str(exc))
+            return
+        self.trash_folder_name = self.mailbox.session.trash_folder()
+        self._populate_folder_tree(folders)
+        self.statusBar().showMessage(f"Папка создана: {full_name}", 5000)
 
     def on_refresh(self) -> None:
         if not self.active_source or not self.current_folder:
