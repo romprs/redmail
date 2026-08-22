@@ -106,10 +106,21 @@ class _EventBlock(QFrame):
             self._drag_start_geom = self.geometry()
         self._dragging = False
         super().mousePressEvent(event)
+        # ВАЖНО: принять событие ПОСЛЕ super() и уже здесь, в конце — иначе
+        # Qt считает клик "необработанным" (QFrame по умолчанию его
+        # игнорирует) и пробрасывает его дальше родительскому виджету
+        # сетки; там есть свой обработчик клика по ПУСТОМУ месту (создание
+        # события) — из-за этого клик по уже существующему событию
+        # одновременно открывал диалог создания нового и ломал
+        # перетаскивание (drag так и не успевал начаться). Найдено по
+        # жалобе "нельзя переместить событие мышью — сразу открывается
+        # окно события".
+        event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._drag_start_mouse is None:
             super().mouseMoveEvent(event)
+            event.accept()
             return
         delta = event.globalPosition().toPoint() - self._drag_start_mouse
         if not self._dragging and delta.manhattanLength() > _DRAG_THRESHOLD_PX:
@@ -118,6 +129,7 @@ class _EventBlock(QFrame):
         if self._dragging:
             self.move(self._drag_start_geom.topLeft() + delta)
         super().mouseMoveEvent(event)
+        event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802 - Qt override
         if self._dragging:
@@ -129,6 +141,7 @@ class _EventBlock(QFrame):
             self.clicked.emit(self.calendar_event)
         self._drag_start_mouse = None
         super().mouseReleaseEvent(event)
+        event.accept()
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
         self.contextMenuRequested.emit(self.calendar_event, event.globalPos())
@@ -140,6 +153,7 @@ class _EventBlock(QFrame):
         self._suppress_click = True
         self.doubleClicked.emit(self.calendar_event)
         super().mouseDoubleClickEvent(event)
+        event.accept()
 
     def set_selected(self, selected: bool) -> None:
         # Раньше "Отменить встречу" действовал на self.selected_calendar_event

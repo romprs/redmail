@@ -11,6 +11,20 @@ Source1:        redmail.desktop
 BuildArch:      x86_64
 BuildRequires:  python3 >= 3.9
 BuildRequires:  python3-pip
+BuildRequires:  python3-devel
+# libpff-python (импорт .pst) собирается из исходников при pip install —
+# готовых wheel под RED OS нет. Без этих пакетов сборка .pst-импорта тихо
+# отсутствует в собранном RPM (было так до Release 9 — обнаружено, когда
+# импорт .pst не заработал через установленный пакет, хотя работал из
+# исходников на этой же машине, где эти пакеты уже стояли вручную).
+BuildRequires:  gcc
+BuildRequires:  make
+BuildRequires:  automake
+BuildRequires:  libtool
+BuildRequires:  autoconf
+BuildRequires:  zlib-devel
+BuildRequires:  bzip2-devel
+BuildRequires:  openssl-devel
 
 Requires:       python3 >= 3.9
 
