@@ -73,7 +73,7 @@ from PySide6.QtWidgets import (
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, itip
 from redmail.config_store import (
     MailRule,
-    load_account,
+    load_accounts,
     load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
@@ -82,7 +82,7 @@ from redmail.config_store import (
     load_pane_orientation,
     load_poll_interval_minutes,
     load_window_geometry,
-    save_account,
+    save_accounts,
     save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
@@ -129,10 +129,6 @@ _HIDDEN_PATH_SEGMENTS = {"[Gmail]", "[Google Mail]"}
 # Протокольное имя папки остаётся "INBOX" (это то, что уходит в IMAP-команды);
 # по-русски она подписывается иначе только в дереве папок.
 _DISPLAY_NAMES: dict[str, str] = {"INBOX": "Входящие"}
-
-# Ключ "источника" для узлов дерева папок живого ящика (см. UserRole ниже) —
-# отличает их от узлов открытых архивов, чей ключ — строковый путь к файлу.
-_LIVE_SOURCE_KEY = "__live__"
 
 _PARTICIPATION_LABELS: dict[str, str] = {
     "accepted": "Принял(а) участие",
@@ -1376,6 +1372,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Почтовый клиент RED OS — прототип")
         self.resize(1200, 760)  # выше умолчание помогает и календарной сетке, и списку писем; реальный размер запоминается между запусками
 
+        # Несколько одновременно подключённых учётных записей (жалоба:
+        # "несколько учётных записей одновременно"). self.account/
+        # self.mailbox/self.smtp_account/self.account_root/
+        # self.trash_folder_name остаются "текущей" учётной записью —
+        # той, чья папка сейчас выбрана в дереве — ради обратной
+        # совместимости со всем кодом почты/календаря/CalDAV, который их
+        # читает напрямую; self.mailboxes и парные словари ниже — источник
+        # истины на несколько записей сразу.
+        self.mailboxes: dict[str, CachedMailbox] = {}
+        self.mailbox_accounts: dict[str, Account] = {}
+        self.mailbox_smtp_accounts: dict[str, SmtpAccount | None] = {}
+        self.mailbox_trash_folders: dict[str, str | None] = {}
+        self.mailbox_tree_roots: dict[str, QTreeWidgetItem] = {}
+
         self.account: Account | None = None
         self.mailbox: CachedMailbox | None = None
         self.account_root: QTreeWidgetItem | None = None
@@ -1746,8 +1756,14 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         settings_action = QAction("Параметры…", self)
+        settings_action.setToolTip("Правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана)")
         settings_action.triggered.connect(self.on_settings)
         toolbar.addAction(settings_action)
+
+        add_account_action = QAction("Добавить учётную запись…", self)
+        add_account_action.setToolTip("Подключить ещё одну учётную запись, не закрывая уже открытые")
+        add_account_action.triggered.connect(self.on_add_account)
+        toolbar.addAction(add_account_action)
 
         self.setStatusBar(QStatusBar(self))
 
@@ -1809,65 +1825,85 @@ class MainWindow(QMainWindow):
 
     def _restore_saved_account(self) -> None:
         try:
-            saved = load_account()
+            saved_accounts = load_accounts()
         except Exception as exc:
-            # Отличаем от штатного "пароля в хранилище нет" (load_account
-            # сам возвращает None в этом случае, без исключения) — сюда
-            # попадает поломка самого хранилища секретов (например, при
-            # запуске без сессионной шины D-Bus keyring выдаёт
-            # NoKeyringError). Раньше это тихо проглатывалось, и
-            # пользователю казалось, что все настройки исчезли без причины.
+            # Отличаем от штатного "пароля в хранилище нет" (load_accounts
+            # сам пропускает такие записи без исключения) — сюда попадает
+            # поломка самого хранилища секретов (например, при запуске без
+            # сессионной шины D-Bus keyring выдаёт NoKeyringError). Раньше
+            # это тихо проглатывалось, и пользователю казалось, что все
+            # настройки исчезли без причины.
             QMessageBox.warning(
                 self,
                 "Не удалось получить сохранённые данные входа",
                 f"Хранилище паролей недоступно: {exc}\n\nПодключитесь заново вручную.",
             )
             return
-        if not saved:
-            return
-        account, smtp_account = saved
-        try:
-            session = ImapSession(account)
-            folders = session.list_folders()
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "Не удалось войти с сохранёнными данными",
-                f"{account.username}: {exc}\n\nПодключитесь заново вручную.",
-            )
-            return
-        self._apply_connection(account, smtp_account, session, folders)
-        self.statusBar().showMessage(f"Восстановлено подключение: {account.username}", 5000)
+        restored = []
+        for account, smtp_account in saved_accounts:
+            try:
+                session = ImapSession(account)
+                folders = session.list_folders()
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Не удалось войти с сохранёнными данными",
+                    f"{account.username}: {exc}\n\nПодключитесь заново вручную.",
+                )
+                continue
+            self._add_or_replace_account(account, smtp_account, session, folders)
+            restored.append(account.username)
+        if restored:
+            self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
 
-    def _apply_connection(
+    def _add_or_replace_account(
         self,
         account: Account,
         smtp_account: SmtpAccount | None,
         session: ImapSession,
         folders: list[FolderInfo],
     ) -> None:
-        if self.mailbox:
-            self.mailbox.close()
+        """Подключает учётную запись, НЕ закрывая уже открытые (в отличие
+        от старого однозаписевого _apply_connection) — та же логика "новый
+        top-level узел в дереве", что уже применяется к архивам. Если
+        запись с этим username уже была открыта (например, правка своих же
+        настроек через "Параметры…"), она заменяется, а не дублируется."""
+        key = account.username
+        old_mailbox = self.mailboxes.get(key)
+        if old_mailbox is not None:
+            old_mailbox.close()
 
+        self.mailboxes[key] = CachedMailbox(session, account)
+        self.mailbox_accounts[key] = account
+        self.mailbox_smtp_accounts[key] = smtp_account
+        self.mailbox_trash_folders[key] = session.trash_folder()
+
+        default_item = self._populate_account_folder_tree(key, folders)
+
+        # Сделать только что добавленную/переподключённую запись "текущей"
+        # для всего кода, который читает self.account/self.mailbox
+        # напрямую (композер, ответ/пересылка, календарь, CalDAV,
+        # "Параметры…").
         self.account = account
-        self.mailbox = CachedMailbox(session, account)
+        self.mailbox = self.mailboxes[key]
         self.smtp_account = smtp_account
-        self.trash_folder_name = session.trash_folder()
+        self.account_root = self.mailbox_tree_roots[key]
+        self.trash_folder_name = self.mailbox_trash_folders[key]
 
-        self._populate_folder_tree(folders)
+        if default_item is not None:
+            self.folder_tree.setCurrentItem(default_item)
 
-    def _populate_folder_tree(self, folders: list[FolderInfo]) -> None:
-        # Только узел живого ящика пересоздаём — открытые архивы (отдельные
-        # top-level узлы) переподключение никак не затрагивает.
-        if self.account_root is not None:
-            index = self.folder_tree.indexOfTopLevelItem(self.account_root)
+    def _populate_account_folder_tree(self, key: str, folders: list[FolderInfo]) -> QTreeWidgetItem | None:
+        old_root = self.mailbox_tree_roots.get(key)
+        if old_root is not None:
+            index = self.folder_tree.indexOfTopLevelItem(old_root)
             if index != -1:
                 self.folder_tree.takeTopLevelItem(index)
 
-        root = QTreeWidgetItem([self.account.username])
+        root = QTreeWidgetItem([key])
         root.setFlags(root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         self.folder_tree.insertTopLevelItem(0, root)
-        self.account_root = root
+        self.mailbox_tree_roots[key] = root
 
         nodes: dict[tuple[str, ...], QTreeWidgetItem] = {(): root}
         inbox_item: QTreeWidgetItem | None = None
@@ -1887,16 +1923,14 @@ class MainWindow(QMainWindow):
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
-            parent.setData(0, Qt.ItemDataRole.UserRole, (_LIVE_SOURCE_KEY, info.name))
+            parent.setData(0, Qt.ItemDataRole.UserRole, (key, info.name))
             if first_selectable is None:
                 first_selectable = parent
             if info.name == "INBOX":
                 inbox_item = parent
 
         self.folder_tree.expandAll()
-        default_item = inbox_item or first_selectable
-        if default_item is not None:
-            self.folder_tree.setCurrentItem(default_item)
+        return inbox_item or first_selectable
 
     def on_open_archive(self) -> None:
         dialog = QFileDialog(self, "Открыть или создать архив")
@@ -2263,10 +2297,41 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # показываем пользователю любую ошибку подключения как есть
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
             return
-        self._apply_connection(new_account, new_smtp, session, folders)
+        self._add_or_replace_account(new_account, new_smtp, session, folders)
+        self._save_all_accounts()
+
+    def on_add_account(self) -> None:
+        """Добавить ЕЩЁ одну учётную запись, не закрывая уже открытые
+        (жалоба: "несколько учётных записей одновременно — сейчас клиент
+        держит только одно подключение") — в отличие от "Параметры…",
+        который правит текущую."""
+        dialog = SettingsDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_account = dialog.account()
+        if not new_account.host or not new_account.username:
+            return
+        new_smtp = dialog.smtp_account()
+        new_smtp = new_smtp if new_smtp.host else None
+        if new_account.username in self.mailboxes:
+            QMessageBox.information(self, "Уже подключено", f"Учётная запись {new_account.username} уже открыта.")
+            return
 
         try:
-            save_account(new_account, new_smtp)
+            session = ImapSession(new_account)
+            folders = session.list_folders()
+        except Exception as exc:
+            QMessageBox.critical(self, "Ошибка подключения", str(exc))
+            return
+        self._add_or_replace_account(new_account, new_smtp, session, folders)
+        self._save_all_accounts()
+        self.statusBar().showMessage(f"Добавлена учётная запись: {new_account.username}", 5000)
+
+    def _save_all_accounts(self) -> None:
+        try:
+            save_accounts(
+                [(self.mailbox_accounts[key], self.mailbox_smtp_accounts[key]) for key in self.mailboxes]
+            )
         except Exception as exc:
             QMessageBox.warning(
                 self,
@@ -2363,11 +2428,21 @@ class MainWindow(QMainWindow):
         if not data:
             return  # промежуточный узел иерархии (учётная запись/архив), не настоящая папка
         source_key, folder_name = data
-        source = self.mailbox if source_key == _LIVE_SOURCE_KEY else self.archives.get(source_key)
+        source = self.mailboxes.get(source_key) or self.archives.get(source_key)
         if source is None:
             return
         self.active_source = source
         self.current_folder = folder_name
+        if source_key in self.mailboxes:
+            # Переключение на папку ДРУГОЙ учётной записи — обновляем
+            # "текущие" алиасы (self.account/self.mailbox/...), которые
+            # читает весь остальной код (композер, календарь, CalDAV,
+            # "Параметры…", удаление/корзина).
+            self.account = self.mailbox_accounts[source_key]
+            self.mailbox = self.mailboxes[source_key]
+            self.smtp_account = self.mailbox_smtp_accounts[source_key]
+            self.account_root = self.mailbox_tree_roots[source_key]
+            self.trash_folder_name = self.mailbox_trash_folders[source_key]
         self._clear_reading_pane()
         try:
             summaries = source.folder_summaries(folder_name)
@@ -2378,15 +2453,21 @@ class MainWindow(QMainWindow):
 
     def on_folder_tree_context_menu(self, pos) -> None:
         item = self.folder_tree.itemAt(pos)
-        if item is None or not self.account or not self.mailbox:
+        if item is None:
             return
         # Только для живого ящика — у архивов своя (плоская) структура папок
-        # без создания через сервер, и IMAP-иерархия им не подходит.
-        is_root = item is self.account_root
+        # без создания через сервер, и IMAP-иерархия им не подходит. Узел
+        # может принадлежать ЛЮБОЙ из открытых учётных записей, не только
+        # "текущей" — определяем, какой именно, по самому узлу.
+        account_key = next((key for key, root in self.mailbox_tree_roots.items() if root is item), None)
+        is_root = account_key is not None
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        is_live_folder = bool(data) and data[0] == _LIVE_SOURCE_KEY
+        if not is_root and bool(data) and data[0] in self.mailboxes:
+            account_key = data[0]
+        is_live_folder = bool(data) and data[0] in self.mailboxes
         if not is_root and not is_live_folder:
             return
+        mailbox = self.mailboxes[account_key]
 
         menu = QMenu(self)
         create_action = menu.addAction("Создать папку…" if is_root else "Создать вложенную папку…")
@@ -2401,13 +2482,15 @@ class MainWindow(QMainWindow):
             return
         full_name = f"{parent_path}{self._folder_delimiter}{name}" if parent_path else name
         try:
-            self.mailbox.session.create_folder(full_name)
-            folders = self.mailbox.session.list_folders()
+            mailbox.session.create_folder(full_name)
+            folders = mailbox.session.list_folders()
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось создать папку", str(exc))
             return
-        self.trash_folder_name = self.mailbox.session.trash_folder()
-        self._populate_folder_tree(folders)
+        self.mailbox_trash_folders[account_key] = mailbox.session.trash_folder()
+        if account_key == next((k for k, m in self.mailboxes.items() if m is self.mailbox), None):
+            self.trash_folder_name = self.mailbox_trash_folders[account_key]
+        self._populate_account_folder_tree(account_key, folders)
         self.statusBar().showMessage(f"Папка создана: {full_name}", 5000)
 
     def on_refresh(self) -> None:
@@ -3543,8 +3626,8 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.poll_timer.stop()
-        if self.mailbox:
-            self.mailbox.close()
+        for mailbox in self.mailboxes.values():
+            mailbox.close()
         for archive in self.archives.values():
             archive.close()
         for temp_dir in self._temp_attachment_dirs:

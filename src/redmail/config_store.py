@@ -193,6 +193,22 @@ def load_account() -> tuple[Account, SmtpAccount | None] | None:
         # его отозвали или это другая машина) — просим ввести заново.
         return None
 
+    return _account_from_dict(data, username, password)
+
+
+def _account_dict(account: Account, smtp: SmtpAccount | None) -> dict:
+    return {
+        "imap_host": account.host,
+        "imap_port": account.port,
+        "imap_use_ssl": account.use_ssl,
+        "username": account.username,
+        "smtp_host": smtp.host if smtp else "",
+        "smtp_port": smtp.port if smtp else 587,
+        "smtp_use_ssl": smtp.use_ssl if smtp else False,
+    }
+
+
+def _account_from_dict(data: dict, username: str, password: str) -> tuple[Account, SmtpAccount | None]:
     account = Account(
         host=data["imap_host"],
         username=username,
@@ -212,3 +228,48 @@ def load_account() -> tuple[Account, SmtpAccount | None] | None:
         else None
     )
     return account, smtp
+
+
+def _accounts_path() -> Path:
+    return app_dir() / "accounts.json"
+
+
+def load_accounts() -> list[tuple[Account, SmtpAccount | None]]:
+    """Несколько одновременно подключённых учётных записей (жалоба:
+    "несколько учётных записей одновременно — сейчас клиент держит только
+    одно подключение"). Формат — отдельный файл со списком; если его ещё
+    нет, но есть старый однозаписевый account.json — переносим его в новый
+    формат один раз, не теряя уже сохранённое подключение."""
+    path = _accounts_path()
+    if not path.exists():
+        single = load_account()
+        return [single] if single else []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for entry in raw:
+        username = entry.get("username") if isinstance(entry, dict) else None
+        if not username:
+            continue
+        password = keyring.get_password(_KEYRING_SERVICE, username)
+        if password is None:
+            continue  # пароль недоступен (другая машина/отозван) — эту запись пропускаем, а не всё подряд
+        try:
+            result.append(_account_from_dict(entry, username, password))
+        except KeyError:
+            continue
+    return result
+
+
+def save_accounts(accounts: list[tuple[Account, SmtpAccount | None]]) -> None:
+    path = _accounts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for account, smtp in accounts:
+        keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
+        entries.append(_account_dict(account, smtp))
+    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")

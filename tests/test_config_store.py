@@ -6,6 +6,7 @@ from unittest.mock import patch
 from redmail.config_store import (
     MailRule,
     load_account,
+    load_accounts,
     load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
@@ -15,6 +16,7 @@ from redmail.config_store import (
     load_poll_interval_minutes,
     load_window_geometry,
     save_account,
+    save_accounts,
     save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
@@ -204,6 +206,67 @@ def test_caldav_url_round_trip(tmp_path: Path) -> None:
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         save_caldav_url("https://calendar.example.corp/caldav/")
         assert load_caldav_url() == "https://calendar.example.corp/caldav/"
+
+
+def test_load_accounts_returns_empty_when_nothing_saved(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    config_file = tmp_path / "account.json"
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), \
+         patch("redmail.config_store._config_path", return_value=config_file):
+        assert load_accounts() == []
+
+
+def test_save_and_load_accounts_round_trip(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    a1 = Account(host="imap1.example.com", username="ivan@example.com", password="p1", port=993, use_ssl=True)
+    smtp1 = SmtpAccount(host="smtp1.example.com", username="ivan@example.com", password="p1", port=587, use_ssl=False)
+    a2 = Account(host="imap2.example.com", username="other@example.com", password="p2", port=993, use_ssl=True)
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        save_accounts([(a1, smtp1), (a2, None)])
+        loaded = load_accounts()
+
+    assert len(loaded) == 2
+    assert loaded[0][0].username == "ivan@example.com"
+    assert loaded[0][0].password == "p1"
+    assert loaded[0][1].host == "smtp1.example.com"
+    assert loaded[1][0].username == "other@example.com"
+    assert loaded[1][1] is None
+
+
+def test_load_accounts_migrates_from_old_single_account_file(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"  # не существует
+    config_file = tmp_path / "account.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), \
+         patch("redmail.config_store._config_path", return_value=config_file), set_patch, get_patch:
+        old_account = Account(host="imap.example.com", username="legacy@example.com", password="secret")
+        save_account(old_account, None)
+        migrated = load_accounts()
+
+    assert len(migrated) == 1
+    assert migrated[0][0].username == "legacy@example.com"
+
+
+def test_load_accounts_skips_entry_with_missing_password(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    a1 = Account(host="imap1.example.com", username="has-password@example.com", password="p1")
+    a2 = Account(host="imap2.example.com", username="no-password@example.com", password="p2")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        save_accounts([(a1, None), (a2, None)])
+        del store["no-password@example.com"]  # как будто пароль отозвали/другая машина
+        loaded = load_accounts()
+
+    assert [a.username for a, _ in loaded] == ["has-password@example.com"]
 
 
 def test_mail_rules_default_to_empty(tmp_path: Path) -> None:
