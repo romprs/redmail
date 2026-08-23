@@ -2596,13 +2596,18 @@ class MainWindow(QMainWindow):
             if chosen is close_action:
                 self._close_archive(archive_key)
             return
+
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if bool(data) and data[0] in self.archives:
+            self._rename_archive_folder(data[0], data[1], pos)
+            return
+
         # Только для живого ящика — у архивов своя (плоская) структура папок
         # без создания через сервер, и IMAP-иерархия им не подходит. Узел
         # может принадлежать ЛЮБОЙ из открытых учётных записей, не только
         # "текущей" — определяем, какой именно, по самому узлу.
         account_key = next((key for key, root in self.mailbox_tree_roots.items() if root is item), None)
         is_root = account_key is not None
-        data = item.data(0, Qt.ItemDataRole.UserRole)
         if not is_root and bool(data) and data[0] in self.mailboxes:
             account_key = data[0]
         is_live_folder = bool(data) and data[0] in self.mailboxes
@@ -2612,7 +2617,12 @@ class MainWindow(QMainWindow):
 
         menu = QMenu(self)
         create_action = menu.addAction("Создать папку…" if is_root else "Создать вложенную папку…")
+        rename_action = None if is_root else menu.addAction("Переименовать папку…")
         chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
+
+        if rename_action is not None and chosen is rename_action:
+            self._rename_live_folder(account_key, mailbox, data[1])
+            return
         if chosen is not create_action:
             return
 
@@ -2633,6 +2643,51 @@ class MainWindow(QMainWindow):
             self.trash_folder_name = self.mailbox_trash_folders[account_key]
         self._populate_account_folder_tree(account_key, folders)
         self.statusBar().showMessage(f"Папка создана: {full_name}", 5000)
+
+    def _rename_archive_folder(self, archive_key: str, folder_name: str, pos) -> None:
+        menu = QMenu(self)
+        rename_action = menu.addAction("Переименовать папку…")
+        chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
+        if chosen is not rename_action:
+            return
+        new_name, ok = QInputDialog.getText(self, "Переименовать папку", "Новое название:", text=folder_name)
+        new_name = new_name.strip()
+        if not ok or not new_name or new_name == folder_name:
+            return
+        archive = self.archives[archive_key]
+        try:
+            archive_store.rename_folder(archive.path, folder_name, new_name)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось переименовать папку", str(exc))
+            return
+        self._refresh_archive_folders(archive_key)
+        if self.active_source is archive and self.current_folder == folder_name:
+            self.current_folder = new_name
+        self.statusBar().showMessage(f"Папка переименована: {new_name}", 5000)
+
+    def _rename_live_folder(self, account_key: str, mailbox: CachedMailbox, old_full_name: str) -> None:
+        short_name = old_full_name.rsplit(self._folder_delimiter, 1)[-1]
+        new_short, ok = QInputDialog.getText(self, "Переименовать папку", "Новое название:", text=short_name)
+        new_short = new_short.strip()
+        if not ok or not new_short or new_short == short_name:
+            return
+        parent_path = (
+            old_full_name.rsplit(self._folder_delimiter, 1)[0] if self._folder_delimiter in old_full_name else ""
+        )
+        new_full_name = f"{parent_path}{self._folder_delimiter}{new_short}" if parent_path else new_short
+        try:
+            mailbox.session.rename_folder(old_full_name, new_full_name)
+            folders = mailbox.session.list_folders()
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось переименовать папку", str(exc))
+            return
+        self.mailbox_trash_folders[account_key] = mailbox.session.trash_folder()
+        if account_key == next((k for k, m in self.mailboxes.items() if m is self.mailbox), None):
+            self.trash_folder_name = self.mailbox_trash_folders[account_key]
+        self._populate_account_folder_tree(account_key, folders)
+        if self.active_source is mailbox and self.current_folder == old_full_name:
+            self.current_folder = new_full_name
+        self.statusBar().showMessage(f"Папка переименована: {new_full_name}", 5000)
 
     def on_refresh(self) -> None:
         if not self.active_source or not self.current_folder:

@@ -70,6 +70,19 @@ def test_append_and_list_messages(tmp_path: Path) -> None:
     assert content.attachments[0].filename == "note.txt"
 
 
+def test_rename_folder(tmp_path: Path) -> None:
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    msg = _build_message("Привет", "Иван <ivan@example.com>")
+    archive_store.append_raw_message(archive_path, "Импорт", msg.as_bytes())
+
+    archive_store.rename_folder(archive_path, "Импорт", "Из Outlook")
+
+    assert archive_store.list_folders(archive_path) == ["Из Outlook"]
+    assert len(archive_store.list_messages(archive_path, "Из Outlook")) == 1
+    assert archive_store.list_messages(archive_path, "Импорт") == []
+
+
 def test_append_raw_message_auto_creates_archive(tmp_path: Path) -> None:
     # append_raw_message используется и для "выгрузить в архив" из живого
     # ящика — не должен требовать отдельного шага "сначала создайте файл".

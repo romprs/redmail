@@ -124,6 +124,9 @@ class ImapSession:
     def create_folder(self, name: str) -> None:
         self._client.create_folder(name)
 
+    def rename_folder(self, old_name: str, new_name: str) -> None:
+        self._client.rename_folder(old_name, new_name)
+
     def trash_folder(self) -> str | None:
         for flags, _delimiter, name in self._raw_folders:
             if b"\\Trash" in flags:

@@ -79,6 +79,17 @@ def list_folders(path: Path) -> list[str]:
     return [row[0] for row in rows]
 
 
+def rename_folder(path: Path, old_name: str, new_name: str) -> None:
+    # У архива нет отдельной таблицы папок — "папка" это просто текстовое
+    # поле у писем (см. схему выше), так что переименование — это
+    # переименование значения этого поля у всех писем сразу. Если
+    # new_name совпадает с уже существующей папкой, письма просто
+    # сольются в неё — это ожидаемо, отдельно не запрещаем.
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE messages SET folder = ? WHERE folder = ?", (new_name, old_name))
+        conn.commit()
+
+
 def list_messages(path: Path, folder: str) -> list[MessageSummary]:
     with closing(_connect(path)) as conn:
         rows = conn.execute(

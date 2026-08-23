@@ -566,6 +566,15 @@ def test_create_folder() -> None:
     fake_client.create_folder.assert_called_once_with("Проекты/Важное")
 
 
+def test_rename_folder() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        ImapSession(_account()).rename_folder("Проекты", "Архив проектов")
+
+    fake_client.rename_folder.assert_called_once_with("Проекты", "Архив проектов")
+
+
 def test_search_uids_all() -> None:
     fake_client = _client()
     fake_client.search.return_value = [1, 2, 3]
