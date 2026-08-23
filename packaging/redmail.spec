@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        12%{?dist}
+Release:        13%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -25,6 +25,10 @@ BuildRequires:  autoconf
 BuildRequires:  zlib-devel
 BuildRequires:  bzip2-devel
 BuildRequires:  openssl-devel
+# requests-gssapi/gssapi (вход в Exchange по Kerberos/SSO без пароля) тоже
+# собирают C-расширение при pip install — против системных заголовков
+# Kerberos, которые есть на любой машине, введённой в домен AD/FreeIPA.
+BuildRequires:  krb5-devel
 
 Requires:       python3 >= 3.9
 
@@ -99,6 +103,17 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Aug 24 2026 RedMail dev <noreply@example.com> - 0.0.1-13
+- Добавлено окно «О программе» (Справка → О программе…) — автор и
+  упоминание о разработке с использованием ИИ
+- Добавлено прямое подключение к Exchange по протоколу EWS (Параметры →
+  «Подключить Exchange (EWS)…») — для серверов, где IMAP отключён
+  политикой безопасности; поддерживает вход по логину/паролю, NTLM и
+  Kerberos (единый вход, SSO, без ввода пароля в приложении). Работает
+  как ещё одна учётная запись наравне с IMAP — та же таблица писем,
+  дерево папок, архивирование, календарь; письмо через EWS-аккаунт
+  отправляется через сам Exchange, отдельный SMTP не нужен
+
 * Sun Aug 23 2026 RedMail dev <noreply@example.com> - 0.0.1-12
 - Импорт .pst/.mbox/Maildir и отправка приглашений/ответов по календарю
   (создание, перенос мышью, отмена встречи, ответ на приглашение) больше

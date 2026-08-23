@@ -86,11 +86,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from redmail import archive_store, calendar_store, caldav_sync, contact_store, itip
+from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail.config_store import (
     MailRule,
     load_accounts,
     load_caldav_url,
+    load_ews_accounts,
     load_font_scale,
     load_mail_columns_state,
     load_mail_rules,
@@ -100,6 +101,7 @@ from redmail.config_store import (
     load_window_geometry,
     save_accounts,
     save_caldav_url,
+    save_ews_accounts,
     save_font_scale,
     save_mail_columns_state,
     save_mail_rules,
@@ -108,10 +110,19 @@ from redmail.config_store import (
     save_poll_interval_minutes,
     save_window_geometry,
 )
+from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+
+# Отправка через EWS идёт через сам EWS-сеанс (Exchange не нуждается в
+# отдельном SMTP-релее), но весь остальной код по всему приложению
+# проверяет "if not self.smtp_account", чтобы понять, настроена ли вообще
+# исходящая почта для текущей учётной записи — этот маркер остаётся
+# истинным (bool), не будучи настоящим SmtpAccount, чтобы все такие
+# проверки продолжали работать без изменений для EWS-аккаунтов тоже.
+_EWS_SEND_MARKER = object()
 from redmail.ui.week_calendar import (
     AllDayRowWidget,
     MonthGridWidget,
@@ -541,12 +552,19 @@ class SettingsDialog(QDialog):
         # окно, и Qt тихо прятал часть кнопок).
         add_account_button = QPushButton("Добавить учётную запись…", self)
         add_account_button.clicked.connect(self._on_add_account)
+        add_ews_account_button = QPushButton("Подключить Exchange (EWS)…", self)
+        add_ews_account_button.setToolTip(
+            "Прямой доступ к Exchange по протоколу EWS — если IMAP отключён "
+            "политикой безопасности, или нужен вход по Kerberos (SSO) без пароля"
+        )
+        add_ews_account_button.clicked.connect(self._on_add_ews_account)
         mail_rules_button = QPushButton("Правила сортировки почты…", self)
         mail_rules_button.clicked.connect(self._on_mail_rules)
         apply_rules_button = QPushButton("Применить правила к текущей папке", self)
         apply_rules_button.clicked.connect(self._on_apply_mail_rules)
         accounts_rules_layout = QVBoxLayout()
         accounts_rules_layout.addWidget(add_account_button)
+        accounts_rules_layout.addWidget(add_ews_account_button)
         accounts_rules_layout.addWidget(mail_rules_button)
         accounts_rules_layout.addWidget(apply_rules_button)
         accounts_rules_group = QGroupBox("Учётные записи и правила почты", self)
@@ -569,6 +587,10 @@ class SettingsDialog(QDialog):
     def _on_add_account(self) -> None:
         if self.parent() is not None:
             self.parent().on_add_account()
+
+    def _on_add_ews_account(self) -> None:
+        if self.parent() is not None:
+            self.parent().on_add_ews_account()
 
     def _on_mail_rules(self) -> None:
         if self.parent() is not None:
@@ -604,6 +626,107 @@ class SettingsDialog(QDialog):
 
     def caldav_url(self) -> str:
         return self.caldav_url_edit.text().strip()
+
+
+class EwsAccountDialog(QDialog):
+    """Подключение к Exchange напрямую по EWS — отдельный диалог от
+    обычного "Параметры" (IMAP/SMTP): модель входа принципиально другая —
+    адрес сервера обычно не нужен вводить (автообнаружение по email), а
+    для Kerberos/SSO вообще не нужен пароль в самом приложении (билет
+    берётся из окружения ОС, см. ews_client.EwsSession)."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Подключить Exchange (EWS)")
+
+        self.email_edit = QLineEdit()
+        self.email_edit.setPlaceholderText("ivan.ivanov@corp.example")
+
+        self.auth_combo = QComboBox()
+        self.auth_combo.addItem("Логин и пароль", "basic")
+        self.auth_combo.addItem("NTLM (DOMAIN\\логин)", "ntlm")
+        self.auth_combo.addItem("Kerberos (SSO, без пароля)", "kerberos")
+        self.auth_combo.currentIndexChanged.connect(self._update_fields_enabled)
+
+        self.username_edit = QLineEdit()
+        self.username_edit.setPlaceholderText("для NTLM — DOMAIN\\логин; иначе обычно совпадает с email")
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.server_edit = QLineEdit()
+        self.server_edit.setPlaceholderText("необязательно — по умолчанию автообнаружение по email")
+
+        form = QFormLayout()
+        form.addRow("Email", self.email_edit)
+        form.addRow("Способ входа", self.auth_combo)
+        form.addRow("Логин", self.username_edit)
+        form.addRow("Пароль", self.password_edit)
+        form.addRow("Сервер EWS", self.server_edit)
+
+        self.test_button = QPushButton("Проверить подключение")
+        self.test_button.clicked.connect(self._on_test)
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        self._test_worker: object | None = None
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.test_button)
+        layout.addWidget(self.status_label)
+        layout.addWidget(buttons)
+
+        self._update_fields_enabled()
+
+    def _update_fields_enabled(self) -> None:
+        is_kerberos = self.auth_combo.currentData() == "kerberos"
+        self.username_edit.setEnabled(not is_kerberos)
+        self.password_edit.setEnabled(not is_kerberos)
+
+    def account(self) -> EwsAccount:
+        return EwsAccount(
+            email=self.email_edit.text().strip(),
+            username=self.username_edit.text().strip(),
+            password=self.password_edit.text(),
+            server=self.server_edit.text().strip(),
+            auth_type=self.auth_combo.currentData(),
+        )
+
+    def _on_test(self) -> None:
+        account = self.account()
+        if not account.email:
+            QMessageBox.warning(
+                self, "Укажите email", "Email обязателен — по нему автообнаружение ищет сервер."
+            )
+            return
+        self.test_button.setEnabled(False)
+        self.status_label.setText("Проверка подключения… (автообнаружение сервера может занять до минуты)")
+
+        def connect_and_list_folders() -> int:
+            session = EwsSession(account)
+            return len(session.list_folders())
+
+        worker = _CallableWorker(connect_and_list_folders, parent=self)
+
+        def on_success(folder_count: object) -> None:
+            self.status_label.setText(f"Подключение успешно, папок найдено: {folder_count}")
+            self.test_button.setEnabled(True)
+            self._test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.status_label.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться", error_text)
+            self.test_button.setEnabled(True)
+            self._test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._test_worker = worker  # держим ссылку, пока поток жив
+        worker.start()
 
 
 class ComposeDialog(QDialog):
@@ -1456,12 +1579,19 @@ class MainWindow(QMainWindow):
         # читает напрямую; self.mailboxes и парные словари ниже — источник
         # истины на несколько записей сразу.
         self.mailboxes: dict[str, CachedMailbox] = {}
-        self.mailbox_accounts: dict[str, Account] = {}
+        self.mailbox_accounts: dict[str, Account | EwsAccount] = {}
         self.mailbox_smtp_accounts: dict[str, SmtpAccount | None] = {}
         self.mailbox_trash_folders: dict[str, str | None] = {}
         self.mailbox_tree_roots: dict[str, QTreeWidgetItem] = {}
+        # "imap" | "ews" на каждый ключ (username для IMAP, email для EWS) —
+        # определяет, каким путём слать почту для ТЕКУЩЕЙ учётной записи:
+        # через отдельный SMTP-аккаунт или через сам EWS-сеанс (см.
+        # _send_message_in_background). self.account_protocol — алиас
+        # "текущей" по тому же принципу, что self.account/self.mailbox.
+        self.mailbox_protocols: dict[str, str] = {}
+        self.account_protocol: str = "imap"
 
-        self.account: Account | None = None
+        self.account: Account | EwsAccount | None = None
         self.mailbox: CachedMailbox | None = None
         self.account_root: QTreeWidgetItem | None = None
         self.archives: dict[str, ArchiveSource] = {}
@@ -1838,6 +1968,11 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self.on_settings)
         archive_toolbar.addAction(settings_action)
 
+        help_menu = self.menuBar().addMenu("Справка")
+        about_action = QAction("О программе…", self)
+        about_action.triggered.connect(self.on_about)
+        help_menu.addAction(about_action)
+
         self.setStatusBar(QStatusBar(self))
 
         initial_font_scale = load_font_scale()
@@ -1926,6 +2061,25 @@ class MainWindow(QMainWindow):
                 continue
             self._add_or_replace_account(account, smtp_account, session, folders)
             restored.append(account.username)
+
+        try:
+            saved_ews_accounts = load_ews_accounts()
+        except Exception:
+            saved_ews_accounts = []  # то же хранилище секретов, что и выше — если оно уже пожаловалось, не дублируем
+        for ews_account in saved_ews_accounts:
+            try:
+                session = EwsSession(ews_account)
+                folders = session.list_folders()
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Не удалось войти в Exchange с сохранёнными данными",
+                    f"{ews_account.email}: {exc}\n\nПодключитесь заново вручную.",
+                )
+                continue
+            self._add_or_replace_ews_account(ews_account, session, folders)
+            restored.append(ews_account.email)
+
         if restored:
             self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
 
@@ -1936,12 +2090,30 @@ class MainWindow(QMainWindow):
         session: ImapSession,
         folders: list[FolderInfo],
     ) -> None:
+        self._add_or_replace_account_generic(account, smtp_account, session, folders, protocol="imap")
+
+    def _add_or_replace_ews_account(
+        self, account: EwsAccount, session: EwsSession, folders: list[FolderInfo]
+    ) -> None:
+        self._add_or_replace_account_generic(account, _EWS_SEND_MARKER, session, folders, protocol="ews")
+
+    def _add_or_replace_account_generic(
+        self,
+        account: Account | EwsAccount,
+        smtp_account,
+        session,
+        folders: list[FolderInfo],
+        *,
+        protocol: str,
+    ) -> None:
         """Подключает учётную запись, НЕ закрывая уже открытые (в отличие
         от старого однозаписевого _apply_connection) — та же логика "новый
         top-level узел в дереве", что уже применяется к архивам. Если
-        запись с этим username уже была открыта (например, правка своих же
-        настроек через "Параметры…"), она заменяется, а не дублируется."""
-        key = account.username
+        запись с этим ключом уже была открыта (например, правка своих же
+        настроек через "Параметры…"), она заменяется, а не дублируется.
+        Ключ — username для IMAP, email для EWS (там username не всегда
+        заполнен: при входе по Kerberos/SSO логин не нужен вовсе)."""
+        key = account.email if protocol == "ews" else account.username
         old_mailbox = self.mailboxes.get(key)
         if old_mailbox is not None:
             old_mailbox.close()
@@ -1949,6 +2121,7 @@ class MainWindow(QMainWindow):
         self.mailboxes[key] = CachedMailbox(session, account)
         self.mailbox_accounts[key] = account
         self.mailbox_smtp_accounts[key] = smtp_account
+        self.mailbox_protocols[key] = protocol
         self.mailbox_trash_folders[key] = session.trash_folder()
 
         default_item = self._populate_account_folder_tree(key, folders)
@@ -1958,6 +2131,7 @@ class MainWindow(QMainWindow):
         # напрямую (композер, ответ/пересылка, календарь, CalDAV,
         # "Параметры…").
         self.account = account
+        self.account_protocol = protocol
         self.mailbox = self.mailboxes[key]
         self.smtp_account = smtp_account
         self.account_root = self.mailbox_tree_roots[key]
@@ -2392,6 +2566,26 @@ class MainWindow(QMainWindow):
         verb = "Перемещено" if move else "Скопировано"
         self.statusBar().showMessage(f"{verb} в архив: {exported}", 5000)
 
+    def on_about(self) -> None:
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+
+            app_version = version("redmail")
+        except PackageNotFoundError:
+            app_version = "?"
+        QMessageBox.about(
+            self,
+            "О программе",
+            "<h3>RedMail</h3>"
+            "<p>Почтовый клиент для RED OS — функциональный аналог Microsoft "
+            "Outlook: почта по IMAP/SMTP, локальные архивы писем, календарь "
+            "с приглашениями по электронной почте (iTIP), адресная книга.</p>"
+            f"<p>Версия: {app_version}</p>"
+            "<p>Автор: Пономарев Роман Сергеевич</p>"
+            "<p><i>Программа разработана с использованием искусственного "
+            "интеллекта.</i></p>",
+        )
+
     def on_settings(self) -> None:
         dialog = SettingsDialog(
             self,
@@ -2460,10 +2654,41 @@ class MainWindow(QMainWindow):
         self._save_all_accounts()
         self.statusBar().showMessage(f"Добавлена учётная запись: {new_account.username}", 5000)
 
+    def on_add_ews_account(self) -> None:
+        """Подключение к Exchange напрямую по EWS — отдельный путь от
+        обычного IMAP (кнопка выше): нужен, когда IMAP отключён политикой
+        безопасности организации, или когда вход должен идти по Kerberos
+        (SSO) без ввода пароля в самом приложении."""
+        dialog = EwsAccountDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_account = dialog.account()
+        if not new_account.email:
+            return
+        if new_account.email in self.mailboxes:
+            QMessageBox.information(self, "Уже подключено", f"Учётная запись {new_account.email} уже открыта.")
+            return
+        try:
+            session = EwsSession(new_account)
+            folders = session.list_folders()
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось подключиться к Exchange", str(exc))
+            return
+        self._add_or_replace_ews_account(new_account, session, folders)
+        self._save_all_accounts()
+        self.statusBar().showMessage(f"Exchange подключён: {new_account.email}", 5000)
+
     def _save_all_accounts(self) -> None:
         try:
             save_accounts(
-                [(self.mailbox_accounts[key], self.mailbox_smtp_accounts[key]) for key in self.mailboxes]
+                [
+                    (self.mailbox_accounts[key], self.mailbox_smtp_accounts[key])
+                    for key in self.mailboxes
+                    if self.mailbox_protocols[key] == "imap"
+                ]
+            )
+            save_ews_accounts(
+                [self.mailbox_accounts[key] for key in self.mailboxes if self.mailbox_protocols[key] == "ews"]
             )
         except Exception as exc:
             QMessageBox.warning(
@@ -2574,6 +2799,7 @@ class MainWindow(QMainWindow):
             self.account = self.mailbox_accounts[source_key]
             self.mailbox = self.mailboxes[source_key]
             self.smtp_account = self.mailbox_smtp_accounts[source_key]
+            self.account_protocol = self.mailbox_protocols[source_key]
             self.account_root = self.mailbox_tree_roots[source_key]
             self.trash_folder_name = self.mailbox_trash_folders[source_key]
         self._clear_reading_pane()
@@ -3598,12 +3824,17 @@ class MainWindow(QMainWindow):
         self, message: OutgoingMessage, *, success_status: str, failure_title: str, severity: str = "critical"
     ) -> None:
         # Событие/ответ на приглашение уже сохранены локально к моменту
-        # вызова — сама отправка по SMTP (обычно 1-2 секунды на реальный
-        # сервер) больше не блокирует интерфейс: раньше "Новая встреча" и
-        # перенос мышью на пару секунд подвешивали всё окно ровно на время
-        # SMTP-разговора (жалоба: "подвисает при создании события").
-        smtp_account = self.smtp_account
-        worker = _CallableWorker(send_message, smtp_account, message, parent=self)
+        # вызова — сама отправка (SMTP или EWS, обычно 1-2 секунды на
+        # реальный сервер) больше не блокирует интерфейс: раньше "Новая
+        # встреча" и перенос мышью на пару секунд подвешивали всё окно
+        # ровно на время сетевого разговора (жалоба: "подвисает при
+        # создании события"). Для EWS-учётной записи отдельного
+        # SMTP-релея нет — письмо уходит через тот же EWS-сеанс, что и
+        # чтение (см. self.account_protocol/_EWS_SEND_MARKER выше).
+        if self.account_protocol == "ews" and self.mailbox is not None:
+            worker = _CallableWorker(ews_client.send_message, self.mailbox.session, message, parent=self)
+        else:
+            worker = _CallableWorker(send_message, self.smtp_account, message, parent=self)
 
         def on_success(_result: object) -> None:
             self.statusBar().showMessage(success_status, 5000)
@@ -3842,13 +4073,15 @@ class MainWindow(QMainWindow):
             in_reply_to=in_reply_to,
             attachments=dialog.attachments,
         )
-        try:
-            send_message(self.smtp_account, message)
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка отправки", str(exc))
-            return
-
-        self.statusBar().showMessage(f"Письмо отправлено: {', '.join(recipients)}", 5000)
+        # Раньше отправка шла синхронно прямо здесь — окно подвисало на
+        # время SMTP-разговора с сервером, как и у календарных приглашений
+        # (см. _send_message_in_background); теперь то же самое одним
+        # общим путём, вместе с поддержкой EWS-аккаунтов.
+        self._send_message_in_background(
+            message,
+            success_status=f"Письмо отправлено: {', '.join(recipients)}",
+            failure_title="Ошибка отправки",
+        )
 
     def closeEvent(self, event) -> None:
         self.poll_timer.stop()

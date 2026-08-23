@@ -7,6 +7,7 @@ from pathlib import Path
 
 import keyring
 
+from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
 from redmail.paths import app_dir
 from redmail.smtp_client import SmtpAccount
@@ -272,4 +273,70 @@ def save_accounts(accounts: list[tuple[Account, SmtpAccount | None]]) -> None:
     for account, smtp in accounts:
         keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
         entries.append(_account_dict(account, smtp))
+    path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _ews_accounts_path() -> Path:
+    return app_dir() / "ews_accounts.json"
+
+
+# Отдельный keyring-"сервис" от обычных IMAP-аккаунтов (_KEYRING_SERVICE) —
+# ключ там username, здесь email, пространства имён не должны пересекаться,
+# даже если у пользователя случайно совпадут username и email.
+_EWS_KEYRING_SERVICE = "redmail-ews"
+
+
+def load_ews_accounts() -> list[EwsAccount]:
+    path = _ews_accounts_path()
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        email = entry.get("email")
+        if not email:
+            continue
+        auth_type = entry.get("auth_type", "basic")
+        password = ""
+        if auth_type != "kerberos":
+            password = keyring.get_password(_EWS_KEYRING_SERVICE, email)
+            if password is None:
+                continue  # пароль недоступен (другая машина/отозван) — пропускаем эту запись
+        try:
+            result.append(
+                EwsAccount(
+                    email=email,
+                    username=entry.get("username", ""),
+                    password=password,
+                    server=entry.get("server", ""),
+                    auth_type=auth_type,
+                )
+            )
+        except KeyError:
+            continue
+    return result
+
+
+def save_ews_accounts(accounts: list[EwsAccount]) -> None:
+    path = _ews_accounts_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    entries = []
+    for account in accounts:
+        if account.auth_type != "kerberos":
+            keyring.set_password(_EWS_KEYRING_SERVICE, account.email, account.password)
+        entries.append(
+            {
+                "email": account.email,
+                "username": account.username,
+                "server": account.server,
+                "auth_type": account.auth_type,
+            }
+        )
     path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")

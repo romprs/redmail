@@ -12,6 +12,8 @@ dependencies = [
     "vobject",
     "caldav",
     "libpff-python",
+    "exchangelib",
+    "requests-gssapi",
 ]
 
 [project.scripts]

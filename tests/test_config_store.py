@@ -26,6 +26,8 @@ from redmail.config_store import (
     save_poll_interval_minutes,
     save_window_geometry,
 )
+from redmail.config_store import load_ews_accounts, save_ews_accounts
+from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
 
@@ -267,6 +269,56 @@ def test_load_accounts_skips_entry_with_missing_password(tmp_path: Path) -> None
         loaded = load_accounts()
 
     assert [a.username for a, _ in loaded] == ["has-password@example.com"]
+
+
+def test_save_and_load_ews_accounts_round_trip(tmp_path: Path) -> None:
+    ews_file = tmp_path / "ews_accounts.json"
+    store: dict[str, str] = {}
+    set_patch = patch(
+        "redmail.config_store.keyring.set_password",
+        side_effect=lambda _service, user, pw: store.__setitem__(user, pw),
+    )
+    get_patch = patch(
+        "redmail.config_store.keyring.get_password",
+        side_effect=lambda _service, user: store.get(user),
+    )
+
+    a1 = EwsAccount(email="ivan@corp.example", username="ivan@corp.example", password="p1", auth_type="basic")
+    a2 = EwsAccount(email="kerberos-user@corp.example", auth_type="kerberos")
+
+    with patch("redmail.config_store._ews_accounts_path", return_value=ews_file), set_patch, get_patch:
+        save_ews_accounts([a1, a2])
+        loaded = load_ews_accounts()
+
+    assert len(loaded) == 2
+    assert loaded[0].email == "ivan@corp.example"
+    assert loaded[0].password == "p1"
+    assert loaded[1].email == "kerberos-user@corp.example"
+    assert loaded[1].auth_type == "kerberos"
+    assert loaded[1].password == ""  # для kerberos пароль не хранится вовсе
+
+
+def test_load_ews_accounts_skips_entry_with_missing_password(tmp_path: Path) -> None:
+    ews_file = tmp_path / "ews_accounts.json"
+    store: dict[str, str] = {}
+    set_patch = patch(
+        "redmail.config_store.keyring.set_password",
+        side_effect=lambda _service, user, pw: store.__setitem__(user, pw),
+    )
+    get_patch = patch(
+        "redmail.config_store.keyring.get_password",
+        side_effect=lambda _service, user: store.get(user),
+    )
+
+    a1 = EwsAccount(email="has-password@corp.example", username="a", password="p1", auth_type="basic")
+    a2 = EwsAccount(email="no-password@corp.example", username="b", password="p2", auth_type="basic")
+
+    with patch("redmail.config_store._ews_accounts_path", return_value=ews_file), set_patch, get_patch:
+        save_ews_accounts([a1, a2])
+        del store["no-password@corp.example"]
+        loaded = load_ews_accounts()
+
+    assert [a.email for a in loaded] == ["has-password@corp.example"]
 
 
 def test_mail_rules_default_to_empty(tmp_path: Path) -> None:
