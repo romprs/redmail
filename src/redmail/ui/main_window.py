@@ -11,7 +11,22 @@ from datetime import date, datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
 
-from PySide6.QtCore import QByteArray, QDate, QDateTime, QPointF, QRectF, QSize, Qt, QStringListModel, QTime, QTimer, QUrl
+from PySide6.QtCore import (
+    QByteArray,
+    QDate,
+    QDateTime,
+    QObject,
+    QPointF,
+    QRectF,
+    QSize,
+    Qt,
+    QStringListModel,
+    QThread,
+    QTime,
+    QTimer,
+    QUrl,
+    Signal,
+)
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
@@ -51,6 +66,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -1396,6 +1412,35 @@ class ContactDialog(QDialog):
         )
 
 
+class _CallableWorker(QThread):
+    """Выполняет одну функцию в отдельном потоке и сообщает результат через
+    сигналы — без этого любая сетевая операция (SMTP-отправка, разбор
+    .pst/.mbox/Maildir) выполнялась прямо в обработчике сигнала Qt, то есть
+    в основном потоке интерфейса: окно переставало перерисовываться и
+    реагировать на клики на всё время операции (для .pst на реальном файле
+    — почти две минуты, для отправки приглашения по SMTP — пара секунд).
+    Жалоба пользователя: "подвисает интерфейс... импорт pst не работает"
+    (на деле работал, но окно выглядело замёршим так долго, что это
+    читалось как сбой)."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, *args, parent: QObject | None = None, **kwargs):
+        super().__init__(parent)
+        self._fn = fn
+        self._args = args
+        self._kwargs = kwargs
+
+    def run(self) -> None:  # noqa: N802 - Qt override
+        try:
+            result = self._fn(*self._args, **self._kwargs)
+        except Exception as exc:  # передаём текст в основной поток — сам exc через границу потоков не тащим
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit(result)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1434,6 +1479,10 @@ class MainWindow(QMainWindow):
         self.pane_orientation = load_pane_orientation()
         self.caldav_url = load_caldav_url()
         self.mail_rules: list[MailRule] = load_mail_rules()
+        # Держим ссылки на фоновые потоки (импорт архивов, отправка
+        # приглашений) — без этого Python может собрать QThread раньше, чем
+        # он реально завершится, даже если у него есть родитель-QObject.
+        self._background_workers: list[QThread] = []
         self.filter_column = COL_SUBJECT
         self.marker_filter: str | None = None
         self._temp_attachment_dirs: list[Path] = []
@@ -2034,6 +2083,19 @@ class MainWindow(QMainWindow):
         self, *, title: str, ask_folder: bool = False, default_folder: str = "", ask_move_copy: bool = False
     ) -> tuple[str, str, bool] | None:
         archive_names = {key: Path(source.path).stem for key, source in self.archives.items()}
+        if not archive_names:
+            # Пока не открыто ни одного архива, выбирать в диалоге
+            # действительно не из чего — там был бы ровно один пункт
+            # «Открыть или создать другой архив…» (жалоба пользователя при
+            # первом импорте .pst: "нет возможности выбрать архив"). Сразу
+            # переходим к созданию нового архива, без бесполезного шага.
+            new_path = self._prompt_new_archive_path()
+            if new_path is None:
+                return None
+            source = self._attach_archive(new_path)
+            if source is None:
+                return None
+            return str(new_path), default_folder or "Импорт", False
         dialog = ArchiveTargetDialog(
             self,
             archive_names,
@@ -2085,16 +2147,11 @@ class MainWindow(QMainWindow):
             return
         archive_key, folder_name, _move = result
         archive_path = self.archives[archive_key].path
-
-        try:
-            importer = archive_store.import_maildir if is_maildir else archive_store.import_mbox
-            count = importer(archive_path, Path(source_path_str), folder_name)
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка импорта", str(exc))
-            return
-
-        self._refresh_archive_folders(archive_key)
-        self.statusBar().showMessage(f"Импортировано писем: {count}", 5000)
+        importer = archive_store.import_maildir if is_maildir else archive_store.import_mbox
+        self._run_archive_import(
+            archive_key, importer, archive_path, Path(source_path_str), folder_name,
+            progress_text="Импорт письма…",
+        )
 
     def _import_pst(self) -> None:
         source_path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл .pst", filter="Outlook PST (*.pst)")
@@ -2106,15 +2163,44 @@ class MainWindow(QMainWindow):
             return
         archive_key, _folder_name, _move = result
         archive_path = self.archives[archive_key].path
+        self._run_archive_import(
+            archive_key, archive_store.import_pst, archive_path, Path(source_path_str),
+            progress_text="Импорт .pst — для больших файлов может занять пару минут…",
+        )
 
-        try:
-            count = archive_store.import_pst(archive_path, Path(source_path_str))
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка импорта", str(exc))
-            return
+    def _run_archive_import(self, archive_key: str, importer, *args, progress_text: str) -> None:
+        # Разбор .pst/.mbox/Maildir раньше выполнялся прямо здесь, в
+        # обработчике клика — то есть в основном потоке интерфейса. На
+        # реальном .pst (586 писем) это занимало почти две минуты, всё это
+        # время окно не перерисовывалось и не отвечало на клики: выглядело
+        # так, будто импорт не работает вовсе (жалоба пользователя после
+        # реального теста). Отмену на середине разбора .pst не поддерживаем
+        # (нет промежуточных точек для безопасной остановки), поэтому кнопки
+        # отмены у индикатора нет — только факт, что окно живое.
+        progress = QProgressDialog(progress_text, None, 0, 0, self)
+        progress.setWindowTitle("Импорт")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setCancelButton(None)
+        progress.show()
 
-        self._refresh_archive_folders(archive_key)
-        self.statusBar().showMessage(f"Импортировано писем: {count}", 5000)
+        worker = _CallableWorker(importer, *args, parent=self)
+
+        def on_success(count: object) -> None:
+            progress.close()
+            self._refresh_archive_folders(archive_key)
+            self.statusBar().showMessage(f"Импортировано писем: {count}", 5000)
+            self._background_workers.remove(worker)
+
+        def on_failure(message: str) -> None:
+            progress.close()
+            QMessageBox.critical(self, "Ошибка импорта", message)
+            self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_archive_selected(self) -> None:
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
@@ -2902,7 +2988,9 @@ class MainWindow(QMainWindow):
         self.invite_label.setText(f"«{event.summary}» — {_PARTICIPATION_LABELS[participation]}")
         for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
             button.setEnabled(False)
-        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {_REPLY_VERBS[participation].lower()}", 5000)
+        # Само письмо с ответом уходит в фоне (см. _send_message_in_background) —
+        # окончательное "отправлен" покажет её собственный колбэк успеха.
+        self.statusBar().showMessage(f"Ответ сохранён, отправляется: {_REPLY_VERBS[participation].lower()}", 3000)
 
     def on_calendar_rsvp(self, event: calendar_store.Event, participation: str) -> None:
         """То же самое, что on_invite_response, но для встречи, открытой
@@ -2913,7 +3001,7 @@ class MainWindow(QMainWindow):
             return
         self.selected_calendar_event = updated
         self.refresh_calendar_view()
-        self.statusBar().showMessage(f"Ответ на приглашение отправлен: {_REPLY_VERBS[participation].lower()}", 5000)
+        self.statusBar().showMessage(f"Ответ сохранён, отправляется: {_REPLY_VERBS[participation].lower()}", 3000)
 
     def _respond_to_invite(self, uid: str, participation: str) -> calendar_store.Event | None:
         if not self.account:
@@ -2943,11 +3031,11 @@ class MainWindow(QMainWindow):
                 )
             ],
         )
-        try:
-            send_message(self.smtp_account, message)
-        except Exception as exc:
-            QMessageBox.critical(self, "Не удалось отправить ответ", str(exc))
-            return None
+        self._send_message_in_background(
+            message,
+            success_status=f"Ответ на приглашение отправлен: {verb.lower()}",
+            failure_title="Не удалось отправить ответ",
+        )
         return event
 
     def _show_calendar_page(self) -> None:
@@ -3417,10 +3505,36 @@ class MainWindow(QMainWindow):
                 )
             ],
         )
-        try:
-            send_message(self.smtp_account, message)
-        except Exception as exc:
-            QMessageBox.critical(self, "Встреча сохранена, но не разослана", str(exc))
+        self._send_message_in_background(
+            message,
+            success_status=f"Приглашения разосланы: «{event.summary}»",
+            failure_title="Встреча сохранена, но не разослана",
+        )
+
+    def _send_message_in_background(
+        self, message: OutgoingMessage, *, success_status: str, failure_title: str, severity: str = "critical"
+    ) -> None:
+        # Событие/ответ на приглашение уже сохранены локально к моменту
+        # вызова — сама отправка по SMTP (обычно 1-2 секунды на реальный
+        # сервер) больше не блокирует интерфейс: раньше "Новая встреча" и
+        # перенос мышью на пару секунд подвешивали всё окно ровно на время
+        # SMTP-разговора (жалоба: "подвисает при создании события").
+        smtp_account = self.smtp_account
+        worker = _CallableWorker(send_message, smtp_account, message, parent=self)
+
+        def on_success(_result: object) -> None:
+            self.statusBar().showMessage(success_status, 5000)
+            self._background_workers.remove(worker)
+
+        def on_failure(error_text: str) -> None:
+            dialog = QMessageBox.warning if severity == "warning" else QMessageBox.critical
+            dialog(self, failure_title, error_text)
+            self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_calendar_event_drag_rescheduled(
         self, event: calendar_store.Event, day_delta: int, minute_delta: int
@@ -3491,10 +3605,12 @@ class MainWindow(QMainWindow):
                     )
                 ],
             )
-            try:
-                send_message(self.smtp_account, message)
-            except Exception as exc:
-                QMessageBox.warning(self, "Не удалось уведомить участников", str(exc))
+            self._send_message_in_background(
+                message,
+                success_status=f"Участники уведомлены об отмене: «{event.summary}»",
+                failure_title="Не удалось уведомить участников",
+                severity="warning",
+            )
 
         calendar_store.delete_event(self.calendar_path, event.uid)
         self.selected_calendar_event = None
