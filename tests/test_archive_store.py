@@ -90,6 +90,21 @@ def test_message_without_display_name_falls_back_to_address(tmp_path: Path) -> N
     assert summary.sender_email == "ivan@example.com"
 
 
+def test_encoded_sender_name_without_angle_brackets_is_decoded(tmp_path: Path) -> None:
+    # PST-письма иногда дают From без реального e-mail в <угловых
+    # скобках> — только закодированное имя целиком. parseaddr() в этом
+    # случае кладёт всю строку в "адрес", а не в "имя" (RFC 822 не может
+    # разделить их без <>) — реальный баг: имя оставалось нерасшифрованным
+    # как "=?utf-8?b?...?=" в списке писем.
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    msg = _build_message("Тест", "=?utf-8?B?0JDQu9C10LrRgdCw0L3QtNGA0L7QstCw?=")
+    archive_store.append_raw_message(archive_path, "F", msg.as_bytes())
+    summary = archive_store.list_messages(archive_path, "F")[0]
+    assert summary.sender == "Александрова"
+    assert summary.sender_email == ""
+
+
 def test_delete_messages(tmp_path: Path) -> None:
     archive_path = tmp_path / "test.rmarchive"
     archive_store.create_archive(archive_path)

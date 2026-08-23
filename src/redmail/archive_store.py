@@ -166,8 +166,21 @@ def _decode_mime_words(value: str | None) -> str:
 
 def _decode_from(message: Message) -> tuple[str, str]:
     name, addr = parseaddr(message.get("From", ""))
-    display = _decode_mime_words(name) or addr or "(неизвестно)"
-    return display, addr
+    decoded_name = _decode_mime_words(name)
+    if decoded_name:
+        return decoded_name, addr
+    # Если в "From" нет реального адреса в <угловых скобках> — только
+    # закодированное отображаемое имя целиком — parseaddr() кладёт всю
+    # строку в "адрес" (RFC 822 не делит её на имя+адрес без <>), и она
+    # так и остаётся закодированной как =?utf-8?b?...?=, потому что
+    # decode_header() выше применялся только к "имени". Найдено на
+    # реальном PST (жалоба: "не распознались адреса отправителей в архиве").
+    decoded_addr = _decode_mime_words(addr)
+    if decoded_addr != addr:
+        # "Адрес" сам оказался закодированным именем, не настоящим
+        # e-mail — реального адреса в письме не было.
+        return decoded_addr or "(неизвестно)", ""
+    return addr or "(неизвестно)", addr
 
 
 def _format_date(raw_date: str | None) -> str:

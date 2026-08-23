@@ -2068,6 +2068,26 @@ class MainWindow(QMainWindow):
         self._refresh_archive_folders(key)
         self.folder_tree.expandItem(root)
 
+    def _close_archive(self, key: str) -> None:
+        # Раньше открытые архивы нельзя было отключить вообще — жалоба
+        # пользователя: "нет возможности отключить импортированный или
+        # открытый архив". Сам файл архива на диске не трогаем — просто
+        # убираем его из списка открытых (аналог "закрыть файл", не "удалить").
+        root = self.archive_tree_roots.pop(key, None)
+        if root is not None:
+            index = self.folder_tree.indexOfTopLevelItem(root)
+            if index != -1:
+                self.folder_tree.takeTopLevelItem(index)
+        was_active = self.active_source is self.archives.get(key)
+        self.archives.pop(key, None)
+        if was_active:
+            self.active_source = None
+            self.current_folder = None
+            self._clear_reading_pane()
+            self._render_folder([])
+        self._save_open_archives()
+        self.statusBar().showMessage("Архив отключён", 3000)
+
     def _refresh_archive_folders(self, key: str) -> None:
         root = self.archive_tree_roots.get(key)
         source = self.archives.get(key)
@@ -2567,6 +2587,14 @@ class MainWindow(QMainWindow):
     def on_folder_tree_context_menu(self, pos) -> None:
         item = self.folder_tree.itemAt(pos)
         if item is None:
+            return
+        archive_key = next((key for key, root in self.archive_tree_roots.items() if root is item), None)
+        if archive_key is not None:
+            menu = QMenu(self)
+            close_action = menu.addAction("Закрыть архив")
+            chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
+            if chosen is close_action:
+                self._close_archive(archive_key)
             return
         # Только для живого ящика — у архивов своя (плоская) структура папок
         # без создания через сервер, и IMAP-иерархия им не подходит. Узел
