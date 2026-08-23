@@ -519,6 +519,23 @@ class SettingsDialog(QDialog):
         caldav_group = QGroupBox("Календарь (CalDAV) — логин и пароль те же, что для IMAP выше")
         caldav_group.setLayout(caldav_form)
 
+        # Редкие действия — перенесены сюда с панели инструментов почты,
+        # чтобы не переполнять её (жалоба: "кнопка параметры пропала" —
+        # оказалось, тулбар с длинными подписями кнопок не помещался в
+        # окно, и Qt тихо прятал часть кнопок).
+        add_account_button = QPushButton("Добавить учётную запись…", self)
+        add_account_button.clicked.connect(self._on_add_account)
+        mail_rules_button = QPushButton("Правила сортировки почты…", self)
+        mail_rules_button.clicked.connect(self._on_mail_rules)
+        apply_rules_button = QPushButton("Применить правила к текущей папке", self)
+        apply_rules_button.clicked.connect(self._on_apply_mail_rules)
+        accounts_rules_layout = QVBoxLayout()
+        accounts_rules_layout.addWidget(add_account_button)
+        accounts_rules_layout.addWidget(mail_rules_button)
+        accounts_rules_layout.addWidget(apply_rules_button)
+        accounts_rules_group = QGroupBox("Учётные записи и правила почты", self)
+        accounts_rules_group.setLayout(accounts_rules_layout)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -530,7 +547,20 @@ class SettingsDialog(QDialog):
         layout.addWidget(smtp_group)
         layout.addWidget(general_group)
         layout.addWidget(caldav_group)
+        layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
+
+    def _on_add_account(self) -> None:
+        if self.parent() is not None:
+            self.parent().on_add_account()
+
+    def _on_mail_rules(self) -> None:
+        if self.parent() is not None:
+            self.parent().on_mail_rules()
+
+    def _on_apply_mail_rules(self) -> None:
+        if self.parent() is not None:
+            self.parent().on_apply_mail_rules()
 
     def account(self) -> Account:
         return Account(
@@ -1677,6 +1707,13 @@ class MainWindow(QMainWindow):
 
         toolbar = QToolBar("Основная", self)
         self.addToolBar(toolbar)
+        # Дополнительный ряд для менее частых действий (архив/импорт/параметры) —
+        # разнесены на вторую строку через addToolBarBreak(), а не оставлены в общем
+        # ряду с остальными: на обычной ширине окна один общий ряд с таким числом
+        # длинных кириллических подписей не помещался, и Qt прятал "лишние" кнопки
+        # за скрытую стрелку-развёртку ">>", из-за чего казалось, что кнопки
+        # "Параметры" и "Импортировать" вовсе пропали (жалоба пользователя после
+        # реального теста на VM). Два полных по ширине ряда решают это без обрезки.
 
         mode_group = QActionGroup(self)
         mode_group.setExclusive(True)
@@ -1722,48 +1759,35 @@ class MainWindow(QMainWindow):
         delete_action.triggered.connect(self.on_delete_selected)
         toolbar.addAction(delete_action)
 
-        toolbar.addSeparator()
+        self.addToolBarBreak()
+        archive_toolbar = QToolBar("Архив", self)
+        self.addToolBar(archive_toolbar)
 
         open_archive_action = QAction("Открыть архив…", self)
         open_archive_action.triggered.connect(self.on_open_archive)
-        toolbar.addAction(open_archive_action)
+        archive_toolbar.addAction(open_archive_action)
 
         import_action = QAction("Импортировать…", self)
         import_action.setToolTip("Импортировать mbox/Maildir (Evolution) или .pst (Outlook) в архив")
         import_action.triggered.connect(self.on_import)
-        toolbar.addAction(import_action)
+        archive_toolbar.addAction(import_action)
 
         archive_selected_action = QAction("В архив…", self)
         archive_selected_action.setToolTip("Выгрузить отмеченные письма в архив (копия или перемещение)")
         archive_selected_action.triggered.connect(self.on_archive_selected)
-        toolbar.addAction(archive_selected_action)
+        archive_toolbar.addAction(archive_selected_action)
 
         archive_folder_action = QAction("Архивировать папку…", self)
         archive_folder_action.setToolTip("Выгрузить в архив всю папку целиком или всё старше выбранной даты")
         archive_folder_action.triggered.connect(self.on_archive_folder)
-        toolbar.addAction(archive_folder_action)
+        archive_toolbar.addAction(archive_folder_action)
 
-        mail_rules_action = QAction("Правила…", self)
-        mail_rules_action.setToolTip("Правила сортировки писем по папкам (применяются вручную)")
-        mail_rules_action.triggered.connect(self.on_mail_rules)
-        toolbar.addAction(mail_rules_action)
-
-        apply_rules_action = QAction("Применить правила", self)
-        apply_rules_action.setToolTip("Разложить письма текущей папки по правилам")
-        apply_rules_action.triggered.connect(self.on_apply_mail_rules)
-        toolbar.addAction(apply_rules_action)
-
-        toolbar.addSeparator()
+        archive_toolbar.addSeparator()
 
         settings_action = QAction("Параметры…", self)
-        settings_action.setToolTip("Правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана)")
+        settings_action.setToolTip("Правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана); там же — добавление учётных записей и правила почты")
         settings_action.triggered.connect(self.on_settings)
-        toolbar.addAction(settings_action)
-
-        add_account_action = QAction("Добавить учётную запись…", self)
-        add_account_action.setToolTip("Подключить ещё одну учётную запись, не закрывая уже открытые")
-        add_account_action.triggered.connect(self.on_add_account)
-        toolbar.addAction(add_account_action)
+        archive_toolbar.addAction(settings_action)
 
         self.setStatusBar(QStatusBar(self))
 
@@ -2158,7 +2182,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Недоступно", "Применение правил работает только в папках живого ящика.")
             return
         if not self.mail_rules:
-            QMessageBox.information(self, "Нет правил", "Сначала добавьте хотя бы одно правило (кнопка «Правила…»).")
+            QMessageBox.information(
+                self, "Нет правил",
+                "Сначала добавьте хотя бы одно правило: Параметры → «Правила сортировки почты…».",
+            )
             return
 
         source_folder = self.current_folder

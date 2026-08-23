@@ -78,8 +78,15 @@ class _EventBlock(QFrame):
 
         # Перетаскивать можно только свои встречи (я организатор) — чужие
         # переносить нечем: у участника нет права менять чужое время, только
-        # отвечать на приглашение (см. invite bar в почте).
-        self._draggable = calendar_event.is_organizer and not calendar_event.all_day
+        # отвечать на приглашение (см. invite bar в почте). Таблетки в виде
+        # месяца (pill=True) тоже не перетаскиваются: они лежат в обычном
+        # QVBoxLayout (MonthCellWidget.events_layout) без переноса дня по
+        # горизонтали — layout вернул бы таблетку на место после любой
+        # перерисовки, а перенос между днями там вообще не реализован.
+        # Раньше курсор/логика драга включались и там, из-за чего таблетку
+        # можно было чуть сдвинуть мышью без всякого эффекта — выглядело как
+        # "событие не переносится" в виде месяца.
+        self._draggable = calendar_event.is_organizer and not calendar_event.all_day and not pill
         self._drag_start_mouse = None
         self._drag_start_geom = None
         self._dragging = False
