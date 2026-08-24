@@ -44,6 +44,7 @@ from PySide6.QtGui import (
     QTextDocument,
 )
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCalendarWidget,
     QCheckBox,
@@ -1845,6 +1846,40 @@ class _CallableWorker(QThread):
             self.succeeded.emit(result)
 
 
+class _FolderTreeWidget(QTreeWidget):
+    """Дерево папок (живые ящики + архивы) с перетаскиванием мышью — по
+    просьбе пользователя ("нужно сделать возможность перетаскивать папки
+    мышью"). Не пользуемся стандартным Qt-InternalMove как есть: он бы сам
+    переставил узлы в дереве ДО того, как реальная папка на диске/сервере
+    действительно переместилась — вместо этого dropEvent() полностью
+    перехватывается, а фактическая перестройка дерева происходит только
+    после успешного archive_store.rename_folder()/session.rename_folder()
+    через folderDropped, которую слушает MainWindow."""
+
+    folderDropped = Signal(object, object)  # (перетаскиваемый item, item под курсором или None)
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self._drag_source_item: QTreeWidgetItem | None = None
+
+    def startDrag(self, supported_actions) -> None:  # noqa: N802 - Qt override
+        self._drag_source_item = self.currentItem()
+        super().startDrag(supported_actions)
+
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt override
+        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+        target_item = self.itemAt(pos)
+        source_item = self._drag_source_item
+        self._drag_source_item = None
+        event.ignore()  # никогда не даём Qt самому переставить узлы визуально
+        if source_item is not None and source_item is not target_item:
+            self.folderDropped.emit(source_item, target_item)
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1914,9 +1949,10 @@ class MainWindow(QMainWindow):
         self.selected_contact: contact_store.Contact | None = None
         self._contacts_by_row: list[contact_store.Contact] = []
 
-        self.folder_tree = QTreeWidget(self)
+        self.folder_tree = _FolderTreeWidget(self)
         self.folder_tree.setHeaderHidden(True)
         self.folder_tree.currentItemChanged.connect(self.on_folder_item_changed)
+        self.folder_tree.folderDropped.connect(self.on_folder_dropped)
         self.folder_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.folder_tree.customContextMenuRequested.connect(self.on_folder_tree_context_menu)
         self._folder_delimiter = "/"
@@ -3406,6 +3442,86 @@ class MainWindow(QMainWindow):
         if self.active_source is mailbox and self.current_folder == old_full_name:
             self.current_folder = new_full_name
         self.statusBar().showMessage(f"Папка переименована: {new_full_name}", 5000)
+
+    def on_folder_dropped(self, source_item: QTreeWidgetItem, target_item: QTreeWidgetItem | None) -> None:
+        """Перетаскивание папки мышью в дереве (по просьбе пользователя) —
+        и для архивов, и для живых ящиков; в обоих случаях "переместить" —
+        это то же самое переименование в новый полный путь, что уже есть у
+        кнопки "Переименовать папку…", просто путь вычисляется из точки
+        сброса, а не спрашивается текстом."""
+        if target_item is None:
+            return  # брошено в пустое место дерева — неоднозначно, к какому корню отнести
+
+        is_source_root = any(root is source_item for root in (*self.archive_tree_roots.values(), *self.mailbox_tree_roots.values()))
+        if is_source_root:
+            return  # тащили целый архив/учётную запись, а не папку внутри неё
+
+        source_data = source_item.data(0, Qt.ItemDataRole.UserRole)
+        if not source_data:
+            return
+        key, source_path = source_data
+
+        target_archive_key = next((k for k, root in self.archive_tree_roots.items() if root is target_item), None)
+        target_account_key = next((k for k, root in self.mailbox_tree_roots.items() if root is target_item), None)
+        if target_archive_key is not None:
+            target_key, target_path = target_archive_key, ""
+        elif target_account_key is not None:
+            target_key, target_path = target_account_key, ""
+        else:
+            target_data = target_item.data(0, Qt.ItemDataRole.UserRole)
+            if not target_data:
+                return
+            target_key, target_path = target_data
+
+        if target_key != key:
+            QMessageBox.information(
+                self, "Нельзя переместить", "Нельзя перетащить папку в другую учётную запись или другой архив."
+            )
+            return
+
+        is_archive = key in self.archives
+        delimiter = "/" if is_archive else self._folder_delimiter
+        short_name = source_path.rsplit(delimiter, 1)[-1]
+        new_path = f"{target_path}{delimiter}{short_name}" if target_path else short_name
+
+        if new_path == source_path:
+            return  # бросили туда же, откуда взяли
+        if target_path == source_path or target_path.startswith(source_path + delimiter):
+            QMessageBox.warning(self, "Нельзя переместить", "Нельзя перетащить папку саму в себя или в свою же подпапку.")
+            return
+
+        confirm = QMessageBox.question(
+            self, "Переместить папку",
+            f"Переместить «{source_path}» в «{target_path or '(верхний уровень)'}»?",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        if is_archive:
+            archive = self.archives[key]
+            try:
+                archive_store.rename_folder(archive.path, source_path, new_path)
+            except Exception as exc:
+                QMessageBox.critical(self, "Не удалось переместить папку", str(exc))
+                return
+            self._refresh_archive_folders(key)
+            if self.active_source is archive and self.current_folder == source_path:
+                self.current_folder = new_path
+        else:
+            mailbox = self.mailboxes[key]
+            try:
+                mailbox.session.rename_folder(source_path, new_path)
+                folders = mailbox.session.list_folders()
+            except Exception as exc:
+                QMessageBox.critical(self, "Не удалось переместить папку", str(exc))
+                return
+            self.mailbox_trash_folders[key] = mailbox.session.trash_folder()
+            if key == next((k for k, m in self.mailboxes.items() if m is self.mailbox), None):
+                self.trash_folder_name = self.mailbox_trash_folders[key]
+            self._populate_account_folder_tree(key, folders)
+            if self.active_source is mailbox and self.current_folder == source_path:
+                self.current_folder = new_path
+        self.statusBar().showMessage(f"Папка перемещена: {new_path}", 5000)
 
     def on_refresh(self) -> None:
         if not self.active_source or not self.current_folder:
