@@ -608,6 +608,75 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
     return QIcon(pixmap)
 
 
+def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
+    """Монохромные значки для панелей инструментов (та же техника, что и
+    _calendar_icon выше — рисуем сами через QPainter, не полагаясь на
+    системную тему/эмодзи-шрифт). Команды переведены с текстовых подписей
+    на иконки с подсказками по явной просьбе пользователя — экономит место
+    в тулбаре (кроме почты/календаря/контактов/параметров/справки, которые
+    намеренно оставлены текстом)."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(_ICON_COLOR))
+    pen.setWidthF(1.4)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    m = size * 0.16
+    cx, cy = size / 2, size / 2
+
+    if kind == "compose":
+        painter.drawLine(QPointF(m, size - m), QPointF(size * 0.55, size * 0.45))
+        painter.drawPolyline([
+            QPointF(size * 0.55, size * 0.45), QPointF(size - m, m),
+            QPointF(size - m * 0.4, m + m * 0.6), QPointF(size * 0.62, size * 0.52),
+        ])
+        painter.drawLine(QPointF(m, size - m), QPointF(m + m * 0.6, size - m * 1.4))
+    elif kind in ("reply", "forward"):
+        flip = kind == "forward"
+        x0, x1 = (size - m, m) if flip else (m, size - m)
+        painter.drawLine(QPointF(x0, cy), QPointF(x1, cy))
+        dx = -1 if flip else 1
+        painter.drawLine(QPointF(x0, cy), QPointF(x0 + dx * size * 0.30, cy - size * 0.22))
+        painter.drawLine(QPointF(x0, cy), QPointF(x0 + dx * size * 0.30, cy + size * 0.22))
+        painter.drawArc(QRectF(cx - size * 0.05, m, size * 0.42, size * 0.42), -20 * 16, 200 * 16)
+    elif kind == "delete":
+        painter.drawRect(QRectF(size * 0.24, size * 0.30, size * 0.52, size * 0.56))
+        painter.drawLine(QPointF(size * 0.16, size * 0.30), QPointF(size * 0.84, size * 0.30))
+        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.60, size * 0.16))
+        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.40, size * 0.30))
+        painter.drawLine(QPointF(size * 0.60, size * 0.16), QPointF(size * 0.60, size * 0.30))
+        painter.drawLine(QPointF(size * 0.38, size * 0.42), QPointF(size * 0.38, size * 0.76))
+        painter.drawLine(QPointF(size * 0.5, size * 0.42), QPointF(size * 0.5, size * 0.76))
+        painter.drawLine(QPointF(size * 0.62, size * 0.42), QPointF(size * 0.62, size * 0.76))
+    elif kind == "refresh":
+        rect = QRectF(m, m, size - 2 * m, size - 2 * m)
+        painter.drawArc(rect, 20 * 16, 280 * 16)
+        angle = math.radians(20)
+        ax = cx + (rect.width() / 2) * math.cos(angle)
+        ay = cy - (rect.height() / 2) * math.sin(angle)
+        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPolygon([QPointF(ax - 3.4, ay - 0.8), QPointF(ax + 1.6, ay - 3.8), QPointF(ax + 0.8, ay + 3.2)])
+    elif kind in ("open_archive", "archive_folder", "import", "archive"):
+        painter.drawPolyline([
+            QPointF(m, size * 0.34), QPointF(m, size - m), QPointF(size - m, size - m), QPointF(size - m, size * 0.34),
+        ])
+        painter.drawPolyline([
+            QPointF(m, size * 0.34), QPointF(size * 0.40, size * 0.34), QPointF(size * 0.46, size * 0.22),
+            QPointF(size * 0.60, size * 0.22), QPointF(size * 0.66, size * 0.34), QPointF(size - m, size * 0.34),
+        ])
+        if kind in ("import", "archive"):
+            painter.drawLine(QPointF(cx, size * 0.42), QPointF(cx, size * 0.68))
+            painter.drawLine(QPointF(cx - size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
+            painter.drawLine(QPointF(cx + size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
+    painter.end()
+    return QIcon(pixmap)
+
+
 def _icon_label(kind: str, parent: QWidget | None = None) -> QLabel:
     label = QLabel(parent)
     label.setPixmap(_calendar_icon(kind).pixmap(16, 16))
@@ -1883,9 +1952,39 @@ class MainWindow(QMainWindow):
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.on_mail_table_context_menu)
 
+        # Команды над списком писем — по просьбе пользователя ("команды
+        # связанные с письмами разместить в среднем окне над фильтрами"):
+        # они действуют на текущее/отмеченные письма в этой же таблице, а
+        # не на весь ящик/архив, так что логично разместить их прямо над
+        # таблицей, а не в общем тулбаре наверху окна. Сами QAction создаём
+        # здесь (а не в основном тулбаре ниже по __init__), потому что
+        # именно здесь строится их видимая панель.
+        compose_action = QAction(_toolbar_icon("compose"), "Написать письмо…", self)
+        compose_action.triggered.connect(self.on_compose)
+
+        self.reply_action = QAction(_toolbar_icon("reply"), "Ответить", self)
+        self.reply_action.triggered.connect(self.on_reply)
+
+        self.forward_action = QAction(_toolbar_icon("forward"), "Переслать", self)
+        self.forward_action.triggered.connect(self.on_forward)
+
+        self.delete_action = QAction(_toolbar_icon("delete"), "Удалить", self)
+        self.delete_action.setToolTip("Удалить — в корзину. Shift+Удалить — безвозвратно.")
+        self.delete_action.triggered.connect(self.on_delete_selected)
+
+        self.archive_selected_action = QAction(_toolbar_icon("archive"), "В архив…", self)
+        self.archive_selected_action.setToolTip("В архив — выгрузить отмеченные письма в архив (копия или перемещение)")
+        self.archive_selected_action.triggered.connect(self.on_archive_selected)
+
+        mail_actions_toolbar = QToolBar("Письмо", self)
+        mail_actions_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        for action in (compose_action, self.reply_action, self.forward_action, self.delete_action, self.archive_selected_action):
+            mail_actions_toolbar.addAction(action)
+
         table_container = QWidget(self)
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(mail_actions_toolbar)
         table_layout.addWidget(self.filter_edit)
         table_layout.addWidget(self.table)
 
@@ -2177,49 +2276,35 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        refresh_action = QAction("Обновить", self)
+        refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         refresh_action.triggered.connect(self.on_refresh)
         toolbar.addAction(refresh_action)
-
-        toolbar.addSeparator()
-
-        compose_action = QAction("Написать письмо…", self)
-        compose_action.triggered.connect(self.on_compose)
-        toolbar.addAction(compose_action)
-
-        self.reply_action = QAction("Ответить", self)
-        self.reply_action.triggered.connect(self.on_reply)
-        toolbar.addAction(self.reply_action)
-
-        self.forward_action = QAction("Переслать", self)
-        self.forward_action.triggered.connect(self.on_forward)
-        toolbar.addAction(self.forward_action)
-
-        self.delete_action = QAction("Удалить", self)
-        self.delete_action.setToolTip("В корзину. Shift+Удалить — безвозвратно.")
-        self.delete_action.triggered.connect(self.on_delete_selected)
-        toolbar.addAction(self.delete_action)
+        # Почта/Календарь/Контакты — единственные подписи, оставленные
+        # текстом по явной просьбе пользователя; весь тулбар по умолчанию
+        # переведён на иконки (refresh_action ниже), поэтому для этих трёх
+        # действий стиль кнопки переопределяется отдельно.
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        for mode_action in (self.mail_mode_action, self.calendar_mode_action, self.contacts_mode_action):
+            button = toolbar.widgetForAction(mode_action)
+            if button is not None:
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
 
         self.addToolBarBreak()
         archive_toolbar = QToolBar("Архив", self)
         self.addToolBar(archive_toolbar)
+        archive_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
 
-        open_archive_action = QAction("Открыть архив…", self)
+        open_archive_action = QAction(_toolbar_icon("open_archive"), "Открыть архив…", self)
         open_archive_action.triggered.connect(self.on_open_archive)
         archive_toolbar.addAction(open_archive_action)
 
-        import_action = QAction("Импортировать…", self)
-        import_action.setToolTip("Импортировать mbox/Maildir (Evolution) или .pst (Outlook) в архив")
+        import_action = QAction(_toolbar_icon("import"), "Импортировать…", self)
+        import_action.setToolTip("Импортировать — mbox/Maildir (Evolution) или .pst (Outlook) в архив")
         import_action.triggered.connect(self.on_import)
         archive_toolbar.addAction(import_action)
 
-        self.archive_selected_action = QAction("В архив…", self)
-        self.archive_selected_action.setToolTip("Выгрузить отмеченные письма в архив (копия или перемещение)")
-        self.archive_selected_action.triggered.connect(self.on_archive_selected)
-        archive_toolbar.addAction(self.archive_selected_action)
-
-        self.archive_folder_action = QAction("Архивировать папку…", self)
-        self.archive_folder_action.setToolTip("Выгрузить в архив всю папку целиком или всё старше выбранной даты")
+        self.archive_folder_action = QAction(_toolbar_icon("archive_folder"), "Архивировать папку…", self)
+        self.archive_folder_action.setToolTip("Архивировать папку — выгрузить в архив всю папку целиком или всё старше выбранной даты")
         self.archive_folder_action.triggered.connect(self.on_archive_folder)
         archive_toolbar.addAction(self.archive_folder_action)
 
@@ -2229,6 +2314,9 @@ class MainWindow(QMainWindow):
         settings_action.setToolTip("Правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана); там же — добавление учётных записей и правила почты")
         settings_action.triggered.connect(self.on_settings)
         archive_toolbar.addAction(settings_action)
+        settings_button = archive_toolbar.widgetForAction(settings_action)
+        if settings_button is not None:
+            settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
 
         help_menu = self.menuBar().addMenu("Справка")
         about_action = QAction("О программе…", self)
