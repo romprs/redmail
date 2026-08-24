@@ -640,9 +640,24 @@ class SettingsDialog(QDialog):
         self.ssl_check = QCheckBox("Использовать SSL")
         self.ssl_check.setChecked(account.use_ssl if account else True)
 
+        self.auth_combo = QComboBox()
+        self.auth_combo.addItem("Логин и пароль", "password")
+        self.auth_combo.addItem("SSO (Kerberos, без пароля)", "kerberos")
+        self.auth_combo.setToolTip(
+            "SSO — почтовый сервер в домене; вход идёт по Kerberos-билету, "
+            "который RED OS уже выдала при входе пользователя в домен "
+            "(SSSD). Пароль в приложении не хранится и не используется — "
+            "его смену на стороне домена обрабатывает сама SSO-инфраструктура."
+        )
+        self.auth_combo.setCurrentIndex(
+            self.auth_combo.findData(account.auth_type if account else "password")
+        )
+        self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
+
         imap_form = QFormLayout()
         imap_form.addRow("Сервер", self.host_edit)
         imap_form.addRow("Порт", self.port_edit)
+        imap_form.addRow("Способ входа", self.auth_combo)
         imap_form.addRow("Логин", self.user_edit)
         imap_form.addRow("Пароль", self.password_edit)
         imap_form.addRow(self.ssl_check)
@@ -727,6 +742,11 @@ class SettingsDialog(QDialog):
         layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
 
+        self._update_password_enabled()
+
+    def _update_password_enabled(self) -> None:
+        self.password_edit.setEnabled(self.auth_combo.currentData() != "kerberos")
+
     def _on_add_account(self) -> None:
         if self.parent() is not None:
             self.parent().on_add_account()
@@ -744,21 +764,25 @@ class SettingsDialog(QDialog):
             self.parent().on_apply_mail_rules()
 
     def account(self) -> Account:
+        auth_type = self.auth_combo.currentData()
         return Account(
             host=self.host_edit.text().strip(),
             username=self.user_edit.text().strip(),
-            password=self.password_edit.text(),
+            password="" if auth_type == "kerberos" else self.password_edit.text(),
             port=self.port_edit.value(),
             use_ssl=self.ssl_check.isChecked(),
+            auth_type=auth_type,
         )
 
     def smtp_account(self) -> SmtpAccount:
+        auth_type = self.auth_combo.currentData()
         return SmtpAccount(
             host=self.smtp_host_edit.text().strip(),
             username=self.user_edit.text().strip(),
-            password=self.password_edit.text(),
+            password="" if auth_type == "kerberos" else self.password_edit.text(),
             port=self.smtp_port_edit.value(),
             use_ssl=self.smtp_ssl_check.isChecked(),
+            auth_type=auth_type,
         )
 
     def poll_interval_minutes(self) -> int:

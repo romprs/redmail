@@ -65,6 +65,11 @@ class Account:
     password: str
     port: int = 993
     use_ssl: bool = True
+    # "password" — обычный LOGIN; "kerberos" — SSO для почтового сервера в
+    # домене: аутентификация идёт по Kerberos-билету, который ОС уже
+    # выдала при входе пользователя в домен (RED OS + SSSD), пароль в
+    # приложении не хранится и не используется (см. gssapi_sasl.py).
+    auth_type: str = "password"
 
 
 @dataclass
@@ -128,10 +133,22 @@ class ImapSession:
     def __init__(self, account: Account):
         self.account = account
         self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
-        self._client.login(account.username, account.password)
+        self._login()
         self._selected_folder: str | None = None
         self._selected_exists = 0
         self._raw_folders: list[tuple] = []
+
+    def _login(self) -> None:
+        if self.account.auth_type == "kerberos":
+            # Импорт внутри функции: пакет gssapi требует системных
+            # библиотек Kerberos, которых нет на части машин (Windows,
+            # окружения без домена) — обычный пароль не должен ломаться
+            # из-за отсутствия зависимости, нужной только для SSO.
+            from redmail import gssapi_sasl
+
+            gssapi_sasl.imap_sasl_login(self._client, self.account.host, self.account.username)
+        else:
+            self._client.login(self.account.username, self.account.password)
 
     def close(self) -> None:
         try:
@@ -141,7 +158,7 @@ class ImapSession:
 
     def _reconnect(self) -> None:
         self._client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.use_ssl)
-        self._client.login(self.account.username, self.account.password)
+        self._login()
         if self._selected_folder is not None:
             # Кое-что из вызывающего кода (fetch_summaries) не делает
             # собственный SELECT — полагается, что папка уже выбрана

@@ -83,6 +83,28 @@ def test_save_without_smtp_round_trips_to_none(tmp_path: Path) -> None:
     assert smtp is None
 
 
+def test_save_and_load_account_kerberos_does_not_store_password(tmp_path: Path) -> None:
+    # SSO для IMAP/SMTP-аккаунта: пароль не отправляется в keyring вовсе —
+    # аутентификация идёт по Kerberos-билету из ОС (см. gssapi_sasl.py).
+    config_file = tmp_path / "account.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    with patch("redmail.config_store._config_path", return_value=config_file), set_patch, get_patch:
+        account = Account(host="imap.corp.local", username="ivan", password="", auth_type="kerberos")
+        smtp = SmtpAccount(host="smtp.corp.local", username="ivan", password="", auth_type="kerberos")
+        save_account(account, smtp)
+        loaded = load_account()
+
+    assert store == {}  # пароль не попал в keyring
+    assert loaded is not None
+    loaded_account, loaded_smtp = loaded
+    assert loaded_account.auth_type == "kerberos"
+    assert loaded_account.password == ""
+    assert loaded_smtp is not None
+    assert loaded_smtp.auth_type == "kerberos"
+
+
 def test_load_account_returns_none_when_no_config_file(tmp_path: Path) -> None:
     config_file = tmp_path / "account.json"
     with patch("redmail.config_store._config_path", return_value=config_file):
@@ -237,6 +259,25 @@ def test_save_and_load_accounts_round_trip(tmp_path: Path) -> None:
     assert loaded[0][1].host == "smtp1.example.com"
     assert loaded[1][0].username == "other@example.com"
     assert loaded[1][1] is None
+
+
+def test_save_and_load_accounts_kerberos_entry_round_trip(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    a1 = Account(host="imap1.example.com", username="ivan@example.com", password="p1")
+    a2 = Account(host="imap2.corp.local", username="sso-user", password="", auth_type="kerberos")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        save_accounts([(a1, None), (a2, None)])
+        loaded = load_accounts()
+
+    assert "sso-user" not in store  # для kerberos пароль не сохраняется
+    assert len(loaded) == 2
+    assert loaded[1][0].username == "sso-user"
+    assert loaded[1][0].auth_type == "kerberos"
+    assert loaded[1][0].password == ""
 
 
 def test_load_accounts_migrates_from_old_single_account_file(tmp_path: Path) -> None:

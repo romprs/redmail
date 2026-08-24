@@ -162,20 +162,15 @@ def save_open_archives(paths: list[str]) -> None:
 
 
 def save_account(account: Account, smtp: SmtpAccount | None) -> None:
-    """Сохраняет настройки подключения. Пароль — не в этом файле, а в keyring."""
+    """Сохраняет настройки подключения. Пароль — не в этом файле, а в
+    keyring (и вовсе не сохраняется для auth_type="kerberos": SSO
+    использует Kerberos-билет из ОС, пароль приложению не нужен)."""
     path = _config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    data = {
-        "imap_host": account.host,
-        "imap_port": account.port,
-        "imap_use_ssl": account.use_ssl,
-        "username": account.username,
-        "smtp_host": smtp.host if smtp else "",
-        "smtp_port": smtp.port if smtp else 587,
-        "smtp_use_ssl": smtp.use_ssl if smtp else False,
-    }
+    data = _account_dict(account, smtp)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
+    if account.auth_type != "kerberos":
+        keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
 
 
 def load_account() -> tuple[Account, SmtpAccount | None] | None:
@@ -188,11 +183,16 @@ def load_account() -> tuple[Account, SmtpAccount | None] | None:
     except (json.JSONDecodeError, KeyError):
         return None
 
-    password = keyring.get_password(_KEYRING_SERVICE, username)
-    if password is None:
-        # Файл настроек есть, а пароля в хранилище секретов нет (например,
-        # его отозвали или это другая машина) — просим ввести заново.
-        return None
+    auth_type = data.get("auth_type", "password")
+    password = ""
+    if auth_type != "kerberos":
+        password = keyring.get_password(_KEYRING_SERVICE, username)
+        if password is None:
+            # Файл настроек есть, а пароля в хранилище секретов нет
+            # (например, его отозвали или это другая машина) — просим
+            # ввести заново. Для SSO (kerberos) пароль и не хранился —
+            # сюда не попадаем.
+            return None
 
     return _account_from_dict(data, username, password)
 
@@ -203,6 +203,7 @@ def _account_dict(account: Account, smtp: SmtpAccount | None) -> dict:
         "imap_port": account.port,
         "imap_use_ssl": account.use_ssl,
         "username": account.username,
+        "auth_type": account.auth_type,
         "smtp_host": smtp.host if smtp else "",
         "smtp_port": smtp.port if smtp else 587,
         "smtp_use_ssl": smtp.use_ssl if smtp else False,
@@ -210,12 +211,14 @@ def _account_dict(account: Account, smtp: SmtpAccount | None) -> dict:
 
 
 def _account_from_dict(data: dict, username: str, password: str) -> tuple[Account, SmtpAccount | None]:
+    auth_type = data.get("auth_type", "password")
     account = Account(
         host=data["imap_host"],
         username=username,
         password=password,
         port=data["imap_port"],
         use_ssl=data["imap_use_ssl"],
+        auth_type=auth_type,
     )
     smtp = (
         SmtpAccount(
@@ -224,6 +227,7 @@ def _account_from_dict(data: dict, username: str, password: str) -> tuple[Accoun
             password=password,
             port=data["smtp_port"],
             use_ssl=data["smtp_use_ssl"],
+            auth_type=auth_type,
         )
         if data.get("smtp_host")
         else None
@@ -256,9 +260,12 @@ def load_accounts() -> list[tuple[Account, SmtpAccount | None]]:
         username = entry.get("username") if isinstance(entry, dict) else None
         if not username:
             continue
-        password = keyring.get_password(_KEYRING_SERVICE, username)
-        if password is None:
-            continue  # пароль недоступен (другая машина/отозван) — эту запись пропускаем, а не всё подряд
+        auth_type = entry.get("auth_type", "password") if isinstance(entry, dict) else "password"
+        password = ""
+        if auth_type != "kerberos":
+            password = keyring.get_password(_KEYRING_SERVICE, username)
+            if password is None:
+                continue  # пароль недоступен (другая машина/отозван) — эту запись пропускаем, а не всё подряд
         try:
             result.append(_account_from_dict(entry, username, password))
         except KeyError:
@@ -271,7 +278,8 @@ def save_accounts(accounts: list[tuple[Account, SmtpAccount | None]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     entries = []
     for account, smtp in accounts:
-        keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
+        if account.auth_type != "kerberos":
+            keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
         entries.append(_account_dict(account, smtp))
     path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
 

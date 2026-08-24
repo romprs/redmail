@@ -42,6 +42,35 @@ def test_session_logs_in_once_on_construction() -> None:
     fake_client.login.assert_called_once_with("ivan", "secret")
 
 
+def test_session_with_kerberos_auth_type_uses_gssapi_sasl_not_password(monkeypatch) -> None:
+    # SSO для почтового сервера в домене: пароль не хранится и не
+    # используется — вход идёт по Kerberos-билету через SASL GSSAPI (см.
+    # redmail/gssapi_sasl.py). Реальный пакет gssapi требует системных
+    # библиотек Kerberos, которых на машине для тестов нет — подменяем
+    # весь модуль redmail.gssapi_sasl мок-объектом.
+    import sys
+
+    import redmail
+
+    fake_gssapi_sasl = MagicMock()
+    # И атрибут пакета, и ключ в sys.modules: "from redmail import
+    # gssapi_sasl" сперва пробует getattr(redmail, "gssapi_sasl") — если
+    # какой-то другой тест уже импортировал настоящий gssapi_sasl раньше
+    # (пусть и с фейковым gssapi внутри), одной подмены sys.modules
+    # недостаточно, подмена через getattr будет проигнорирована.
+    monkeypatch.setattr(redmail, "gssapi_sasl", fake_gssapi_sasl, raising=False)
+    monkeypatch.setitem(sys.modules, "redmail.gssapi_sasl", fake_gssapi_sasl)
+
+    fake_client = _client(exists=0)
+    account = Account(host="imap.corp.local", username="ivan", password="", auth_type="kerberos")
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        ImapSession(account)
+
+    fake_client.login.assert_not_called()
+    fake_gssapi_sasl.imap_sasl_login.assert_called_once_with(fake_client, "imap.corp.local", "ivan")
+
+
 def test_fetch_folder_summaries_always_reselects_for_fresh_exists() -> None:
     # Намеренно НЕ пропускаем повторный SELECT для той же папки: иначе, раз мы
     # больше не делаем отдельный SEARCH ALL, можно не заметить письма, пришедшие

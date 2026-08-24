@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from unittest.mock import MagicMock, patch
 
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
@@ -29,6 +30,33 @@ def test_send_message_starttls_flow() -> None:
     assert sent["To"] == "boss@example.com"
     assert sent["From"] == "ivan@example.com"
     assert sent.get_content().strip() == "Текст письма с кириллицей"
+
+
+def test_send_message_kerberos_auth_uses_gssapi_sasl_not_password(monkeypatch) -> None:
+    # SSO: пароль не хранится и не отправляется на сервер вовсе — вход по
+    # Kerberos-билету через SASL GSSAPI. Реальный пакет gssapi требует
+    # системных библиотек Kerberos, которых на машине для тестов нет —
+    # подменяем весь модуль redmail.gssapi_sasl мок-объектом.
+    import redmail
+
+    fake_gssapi_sasl = MagicMock()
+    # См. комментарий в test_imap_client.py — нужны и атрибут пакета, и
+    # ключ sys.modules, иначе "from redmail import gssapi_sasl" может
+    # найти уже импортированный ранее настоящий модуль в обход подмены.
+    monkeypatch.setattr(redmail, "gssapi_sasl", fake_gssapi_sasl, raising=False)
+    monkeypatch.setitem(sys.modules, "redmail.gssapi_sasl", fake_gssapi_sasl)
+
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.corp.local", username="ivan", password="", auth_type="kerberos")
+        message = OutgoingMessage(sender="ivan@corp.local", to=["boss@corp.local"], subject="S", body="B")
+        send_message(account, message)
+
+    fake_client.login.assert_not_called()
+    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(fake_client, "smtp.corp.local", "ivan")
+    fake_client.send_message.assert_called_once()
 
 
 def test_send_message_implicit_ssl_skips_starttls() -> None:

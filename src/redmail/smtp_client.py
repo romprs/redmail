@@ -13,6 +13,9 @@ class SmtpAccount:
     password: str
     port: int = 587
     use_ssl: bool = False  # True = неявный TLS (порт 465), False = STARTTLS (порт 587)
+    # "password" — обычный AUTH LOGIN/PLAIN; "kerberos" — SSO для сервера в
+    # домене, см. Account.auth_type в imap_client.py и gssapi_sasl.py.
+    auth_type: str = "password"
 
 
 @dataclass
@@ -83,5 +86,13 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
     with smtp_cls(account.host, account.port, timeout=30) as client:
         if not account.use_ssl:
             client.starttls()
-        client.login(account.username, account.password)
+        if account.auth_type == "kerberos":
+            # Импорт внутри функции — см. imap_client.py._login: gssapi
+            # нужен только для SSO и не должен ломать обычный пароль там,
+            # где нет системных библиотек Kerberos.
+            from redmail import gssapi_sasl
+
+            gssapi_sasl.smtp_sasl_login(client, account.host, account.username)
+        else:
+            client.login(account.username, account.password)
         client.send_message(email_message)
