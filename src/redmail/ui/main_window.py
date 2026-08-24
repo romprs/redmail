@@ -56,6 +56,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -1447,6 +1448,10 @@ class EventDialog(QDialog):
         self.description_edit = QPlainTextEdit(event.description if event else "")
         self.description_edit.setPlaceholderText("Добавьте описание")
         self.description_edit.setFixedHeight(70)
+        # Жалоба "убери внутреннюю рамку" была про это поле — стандартная
+        # рамка QPlainTextEdit вокруг текста описания, а не про карточку
+        # события в недельной сетке (которую я по ошибке трогал раньше).
+        self.description_edit.setFrameShape(QFrame.Shape.NoFrame)
 
         attendees_address_book_button = QPushButton("Адресная книга…", self)
         attendees_address_book_button.clicked.connect(
@@ -2127,6 +2132,11 @@ class MainWindow(QMainWindow):
         # же письмо заново при каждом переключении между письмами одной
         # цепочки.
         self._thread_content_cache: dict[int, MessageContent] = {}
+        # Растёт при каждом открытии письма/переключении папки — фоновый
+        # результат подгрузки цепочки применяется, только если токен всё
+        # ещё тот же (иначе пользователь уже открыл что-то другое, а
+        # устаревший ответ из сети может прийти позже).
+        self._thread_render_token = 0
 
         self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
@@ -3372,6 +3382,7 @@ class MainWindow(QMainWindow):
             self.drafts_folder_name = self.mailbox_drafts_folders[source_key]
         self._clear_reading_pane()
         self._thread_content_cache.clear()
+        self._thread_render_token += 1
         try:
             summaries = source.folder_summaries(folder_name)
         except Exception as exc:
@@ -4017,7 +4028,58 @@ class MainWindow(QMainWindow):
 
         all_in_thread = sorted([summary, *thread], key=lambda s: s.date)[-_THREAD_DEPTH_LIMIT:]
         self._thread_content_cache[summary.uid] = content
+        self._thread_render_token += 1
+        token = self._thread_render_token
 
+        # Показываем то, что уже есть (текущее письмо — сразу, остальные —
+        # из кэша, если уже когда-то грузились), не дожидаясь сети —
+        # раньше загрузка недостающих писем цепочки шла синхронно прямо
+        # здесь, и окно "подвисало" на каждое письмо цепочки, которого ещё
+        # не было в кэше (жалоба: "при просмотре цепочки клиент зависает").
+        self._paint_thread(summary, all_in_thread, content)
+
+        missing = [s for s in all_in_thread if s.uid != summary.uid and s.uid not in self._thread_content_cache]
+        if not missing:
+            return
+
+        folder = self.current_folder
+        source = self.active_source
+
+        def fetch_missing() -> dict[int, MessageContent | None]:
+            results: dict[int, MessageContent | None] = {}
+            for other in missing:
+                try:
+                    results[other.uid] = source.message_content(folder, other.uid)
+                except Exception:
+                    results[other.uid] = None
+            return results
+
+        worker = _CallableWorker(fetch_missing, parent=self)
+
+        def on_success(results: object) -> None:
+            self._background_workers.remove(worker)
+            if token != self._thread_render_token:
+                return  # пользователь уже открыл другое письмо — этот ответ больше не актуален
+            for uid, other_content in results.items():
+                if other_content is not None:
+                    self._thread_content_cache[uid] = other_content
+            self._paint_thread(summary, all_in_thread, content)
+
+        def on_failure(_message: str) -> None:
+            self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
+
+    def _paint_thread(
+        self, summary: MessageSummary, all_in_thread: list[MessageSummary], content: MessageContent
+    ) -> None:
+        """Собирает и показывает HTML цепочки из того, что сейчас есть в
+        _thread_content_cache — письма, ещё не подгруженные из сети,
+        показываются заглушкой "Загрузка…" (заменяется на реальный текст,
+        когда придёт фоновый ответ, см. _render_thread)."""
         entries: list[tuple[MessageSummary, str]] = []
         for other in all_in_thread:
             if other.uid == summary.uid:
@@ -4025,12 +4087,8 @@ class MainWindow(QMainWindow):
                 continue
             other_content = self._thread_content_cache.get(other.uid)
             if other_content is None:
-                try:
-                    other_content = self.active_source.message_content(self.current_folder, other.uid)
-                    self._thread_content_cache[other.uid] = other_content
-                except Exception:
-                    entries.append((other, "<i>(не удалось загрузить это письмо)</i>"))
-                    continue
+                entries.append((other, "<i>Загрузка…</i>"))
+                continue
             # Тело остальных писем цепочки — только текстом, не их родным
             # HTML: см. подробное объяснение в _build_thread_html.
             body = _linkify(other_content.text) if other_content.text.strip() else "<i>(письмо в формате HTML — предпросмотр недоступен в цепочке)</i>"

@@ -185,22 +185,23 @@ class _EventBlock(QFrame):
         # цветного блока с белым текстом. Таблетки "весь день" — маленькие
         # плашки, там сплошная заливка читается лучше (компактно, мало
         # текста), поэтому для них старый стиль сохранён.
+        # Была неверная догадка, что "внутренняя рамка" — это тонкая
+        # обводка самой карточки, и её убирали, оставляя только border-left
+        # (жалоба на результат: "убрал все рамки... оставив слева 2
+        # черты" — border-radius с односторонним border-left у Qt рисуется
+        # именно так, кривым обрубком). Внешняя обводка карточки — то, что
+        # нужно было оставить, — восстановлена как было; настоящая "рамка,
+        # обрамлявшая текст" — это стандартная рамка QPlainTextEdit у поля
+        # описания в EventDialog (см. description_edit.setFrameShape ниже).
         if self._pill:
             outline = "2px solid #1A73E8" if self._selected else "1px solid transparent"
             self.setStyleSheet(
                 f"background-color: {self._color}; border-radius: {self._radius}; border: {outline};"
             )
-        elif self._selected:
-            self.setStyleSheet(
-                f"background-color: #ffffff; border-radius: {self._radius}; border: 2px solid #1A73E8;"
-            )
         else:
-            # Раньше был ещё и тонкий border: 1px solid #dadce0" по всему
-            # периметру карточки поверх цветной левой полосы — визуально
-            # читалось как двойная/внутренняя рамка (жалоба: "уберите
-            # внутреннюю рамку"). Оставляем только цветную полосу слева.
+            outline = "2px solid #1A73E8" if self._selected else "1px solid #dadce0"
             self.setStyleSheet(
-                f"background-color: #ffffff; border-radius: {self._radius}; border: none; "
+                f"background-color: #ffffff; border-radius: {self._radius}; border: {outline}; "
                 f"border-left: 4px solid {self._color};"
             )
 
