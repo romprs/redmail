@@ -6,6 +6,7 @@ from redmail.ui.main_window import (
     _format_recipient_candidate,
     _normalize_subject,
     _parse_recipient_list,
+    _safe_attachment_filename,
 )
 
 
@@ -74,3 +75,27 @@ def test_parse_recipient_list_respects_quoted_comma_in_name() -> None:
 def test_parse_recipient_list_empty() -> None:
     assert _parse_recipient_list("") == []
     assert _parse_recipient_list("   ") == []
+
+
+def test_safe_attachment_filename_strips_relative_traversal() -> None:
+    # Вредоносное вложение может прийти с именем-выходом за пределы
+    # temp_dir/каталога сохранения — базовое имя не должно содержать
+    # путевых разделителей.
+    assert _safe_attachment_filename("../../.ssh/authorized_keys") == "authorized_keys"
+
+
+def test_safe_attachment_filename_strips_absolute_path() -> None:
+    # Path(temp_dir) / "/etc/passwd" в pathlib отбрасывает temp_dir
+    # целиком и резолвится в абсолютный путь — критично отфильтровать.
+    assert _safe_attachment_filename("/etc/passwd") == "passwd"
+    assert _safe_attachment_filename("C:\\Windows\\System32\\evil.dll") == "evil.dll"
+
+
+def test_safe_attachment_filename_rejects_dot_and_dotdot() -> None:
+    assert _safe_attachment_filename("..") == "attachment"
+    assert _safe_attachment_filename(".") == "attachment"
+    assert _safe_attachment_filename("") == "attachment"
+
+
+def test_safe_attachment_filename_keeps_normal_name() -> None:
+    assert _safe_attachment_filename("Отчёт.pdf") == "Отчёт.pdf"

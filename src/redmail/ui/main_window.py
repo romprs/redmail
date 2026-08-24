@@ -210,6 +210,19 @@ def _format_size(num_bytes: int) -> str:
     return f"{num_bytes / (1024 * 1024):.1f} МБ"
 
 
+def _safe_attachment_filename(filename: str) -> str:
+    """Только базовое имя файла — Attachment.filename приходит из письма
+    как есть (никем не проверялось) и может быть "../../.ssh/authorized_keys"
+    или абсолютным путём; мы дописываем его к temp_dir/пути сохранения
+    напрямую, поэтому путевые компоненты нужно отбросить, иначе
+    вредоносное вложение может записать файл вне предполагаемого каталога."""
+    candidate = (filename or "").replace("\\", "/").split("/")[-1]
+    candidate = candidate.rsplit(":", 1)[-1].strip()
+    if candidate in ("", ".", ".."):
+        return "attachment"
+    return candidate
+
+
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 
 _SUBJECT_PREFIX_PATTERN = re.compile(r"^\s*(re|fw|fwd|ответ|отв|пересыл)\s*:\s*", re.IGNORECASE)
@@ -1609,7 +1622,7 @@ class EventDetailsDialog(QDialog):
         attachment = self.event.attachments[self.attachments_list.row(item)]
         try:
             temp_dir = Path(tempfile.mkdtemp(prefix="redmail_event_"))
-            temp_path = temp_dir / attachment.filename
+            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
             temp_path.write_bytes(attachment.payload)
         except OSError as exc:
             QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
@@ -1627,7 +1640,7 @@ class EventDetailsDialog(QDialog):
         if chosen is not save_action:
             return
         attachment = self.event.attachments[self.attachments_list.row(item)]
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", attachment.filename)
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", _safe_attachment_filename(attachment.filename))
         if not path:
             return
         try:
@@ -4463,7 +4476,7 @@ class MainWindow(QMainWindow):
         attachment = self.current_attachments[self.attachments_list.row(item)]
         try:
             temp_dir = Path(tempfile.mkdtemp(prefix="redmail_"))
-            temp_path = temp_dir / attachment.filename
+            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
             temp_path.write_bytes(attachment.payload)
         except OSError as exc:
             QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
@@ -4485,7 +4498,7 @@ class MainWindow(QMainWindow):
 
     def _save_attachment(self, item: QListWidgetItem) -> None:
         attachment = self.current_attachments[self.attachments_list.row(item)]
-        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", attachment.filename)
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", _safe_attachment_filename(attachment.filename))
         if not path:
             return
         try:
