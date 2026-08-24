@@ -247,6 +247,47 @@ def _normalize_subject(subject: str) -> str:
         normalized = stripped
 
 
+# Сколько последних писем цепочки показываем подряд при последовательном
+# просмотре — без ограничения на живом IMAP каждое письмо цепочки (кроме
+# текущего) это отдельный сетевой запрос при первом открытии, а цепочка
+# вопрос-ответ в рабочей переписке легко насчитывает десятки писем.
+_THREAD_DEPTH_LIMIT = 8
+
+
+def _build_thread_html(entries: list[tuple[MessageSummary, str]], current_uid: int) -> str:
+    """Склеивает несколько писем цепочки в один прокручиваемый документ
+    (жалоба: "есть только ссылки на другие письма, а надо просмотр цепочки
+    последовательно"). entries — (summary, тело_как_html) по одному на
+    письмо, в хронологическом порядке (от старого к новому).
+
+    Тело НЕ-текущих писем цепочки специально передаётся уже как
+    экранированный текст (см. _render_thread), а не их родной
+    content.html: несколько ПОЛНЫХ HTML-документов (со своими <html>/
+    <head>/<style>) нельзя просто склеить в один setHtml() — упрощённый
+    рич-текстовый движок Qt не изолирует стили одного письма от
+    следующих в том же документе. Только текущее (выбранное) письмо
+    показывается его настоящим HTML."""
+    parts = []
+    for summary, body_html in entries:
+        is_current = summary.uid == current_uid
+        accent = "#1A73E8" if is_current else "#c9cdd1"
+        header = (
+            f'<div style="background:#f1f3f4;padding:6px 10px;margin-top:14px;'
+            f'border-left:3px solid {accent};">'
+            f"<b>{html.escape(summary.sender)}</b> — {html.escape(summary.date)}"
+            f"</div>"
+        )
+        # &#8203; (нулевой ширины пробел) — не просто пустой тег: Qt
+        # схлопывает и теряет полностью пустые <a name="..."></a> при
+        # разборе HTML в QTextDocument (проверено эмпирически), а
+        # scrollToAnchor() ищет именно якорь, сохранённый в документе.
+        parts.append(
+            f'<a name="msg-{summary.uid}">&#8203;</a>{header}'
+            f'<div style="padding:6px 10px 4px 10px;">{body_html}</div>'
+        )
+    return "".join(parts)
+
+
 def _populate_body_browser(browser: QTextBrowser, content: MessageContent) -> None:
     """HTML-письма показываем как есть (с внедрёнными картинками из
     cid:-вложений через addResource — без этого <img src="cid:..."> не
@@ -2068,16 +2109,24 @@ class MainWindow(QMainWindow):
         self.message_header_widget.hide()
 
         # Список остальных писем той же цепочки (по теме, без Re:/Fwd:) —
-        # раньше цепочка вопрос-ответ никак не была видна при просмотре
-        # письма (жалоба: "письма цепочки... не группируются и не
-        # схлапываются... при просмотре не видно цепочки писем"). Полноценная
-        # схлопываемая группировка прямо в списке писем — отдельная, более
-        # крупная переделка таблицы; здесь — видимость цепочки при просмотре
-        # конкретного письма, с переходом по клику.
+        # быстрый переход к письму внутри последовательной ленты (см.
+        # _render_thread ниже), которая теперь и есть основной способ
+        # просмотра цепочки — раньше клик по элементу списка просто менял
+        # выбранную строку в таблице, а сама цепочка целиком нигде не
+        # показывалась подряд (жалоба: "есть только ссылки на другие
+        # письма, а надо просмотр цепочки последовательно").
         self.thread_list = QListWidget(self)
         self.thread_list.setMaximumHeight(90)
         self.thread_list.itemClicked.connect(self._on_thread_item_clicked)
         self.thread_list.hide()
+
+        # Содержимое писем цепочки (кроме текущего) подгружается отдельными
+        # запросами к active_source — на живом IMAP это реальный сетевой
+        # round trip на каждое письмо цепочки. Кэш по uid, очищается при
+        # смене папки (on_folder_item_changed), не даёт грузить одно и то
+        # же письмо заново при каждом переключении между письмами одной
+        # цепочки.
+        self._thread_content_cache: dict[int, MessageContent] = {}
 
         self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
@@ -3322,6 +3371,7 @@ class MainWindow(QMainWindow):
             self.sent_folder_name = self.mailbox_sent_folders[source_key]
             self.drafts_folder_name = self.mailbox_drafts_folders[source_key]
         self._clear_reading_pane()
+        self._thread_content_cache.clear()
         try:
             summaries = source.folder_summaries(folder_name)
         except Exception as exc:
@@ -3894,7 +3944,7 @@ class MainWindow(QMainWindow):
         self.current_attachments = content.attachments
         self.current_content = content
         self._render_message_header(summary, content)
-        self._render_body(content)
+        self._render_thread(summary, content)
         self._update_invite_bar(content)
         self._refresh_attachments_list()
 
@@ -3926,12 +3976,18 @@ class MainWindow(QMainWindow):
         self.message_header_widget.show()
         self._render_thread_list(summary)
 
-    def _render_thread_list(self, summary: MessageSummary) -> None:
+    def _thread_summaries_for(self, summary: MessageSummary) -> list[MessageSummary]:
+        """Остальные письма текущей папки с той же темой (без Re:/Fwd:/
+        Ответ:/Пересыл:), отсортированные от старых к новым — не включает
+        само summary."""
         normalized = _normalize_subject(summary.subject)
-        thread = sorted(
+        return sorted(
             (s for s in self.current_summaries if s.uid != summary.uid and _normalize_subject(s.subject) == normalized),
             key=lambda s: s.date,
         )
+
+    def _render_thread_list(self, summary: MessageSummary) -> None:
+        thread = self._thread_summaries_for(summary)
         self.thread_list.clear()
         if not thread:
             self.thread_list.hide()
@@ -3943,12 +3999,51 @@ class MainWindow(QMainWindow):
         self.thread_list.show()
 
     def _on_thread_item_clicked(self, item: QListWidgetItem) -> None:
+        # Вся цепочка уже отрисована последовательно в reading_pane (см.
+        # _render_thread) — переход к письму это просто прокрутка к его
+        # якорю, а не смена выбранной строки в таблице.
         uid = item.data(Qt.ItemDataRole.UserRole)
-        for row in range(self.table.rowCount()):
-            if self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) == uid:
-                self.table.setCurrentCell(row, COL_SUBJECT)
-                self.table.scrollToItem(self.table.item(row, COL_SUBJECT))
-                break
+        self.reading_pane.scrollToAnchor(f"msg-{uid}")
+
+    def _render_thread(self, summary: MessageSummary, content: MessageContent) -> None:
+        """Показывает письмо вместе со всей его цепочкой подряд, одной
+        прокручиваемой лентой (жалоба: "есть только ссылки на другие
+        письма, а надо просмотр цепочки последовательно"). Если у письма
+        нет цепочки — обычный показ одного письма, без изменений."""
+        thread = self._thread_summaries_for(summary)
+        if not thread:
+            self._render_body(content)
+            return
+
+        all_in_thread = sorted([summary, *thread], key=lambda s: s.date)[-_THREAD_DEPTH_LIMIT:]
+        self._thread_content_cache[summary.uid] = content
+
+        entries: list[tuple[MessageSummary, str]] = []
+        for other in all_in_thread:
+            if other.uid == summary.uid:
+                entries.append((other, content.html or _linkify(content.text)))
+                continue
+            other_content = self._thread_content_cache.get(other.uid)
+            if other_content is None:
+                try:
+                    other_content = self.active_source.message_content(self.current_folder, other.uid)
+                    self._thread_content_cache[other.uid] = other_content
+                except Exception:
+                    entries.append((other, "<i>(не удалось загрузить это письмо)</i>"))
+                    continue
+            # Тело остальных писем цепочки — только текстом, не их родным
+            # HTML: см. подробное объяснение в _build_thread_html.
+            body = _linkify(other_content.text) if other_content.text.strip() else "<i>(письмо в формате HTML — предпросмотр недоступен в цепочке)</i>"
+            entries.append((other, body))
+
+        document = self.reading_pane.document()
+        document.clear()
+        for content_id, (_content_type, payload) in content.inline_images.items():
+            image = QImage.fromData(payload)
+            if not image.isNull():
+                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
+        self.reading_pane.setHtml(_build_thread_html(entries, summary.uid))
+        self.reading_pane.scrollToAnchor(f"msg-{summary.uid}")
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:
