@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        15%{?dist}
+Release:        16%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,13 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Aug 24 2026 RedMail dev <noreply@example.com> - 0.0.1-16
+- Исправлена уязвимость: имя файла вложения (из письма или .ics-приглашения)
+  подставлялось напрямую в путь при открытии/сохранении на диск —
+  вложение с именем вида «../../.ssh/authorized_keys» или абсолютным
+  путём могло записать данные вне временного каталога. Теперь
+  используется только базовое имя файла.
+
 * Mon Aug 24 2026 RedMail dev <noreply@example.com> - 0.0.1-15
 - Из черновика теперь можно отправить письмо: определение папок
   «Черновики»/«Отправленные»/«Корзина» больше не полагается только на
