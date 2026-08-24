@@ -217,6 +217,93 @@ def test_import_pst_folder_skips_broken_message_and_keeps_the_rest(tmp_path: Pat
     assert summaries[0].sender == "Иван Иванов"
 
 
+def _fake_pst_message(subject: str) -> object:
+    from unittest.mock import MagicMock
+
+    message = MagicMock()
+    message.get_subject.return_value = subject
+    message.get_sender_name.return_value = "Отправитель"
+    message.get_delivery_time.return_value = None
+    message.get_transport_headers.return_value = ""
+    message.get_plain_text_body.return_value = "Текст"
+    message.get_html_body.return_value = None
+    message.get_number_of_attachments.return_value = 0
+    return message
+
+
+def test_import_pst_skips_root_and_top_of_personal_folders_wrapper_levels(tmp_path: Path) -> None:
+    # Реальный .pst: корень хранилища безымянный, под ним ровно одна папка
+    # "Top of Personal Folders" — оба уровня служебные, Outlook их не
+    # показывает. Раньше архив показывал письма под путём
+    # "(без имени)/Top of Personal Folders/Входящие" вместо "Входящие"
+    # (жалоба: "зачем эта структура?").
+    from types import SimpleNamespace
+
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+
+    inbox = SimpleNamespace(get_name=lambda: "Входящие", sub_messages=[_fake_pst_message("Привет")], sub_folders=[])
+    top_of_personal = SimpleNamespace(get_name=lambda: "Top of Personal Folders", sub_messages=[], sub_folders=[inbox])
+    root = SimpleNamespace(get_name=lambda: "", sub_messages=[], sub_folders=[top_of_personal])
+
+    with sqlite3.connect(archive_path) as conn:
+        count = archive_store._import_pst_folder(conn, root, "")
+        conn.commit()
+
+    assert count == 1
+    assert archive_store.list_folders(archive_path) == ["Входящие"]
+
+
+def test_import_pst_skips_calendar_and_contacts_folders() -> None:
+    # Папки "Календарь"/"Контакты" содержат не почту, а события/карточки —
+    # get_plain_text_body() и т.п. на таких элементах бессмысленны, раньше
+    # они всё равно попадали в архив как мусорные "письма" (жалоба:
+    # "календарь загрузился как письма, контакты тоже как письма").
+    from types import SimpleNamespace
+
+    calendar_item = _fake_pst_message("не должно попасть в архив")
+    calendar_folder = SimpleNamespace(get_name=lambda: "Календарь", sub_messages=[calendar_item], sub_folders=[])
+    contacts_folder = SimpleNamespace(get_name=lambda: "Contacts", sub_messages=[_fake_pst_message("тоже нет")], sub_folders=[])
+    root = SimpleNamespace(get_name=lambda: "", sub_messages=[], sub_folders=[calendar_folder, contacts_folder])
+
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(archive_store._SCHEMA)
+    count = archive_store._import_pst_folder(conn, root, "")
+
+    assert count == 0
+    assert conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0] == 0
+
+
+def test_rename_folder_renames_nested_subfolders_too(tmp_path: Path) -> None:
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    msg = _build_message("Отчёт", "a@x.com")
+    archive_store.append_raw_message(archive_path, "Работа/Проекты", msg.as_bytes())
+    archive_store.append_raw_message(archive_path, "Работа", msg.as_bytes())
+    archive_store.append_raw_message(archive_path, "Личное", msg.as_bytes())  # не должно затронуться
+
+    archive_store.rename_folder(archive_path, "Работа", "Дела")
+
+    folders = set(archive_store.list_folders(archive_path))
+    assert folders == {"Дела", "Дела/Проекты", "Личное"}
+
+
+def test_rename_folder_escapes_sql_like_wildcards_in_old_name(tmp_path: Path) -> None:
+    # "%"/"_" в имени папки — это спецсимволы LIKE, не должны трактоваться
+    # как wildcard при поиске вложенных подпапок для переименования.
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+    msg = _build_message("Отчёт", "a@x.com")
+    archive_store.append_raw_message(archive_path, "100%_Готово", msg.as_bytes())
+    archive_store.append_raw_message(archive_path, "100X_ГотовоНЕТ/Sub", msg.as_bytes())  # "%" != "X" буквально
+
+    archive_store.rename_folder(archive_path, "100%_Готово", "Сделано")
+
+    folders = set(archive_store.list_folders(archive_path))
+    assert "Сделано" in folders
+    assert "100X_ГотовоНЕТ/Sub" in folders  # не затронуто
+
+
 def test_import_pst_without_pypff_raises_clear_error(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "pypff", None)  # имитируем отсутствие пакета
     archive_path = tmp_path / "test.rmarchive"

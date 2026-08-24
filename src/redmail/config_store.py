@@ -83,6 +83,26 @@ def save_caldav_url(url: str) -> None:
     _save_settings_dict(data)
 
 
+def default_archive_storage_dir() -> Path:
+    return Path.home() / "Архивы RedMail"
+
+
+def load_archive_storage_dir() -> Path:
+    """Каталог, куда автоматически кладутся новые архивы при импорте
+    .pst/mbox/Maildir — раньше при первом импорте приходилось руками
+    выбирать полный путь к файлу через диалог сохранения; теперь
+    спрашиваем только имя (см. _prompt_new_archive_name в main_window.py),
+    а каталог настраивается один раз здесь."""
+    value = _load_settings_dict().get("archive_storage_dir", "")
+    return Path(value) if value else default_archive_storage_dir()
+
+
+def save_archive_storage_dir(directory: Path) -> None:
+    data = _load_settings_dict()
+    data["archive_storage_dir"] = str(directory)
+    _save_settings_dict(data)
+
+
 @dataclass
 class MailRule:
     field: str  # "from" | "subject"

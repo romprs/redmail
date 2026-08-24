@@ -85,8 +85,18 @@ def rename_folder(path: Path, old_name: str, new_name: str) -> None:
     # переименование значения этого поля у всех писем сразу. Если
     # new_name совпадает с уже существующей папкой, письма просто
     # сольются в неё — это ожидаемо, отдельно не запрещаем.
+    #
+    # Дерево в интерфейсе строится из этих строк разбиением по "/" — у
+    # промежуточного узла ("Работа" для писем в "Работа/Проекты") нет
+    # отдельной записи, только у его вложенных подпапок. Чтобы
+    # переименование такого узла вообще что-то делало, переименовываем и
+    # все вложенные "old_name/..." тем же префиксом.
     with closing(_connect(path)) as conn:
         conn.execute("UPDATE messages SET folder = ? WHERE folder = ?", (new_name, old_name))
+        conn.execute(
+            "UPDATE messages SET folder = ? || substr(folder, ?) WHERE folder LIKE ? ESCAPE '\\'",
+            (new_name, len(old_name) + 1, old_name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"),
+        )
         conn.commit()
 
 
@@ -259,6 +269,38 @@ def import_maildir(path: Path, maildir_dir: Path, folder: str) -> int:
 
 _ATTACHMENT_FILENAME_TAGS = (0x3707, 0x3704)  # PidTagAttachLongFilename, PidTagAttachFilename
 
+# Служебные уровни, которые MAPI/PST всегда создаёт над реальными папками
+# пользователя (корень хранилища — имя пустое, а под ним ровно одна папка
+# с одним из этих стандартных имён) — Outlook сам их никогда не показывает,
+# сразу открывая содержимое "Top of Personal Folders" как верхний уровень.
+# Раньше архив показывал оба уровня как настоящие папки (жалоба
+# пользователя: "зачем эта структура?", видел в дереве
+# "(без имени)/Top of Personal Folders/Входящие" вместо просто "Входящие").
+_PST_WRAPPER_FOLDER_NAMES = {
+    "top of personal folders",
+    "top of information store",
+    "root - mailbox",
+    "root - mailbox data",
+}
+
+# Папки, чьё содержимое — не почта (события календаря, карточки контактов и
+# т.п.), а другие типы MAPI-элементов. get_plain_text_body()/get_subject() и
+# т.д. на таких элементах либо пусты, либо не имеют смысла как "письмо" —
+# раньше они всё равно попадали в архив как обычные (пустые/бессмысленные)
+# письма (жалоба: "календарь загрузился как письма, контакты тоже как
+# письма"). pypff не даёт типизированного доступа к событиям/контактам
+# (только к обычным message-элементам с почтовыми полями), поэтому такие
+# папки при импорте пропускаются целиком, а не превращаются в мусорные
+# "письма" — полноценный перенос PST-календаря/контактов в модули
+# Календарь/Контакты это отдельная, более крупная задача.
+_PST_NON_MAIL_FOLDER_NAMES = {
+    "календарь", "calendar",
+    "контакты", "contacts",
+    "задачи", "tasks",
+    "заметки", "notes", "sticky notes",
+    "журнал", "journal",
+}
+
 
 def import_pst(path: Path, pst_file: Path) -> int:
     """Импортирует .pst (Outlook), сохраняя структуру папок исходного файла.
@@ -294,20 +336,35 @@ def import_pst(path: Path, pst_file: Path) -> int:
 
 def _import_pst_folder(conn: sqlite3.Connection, folder, path_prefix: str) -> int:
     count = 0
-    folder_name = _safe_pst_text(folder.get_name()) or "(без имени)"
-    current_path = f"{path_prefix}/{folder_name}" if path_prefix else folder_name
-    for message in folder.sub_messages:
-        try:
-            raw = _pst_message_to_raw(message)
-            _insert_raw(conn, current_path or "Импорт из PST", raw)
-        except Exception:
-            # Одно повреждённое/нестандартное письмо не должно ронять весь
-            # импорт (жалоба: "загрузка из pst все ещё некорректно
-            # загружает имена папок и авторов" — раньше на таком письме
-            # мог упасть весь импорт разом, теряя и все остальные,
-            # корректные письма вместе с ним).
-            continue
-        count += 1
+    raw_name = _safe_pst_text(folder.get_name()).strip()
+    is_wrapper = not path_prefix and (not raw_name or raw_name.lower() in _PST_WRAPPER_FOLDER_NAMES)
+    is_non_mail = raw_name.lower() in _PST_NON_MAIL_FOLDER_NAMES
+
+    if is_wrapper:
+        # Служебный уровень хранилища — не настоящая папка пользователя,
+        # пропускаем его в пути, но всё равно спускаемся в подпапки (там и
+        # лежат реальные "Входящие"/"Отправленные"/...). "not path_prefix"
+        # защищает от совпадения с реальной пользовательской подпапкой
+        # где-то глубже — эти служебные имена MAPI создаёт только на самом
+        # верхнем уровне хранилища.
+        current_path = path_prefix
+    else:
+        folder_name = raw_name or "(без имени)"
+        current_path = f"{path_prefix}/{folder_name}" if path_prefix else folder_name
+
+    if not is_wrapper and not is_non_mail:
+        for message in folder.sub_messages:
+            try:
+                raw = _pst_message_to_raw(message)
+                _insert_raw(conn, current_path or "Импорт из PST", raw)
+            except Exception:
+                # Одно повреждённое/нестандартное письмо не должно ронять весь
+                # импорт (жалоба: "загрузка из pst все ещё некорректно
+                # загружает имена папок и авторов" — раньше на таком письме
+                # мог упасть весь импорт разом, теряя и все остальные,
+                # корректные письма вместе с ним).
+                continue
+            count += 1
     for sub_folder in folder.sub_folders:
         count += _import_pst_folder(conn, sub_folder, current_path)
     return count

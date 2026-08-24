@@ -5,8 +5,10 @@ from unittest.mock import patch
 
 from redmail.config_store import (
     MailRule,
+    default_archive_storage_dir,
     load_account,
     load_accounts,
+    load_archive_storage_dir,
     load_caldav_url,
     load_font_scale,
     load_mail_columns_state,
@@ -17,6 +19,7 @@ from redmail.config_store import (
     load_window_geometry,
     save_account,
     save_accounts,
+    save_archive_storage_dir,
     save_caldav_url,
     save_font_scale,
     save_mail_columns_state,
@@ -230,6 +233,19 @@ def test_caldav_url_round_trip(tmp_path: Path) -> None:
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         save_caldav_url("https://calendar.example.corp/caldav/")
         assert load_caldav_url() == "https://calendar.example.corp/caldav/"
+
+
+def test_archive_storage_dir_defaults_to_home_folder(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_archive_storage_dir() == default_archive_storage_dir()
+
+
+def test_archive_storage_dir_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_archive_storage_dir(tmp_path / "Мои архивы")
+        assert load_archive_storage_dir() == tmp_path / "Мои архивы"
 
 
 def test_load_accounts_returns_empty_when_nothing_saved(tmp_path: Path) -> None:

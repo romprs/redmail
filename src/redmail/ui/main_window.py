@@ -90,7 +90,9 @@ from PySide6.QtWidgets import (
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail.config_store import (
     MailRule,
+    default_archive_storage_dir,
     load_accounts,
+    load_archive_storage_dir,
     load_caldav_url,
     load_ews_accounts,
     load_font_scale,
@@ -101,6 +103,7 @@ from redmail.config_store import (
     load_poll_interval_minutes,
     load_window_geometry,
     save_accounts,
+    save_archive_storage_dir,
     save_caldav_url,
     save_ews_accounts,
     save_font_scale,
@@ -626,6 +629,7 @@ class SettingsDialog(QDialog):
         poll_interval_minutes: int = 5,
         pane_orientation: str = "vertical",
         caldav_url: str = "",
+        archive_storage_dir: Path | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -704,6 +708,17 @@ class SettingsDialog(QDialog):
         caldav_group = QGroupBox("Календарь (CalDAV) — логин и пароль те же, что для IMAP выше")
         caldav_group.setLayout(caldav_form)
 
+        self.archive_dir_edit = QLineEdit(str(archive_storage_dir or default_archive_storage_dir()))
+        archive_dir_browse = QPushButton("Обзор…", self)
+        archive_dir_browse.clicked.connect(self._on_browse_archive_dir)
+        archive_dir_row = QHBoxLayout()
+        archive_dir_row.addWidget(self.archive_dir_edit)
+        archive_dir_row.addWidget(archive_dir_browse)
+        archive_dir_form = QFormLayout()
+        archive_dir_form.addRow("Каталог для новых архивов", archive_dir_row)
+        archive_dir_group = QGroupBox("Архивы почты")
+        archive_dir_group.setLayout(archive_dir_form)
+
         # Редкие действия — перенесены сюда с панели инструментов почты,
         # чтобы не переполнять её (жалоба: "кнопка параметры пропала" —
         # оказалось, тулбар с длинными подписями кнопок не помещался в
@@ -739,6 +754,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(smtp_group)
         layout.addWidget(general_group)
         layout.addWidget(caldav_group)
+        layout.addWidget(archive_dir_group)
         layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
 
@@ -746,6 +762,15 @@ class SettingsDialog(QDialog):
 
     def _update_password_enabled(self) -> None:
         self.password_edit.setEnabled(self.auth_combo.currentData() != "kerberos")
+
+    def _on_browse_archive_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
+        if chosen:
+            self.archive_dir_edit.setText(chosen)
+
+    def archive_storage_dir(self) -> Path:
+        text = self.archive_dir_edit.text().strip()
+        return Path(text) if text else default_archive_storage_dir()
 
     def _on_add_account(self) -> None:
         if self.parent() is not None:
@@ -1801,6 +1826,7 @@ class MainWindow(QMainWindow):
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
         self.caldav_url = load_caldav_url()
+        self.archive_storage_dir = load_archive_storage_dir()
         self.mail_rules: list[MailRule] = load_mail_rules()
         # Держим ссылки на фоновые потоки (импорт архивов, отправка
         # приглашений) — без этого Python может собрать QThread раньше, чем
@@ -2442,12 +2468,22 @@ class MainWindow(QMainWindow):
         return path
 
     def _prompt_new_archive_path(self) -> Path | None:
-        path_str, _ = QFileDialog.getSaveFileName(
-            self, "Создать архив", filter="Архивы RedMail (*.rmarchive)"
-        )
-        if not path_str:
+        # Раньше здесь был полный диалог "Сохранить как" — пользователь
+        # каждый раз сам выбирал каталог на диске (жалоба: "при импорте pst
+        # просит создать архив" — воспринималось как лишний обязательный
+        # шаг). Теперь спрашиваем только имя, каталог берём из настроек
+        # (self.archive_storage_dir, "Архивы почты" в "Параметры…") и
+        # создаём его при необходимости.
+        name, ok = QInputDialog.getText(self, "Новый архив", "Название архива:")
+        name = name.strip()
+        if not ok or not name:
             return None
-        return self._normalize_archive_path(path_str)
+        try:
+            self.archive_storage_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось создать каталог архивов", str(exc))
+            return None
+        return self._normalize_archive_path(str(self.archive_storage_dir / name))
 
     def _attach_archive(self, path: Path, *, persist: bool = True) -> ArchiveSource | None:
         key = str(path)
@@ -2611,10 +2647,20 @@ class MainWindow(QMainWindow):
                 node = nodes.get(path)
                 if node is None:
                     node = QTreeWidgetItem([part])
+                    # Раньше UserRole ставился только на "листовой" узел (тот,
+                    # что совпадает с конкретной строкой folder в БД) — клик
+                    # правой кнопкой на промежуточном сегменте пути (например,
+                    # "Работа" для писем в "Работа/Проекты") не находил
+                    # никаких данных и меню вообще не открывалось (жалоба:
+                    # "папки в архиве не даёт переименовать"). Ставим сразу на
+                    # каждый узел — archive_store.rename_folder теперь
+                    # переименовывает и вложенные "путь/..." тем же
+                    # префиксом, так что промежуточный узел тоже осмысленно
+                    # переименовывается.
+                    node.setData(0, Qt.ItemDataRole.UserRole, (key, "/".join(path)))
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
-            parent.setData(0, Qt.ItemDataRole.UserRole, (key, folder_name))
         self.folder_tree.expandItem(root)
 
     def _pick_archive_target(
@@ -2938,6 +2984,7 @@ class MainWindow(QMainWindow):
             poll_interval_minutes=self.poll_interval_minutes,
             pane_orientation=self.pane_orientation,
             caldav_url=self.caldav_url,
+            archive_storage_dir=self.archive_storage_dir,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2945,10 +2992,12 @@ class MainWindow(QMainWindow):
         self.poll_interval_minutes = dialog.poll_interval_minutes()
         self.pane_orientation = dialog.pane_orientation()
         self.caldav_url = dialog.caldav_url()
+        self.archive_storage_dir = dialog.archive_storage_dir()
         try:
             save_poll_interval_minutes(self.poll_interval_minutes)
             save_pane_orientation(self.pane_orientation)
             save_caldav_url(self.caldav_url)
+            save_archive_storage_dir(self.archive_storage_dir)
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
         self._restart_poll_timer()

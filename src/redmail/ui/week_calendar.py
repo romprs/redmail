@@ -185,17 +185,22 @@ class _EventBlock(QFrame):
         # цветного блока с белым текстом. Таблетки "весь день" — маленькие
         # плашки, там сплошная заливка читается лучше (компактно, мало
         # текста), поэтому для них старый стиль сохранён.
-        if self._selected:
-            outline = "2px solid #1A73E8"
-        else:
-            outline = "1px solid #dadce0" if not self._pill else "1px solid transparent"
         if self._pill:
+            outline = "2px solid #1A73E8" if self._selected else "1px solid transparent"
             self.setStyleSheet(
                 f"background-color: {self._color}; border-radius: {self._radius}; border: {outline};"
             )
-        else:
+        elif self._selected:
             self.setStyleSheet(
-                f"background-color: #ffffff; border-radius: {self._radius}; border: {outline}; "
+                f"background-color: #ffffff; border-radius: {self._radius}; border: 2px solid #1A73E8;"
+            )
+        else:
+            # Раньше был ещё и тонкий border: 1px solid #dadce0" по всему
+            # периметру карточки поверх цветной левой полосы — визуально
+            # читалось как двойная/внутренняя рамка (жалоба: "уберите
+            # внутреннюю рамку"). Оставляем только цветную полосу слева.
+            self.setStyleSheet(
+                f"background-color: #ffffff; border-radius: {self._radius}; border: none; "
                 f"border-left: 4px solid {self._color};"
             )
 
