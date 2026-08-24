@@ -160,12 +160,27 @@ class EwsSession:
         folder.save(update_fields=["name"])
 
     def trash_folder(self) -> str | None:
+        return self._special_folder_path(lambda account: account.trash)
+
+    def sent_folder(self) -> str | None:
+        # На практике не используется для реальной отправки — EWS сам
+        # сохраняет копию в "Отправленные" при Message.send(save_copy=True)
+        # (умолчание exchangelib), в отличие от IMAP/SMTP, где сервер не
+        # всегда это делает сам. Но метод даёт единый интерфейс с
+        # ImapSession — остальному коду (например, определению, что
+        # текущая папка — Черновики) не нужно знать про протокол.
+        return self._special_folder_path(lambda account: account.sent)
+
+    def drafts_folder(self) -> str | None:
+        return self._special_folder_path(lambda account: account.drafts)
+
+    def _special_folder_path(self, get_special_folder) -> str | None:
         try:
-            trash = self._account.trash
+            special = get_special_folder(self._account)
         except Exception:
             return None
         for path, folder in self._folders_by_path.items():
-            if folder.id == trash.id:
+            if folder.id == special.id:
                 return path
         return None
 

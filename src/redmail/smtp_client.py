@@ -3,6 +3,7 @@ from __future__ import annotations
 import smtplib
 from dataclasses import dataclass, field
 from email.message import EmailMessage
+from email.utils import formatdate, make_msgid
 
 
 @dataclass
@@ -39,7 +40,12 @@ class OutgoingMessage:
     attachments: list[OutgoingAttachment] = field(default_factory=list)
 
 
-def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
+def build_email_message(message: OutgoingMessage) -> EmailMessage:
+    """Общая сборка RFC 822 письма — используется и для реальной отправки
+    по SMTP, и для того, чтобы положить готовую копию письма прямо в
+    "Отправленные"/"Черновики" через IMAP APPEND (сервер не всегда сам
+    сохраняет копию исходящих — жалоба: "не отображается отправка почты,
+    не появляется в папке отправленные")."""
     email_message = EmailMessage()
     email_message["From"] = message.sender
     email_message["To"] = ", ".join(message.to)
@@ -52,6 +58,8 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
         # получателям Bcc не виден друг друга и остальным получателям.
         email_message["Bcc"] = ", ".join(message.bcc)
     email_message["Subject"] = message.subject
+    email_message["Date"] = formatdate(localtime=True)
+    email_message["Message-Id"] = make_msgid()
     if message.in_reply_to:
         email_message["In-Reply-To"] = message.in_reply_to
         email_message["References"] = " ".join([*message.references, message.in_reply_to])
@@ -66,7 +74,11 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
             filename=attachment.filename,
             params=attachment.content_type_params or None,
         )
+    return email_message
 
+
+def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
+    email_message = build_email_message(message)
     smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
     with smtp_cls(account.host, account.port, timeout=30) as client:
         if not account.use_ssl:

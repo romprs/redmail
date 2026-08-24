@@ -8,7 +8,9 @@ from unittest.mock import MagicMock, patch
 from imapclient.exceptions import IMAPClientError
 from imapclient.response_types import BodyData
 
-from redmail.imap_client import Account, FolderInfo, ImapSession
+from email import message_from_bytes
+
+from redmail.imap_client import Account, FolderInfo, ImapSession, extract_content
 
 _FETCH_FIELDS = ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"]
 
@@ -115,6 +117,90 @@ def test_trash_folder_none_when_not_found() -> None:
         trash = session.trash_folder()
 
     assert trash is None
+
+
+def test_sent_and_drafts_folders_found_by_flag() -> None:
+    fake_client = MagicMock()
+    fake_client.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\HasNoChildren", b"\\Sent"), b"/", "Отправленные"),
+        ((b"\\HasNoChildren", b"\\Drafts"), b"/", "Черновики"),
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.list_folders()
+        sent = session.sent_folder()
+        drafts = session.drafts_folder()
+
+    assert sent == "Отправленные"
+    assert drafts == "Черновики"
+
+
+def test_extract_content_exposes_headers() -> None:
+    # Жалоба: "при просмотре письма невидно его реквизитов (тема,
+    # отправитель, адресаты)" — MessageContent раньше не нёс To/Cc/Bcc/
+    # Subject/From вовсе, хотя они уже были в разобранном сообщении.
+    raw = (
+        b"From: Ivan <ivan@example.com>\r\n"
+        b"To: a@example.com, b@example.com\r\n"
+        b"Cc: c@example.com\r\n"
+        b"Bcc: d@example.com\r\n"
+        b"Subject: Test\r\n"
+        b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+        b"hello"
+    )
+    content = extract_content(message_from_bytes(raw))
+    assert content.subject == "Test"
+    assert content.from_ == "Ivan <ivan@example.com>"
+    assert content.to == "a@example.com, b@example.com"
+    assert content.cc == "c@example.com"
+    assert content.bcc == "d@example.com"
+
+
+def test_append_message_calls_client_append() -> None:
+    fake_client = _client()
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        ImapSession(_account()).append_message("Отправленные", b"raw-bytes", flags=(b"\\Seen",))
+
+    fake_client.append.assert_called_once_with("Отправленные", b"raw-bytes", flags=(b"\\Seen",))
+
+
+def test_reconnects_and_retries_after_dead_connection() -> None:
+    # Жалоба: "после простоя часто выдаёт ошибку подключения" — реальный
+    # сервер молча рвёт TCP после долгого простоя.
+    dead_client = MagicMock()
+    dead_client.select_folder.side_effect = ConnectionResetError("connection reset by peer")
+    fresh_client = _client(exists=5)
+    clients = [dead_client, fresh_client]
+
+    with patch("redmail.imap_client.IMAPClient", side_effect=lambda *a, **k: clients.pop(0)):
+        session = ImapSession(_account())
+        count = session.folder_message_count("INBOX")
+
+    assert count == 5
+    dead_client.select_folder.assert_called_once_with("INBOX", readonly=False)
+    fresh_client.login.assert_called_once_with("ivan", "secret")
+    fresh_client.select_folder.assert_called_once_with("INBOX", readonly=False)
+
+
+def test_protocol_error_is_not_treated_as_dead_connection() -> None:
+    # Настоящая протокольная ошибка (сервер понял команду и отверг) не
+    # лечится переподключением — не должна его вызывать вообще.
+    bad_client = _client()
+    bad_client.create_folder.side_effect = IMAPClientError("NO folder already exists")
+
+    with patch("redmail.imap_client.IMAPClient", return_value=bad_client):
+        session = ImapSession(_account())
+        try:
+            session.create_folder("Existing")
+            raised = False
+        except IMAPClientError:
+            raised = True
+
+    assert raised
+    bad_client.login.assert_called_once()
 
 
 def test_fetch_folder_summaries_parses_envelope() -> None:

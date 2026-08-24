@@ -46,7 +46,19 @@ class CalDavSession:
         self.account = account
         try:
             self._client = caldav.DAVClient(
-                account.url, username=account.username, password=account.password
+                # Без явного таймаута зависший/недоступный сервер (закрытая
+                # корпоративная сеть, где угодно может быть неверно
+                # настроенный прокси/файрвол) мог держать HTTP-запрос
+                # сколько угодно — а весь on_caldav_sync() до сих пор шёл
+                # синхронно в основном потоке интерфейса: жалоба "после
+                # настройки CalDAV сломалась отправка, просмотр, переход
+                # между папками и получение почты" — на деле не сломалась,
+                # а всё это время буквально ждала одного зависшего сетевого
+                # запроса. См. MainWindow.on_caldav_sync — сама синхронизация
+                # теперь выполняется в фоновом потоке, но таймаут всё равно
+                # нужен: без него поток просто завис бы бесконечно вместо
+                # того, чтобы сообщить об ошибке.
+                account.url, username=account.username, password=account.password, timeout=30
             )
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось создать CalDAV-соединение: {exc}") from exc

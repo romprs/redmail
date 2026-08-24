@@ -78,6 +78,17 @@ def test_delete_contact(tmp_path: Path) -> None:
     assert contact_store.list_contacts(path) == []
 
 
+def test_delete_all_contacts(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcontacts"
+    contact_store.save_contact(path, _contact())
+    contact_store.save_contact(path, contact_store.Contact(display_name="Пётр Петров", emails=["petr@example.com"]))
+    assert len(contact_store.list_contacts(path)) == 2
+
+    contact_store.delete_all_contacts(path)
+
+    assert contact_store.list_contacts(path) == []
+
+
 def test_import_vcard_multiple_cards(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcontacts"
     vcf = (

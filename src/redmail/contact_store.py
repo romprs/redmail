@@ -153,6 +153,14 @@ def delete_contact(path: Path, contact_id: int) -> None:
         conn.commit()
 
 
+def delete_all_contacts(path: Path) -> None:
+    """Раньше можно было удалить только по одному — жалоба: "нет
+    возможности удалить все контакты"."""
+    with closing(_connect(path)) as conn:
+        conn.execute("DELETE FROM contacts")
+        conn.commit()
+
+
 # ---------------------------------------------------------------------------
 # Импорт из внешних форматов
 # ---------------------------------------------------------------------------

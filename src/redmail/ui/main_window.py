@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import html
 import math
+from collections.abc import Callable
 import mimetypes
 import re
 import shutil
 import tempfile
 import zlib
 from datetime import date, datetime, timedelta, timezone
-from email.utils import parseaddr
+from email.utils import getaddresses
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -114,7 +115,7 @@ from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
-from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, build_email_message, send_message
 
 # Отправка через EWS идёт через сам EWS-сеанс (Exchange не нуждается в
 # отдельном SMTP-релее), но весь остальной код по всему приложению
@@ -212,6 +213,61 @@ def _format_size(num_bytes: int) -> str:
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 
 
+def _populate_body_browser(browser: QTextBrowser, content: MessageContent) -> None:
+    """HTML-письма показываем как есть (с внедрёнными картинками из
+    cid:-вложений через addResource — без этого <img src="cid:..."> не
+    отрисуется); письма с обычным текстом — тоже через setHtml, но
+    экранированным и с активными ссылками (_linkify), чтобы голые
+    http(s)-ссылки в теле письма были кликабельны, как и в HTML-версии.
+    Внешние (не cid:) картинки Qt сам не подгружает — не течём в сеть на
+    отрисовку письма. Общая для MainWindow.reading_pane и MessageWindow —
+    открытие письма в отдельном окне должно выглядеть так же, как в
+    основной панели чтения."""
+    document = browser.document()
+    document.clear()
+    for content_id, (_content_type, payload) in content.inline_images.items():
+        image = QImage.fromData(payload)
+        if not image.isNull():
+            document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
+    if content.html:
+        browser.setHtml(content.html)
+    else:
+        browser.setHtml(_linkify(content.text))
+
+
+class MessageWindow(QWidget):
+    """Письмо в отдельном окне (жалоба: "нельзя открыть письмо в отдельном
+    окне") — независимое от основного окна, можно держать открытым рядом,
+    пока просматриваешь другие письма в списке."""
+
+    def __init__(self, summary: MessageSummary, content: MessageContent, parent: QWidget | None = None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(content.subject or summary.subject or "(без темы)")
+        self.resize(700, 500)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
+        lines = [f"<b>Тема:</b> {html.escape(content.subject or summary.subject or '(без темы)')}", f"<b>От:</b> {html.escape(sender)}"]
+        if content.to:
+            lines.append(f"<b>Кому:</b> {html.escape(content.to)}")
+        if content.cc:
+            lines.append(f"<b>Копия:</b> {html.escape(content.cc)}")
+        if summary.date:
+            lines.append(f"<b>Дата:</b> {html.escape(summary.date)}")
+        header_label = QLabel("<br>".join(lines), self)
+        header_label.setWordWrap(True)
+        header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+
+        body = QTextBrowser(self)
+        body.setReadOnly(True)
+        body.setOpenExternalLinks(True)
+        _populate_body_browser(body, content)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(header_label)
+        layout.addWidget(body)
+
+
 def _linkify(text: str) -> str:
     """HTML-экранирует текст и оборачивает http(s)-ссылки в <a href>, чтобы
     их можно было открыть кликом в QTextBrowser."""
@@ -230,19 +286,40 @@ def _format_event_time(event: calendar_store.Event) -> str:
     return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
 
 
+def _format_recipient_candidate(name: str, email: str) -> str:
+    """"Имя <email>", в кавычках, если имя само содержит запятую (частый
+    формат "Фамилия, Имя") — без этого такое имя в поле "Кому" ломало
+    разбор по запятой (жалоба: "адреса, импортированные... надо вручную
+    добавлять разделитель — запятую, чтобы распознался второй адресат").
+    Не email.utils.formataddr(): тот попутно кодирует не-ASCII имя в
+    RFC 2047 (=?utf-8?...?=) — годится для реального заголовка письма, но
+    в текстовом поле интерфейса пользователь увидел бы нечитаемую кашу
+    вместо своего же кириллического имени."""
+    if not name:
+        return email
+    if any(ch in name for ch in ',"<>'):
+        escaped = name.replace('"', '\\"')
+        return f'"{escaped}" <{email}>'
+    return f"{name} <{email}>"
+
+
 def _contact_candidates(contacts: list[contact_store.Contact]) -> list[str]:
     candidates = []
     for contact in contacts:
         for email in contact.emails:
-            candidates.append(f"{contact.display_name} <{email}>" if contact.display_name else email)
+            candidates.append(_format_recipient_candidate(contact.display_name, email))
     return candidates
 
 
 def _parse_recipient_list(text: str) -> list[str]:
     """Достаёт голые адреса из поля через запятую — элементы могут быть как
     просто email, так и "Имя <email>" (так автодополнение по контактам
-    вставляет выбранный вариант; email.utils.parseaddr понимает оба)."""
-    return [addr for raw in text.split(",") if (addr := parseaddr(raw.strip())[1])]
+    вставляет выбранный вариант). getaddresses() (не parseaddr — тот не
+    умеет список) разбирает полноценный список адресов сразу, включая
+    случай, когда имя в кавычках само содержит запятую (см.
+    _contact_candidates/_format_recipient_candidate) — раньше text.split(",") резал такое
+    имя пополам, и второй адрес в списке переставал распознаваться."""
+    return [addr for _name, addr in getaddresses([text]) if addr]
 
 
 def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_store.Contact]) -> QCompleter:
@@ -333,11 +410,19 @@ def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_st
     picked = dialog.selected_candidates()
     if not picked:
         return
-    existing = [p.strip() for p in line_edit.text().split(",") if p.strip()]
+    # getaddresses (не наивный split(",")) при разборе уже введённого — иначе
+    # имя в кавычках со своей запятой внутри (см. _contact_candidates)
+    # резалось бы пополам при пересборке поля.
+    existing_pairs = getaddresses([line_edit.text()]) if line_edit.text().strip() else []
+    entries = [_format_recipient_candidate(name, addr) for name, addr in existing_pairs if addr]
+    existing_addrs = {addr for _name, addr in existing_pairs if addr}
     for candidate in picked:
-        if candidate not in existing:
-            existing.append(candidate)
-    line_edit.setText(", ".join(existing))
+        picked_pairs = getaddresses([candidate])
+        addr = picked_pairs[0][1] if picked_pairs else ""
+        if addr and addr not in existing_addrs:
+            entries.append(candidate)
+            existing_addrs.add(addr)
+    line_edit.setText(", ".join(entries))
 
 
 def _importance_mark(importance: str) -> str:
@@ -736,6 +821,8 @@ class ComposeDialog(QDialog):
         *,
         title: str = "Новое письмо",
         to: str = "",
+        cc: str = "",
+        bcc: str = "",
         subject: str = "",
         body: str = "",
         contacts: list[contact_store.Contact] | None = None,
@@ -765,11 +852,11 @@ class ComposeDialog(QDialog):
         to_row.addWidget(address_book_button)
         to_row.addWidget(cc_bcc_button)
 
-        self.cc_edit = QLineEdit(self)
+        self.cc_edit = QLineEdit(cc, self)
         self.cc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.cc_edit, contacts)
-        self.bcc_edit = QLineEdit(self)
+        self.bcc_edit = QLineEdit(bcc, self)
         self.bcc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.bcc_edit, contacts)
@@ -781,7 +868,10 @@ class ComposeDialog(QDialog):
         form.addRow("Скрытая копия", self.bcc_edit)
         form.addRow("Тема", self.subject_edit)
         self._form = form
-        self._show_cc_bcc_fields(False)
+        # Если письмо открыто с уже заполненными Копия/Скрытая копия
+        # (например, редактирование сохранённого черновика) — сразу
+        # показываем эти поля, а не прячем данные от пользователя.
+        self._show_cc_bcc_fields(bool(cc) or bool(bcc))
 
         self.attachments_list = QListWidget()
         self.attachments_list.setMaximumHeight(70)
@@ -805,6 +895,14 @@ class ComposeDialog(QDialog):
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        # ActionRole, а не Accepted/Rejected — сохранение черновика не
+        # должно идти по тому же пути, что и "Отправить" (жалоба: "в
+        # черновики новые письма не сохраняет" — раньше кнопки не было
+        # вовсе, письмо можно было либо отправить, либо потерять при
+        # закрытии окна).
+        self._save_as_draft = False
+        self.save_draft_button = buttons.addButton("Сохранить черновик", QDialogButtonBox.ButtonRole.ActionRole)
+        self.save_draft_button.clicked.connect(self._on_save_draft)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -812,6 +910,13 @@ class ComposeDialog(QDialog):
         layout.addWidget(self.attachments_list)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
+
+    def _on_save_draft(self) -> None:
+        self._save_as_draft = True
+        self.accept()
+
+    def save_as_draft_requested(self) -> bool:
+        return self._save_as_draft
 
     def _show_cc_bcc(self) -> None:
         self._show_cc_bcc_fields(True)
@@ -1582,6 +1687,8 @@ class MainWindow(QMainWindow):
         self.mailbox_accounts: dict[str, Account | EwsAccount] = {}
         self.mailbox_smtp_accounts: dict[str, SmtpAccount | None] = {}
         self.mailbox_trash_folders: dict[str, str | None] = {}
+        self.mailbox_sent_folders: dict[str, str | None] = {}
+        self.mailbox_drafts_folders: dict[str, str | None] = {}
         self.mailbox_tree_roots: dict[str, QTreeWidgetItem] = {}
         # "imap" | "ews" на каждый ключ (username для IMAP, email для EWS) —
         # определяет, каким путём слать почту для ТЕКУЩЕЙ учётной записи:
@@ -1599,12 +1706,16 @@ class MainWindow(QMainWindow):
         self.active_source: CachedMailbox | ArchiveSource | None = None
         self.smtp_account: SmtpAccount | None = None
         self.trash_folder_name: str | None = None
+        self.sent_folder_name: str | None = None
+        self.drafts_folder_name: str | None = None
         self.current_folder: str | None = None
         self.current_summaries: list[MessageSummary] = []
         self.summaries_by_uid: dict[int, MessageSummary] = {}
         self.current_body: str = ""
         self.current_attachments: list[Attachment] = []
+        self.current_content: MessageContent | None = None
         self.selected_summary: MessageSummary | None = None
+        self._message_windows: list[QWidget] = []  # держим ссылки, пока окна открыты
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
         self.caldav_url = load_caldav_url()
@@ -1659,6 +1770,7 @@ class MainWindow(QMainWindow):
         self.table.setSortingEnabled(True)
         self.table.itemSelectionChanged.connect(self.on_message_selected)
         self.table.itemClicked.connect(self.on_table_item_clicked)
+        self.table.itemDoubleClicked.connect(self.on_table_item_double_clicked)
         self.table.currentCellChanged.connect(self.on_current_cell_changed)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.on_mail_table_context_menu)
@@ -1694,6 +1806,24 @@ class MainWindow(QMainWindow):
             invite_layout.addWidget(button)
         self.invite_bar.hide()
 
+        # Реквизиты письма (тема/отправитель/получатели) — раньше нигде не
+        # отображались (жалоба: "при просмотре письма невидно его
+        # реквизитов"). Отдельный виджет над телом, а не встроено в HTML
+        # письма — тело часто само содержит полный <html>...</html>, и
+        # примешивать туда наш текст means риск сломать вёрстку письма.
+        self.message_header_widget = QWidget(self)
+        header_layout = QHBoxLayout(self.message_header_widget)
+        header_layout.setContentsMargins(6, 4, 6, 4)
+        self.message_header_label = QLabel(self.message_header_widget)
+        self.message_header_label.setWordWrap(True)
+        self.message_header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header_layout.addWidget(self.message_header_label, 1)
+        self.open_message_window_button = QPushButton("Открыть в окне", self.message_header_widget)
+        self.open_message_window_button.setToolTip("Открыть письмо в отдельном окне")
+        self.open_message_window_button.clicked.connect(self.on_open_message_window)
+        header_layout.addWidget(self.open_message_window_button)
+        self.message_header_widget.hide()
+
         self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
         self.reading_pane.setOpenExternalLinks(True)
@@ -1702,6 +1832,7 @@ class MainWindow(QMainWindow):
         reading_container = QWidget(self)
         reading_layout = QVBoxLayout(reading_container)
         reading_layout.setContentsMargins(0, 0, 0, 0)
+        reading_layout.addWidget(self.message_header_widget)
         reading_layout.addWidget(self.invite_bar)
         reading_layout.addWidget(self.attachments_list)
         reading_layout.addWidget(self.reading_pane)
@@ -1852,7 +1983,14 @@ class MainWindow(QMainWindow):
         self.contacts_table.verticalHeader().setVisible(False)
         self.contacts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.contacts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.contacts_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # Раньше растягивался только первый столбец (Stretch стоял только
+        # на нём) — при изменении размера окна таблица "перекашивалась",
+        # остальные столбцы оставались фиксированной ширины (жалоба: "в
+        # контактах таблица расширяется не пропорционально, а не каждый
+        # столбец"). Растягиваем все столбцы поровну.
+        contacts_header = self.contacts_table.horizontalHeader()
+        for col in range(4):
+            contacts_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         self.contacts_table.itemSelectionChanged.connect(self.on_contact_selection_changed)
         self.contacts_table.itemDoubleClicked.connect(self.on_contact_double_clicked)
 
@@ -1867,6 +2005,9 @@ class MainWindow(QMainWindow):
         delete_contact_action = QAction("Удалить", self)
         delete_contact_action.triggered.connect(self.on_delete_contact)
         contacts_toolbar.addAction(delete_contact_action)
+        delete_all_contacts_action = QAction("Удалить все…", self)
+        delete_all_contacts_action.triggered.connect(self.on_delete_all_contacts)
+        contacts_toolbar.addAction(delete_all_contacts_action)
         contacts_refresh_action = QAction("Обновить", self)
         contacts_refresh_action.triggered.connect(self.refresh_contacts_view)
         contacts_toolbar.addAction(contacts_refresh_action)
@@ -2123,6 +2264,8 @@ class MainWindow(QMainWindow):
         self.mailbox_smtp_accounts[key] = smtp_account
         self.mailbox_protocols[key] = protocol
         self.mailbox_trash_folders[key] = session.trash_folder()
+        self.mailbox_sent_folders[key] = session.sent_folder()
+        self.mailbox_drafts_folders[key] = session.drafts_folder()
 
         default_item = self._populate_account_folder_tree(key, folders)
 
@@ -2136,6 +2279,8 @@ class MainWindow(QMainWindow):
         self.smtp_account = smtp_account
         self.account_root = self.mailbox_tree_roots[key]
         self.trash_folder_name = self.mailbox_trash_folders[key]
+        self.sent_folder_name = self.mailbox_sent_folders[key]
+        self.drafts_folder_name = self.mailbox_drafts_folders[key]
 
         if default_item is not None:
             self.folder_tree.setCurrentItem(default_item)
@@ -2261,6 +2406,56 @@ class MainWindow(QMainWindow):
             self._render_folder([])
         self._save_open_archives()
         self.statusBar().showMessage("Архив отключён", 3000)
+
+    def _disconnect_account(self, key: str) -> None:
+        # Раньше живую учётную запись (IMAP/EWS) нельзя было отключить
+        # вообще, только закрыть всё приложение (жалоба: "нет возможности
+        # отключить ящик") — по аналогии с "Закрыть архив" выше, но здесь
+        # ещё нужно перевыбрать "текущую" запись, если отключаем именно её.
+        mailbox = self.mailboxes.pop(key, None)
+        if mailbox is not None:
+            mailbox.close()
+        self.mailbox_accounts.pop(key, None)
+        self.mailbox_smtp_accounts.pop(key, None)
+        self.mailbox_protocols.pop(key, None)
+        self.mailbox_trash_folders.pop(key, None)
+        self.mailbox_sent_folders.pop(key, None)
+        self.mailbox_drafts_folders.pop(key, None)
+        root = self.mailbox_tree_roots.pop(key, None)
+        if root is not None:
+            index = self.folder_tree.indexOfTopLevelItem(root)
+            if index != -1:
+                self.folder_tree.takeTopLevelItem(index)
+
+        if self.active_source is mailbox:
+            self.active_source = None
+            self.current_folder = None
+            self._clear_reading_pane()
+            self._render_folder([])
+
+        if self.mailbox is mailbox:
+            remaining_key = next(iter(self.mailboxes), None)
+            if remaining_key is not None:
+                self.account = self.mailbox_accounts[remaining_key]
+                self.mailbox = self.mailboxes[remaining_key]
+                self.smtp_account = self.mailbox_smtp_accounts[remaining_key]
+                self.account_protocol = self.mailbox_protocols[remaining_key]
+                self.account_root = self.mailbox_tree_roots[remaining_key]
+                self.trash_folder_name = self.mailbox_trash_folders[remaining_key]
+                self.sent_folder_name = self.mailbox_sent_folders[remaining_key]
+                self.drafts_folder_name = self.mailbox_drafts_folders[remaining_key]
+            else:
+                self.account = None
+                self.mailbox = None
+                self.smtp_account = None
+                self.account_protocol = "imap"
+                self.account_root = None
+                self.trash_folder_name = None
+                self.sent_folder_name = None
+                self.drafts_folder_name = None
+
+        self._save_all_accounts()
+        self.statusBar().showMessage("Ящик отключён", 3000)
 
     def _refresh_archive_folders(self, key: str) -> None:
         root = self.archive_tree_roots.get(key)
@@ -2802,6 +2997,8 @@ class MainWindow(QMainWindow):
             self.account_protocol = self.mailbox_protocols[source_key]
             self.account_root = self.mailbox_tree_roots[source_key]
             self.trash_folder_name = self.mailbox_trash_folders[source_key]
+            self.sent_folder_name = self.mailbox_sent_folders[source_key]
+            self.drafts_folder_name = self.mailbox_drafts_folders[source_key]
         self._clear_reading_pane()
         try:
             summaries = source.folder_summaries(folder_name)
@@ -2844,10 +3041,14 @@ class MainWindow(QMainWindow):
         menu = QMenu(self)
         create_action = menu.addAction("Создать папку…" if is_root else "Создать вложенную папку…")
         rename_action = None if is_root else menu.addAction("Переименовать папку…")
+        disconnect_action = menu.addAction("Отключить ящик") if is_root else None
         chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
 
         if rename_action is not None and chosen is rename_action:
             self._rename_live_folder(account_key, mailbox, data[1])
+            return
+        if disconnect_action is not None and chosen is disconnect_action:
+            self._disconnect_account(account_key)
             return
         if chosen is not create_action:
             return
@@ -2941,11 +3142,13 @@ class MainWindow(QMainWindow):
     def _clear_reading_pane(self) -> None:
         self.reading_pane.clear()
         self.selected_summary = None
+        self.current_content = None
         self.current_attachments = []
         self.attachments_list.clear()
         self.attachments_list.hide()
         self.current_invite = None
         self.invite_bar.hide()
+        self.message_header_widget.hide()
 
     def on_filter_changed(self, text: str) -> None:
         needle = text.strip().lower()
@@ -3031,12 +3234,23 @@ class MainWindow(QMainWindow):
         toggle_read_action = menu.addAction(
             "Отметить как непрочитанное" if summary.is_read else "Отметить как прочитанное"
         )
+        restore_action = None
+        in_trash = (
+            self.active_source is self.mailbox
+            and self.trash_folder_name is not None
+            and self.current_folder == self.trash_folder_name
+        )
+        if in_trash:
+            restore_action = menu.addAction("Восстановить из корзины")
         menu.addSeparator()
         add_contact_action = menu.addAction("Добавить отправителя в контакты…")
         chosen = menu.exec(self.table.mapToGlobal(pos))
 
         if chosen is toggle_read_action:
             self._set_message_read(item.row(), summary, not summary.is_read)
+            return
+        if restore_action is not None and chosen is restore_action:
+            self.on_restore_from_trash()
             return
         if chosen is not add_contact_action:
             return
@@ -3071,6 +3285,47 @@ class MainWindow(QMainWindow):
             return
         self._open_marker_menu(item, summary)
 
+    def on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
+        if not self.active_source or not self.current_folder:
+            return
+        summary = self._summary_for_row(item.row())
+        if summary is None:
+            return
+        try:
+            content = self.active_source.message_content(self.current_folder, summary.uid)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
+            return
+
+        # Двойной клик по письму в "Черновиках" — сразу продолжить его
+        # редактирование, а не просто показать (жалоба: "из черновиков не
+        # отправляет"); во всех остальных папках — открыть в отдельном
+        # окне (жалоба: "нельзя открыть письмо в отдельном окне").
+        is_draft = (
+            self.active_source is self.mailbox
+            and self.drafts_folder_name is not None
+            and self.current_folder == self.drafts_folder_name
+        )
+        if is_draft:
+            dialog = ComposeDialog(
+                self,
+                title="Черновик",
+                to=content.to,
+                cc=content.cc,
+                bcc=content.bcc,
+                subject=content.subject or summary.subject,
+                body=content.text,
+                contacts=self._load_contacts(),
+                attachments=[
+                    OutgoingAttachment(filename=a.filename, content_type=a.content_type, payload=a.payload)
+                    for a in content.attachments
+                ],
+            )
+            self._exec_compose(dialog, source_draft=(self.current_folder, summary.uid))
+            return
+
+        self._open_message_window(summary, content)
+
     def _open_marker_menu(self, item: QTableWidgetItem, summary: MessageSummary) -> None:
         menu = QMenu(self)
         none_action = menu.addAction("Без маркера")
@@ -3097,11 +3352,52 @@ class MainWindow(QMainWindow):
         item.setIcon(_marker_icon(new_color) if new_color else QIcon())
 
     def _checked_uids(self) -> list[int]:
-        return [
+        checked = [
             self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
             for row in range(self.table.rowCount())
             if self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
         ]
+        if checked:
+            return checked
+        # Ничего не отмечено галочками — при ДВУХ и более выделенных
+        # строках (обычный Ctrl+клик/Shift+клик) считаем это тем же самым:
+        # раньше массовые действия (удаление, восстановление из корзины)
+        # требовали ставить галочку на каждое письмо по отдельности, даже
+        # если уже была выделена целая группа строк (жалоба: "невозможно
+        # удалить письма из корзины сразу (только выбор по 1)"). Одно
+        # выделение НЕ считаем — это обычно просто открытое для чтения
+        # письмо (клик по строке = его выделение), а не намерение
+        # массового действия; так одиночный клик по письму по-прежнему не
+        # рискует случайно попасть под "Удалить".
+        selected_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+        if len(selected_rows) < 2:
+            return []
+        return [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) for row in selected_rows]
+
+    def on_restore_from_trash(self) -> None:
+        if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
+            return
+        checked_uids = self._checked_uids()
+        if not checked_uids:
+            QMessageBox.information(
+                self, "Нечего восстанавливать", "Выделите (или отметьте галочками) письма для восстановления."
+            )
+            return
+        # "INBOX" — единственное протокольное имя папки, гарантированное
+        # на любом IMAP-сервере (RFC 3501); у нас нет сведений, из какой
+        # именно папки письмо когда-то попало в корзину, поэтому
+        # восстанавливаем во "Входящие" как разумное значение по умолчанию.
+        try:
+            self.mailbox.move_to_folder(self.current_folder, checked_uids, "INBOX")
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось восстановить", str(exc))
+            return
+        try:
+            summaries = self.mailbox.refresh_folder(self.current_folder)
+        except Exception:
+            summaries = [s for s in self.current_summaries if s.uid not in checked_uids]
+        self._render_folder(summaries)
+        self.statusBar().showMessage(f"Восстановлено во «Входящие»: {len(checked_uids)}", 5000)
 
     def on_delete_selected(self) -> None:
         if not self.active_source or not self.current_folder:
@@ -3179,12 +3475,16 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self.current_body = ""
             self.current_attachments = []
+            self.current_content = None
             self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {exc}")
             self.attachments_list.clear()
             self.attachments_list.hide()
+            self.message_header_widget.hide()
             return
         self.current_body = content.text
         self.current_attachments = content.attachments
+        self.current_content = content
+        self._render_message_header(summary, content)
         self._render_body(content)
         self._update_invite_bar(content)
         self._refresh_attachments_list()
@@ -3200,24 +3500,35 @@ class MainWindow(QMainWindow):
             row = rows[0].row()
             QTimer.singleShot(0, lambda: self._set_message_read(row, summary, True))
 
+    def _render_message_header(self, summary: MessageSummary, content: MessageContent) -> None:
+        subject = content.subject or summary.subject or "(без темы)"
+        sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
+        lines = [
+            f"<b>Тема:</b> {html.escape(subject)}",
+            f"<b>От:</b> {html.escape(sender)}",
+        ]
+        if content.to:
+            lines.append(f"<b>Кому:</b> {html.escape(content.to)}")
+        if content.cc:
+            lines.append(f"<b>Копия:</b> {html.escape(content.cc)}")
+        if summary.date:
+            lines.append(f"<b>Дата:</b> {html.escape(summary.date)}")
+        self.message_header_label.setText("<br>".join(lines))
+        self.message_header_widget.show()
+
+    def on_open_message_window(self) -> None:
+        if self.selected_summary is None or self.current_content is None:
+            return
+        self._open_message_window(self.selected_summary, self.current_content)
+
+    def _open_message_window(self, summary: MessageSummary, content: MessageContent) -> None:
+        window = MessageWindow(summary, content, parent=self)
+        window.destroyed.connect(lambda: self._message_windows.remove(window) if window in self._message_windows else None)
+        self._message_windows.append(window)
+        window.show()
+
     def _render_body(self, content: MessageContent) -> None:
-        """HTML-письма показываем как есть (с внедрёнными картинками из
-        cid:-вложений через addResource — без этого <img src="cid:..."> не
-        отрисуется); письма с обычным текстом — тоже через setHtml, но
-        экранированным и с активными ссылками (_linkify), чтобы голые
-        http(s)-ссылки в теле письма были кликабельны, как и в HTML-версии.
-        Внешние (не cid:) картинки Qt сам не подгружает — не течём в сеть
-        на отрисовку письма."""
-        document = self.reading_pane.document()
-        document.clear()
-        for content_id, (_content_type, payload) in content.inline_images.items():
-            image = QImage.fromData(payload)
-            if not image.isNull():
-                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
-        if content.html:
-            self.reading_pane.setHtml(content.html)
-        else:
-            self.reading_pane.setHtml(_linkify(content.text))
+        _populate_body_browser(self.reading_pane, content)
 
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
         try:
@@ -3409,7 +3720,18 @@ class MainWindow(QMainWindow):
         не проверялся вживую (закрытая корпоративная сеть, доступа отсюда
         нет), поэтому автоматический фоновый опрос пока не включаем —
         только явный запуск, чтобы первые реальные проблемы были видны
-        сразу пользователю, а не тихо повторялись каждые несколько минут."""
+        сразу пользователю, а не тихо повторялись каждые несколько минут.
+
+        Раньше вся синхронизация (создание CalDAV-соединения, отправка
+        каждой встречи по одной, затем получение всех с сервера) шла
+        синхронно прямо здесь — в основном потоке интерфейса. На реальном
+        сервере это могло занять заметное время, а без таймаута на HTTP
+        (см. caldav_sync.CalDavSession) — зависнуть надолго при сетевых
+        проблемах: жалоба "после настройки CalDav сломалась отправка,
+        просмотр, переход между папками и получение почты" — окно было не
+        сломано, а всё это время ждало одного зависшего запроса к CalDAV,
+        полностью замёрзшее. Теперь вся сетевая часть уходит в фоновый
+        поток, как и импорт/отправка почты."""
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
@@ -3419,59 +3741,63 @@ class MainWindow(QMainWindow):
             )
             return
 
-        try:
-            session = caldav_sync.CalDavSession(
-                caldav_sync.CalDavAccount(
-                    url=self.caldav_url, username=self.account.username, password=self.account.password
-                )
-            )
-        except caldav_sync.CalDavSyncError as exc:
-            QMessageBox.critical(self, "Ошибка CalDAV", str(exc))
-            return
-
+        account = caldav_sync.CalDavAccount(
+            url=self.caldav_url, username=self.account.username, password=self.account.password
+        )
+        calendar_path = self.calendar_path
         window_start = datetime.now(timezone.utc) - timedelta(days=30)
         window_end = datetime.now(timezone.utc) + timedelta(days=180)
 
-        # Сначала отправляем локальные изменения (свои встречи), потом
-        # забираем с сервера — если сделать наоборот, свежая локальная
-        # правка, ещё не отправленная, могла бы затереться устаревшей
-        # версией с сервера при получении.
-        pushed = 0
-        try:
-            local_events = calendar_store.list_events(self.calendar_path, start=window_start, end=window_end)
-            for event in local_events:
-                if event.is_organizer and event.status != "cancelled":
-                    session.push_event(event, self.account.username, self.account.username)
-                    pushed += 1
-        except caldav_sync.CalDavSyncError as exc:
-            QMessageBox.critical(self, "Ошибка отправки на CalDAV", str(exc))
-            session.close()
-            return
+        def do_sync() -> tuple[int, int]:
+            session = caldav_sync.CalDavSession(account)
+            try:
+                # Сначала отправляем локальные изменения (свои встречи),
+                # потом забираем с сервера — если сделать наоборот, свежая
+                # локальная правка, ещё не отправленная, могла бы затереться
+                # устаревшей версией с сервера при получении.
+                pushed = 0
+                local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
+                for event in local_events:
+                    if event.is_organizer and event.status != "cancelled":
+                        session.push_event(event, account.username, account.username)
+                        pushed += 1
 
-        pulled = 0
-        try:
-            server_events = session.fetch_events(window_start, window_end, self.account.username)
-            for event in server_events:
-                # CalDAV-сервер ничего не знает о наших полях, которых нет
-                # в стандартном iCalendar (ручной цвет события) и может не
-                # хранить произвольные вложения — не даём синхронизации
-                # тихо стереть то, что есть только локально.
-                existing_local = calendar_store.get_event(self.calendar_path, event.uid)
-                if existing_local:
-                    if not event.attachments and existing_local.attachments:
-                        event.attachments = existing_local.attachments
-                    if not event.color and existing_local.color:
-                        event.color = existing_local.color
-                calendar_store.save_event(self.calendar_path, event)
-                pulled += 1
-        except caldav_sync.CalDavSyncError as exc:
-            QMessageBox.critical(self, "Ошибка получения с CalDAV", str(exc))
-            session.close()
-            return
+                pulled = 0
+                server_events = session.fetch_events(window_start, window_end, account.username)
+                for event in server_events:
+                    # CalDAV-сервер ничего не знает о наших полях, которых
+                    # нет в стандартном iCalendar (ручной цвет события) и
+                    # может не хранить произвольные вложения — не даём
+                    # синхронизации тихо стереть то, что есть только локально.
+                    existing_local = calendar_store.get_event(calendar_path, event.uid)
+                    if existing_local:
+                        if not event.attachments and existing_local.attachments:
+                            event.attachments = existing_local.attachments
+                        if not event.color and existing_local.color:
+                            event.color = existing_local.color
+                    calendar_store.save_event(calendar_path, event)
+                    pulled += 1
+                return pushed, pulled
+            finally:
+                session.close()
 
-        session.close()
-        self.refresh_calendar_view()
-        self.statusBar().showMessage(f"CalDAV: отправлено {pushed}, получено {pulled}", 7000)
+        self.statusBar().showMessage("Синхронизация с CalDAV…")
+        worker = _CallableWorker(do_sync, parent=self)
+
+        def on_success(result: object) -> None:
+            pushed, pulled = result
+            self.refresh_calendar_view()
+            self.statusBar().showMessage(f"CalDAV: отправлено {pushed}, получено {pulled}", 7000)
+            self._background_workers.remove(worker)
+
+        def on_failure(error_text: str) -> None:
+            QMessageBox.critical(self, "Ошибка CalDAV", error_text)
+            self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def refresh_calendar_view(self) -> None:
         # Локальный календарь ничего не опрашивает по сети — "Обновить"
@@ -3710,6 +4036,24 @@ class MainWindow(QMainWindow):
         self.selected_contact = None
         self.refresh_contacts_view()
 
+    def on_delete_all_contacts(self) -> None:
+        count = self.contacts_table.rowCount()
+        if count == 0:
+            QMessageBox.information(self, "Адресная книга пуста", "Удалять нечего.")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Удалить все контакты",
+            f"Удалить все контакты ({count})? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        contact_store.delete_all_contacts(self.contacts_path)
+        self.selected_contact = None
+        self.refresh_contacts_view()
+        self.statusBar().showMessage(f"Удалено контактов: {count}", 5000)
+
     def on_import_contacts(self) -> None:
         menu = QMenu(self)
         vcard_action = menu.addAction("vCard (.vcf)…")
@@ -3821,7 +4165,13 @@ class MainWindow(QMainWindow):
         )
 
     def _send_message_in_background(
-        self, message: OutgoingMessage, *, success_status: str, failure_title: str, severity: str = "critical"
+        self,
+        message: OutgoingMessage,
+        *,
+        success_status: str,
+        failure_title: str,
+        severity: str = "critical",
+        on_success_extra: Callable[[], None] | None = None,
     ) -> None:
         # Событие/ответ на приглашение уже сохранены локально к моменту
         # вызова — сама отправка (SMTP или EWS, обычно 1-2 секунды на
@@ -3839,6 +4189,8 @@ class MainWindow(QMainWindow):
         def on_success(_result: object) -> None:
             self.statusBar().showMessage(success_status, 5000)
             self._background_workers.remove(worker)
+            if on_success_extra is not None:
+                on_success_extra()
 
         def on_failure(error_text: str) -> None:
             dialog = QMessageBox.warning if severity == "warning" else QMessageBox.critical
@@ -4054,8 +4406,18 @@ class MainWindow(QMainWindow):
         )
         self._exec_compose(dialog)
 
-    def _exec_compose(self, dialog: ComposeDialog, *, in_reply_to: str | None = None) -> None:
+    def _exec_compose(
+        self,
+        dialog: ComposeDialog,
+        *,
+        in_reply_to: str | None = None,
+        source_draft: tuple[str, int] | None = None,
+    ) -> None:
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        if dialog.save_as_draft_requested():
+            self._save_draft(dialog, source_draft=source_draft)
             return
 
         recipients = dialog.recipients()
@@ -4073,6 +4435,12 @@ class MainWindow(QMainWindow):
             in_reply_to=in_reply_to,
             attachments=dialog.attachments,
         )
+
+        def after_send() -> None:
+            self._append_sent_copy(message)
+            if source_draft is not None:
+                self._delete_draft(source_draft)
+
         # Раньше отправка шла синхронно прямо здесь — окно подвисало на
         # время SMTP-разговора с сервером, как и у календарных приглашений
         # (см. _send_message_in_background); теперь то же самое одним
@@ -4081,7 +4449,70 @@ class MainWindow(QMainWindow):
             message,
             success_status=f"Письмо отправлено: {', '.join(recipients)}",
             failure_title="Ошибка отправки",
+            on_success_extra=after_send,
         )
+
+    def _append_sent_copy(self, message: OutgoingMessage) -> None:
+        """Кладёт копию только что отправленного письма в "Отправленные"
+        через IMAP APPEND — VK Mail (и не только) не всегда сам сохраняет
+        копию исходящих (жалоба: "не отображается отправка почты, не
+        появляется в папке отправленные"). Для EWS не нужно: там копия
+        сохраняется автоматически самим Message.send() (см. ews_client)."""
+        if self.account_protocol != "imap" or not self.sent_folder_name or self.mailbox is None:
+            return
+        try:
+            raw = build_email_message(message).as_bytes()
+            self.mailbox.append_message(self.sent_folder_name, raw, flags=(b"\\Seen",))
+        except Exception:
+            pass  # письмо уже реально ушло получателю — копия в "Отправленные" необязательна
+
+    def _save_draft(self, dialog: ComposeDialog, *, source_draft: tuple[str, int] | None) -> None:
+        # Жалоба: "в черновики новые письма не сохраняет" — раньше кнопки
+        # сохранения черновика не было вовсе, при закрытии окна
+        # недописанное письмо просто терялось.
+        if self.account_protocol != "imap":
+            QMessageBox.warning(
+                self,
+                "Пока не поддерживается",
+                "Сохранение черновиков для учётных записей Exchange (EWS) пока не реализовано.",
+            )
+            return
+        if not self.drafts_folder_name or self.mailbox is None:
+            QMessageBox.warning(
+                self, "Нет папки «Черновики»", "У этой учётной записи не найдена папка «Черновики» на сервере."
+            )
+            return
+        message = OutgoingMessage(
+            sender=self.account.username,
+            to=dialog.recipients(),
+            cc=dialog.cc_recipients(),
+            bcc=dialog.bcc_recipients(),
+            subject=dialog.subject(),
+            body=dialog.body(),
+            attachments=dialog.attachments,
+        )
+        try:
+            raw = build_email_message(message).as_bytes()
+            self.mailbox.append_message(self.drafts_folder_name, raw, flags=(b"\\Draft",))
+            if source_draft is not None and source_draft[0] == self.drafts_folder_name:
+                # Правка уже существующего черновика — старую копию убираем,
+                # иначе при каждом "Сохранить" в Черновиках копилось бы по
+                # дубликату письма.
+                self.mailbox.delete_messages(source_draft[0], [source_draft[1]])
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить черновик", str(exc))
+            return
+        self.statusBar().showMessage("Черновик сохранён", 5000)
+        if self.active_source is self.mailbox and self.current_folder == self.drafts_folder_name:
+            self.on_refresh()
+
+    def _delete_draft(self, source_draft: tuple[str, int]) -> None:
+        if self.mailbox is None:
+            return
+        try:
+            self.mailbox.delete_messages(source_draft[0], [source_draft[1]])
+        except Exception:
+            pass  # письмо уже отправлено — то, что старая черновая копия не убралась, не критично
 
     def closeEvent(self, event) -> None:
         self.poll_timer.stop()

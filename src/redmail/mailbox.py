@@ -86,6 +86,13 @@ class CachedMailbox:
     def close(self) -> None:
         self.session.close()
 
+    def append_message(self, folder: str, raw: bytes, *, flags: tuple = ()) -> None:
+        # Кэш сам заметит новое письмо при следующем открытии папки — там
+        # refresh_folder() уже сравнивает EXISTS с закэшированным числом
+        # писем и перечитывает при расхождении, отдельная инвалидация не
+        # нужна.
+        self.session.append_message(folder, raw, flags=flags)
+
 
 class ArchiveSource:
     """Тот же протокол, что у CachedMailbox (folder_summaries/refresh_folder/

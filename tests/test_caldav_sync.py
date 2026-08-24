@@ -39,7 +39,7 @@ def test_session_creates_client_with_account_credentials() -> None:
     with patch("redmail.caldav_sync.caldav.DAVClient") as client_cls:
         CalDavSession(_account())
     client_cls.assert_called_once_with(
-        "https://calendar.example.corp/caldav/", username="ivan", password="secret"
+        "https://calendar.example.corp/caldav/", username="ivan", password="secret", timeout=30
     )
 
 

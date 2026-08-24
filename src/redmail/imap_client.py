@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header
@@ -30,6 +31,31 @@ _COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
 # было — снимать нечего). Спутать их означало бы на реальном сервере либо
 # лишние round trip'ы, либо оставленный висеть старый keyword.
 UNKNOWN_MARKER = object()
+
+
+def _reconnecting(method):
+    """После простоя реальный IMAP-сервер молча рвёт TCP-соединение (никто
+    не обязан держать сессию вечно — RFC 3501 не гарантирует этого), и
+    следующая же операция падала с сырой сетевой ошибкой (жалоба
+    пользователя: "после простоя часто выдаёт ошибку подключения").
+    OSError — общий предок и для обрыва соединения, и для TLS-ошибок в
+    современном Python; imaplib.IMAP4.abort — imapclient/imaplib так
+    сигнализируют "соединение уже мертво". Настоящие протокольные ошибки
+    (IMAPClientError на команду, которую сервер понял, но отверг) НЕ
+    перехватываются — переподключение их не лечит, показываем как есть."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except (OSError, EOFError) as exc:
+            try:
+                self._reconnect()
+            except Exception:
+                raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 @dataclass
@@ -80,6 +106,15 @@ class MessageContent:
     # Content-Id (без угловых скобок) -> (content_type, данные) — картинки,
     # встроенные в HTML через <img src="cid:...">, а не обычные вложения.
     inline_images: dict[str, tuple[str, bytes]] = field(default_factory=dict)
+    # Реквизиты письма (тема/отправитель/получатели) — раньше нигде не
+    # показывались при просмотре письма (жалоба: "невидно его реквизитов
+    # (тема, отправитель, адресаты)"). MessageSummary уже даёт subject/
+    # sender для списка писем, но не даёт To/Cc — они здесь.
+    subject: str = ""
+    from_: str = ""
+    to: str = ""
+    cc: str = ""
+    bcc: str = ""
 
 
 class ImapSession:
@@ -104,12 +139,24 @@ class ImapSession:
         except Exception:
             pass
 
+    def _reconnect(self) -> None:
+        self._client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.use_ssl)
+        self._client.login(self.account.username, self.account.password)
+        if self._selected_folder is not None:
+            # Кое-что из вызывающего кода (fetch_summaries) не делает
+            # собственный SELECT — полагается, что папка уже выбрана
+            # предыдущим folder_message_count()/_select(). Восстанавливаем
+            # это состояние сразу, иначе повтор упал бы снова, уже по
+            # другой причине (ничего не выбрано).
+            self._client.select_folder(self._selected_folder, readonly=False)
+
     def __enter__(self) -> "ImapSession":
         return self
 
     def __exit__(self, *exc_info) -> None:
         self.close()
 
+    @_reconnecting
     def list_folders(self) -> list[FolderInfo]:
         # Сырой ответ запоминаем — из него же достаём папку "Корзина" в
         # trash_folder(), без второго похода на сервер (find_special_folder
@@ -121,18 +168,38 @@ class ImapSession:
             if b"\\Noselect" not in flags
         ]
 
+    @_reconnecting
     def create_folder(self, name: str) -> None:
         self._client.create_folder(name)
 
+    @_reconnecting
     def rename_folder(self, old_name: str, new_name: str) -> None:
         self._client.rename_folder(old_name, new_name)
 
     def trash_folder(self) -> str | None:
+        return self._special_folder(b"\\Trash")
+
+    def sent_folder(self) -> str | None:
+        return self._special_folder(b"\\Sent")
+
+    def drafts_folder(self) -> str | None:
+        return self._special_folder(b"\\Drafts")
+
+    def _special_folder(self, special_flag: bytes) -> str | None:
         for flags, _delimiter, name in self._raw_folders:
-            if b"\\Trash" in flags:
+            if special_flag in flags:
                 return name
         return None
 
+    @_reconnecting
+    def append_message(self, folder: str, raw: bytes, *, flags: tuple[bytes, ...] = ()) -> None:
+        """Кладёт готовое (уже собранное) сообщение в папку напрямую,
+        минуя SMTP — для "Отправленные" (сервер сам не всегда сохраняет
+        копию исходящих) и "Черновики" (письмо, которое никуда не
+        отправлялось)."""
+        self._client.append(folder, raw, flags=flags)
+
+    @_reconnecting
     def folder_message_count(self, folder: str) -> int:
         """SELECT папку, вернуть общее число писем в ней (EXISTS).
 
@@ -145,6 +212,7 @@ class ImapSession:
         self._selected_exists = status[b"EXISTS"]
         return self._selected_exists
 
+    @_reconnecting
     def fetch_summaries(self, limit: int = 50) -> list[MessageSummary]:
         """Сводки последних `limit` писем уже выбранной папки.
 
@@ -174,6 +242,7 @@ class ImapSession:
         self.folder_message_count(folder)
         return self.fetch_summaries(limit)
 
+    @_reconnecting
     def search_uids(self, folder: str, *, before=None) -> list[int]:
         """UID всех писем папки (или только тех, что старше даты `before`) —
         в отличие от fetch_summaries/fetch_folder_summaries это не
@@ -187,6 +256,7 @@ class ImapSession:
     def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
         return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))
 
+    @_reconnecting
     def fetch_message_raw(self, folder: str, uid: int) -> bytes:
         """Полный RFC 822 письма как есть — нужен для выгрузки в архив без
         потерь (в отличие от fetch_message_content, который уже разобрал бы
@@ -195,6 +265,7 @@ class ImapSession:
         response = self._client.fetch([uid], ["BODY.PEEK[]"])
         return response[uid][b"BODY[]"]
 
+    @_reconnecting
     def set_read(self, folder: str, uid: int, read: bool) -> None:
         self._select(folder)
         if read:
@@ -202,6 +273,7 @@ class ImapSession:
         else:
             self._client.remove_flags([uid], [b"\\Seen"])
 
+    @_reconnecting
     def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         """Ставит/снимает \\Flagged + наш цветной keyword-флаг.
 
@@ -252,6 +324,7 @@ class ImapSession:
             except IMAPClientError:
                 pass  # флаг и так не поддерживается/не был установлен — не критично
 
+    @_reconnecting
     def move_messages(self, folder: str, uids: list[int], target_folder: str) -> None:
         """Переносит письма в другую папку (например, в корзину) — атомарно,
         если сервер поддерживает MOVE (RFC 6851), иначе COPY + удаление."""
@@ -265,6 +338,7 @@ class ImapSession:
             self._client.delete_messages(uids)
             self._client.expunge()
 
+    @_reconnecting
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         """Безвозвратное удаление (Shift+Удалить, либо удаление из самой корзины)."""
         if not uids:
@@ -281,17 +355,33 @@ class ImapSession:
 
 
 def extract_content(message: Message) -> MessageContent:
+    # Заголовки живут на верхнем уровне сообщения независимо от того,
+    # multipart оно или нет — читаем их один раз, а не в каждой из веток
+    # ниже (жалоба: "при просмотре письма невидно его реквизитов"), и
+    # передаём во все ветки через один хелпер, а не повторяя 5 kwargs в
+    # каждом return.
+    header_kwargs = dict(
+        subject=_decode_header_text(message.get("Subject")),
+        from_=_decode_header_text(message.get("From")),
+        to=_decode_header_text(message.get("To")),
+        cc=_decode_header_text(message.get("Cc")),
+        bcc=_decode_header_text(message.get("Bcc")),
+    )
+
     if not message.is_multipart():
         if message.get_content_type() == "text/plain":
-            return MessageContent(text=_decode_payload(message))
+            return MessageContent(text=_decode_payload(message), **header_kwargs)
         if message.get_content_type() == "text/html":
             return MessageContent(
                 text="(письмо в формате HTML — предпросмотр текста недоступен)",
                 html=_decode_payload(message),
+                **header_kwargs,
             )
         if message.get_content_type() == "text/calendar":
-            return MessageContent(text="", attachments=[_calendar_attachment(message)])
-        return MessageContent(text="(письмо в формате HTML — предпросмотр текста недоступен)")
+            return MessageContent(text="", attachments=[_calendar_attachment(message)], **header_kwargs)
+        return MessageContent(
+            text="(письмо в формате HTML — предпросмотр текста недоступен)", **header_kwargs
+        )
 
     text: str | None = None
     html: str | None = None
@@ -336,7 +426,13 @@ def extract_content(message: Message) -> MessageContent:
     if text is None:
         text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html is not None else "(нет текстового содержимого)"
 
-    return MessageContent(text=text, attachments=attachments, html=html or "", inline_images=inline_images)
+    return MessageContent(
+        text=text,
+        attachments=attachments,
+        html=html or "",
+        inline_images=inline_images,
+        **header_kwargs,
+    )
 
 
 def _calendar_attachment(part: Message) -> Attachment:
@@ -345,6 +441,16 @@ def _calendar_attachment(part: Message) -> Attachment:
         content_type="text/calendar",
         payload=part.get_payload(decode=True) or b"",
     )
+
+
+def _decode_header_text(value: str | None) -> str:
+    """Как _decode_filename, но для обычных текстовых заголовков (Subject/
+    From/To/Cc) — не все сервера сворачивают RFC 2047 encoded-word до
+    ENVELOPE, который парсит imapclient (см. _decode_subject); здесь тот
+    же случай, но для содержимого письма, разбираемого через email.message."""
+    if not value or "=?" not in value:
+        return value or ""
+    return _decode_rfc2047(value.encode("ascii", errors="replace"))
 
 
 def _decode_filename(filename: str | None) -> str | None:
