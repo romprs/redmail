@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        16%{?dist}
+Release:        17%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,17 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Aug 24 2026 RedMail dev <noreply@example.com> - 0.0.1-17
+- Добавлен вход через SSO (Kerberos) для обычных учётных записей
+  IMAP/SMTP (почтовый сервер в домене) — как уже было для Exchange
+  (EWS). В параметрах учётной записи выбирается способ входа «Логин и
+  пароль» (по умолчанию, как раньше) или «SSO (Kerberos, без пароля)»:
+  во втором случае пароль в приложении не запрашивается и не хранится
+  — используется Kerberos-билет, который RED OS уже выдала при входе
+  пользователя в домен (SSSD); смену пароля на стороне домена
+  отслеживает сама SSO-инфраструктура, приложению обновлять ничего не
+  нужно.
+
 * Mon Aug 24 2026 RedMail dev <noreply@example.com> - 0.0.1-16
 - Исправлена уязвимость: имя файла вложения (из письма или .ics-приглашения)
   подставлялось напрямую в путь при открытии/сохранении на диск —
