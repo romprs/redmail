@@ -212,6 +212,23 @@ def _format_size(num_bytes: int) -> str:
 
 _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+")
 
+_SUBJECT_PREFIX_PATTERN = re.compile(r"^\s*(re|fw|fwd|ответ|отв|пересыл)\s*:\s*", re.IGNORECASE)
+
+
+def _normalize_subject(subject: str) -> str:
+    """Убирает префиксы "Re:"/"Fwd:"/"Ответ:"/"Пересыл:" (возможно
+    несколько подряд — "Re: Fwd: Re: ...") и лишние пробелы, чтобы связать
+    письма одной цепочки (вопрос-ответ) по теме. Используется только для
+    группировки в интерфейсе (жалоба: "письма цепочки... не группируются
+    и не схлапываются... не видно цепочки писем") — не трогает реальные
+    заголовки References/In-Reply-To, которых архив/IMAP-сводки не несут."""
+    normalized = subject.strip()
+    while True:
+        stripped = _SUBJECT_PREFIX_PATTERN.sub("", normalized)
+        if stripped == normalized:
+            return normalized
+        normalized = stripped
+
 
 def _populate_body_browser(browser: QTextBrowser, content: MessageContent) -> None:
     """HTML-письма показываем как есть (с внедрёнными картинками из
@@ -245,6 +262,8 @@ class MessageWindow(QWidget):
         self.setWindowTitle(content.subject or summary.subject or "(без темы)")
         self.resize(700, 500)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self._summary = summary
+        self._content = content
 
         sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
         lines = [f"<b>Тема:</b> {html.escape(content.subject or summary.subject or '(без темы)')}", f"<b>От:</b> {html.escape(sender)}"]
@@ -258,6 +277,21 @@ class MessageWindow(QWidget):
         header_label.setWordWrap(True)
         header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
 
+        # Раньше здесь не было ни ответить, ни переслать вовсе — окно было
+        # только для чтения (жалоба: "при открытии письма в отдельном окне
+        # нет кнопок ответить, переслать"). Оба действия зовут обратно в
+        # MainWindow (_start_reply/_start_forward) с ЭТИМ summary/content
+        # явно, а не через self.selected_summary — письмо в этом окне
+        # может быть вовсе не тем, что сейчас выделено в основном списке.
+        reply_button = QPushButton("Ответить", self)
+        reply_button.clicked.connect(self._on_reply)
+        forward_button = QPushButton("Переслать", self)
+        forward_button.clicked.connect(self._on_forward)
+        button_row = QHBoxLayout()
+        button_row.addWidget(reply_button)
+        button_row.addWidget(forward_button)
+        button_row.addStretch(1)
+
         body = QTextBrowser(self)
         body.setReadOnly(True)
         body.setOpenExternalLinks(True)
@@ -265,7 +299,18 @@ class MessageWindow(QWidget):
 
         layout = QVBoxLayout(self)
         layout.addWidget(header_label)
+        layout.addLayout(button_row)
         layout.addWidget(body)
+
+    def _on_reply(self) -> None:
+        main_window = self.parent()
+        if main_window is not None:
+            main_window._start_reply(self._summary, self._content.text)
+
+    def _on_forward(self) -> None:
+        main_window = self.parent()
+        if main_window is not None:
+            main_window._start_forward(self._summary, self._content)
 
 
 def _linkify(text: str) -> str:
@@ -1824,6 +1869,18 @@ class MainWindow(QMainWindow):
         header_layout.addWidget(self.open_message_window_button)
         self.message_header_widget.hide()
 
+        # Список остальных писем той же цепочки (по теме, без Re:/Fwd:) —
+        # раньше цепочка вопрос-ответ никак не была видна при просмотре
+        # письма (жалоба: "письма цепочки... не группируются и не
+        # схлапываются... при просмотре не видно цепочки писем"). Полноценная
+        # схлопываемая группировка прямо в списке писем — отдельная, более
+        # крупная переделка таблицы; здесь — видимость цепочки при просмотре
+        # конкретного письма, с переходом по клику.
+        self.thread_list = QListWidget(self)
+        self.thread_list.setMaximumHeight(90)
+        self.thread_list.itemClicked.connect(self._on_thread_item_clicked)
+        self.thread_list.hide()
+
         self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
         self.reading_pane.setOpenExternalLinks(True)
@@ -1833,6 +1890,7 @@ class MainWindow(QMainWindow):
         reading_layout = QVBoxLayout(reading_container)
         reading_layout.setContentsMargins(0, 0, 0, 0)
         reading_layout.addWidget(self.message_header_widget)
+        reading_layout.addWidget(self.thread_list)
         reading_layout.addWidget(self.invite_bar)
         reading_layout.addWidget(self.attachments_list)
         reading_layout.addWidget(self.reading_pane)
@@ -2040,7 +2098,7 @@ class MainWindow(QMainWindow):
         self.mail_mode_action = QAction("Почта", self)
         self.mail_mode_action.setCheckable(True)
         self.mail_mode_action.setChecked(True)
-        self.mail_mode_action.triggered.connect(lambda: self.pages.setCurrentIndex(0))
+        self.mail_mode_action.triggered.connect(self._show_mail_page)
         self.calendar_mode_action = QAction("Календарь", self)
         self.calendar_mode_action.setCheckable(True)
         self.calendar_mode_action.triggered.connect(self._show_calendar_page)
@@ -2066,18 +2124,18 @@ class MainWindow(QMainWindow):
         compose_action.triggered.connect(self.on_compose)
         toolbar.addAction(compose_action)
 
-        reply_action = QAction("Ответить", self)
-        reply_action.triggered.connect(self.on_reply)
-        toolbar.addAction(reply_action)
+        self.reply_action = QAction("Ответить", self)
+        self.reply_action.triggered.connect(self.on_reply)
+        toolbar.addAction(self.reply_action)
 
-        forward_action = QAction("Переслать", self)
-        forward_action.triggered.connect(self.on_forward)
-        toolbar.addAction(forward_action)
+        self.forward_action = QAction("Переслать", self)
+        self.forward_action.triggered.connect(self.on_forward)
+        toolbar.addAction(self.forward_action)
 
-        delete_action = QAction("Удалить", self)
-        delete_action.setToolTip("В корзину. Shift+Удалить — безвозвратно.")
-        delete_action.triggered.connect(self.on_delete_selected)
-        toolbar.addAction(delete_action)
+        self.delete_action = QAction("Удалить", self)
+        self.delete_action.setToolTip("В корзину. Shift+Удалить — безвозвратно.")
+        self.delete_action.triggered.connect(self.on_delete_selected)
+        toolbar.addAction(self.delete_action)
 
         self.addToolBarBreak()
         archive_toolbar = QToolBar("Архив", self)
@@ -2092,15 +2150,15 @@ class MainWindow(QMainWindow):
         import_action.triggered.connect(self.on_import)
         archive_toolbar.addAction(import_action)
 
-        archive_selected_action = QAction("В архив…", self)
-        archive_selected_action.setToolTip("Выгрузить отмеченные письма в архив (копия или перемещение)")
-        archive_selected_action.triggered.connect(self.on_archive_selected)
-        archive_toolbar.addAction(archive_selected_action)
+        self.archive_selected_action = QAction("В архив…", self)
+        self.archive_selected_action.setToolTip("Выгрузить отмеченные письма в архив (копия или перемещение)")
+        self.archive_selected_action.triggered.connect(self.on_archive_selected)
+        archive_toolbar.addAction(self.archive_selected_action)
 
-        archive_folder_action = QAction("Архивировать папку…", self)
-        archive_folder_action.setToolTip("Выгрузить в архив всю папку целиком или всё старше выбранной даты")
-        archive_folder_action.triggered.connect(self.on_archive_folder)
-        archive_toolbar.addAction(archive_folder_action)
+        self.archive_folder_action = QAction("Архивировать папку…", self)
+        self.archive_folder_action.setToolTip("Выгрузить в архив всю папку целиком или всё старше выбранной даты")
+        self.archive_folder_action.triggered.connect(self.on_archive_folder)
+        archive_toolbar.addAction(self.archive_folder_action)
 
         archive_toolbar.addSeparator()
 
@@ -2457,16 +2515,70 @@ class MainWindow(QMainWindow):
         self._save_all_accounts()
         self.statusBar().showMessage("Ящик отключён", 3000)
 
+    def _empty_trash(self, mailbox: CachedMailbox, folder: str) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Очистить корзину",
+            "Удалить безвозвратно ВСЕ письма в корзине? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        def do_empty() -> int:
+            uids = mailbox.session.search_uids(folder)
+            if uids:
+                mailbox.delete_messages(folder, uids)
+            return len(uids)
+
+        worker = _CallableWorker(do_empty, parent=self)
+
+        def on_success(result: object) -> None:
+            count = result
+            if self.active_source is mailbox and self.current_folder == folder:
+                self._render_folder([])
+            self.statusBar().showMessage(f"Корзина очищена: удалено {count}", 5000)
+            self._background_workers.remove(worker)
+
+        def on_failure(error_text: str) -> None:
+            QMessageBox.critical(self, "Не удалось очистить корзину", error_text)
+            self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
+
     def _refresh_archive_folders(self, key: str) -> None:
         root = self.archive_tree_roots.get(key)
         source = self.archives.get(key)
         if root is None or source is None:
             return
         root.takeChildren()
+        # Раньше каждая папка архива становилась ПРЯМЫМ ребёнком корня с
+        # ПОЛНЫМ путём в качестве подписи (например, "Top of Personal
+        # Folders/Входящие/Подпапка") — у PST с общим длинным префиксом у
+        # всех папок ("Top of Personal Folders/...") они все визуально
+        # выглядели одинаково обрезанными в узкой колонке дерева (жалоба:
+        # "загрузка из pst все ещё некорректно загружает имена папок").
+        # Строим настоящее вложенное дерево тем же способом, что и для
+        # живого ящика (_populate_account_folder_tree) — на каждом уровне
+        # подпись это только сегмент имени, не весь путь.
+        nodes: dict[tuple[str, ...], QTreeWidgetItem] = {(): root}
         for folder_name in archive_store.list_folders(source.path):
-            node = QTreeWidgetItem([folder_name])
-            node.setData(0, Qt.ItemDataRole.UserRole, (key, folder_name))
-            root.addChild(node)
+            parts = [p for p in folder_name.split("/") if p] or [folder_name]
+            path: tuple[str, ...] = ()
+            parent = root
+            for part in parts:
+                path = path + (part,)
+                node = nodes.get(path)
+                if node is None:
+                    node = QTreeWidgetItem([part])
+                    parent.addChild(node)
+                    nodes[path] = node
+                parent = node
+            parent.setData(0, Qt.ItemDataRole.UserRole, (key, folder_name))
+        self.folder_tree.expandItem(root)
 
     def _pick_archive_target(
         self, *, title: str, ask_folder: bool = False, default_folder: str = "", ask_move_copy: bool = False
@@ -3037,15 +3149,20 @@ class MainWindow(QMainWindow):
         if not is_root and not is_live_folder:
             return
         mailbox = self.mailboxes[account_key]
+        is_trash = not is_root and data[1] == self.mailbox_trash_folders.get(account_key)
 
         menu = QMenu(self)
         create_action = menu.addAction("Создать папку…" if is_root else "Создать вложенную папку…")
         rename_action = None if is_root else menu.addAction("Переименовать папку…")
+        empty_trash_action = menu.addAction("Очистить корзину…") if is_trash else None
         disconnect_action = menu.addAction("Отключить ящик") if is_root else None
         chosen = menu.exec(self.folder_tree.mapToGlobal(pos))
 
         if rename_action is not None and chosen is rename_action:
             self._rename_live_folder(account_key, mailbox, data[1])
+            return
+        if empty_trash_action is not None and chosen is empty_trash_action:
+            self._empty_trash(mailbox, data[1])
             return
         if disconnect_action is not None and chosen is disconnect_action:
             self._disconnect_account(account_key)
@@ -3149,6 +3266,8 @@ class MainWindow(QMainWindow):
         self.current_invite = None
         self.invite_bar.hide()
         self.message_header_widget.hide()
+        self.thread_list.clear()
+        self.thread_list.hide()
 
     def on_filter_changed(self, text: str) -> None:
         needle = text.strip().lower()
@@ -3515,6 +3634,31 @@ class MainWindow(QMainWindow):
             lines.append(f"<b>Дата:</b> {html.escape(summary.date)}")
         self.message_header_label.setText("<br>".join(lines))
         self.message_header_widget.show()
+        self._render_thread_list(summary)
+
+    def _render_thread_list(self, summary: MessageSummary) -> None:
+        normalized = _normalize_subject(summary.subject)
+        thread = sorted(
+            (s for s in self.current_summaries if s.uid != summary.uid and _normalize_subject(s.subject) == normalized),
+            key=lambda s: s.date,
+        )
+        self.thread_list.clear()
+        if not thread:
+            self.thread_list.hide()
+            return
+        for other in thread:
+            item = QListWidgetItem(f"{other.date} — {other.sender}: {other.subject}")
+            item.setData(Qt.ItemDataRole.UserRole, other.uid)
+            self.thread_list.addItem(item)
+        self.thread_list.show()
+
+    def _on_thread_item_clicked(self, item: QListWidgetItem) -> None:
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        for row in range(self.table.rowCount()):
+            if self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) == uid:
+                self.table.setCurrentCell(row, COL_SUBJECT)
+                self.table.scrollToItem(self.table.item(row, COL_SUBJECT))
+                break
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:
@@ -3658,8 +3802,29 @@ class MainWindow(QMainWindow):
         )
         return event
 
+    def _show_mail_page(self) -> None:
+        self.pages.setCurrentIndex(0)
+        self._update_mail_actions_enabled()
+
+    def _update_mail_actions_enabled(self) -> None:
+        # Раньше "Ответить"/"Переслать"/"Удалить" (и выгрузка в архив)
+        # оставались нажимаемыми и на вкладках "Контакты"/"Календарь", хотя
+        # там нет ни выбранного письма, ни текущей папки почты — жалоба:
+        # "при нахождении в контактах или календаре можно нажать кнопку
+        # переслать, удалить, ответить".
+        is_mail_page = self.pages.currentIndex() == 0
+        for action in (
+            self.reply_action,
+            self.forward_action,
+            self.delete_action,
+            self.archive_selected_action,
+            self.archive_folder_action,
+        ):
+            action.setEnabled(is_mail_page)
+
     def _show_calendar_page(self) -> None:
         self.pages.setCurrentIndex(1)
+        self._update_mail_actions_enabled()
         self.refresh_calendar_view()
         if not self._calendar_scrolled_to_now:
             self._calendar_scrolled_to_now = True
@@ -3974,6 +4139,7 @@ class MainWindow(QMainWindow):
 
     def _show_contacts_page(self) -> None:
         self.pages.setCurrentIndex(2)
+        self._update_mail_actions_enabled()
         self.refresh_contacts_view()
 
     def refresh_contacts_view(self) -> None:
@@ -4341,6 +4507,16 @@ class MainWindow(QMainWindow):
         self._exec_compose(dialog)
 
     def on_reply(self) -> None:
+        if not self.selected_summary:
+            QMessageBox.warning(self, "Нет письма", "Выберите письмо, на которое хотите ответить.")
+            return
+        self._start_reply(self.selected_summary, self.current_body)
+
+    def _start_reply(self, summary: MessageSummary, body_text: str) -> None:
+        # Вынесено из on_reply() отдельно — тем же путём пользуется кнопка
+        # "Ответить" в окне отдельно открытого письма (MessageWindow),
+        # где нет self.selected_summary/self.current_body (жалоба: "при
+        # открытии письма в отдельном окне нет кнопок ответить, переслать").
         if not self.smtp_account:
             QMessageBox.warning(
                 self,
@@ -4348,14 +4524,9 @@ class MainWindow(QMainWindow):
                 "Сначала подключитесь и укажите сервер SMTP в настройках учётной записи.",
             )
             return
-        if not self.selected_summary:
-            QMessageBox.warning(self, "Нет письма", "Выберите письмо, на которое хотите ответить.")
-            return
-
-        summary = self.selected_summary
         subject = summary.subject if summary.subject.lower().startswith("re:") else f"Re: {summary.subject}"
         quote_header = f"{summary.date}, {summary.sender} писал(а):"
-        quoted = "\n".join(f"> {line}" for line in self.current_body.splitlines())
+        quoted = "\n".join(f"> {line}" for line in body_text.splitlines())
         body = f"\n\n{quote_header}\n{quoted}"
 
         dialog = ComposeDialog(
@@ -4364,6 +4535,20 @@ class MainWindow(QMainWindow):
         self._exec_compose(dialog, in_reply_to=summary.message_id or None)
 
     def on_forward(self) -> None:
+        if not self.selected_summary or not self.active_source or not self.current_folder:
+            QMessageBox.warning(self, "Нет письма", "Выберите письмо, которое хотите переслать.")
+            return
+        summary = self.selected_summary
+        try:
+            content = self.active_source.message_content(self.current_folder, summary.uid)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
+            return
+        self._start_forward(summary, content)
+
+    def _start_forward(self, summary: MessageSummary, content: MessageContent) -> None:
+        # См. _start_reply — то же самое: общая часть для тулбара и для
+        # кнопки "Переслать" в отдельном окне письма.
         if not self.smtp_account:
             QMessageBox.warning(
                 self,
@@ -4371,17 +4556,6 @@ class MainWindow(QMainWindow):
                 "Сначала подключитесь и укажите сервер SMTP в настройках учётной записи.",
             )
             return
-        if not self.selected_summary or not self.active_source or not self.current_folder:
-            QMessageBox.warning(self, "Нет письма", "Выберите письмо, которое хотите переслать.")
-            return
-
-        summary = self.selected_summary
-        try:
-            content = self.active_source.message_content(self.current_folder, summary.uid)
-        except Exception as exc:
-            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
-            return
-
         subject = summary.subject if summary.subject.lower().startswith("fwd:") else f"Fwd: {summary.subject}"
         forward_header = (
             f"---------- Пересланное сообщение ----------\n"

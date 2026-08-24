@@ -177,17 +177,28 @@ class ImapSession:
         self._client.rename_folder(old_name, new_name)
 
     def trash_folder(self) -> str | None:
-        return self._special_folder(b"\\Trash")
+        return self._special_folder(b"\\Trash", ("trash", "корзин"))
 
     def sent_folder(self) -> str | None:
-        return self._special_folder(b"\\Sent")
+        return self._special_folder(b"\\Sent", ("sent", "отправленн"))
 
     def drafts_folder(self) -> str | None:
-        return self._special_folder(b"\\Drafts")
+        return self._special_folder(b"\\Drafts", ("draft", "черновик"))
 
-    def _special_folder(self, special_flag: bytes) -> str | None:
+    def _special_folder(self, special_use_flag: bytes, name_hints: tuple[str, ...]) -> str | None:
+        # Сначала — SPECIAL-USE (RFC 6154), это надёжно, сервер сам сказал,
+        # какая папка какая. Но объявляет его не каждый реальный сервер —
+        # без запасного варианта по имени такая папка оставалась вовсе не
+        # распознанной: письмо можно было открыть, но не отправить (жалоба
+        # "из черновика не даёт отправить" — двойной клик по письму в
+        # "Черновиках" тихо считал, что это просто обычная папка, и
+        # открывал письмо на просмотр, а не на редактирование).
         for flags, _delimiter, name in self._raw_folders:
-            if special_flag in flags:
+            if special_use_flag in flags:
+                return name
+        for _flags, _delimiter, name in self._raw_folders:
+            lowered = name.lower()
+            if any(hint in lowered for hint in name_hints):
                 return name
         return None
 
@@ -394,6 +405,7 @@ def extract_content(message: Message) -> MessageContent:
 
         filename = _decode_filename(part.get_filename())
         content_type = part.get_content_type()
+        content_disposition = part.get_content_disposition()  # 'attachment' | 'inline' | None
         content_id = (part.get("Content-Id") or "").strip().strip("<>")
 
         # Картинка со своим Content-Id — то, на что ссылается <img
@@ -403,11 +415,25 @@ def extract_content(message: Message) -> MessageContent:
             inline_images[content_id] = (content_type, part.get_payload(decode=True) or b"")
             continue
 
+        # text/plain и text/html — кандидаты в само тело письма, а не во
+        # вложение, даже если у части задан Content-Type: ...; name="..."
+        # (part.get_filename() читает и его, не только
+        # Content-Disposition: filename=) — реальные HTML-рассылки
+        # (например, от Авито) так подписывают HTML-часть письма без
+        # всякого намерения сделать её вложением. Раньше bool(filename)
+        # ниже срабатывал именно на этом и уводил всё письмо во вложение,
+        # оставляя тело пустым (жалоба: "письма в формате html не
+        # просматриваются"). Вложением текстовая часть считается только
+        # при явном Content-Disposition: attachment.
+        is_body_part = content_type in ("text/plain", "text/html") and content_disposition != "attachment"
+
         # text/calendar (RFC 5546 iTIP-приглашение) сохраняем как вложение
         # всегда — не только когда отправитель явно проставил
         # Content-Disposition: attachment/filename (не все серверы это
         # делают), иначе приглашение молча потеряется.
-        is_attachment = bool(filename) or part.get_content_disposition() == "attachment" or content_type == "text/calendar"
+        is_attachment = not is_body_part and (
+            bool(filename) or content_disposition == "attachment" or content_type == "text/calendar"
+        )
         if is_attachment:
             attachments.append(
                 _calendar_attachment(part) if content_type == "text/calendar" else Attachment(

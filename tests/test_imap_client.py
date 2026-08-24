@@ -137,6 +137,30 @@ def test_sent_and_drafts_folders_found_by_flag() -> None:
     assert drafts == "Черновики"
 
 
+def test_sent_and_drafts_folders_fall_back_to_name_when_no_special_use_flag() -> None:
+    # Не каждый реальный сервер объявляет SPECIAL-USE (RFC 6154) — без
+    # запасного варианта по имени такая папка вообще не распознавалась
+    # (реальная жалоба: "из черновика не даёт отправить").
+    fake_client = MagicMock()
+    fake_client.list_folders.return_value = [
+        ((b"\\HasNoChildren",), b"/", "INBOX"),
+        ((b"\\HasNoChildren",), b"/", "Отправленные"),
+        ((b"\\HasNoChildren",), b"/", "Черновики"),
+        ((b"\\HasNoChildren",), b"/", "Корзина"),
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.list_folders()
+        sent = session.sent_folder()
+        drafts = session.drafts_folder()
+        trash = session.trash_folder()
+
+    assert sent == "Отправленные"
+    assert drafts == "Черновики"
+    assert trash == "Корзина"
+
+
 def test_extract_content_exposes_headers() -> None:
     # Жалоба: "при просмотре письма невидно его реквизитов (тема,
     # отправитель, адресаты)" — MessageContent раньше не нёс To/Cc/Bcc/
@@ -703,6 +727,40 @@ def test_fetch_message_content_html_alternative_populates_html_field() -> None:
 
     assert content.text.strip() == "plain fallback"
     assert "<b>world</b>" in content.html
+
+
+def test_fetch_message_content_html_with_content_type_name_is_not_an_attachment() -> None:
+    # Реальная жалоба: "письма в формате html не просматриваются - пример
+    # письма от Авито". Такие рассылки нередко подписывают HTML-часть
+    # через "Content-Type: text/html; name=..." без всякого
+    # Content-Disposition: attachment — Python's get_filename() всё равно
+    # читает этот name= как "имя файла", и старая эвристика
+    # (bool(filename) => вложение) ошибочно уводила всё тело письма во
+    # вложение вместо отображения.
+    from email.message import EmailMessage
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = "noreply@avito.ru"
+    msg["Subject"] = "Новое сообщение"
+    plain_part = MIMEText("Текст письма", "plain", "utf-8")
+    plain_part.set_param("name", "message.txt")
+    html_part = MIMEText("<p>Текст <b>письма</b></p>", "html", "utf-8")
+    html_part.set_param("name", "message.html")
+    msg.attach(plain_part)
+    msg.attach(html_part)
+    raw = msg.as_bytes()
+
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    assert content.attachments == []
+    assert "письма" in content.text
+    assert "<b>письма</b>" in content.html
 
 
 def test_fetch_message_content_extracts_inline_cid_image_not_as_attachment() -> None:

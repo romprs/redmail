@@ -168,7 +168,19 @@ def _insert_raw(conn: sqlite3.Connection, folder: str, raw: bytes) -> int:
 def _decode_mime_words(value: str | None) -> str:
     if not value:
         return ""
-    parts = decode_header(value)
+    try:
+        parts = decode_header(value)
+    except Exception:
+        # decode_header() поднимает HeaderParseError на действительно
+        # повреждённом base64/QP (не только на пустой строке) — реальный
+        # случай: PST-свойство "имя отправителя" иногда хранит RFC2047-имя
+        # ОБРЕЗАННЫМ (см. _pst_message_to_raw), и обрезка иногда режет
+        # прямо посреди base64-группы, оставляя невалидные символы. Без
+        # этого один такой отправитель падал бы всем импортом .pst разом
+        # (жалоба: "загрузка из pst все ещё некорректно загружает...
+        # авторов") — лучше показать значение как есть, чем потерять
+        # письмо или весь импорт целиком.
+        return value
     return "".join(
         chunk.decode(encoding or "utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
         for chunk, encoding in parts
@@ -282,15 +294,34 @@ def import_pst(path: Path, pst_file: Path) -> int:
 
 def _import_pst_folder(conn: sqlite3.Connection, folder, path_prefix: str) -> int:
     count = 0
-    folder_name = folder.get_name() or ""
+    folder_name = _safe_pst_text(folder.get_name()) or "(без имени)"
     current_path = f"{path_prefix}/{folder_name}" if path_prefix else folder_name
     for message in folder.sub_messages:
-        raw = _pst_message_to_raw(message)
-        _insert_raw(conn, current_path or "Импорт из PST", raw)
+        try:
+            raw = _pst_message_to_raw(message)
+            _insert_raw(conn, current_path or "Импорт из PST", raw)
+        except Exception:
+            # Одно повреждённое/нестандартное письмо не должно ронять весь
+            # импорт (жалоба: "загрузка из pst все ещё некорректно
+            # загружает имена папок и авторов" — раньше на таком письме
+            # мог упасть весь импорт разом, теряя и все остальные,
+            # корректные письма вместе с ним).
+            continue
         count += 1
     for sub_folder in folder.sub_folders:
         count += _import_pst_folder(conn, sub_folder, current_path)
     return count
+
+
+def _safe_pst_text(value) -> str:
+    """pypff обычно отдаёт уже готовую Python-строку, но на нестандартных
+    .pst встречались случаи, когда свойство отдаёт bytes или бросает
+    исключение при доступе — не даём этому уронить весь импорт."""
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return str(value)
 
 
 def _sanitize_header_value(value: str) -> str:

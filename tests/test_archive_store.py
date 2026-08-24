@@ -173,6 +173,50 @@ def test_import_maildir(tmp_path: Path) -> None:
     assert summaries[0].subject == "Из мейлдира"
 
 
+def test_decode_mime_words_falls_back_on_malformed_input() -> None:
+    # Реальная жалоба: "загрузка из pst все ещё некорректно загружает...
+    # авторов" — decode_header() поднимает HeaderParseError на
+    # действительно повреждённом base64 (не просто пустую строку не
+    # обрабатывает), и раньше это роняло весь импорт .pst.
+    malformed = "=?utf-8?B?!!!invalid-base64!!!?="
+    assert archive_store._decode_mime_words(malformed) == malformed
+
+
+def test_import_pst_folder_skips_broken_message_and_keeps_the_rest(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    archive_path = tmp_path / "test.rmarchive"
+    archive_store.create_archive(archive_path)
+
+    good_message = MagicMock()
+    good_message.get_subject.return_value = "Хорошее письмо"
+    good_message.get_sender_name.return_value = "Иван Иванов"
+    good_message.get_delivery_time.return_value = None
+    good_message.get_transport_headers.return_value = ""
+    good_message.get_plain_text_body.return_value = "Текст"
+    good_message.get_html_body.return_value = None
+    good_message.get_number_of_attachments.return_value = 0
+
+    broken_message = MagicMock()
+    broken_message.get_subject.side_effect = RuntimeError("повреждённое MAPI-свойство")
+
+    fake_folder = SimpleNamespace(
+        get_name=lambda: "Входящие",
+        sub_messages=[broken_message, good_message],
+        sub_folders=[],
+    )
+
+    with sqlite3.connect(archive_path) as conn:
+        count = archive_store._import_pst_folder(conn, fake_folder, "")
+        conn.commit()
+
+    assert count == 1  # только хорошее письмо — сломанное пропущено, а не уронило всё
+    summaries = archive_store.list_messages(archive_path, "Входящие")
+    assert len(summaries) == 1
+    assert summaries[0].sender == "Иван Иванов"
+
+
 def test_import_pst_without_pypff_raises_clear_error(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "pypff", None)  # имитируем отсутствие пакета
     archive_path = tmp_path / "test.rmarchive"

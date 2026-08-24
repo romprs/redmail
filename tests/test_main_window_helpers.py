@@ -1,7 +1,29 @@
 from __future__ import annotations
 
 from redmail import contact_store
-from redmail.ui.main_window import _contact_candidates, _format_recipient_candidate, _parse_recipient_list
+from redmail.ui.main_window import (
+    _contact_candidates,
+    _format_recipient_candidate,
+    _normalize_subject,
+    _parse_recipient_list,
+)
+
+
+def test_normalize_subject_strips_single_prefix() -> None:
+    assert _normalize_subject("Re: Вопрос по счёту") == "Вопрос по счёту"
+
+
+def test_normalize_subject_strips_repeated_prefixes() -> None:
+    assert _normalize_subject("Re: Fwd: Re: Вопрос по счёту") == "Вопрос по счёту"
+
+
+def test_normalize_subject_strips_russian_prefixes_case_insensitive() -> None:
+    assert _normalize_subject("ОТВЕТ: Вопрос") == "Вопрос"
+    assert _normalize_subject("Пересыл: Вопрос") == "Вопрос"
+
+
+def test_normalize_subject_no_prefix_unchanged() -> None:
+    assert _normalize_subject("Вопрос по счёту") == "Вопрос по счёту"
 
 
 def test_format_recipient_candidate_plain_name() -> None:
