@@ -184,6 +184,23 @@ def import_vcard(path: Path, vcf_bytes: bytes) -> int:
 def _contact_from_vcard(card) -> Contact | None:
     emails = [e.value.strip() for e in card.contents.get("email", []) if e.value.strip()]
     display_name = str(card.fn.value).strip() if hasattr(card, "fn") else ""
+    if not display_name and hasattr(card, "n"):
+        # FN пуст, но структурированное имя (N) может быть заполнено —
+        # соберём его из частей (Фамилия/Имя/Отчество и т.п.).
+        name = card.n.value
+        parts = (
+            getattr(name, "prefix", ""), getattr(name, "given", ""),
+            getattr(name, "additional", ""), getattr(name, "family", ""),
+            getattr(name, "suffix", ""),
+        )
+        display_name = " ".join(p.strip() for p in parts if p and p.strip())
+    if not display_name and hasattr(card, "nickname"):
+        # Найдено на реальном экспорте: FN и N оба пустые, а полное ФИО
+        # лежит в NICKNAME — не по стандарту (NICKNAME предназначен для
+        # короткого прозвища), но это реальные данные экспортёра, и терять
+        # ФИО молча из-за нестандартного размещения хуже, чем принять его
+        # (жалоба: "импорт прошёл некорректно, не подгрузились ФИО").
+        display_name = str(card.nickname.value).strip()
     if not display_name and emails:
         display_name = emails[0]
     if not display_name and not emails:

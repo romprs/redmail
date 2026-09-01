@@ -141,6 +141,39 @@ def test_import_vcard_empty_card_skipped(tmp_path: Path) -> None:
     assert contact_store.list_contacts(path) == []
 
 
+def test_import_vcard_falls_back_to_nickname_when_fn_and_n_empty(tmp_path: Path) -> None:
+    # Реальная жалоба: "импорт прошёл некорректно, не подгрузились ФИО" —
+    # найденный .vcf-файл имел пустые FN и N (N:;;;), а полное имя лежало
+    # в NICKNAME (нестандартно, но так экспортировал реальный источник).
+    path = tmp_path / "test.rmcontacts"
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:\r\nN:;;;\r\n"
+        "NICKNAME:Поздняков Сергей Владимирович\r\n"
+        "EMAIL:svpozdniakov@example.com\r\nNOTE:\r\nTITLE:\r\nEND:VCARD\r\n"
+    ).encode("utf-8")
+
+    count = contact_store.import_vcard(path, vcf)
+    assert count == 1
+
+    contacts = contact_store.list_contacts(path)
+    assert contacts[0].display_name == "Поздняков Сергей Владимирович"
+    assert contacts[0].emails == ["svpozdniakov@example.com"]
+
+
+def test_import_vcard_uses_structured_n_when_fn_empty(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcontacts"
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:\r\nN:Иванов;Иван;Иванович;;\r\n"
+        "EMAIL:ivan@example.com\r\nEND:VCARD\r\n"
+    ).encode("utf-8")
+
+    count = contact_store.import_vcard(path, vcf)
+    assert count == 1
+
+    contacts = contact_store.list_contacts(path)
+    assert contacts[0].display_name == "Иван Иванович Иванов"
+
+
 def test_import_csv_with_display_name_column(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcontacts"
     csv_bytes = (
