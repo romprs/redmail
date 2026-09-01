@@ -4,6 +4,7 @@ import sys
 from unittest.mock import MagicMock, patch
 
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+from redmail.smtp_client import test_connection as smtp_test_connection
 
 
 def test_send_message_starttls_flow() -> None:
@@ -57,6 +58,40 @@ def test_send_message_kerberos_auth_uses_gssapi_sasl_not_password(monkeypatch) -
     fake_client.login.assert_not_called()
     fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(fake_client, "smtp.corp.local", "ivan")
     fake_client.send_message.assert_called_once()
+
+
+def test_test_connection_authenticates_but_does_not_send() -> None:
+    # Кнопка "Проверить подключение" в настройках - должна залогиниться
+    # и сразу отключиться, не отправляя ни одного письма.
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        smtp_test_connection(account)
+
+    fake_client.starttls.assert_called_once()
+    fake_client.login.assert_called_once_with("ivan", "secret")
+    fake_client.send_message.assert_not_called()
+
+
+def test_test_connection_kerberos_uses_gssapi_sasl(monkeypatch) -> None:
+    import redmail
+
+    fake_gssapi_sasl = MagicMock()
+    monkeypatch.setattr(redmail, "gssapi_sasl", fake_gssapi_sasl, raising=False)
+    monkeypatch.setitem(sys.modules, "redmail.gssapi_sasl", fake_gssapi_sasl)
+
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.corp.local", username="ivan", password="", auth_type="kerberos")
+        smtp_test_connection(account)
+
+    fake_client.login.assert_not_called()
+    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(fake_client, "smtp.corp.local", "ivan")
+    fake_client.send_message.assert_not_called()
 
 
 def test_send_message_implicit_ssl_skips_starttls() -> None:

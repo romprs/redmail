@@ -120,7 +120,14 @@ from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
-from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, build_email_message, send_message
+from redmail.smtp_client import (
+    OutgoingAttachment,
+    OutgoingMessage,
+    SmtpAccount,
+    build_email_message,
+    send_message,
+    test_connection as smtp_test_connection,
+)
 
 # Отправка через EWS идёт через сам EWS-сеанс (Exchange не нуждается в
 # отдельном SMTP-релее), но весь остальной код по всему приложению
@@ -770,6 +777,12 @@ class SettingsDialog(QDialog):
         )
         self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
 
+        self.imap_test_button = QPushButton("Проверить подключение")
+        self.imap_test_button.clicked.connect(self._on_test_imap)
+        self.imap_test_status = QLabel("")
+        self.imap_test_status.setWordWrap(True)
+        self._imap_test_worker: object | None = None
+
         imap_form = QFormLayout()
         imap_form.addRow("Сервер", self.host_edit)
         imap_form.addRow("Порт", self.port_edit)
@@ -777,6 +790,8 @@ class SettingsDialog(QDialog):
         imap_form.addRow("Логин", self.user_edit)
         imap_form.addRow("Пароль", self.password_edit)
         imap_form.addRow(self.ssl_check)
+        imap_form.addRow(self.imap_test_button)
+        imap_form.addRow(self.imap_test_status)
         imap_group = QGroupBox("Входящая почта (IMAP)")
         imap_group.setLayout(imap_form)
 
@@ -787,10 +802,18 @@ class SettingsDialog(QDialog):
         self.smtp_ssl_check = QCheckBox("SSL напрямую (порт 465) вместо STARTTLS")
         self.smtp_ssl_check.setChecked(smtp.use_ssl if smtp else False)
 
+        self.smtp_test_button = QPushButton("Проверить подключение")
+        self.smtp_test_button.clicked.connect(self._on_test_smtp)
+        self.smtp_test_status = QLabel("")
+        self.smtp_test_status.setWordWrap(True)
+        self._smtp_test_worker: object | None = None
+
         smtp_form = QFormLayout()
         smtp_form.addRow("Сервер", self.smtp_host_edit)
         smtp_form.addRow("Порт", self.smtp_port_edit)
         smtp_form.addRow(self.smtp_ssl_check)
+        smtp_form.addRow(self.smtp_test_button)
+        smtp_form.addRow(self.smtp_test_status)
         smtp_group = QGroupBox("Исходящая почта (SMTP) — тот же логин и пароль")
         smtp_group.setLayout(smtp_form)
 
@@ -815,8 +838,17 @@ class SettingsDialog(QDialog):
 
         self.caldav_url_edit = QLineEdit(caldav_url)
         self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/ (необязательно)")
+
+        self.caldav_test_button = QPushButton("Проверить подключение")
+        self.caldav_test_button.clicked.connect(self._on_test_caldav)
+        self.caldav_test_status = QLabel("")
+        self.caldav_test_status.setWordWrap(True)
+        self._caldav_test_worker: object | None = None
+
         caldav_form = QFormLayout()
         caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
+        caldav_form.addRow(self.caldav_test_button)
+        caldav_form.addRow(self.caldav_test_status)
         caldav_group = QGroupBox("Календарь (CalDAV) — логин и пароль те же, что для IMAP выше")
         caldav_group.setLayout(caldav_form)
 
@@ -874,6 +906,101 @@ class SettingsDialog(QDialog):
 
     def _update_password_enabled(self) -> None:
         self.password_edit.setEnabled(self.auth_combo.currentData() != "kerberos")
+
+    def _on_test_imap(self) -> None:
+        account = self.account()
+        if not account.host or not account.username:
+            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
+            return
+        self.imap_test_button.setEnabled(False)
+        self.imap_test_status.setText("Проверка подключения…")
+
+        def connect_and_list_folders() -> int:
+            with ImapSession(account) as session:
+                return len(session.list_folders())
+
+        worker = _CallableWorker(connect_and_list_folders, parent=self)
+
+        def on_success(folder_count: object) -> None:
+            self.imap_test_status.setText(f"Подключение успешно, папок найдено: {folder_count}")
+            self.imap_test_button.setEnabled(True)
+            self._imap_test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.imap_test_status.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться (IMAP)", error_text)
+            self.imap_test_button.setEnabled(True)
+            self._imap_test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._imap_test_worker = worker
+        worker.start()
+
+    def _on_test_smtp(self) -> None:
+        smtp = self.smtp_account()
+        if not smtp.host or not smtp.username:
+            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
+            return
+        self.smtp_test_button.setEnabled(False)
+        self.smtp_test_status.setText("Проверка подключения…")
+
+        worker = _CallableWorker(smtp_test_connection, smtp, parent=self)
+
+        def on_success(_result: object) -> None:
+            self.smtp_test_status.setText("Подключение и вход успешны")
+            self.smtp_test_button.setEnabled(True)
+            self._smtp_test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.smtp_test_status.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться (SMTP)", error_text)
+            self.smtp_test_button.setEnabled(True)
+            self._smtp_test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._smtp_test_worker = worker
+        worker.start()
+
+    def _on_test_caldav(self) -> None:
+        url = self.caldav_url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для проверки.")
+            return
+        # Логин/пароль — те же, что для IMAP (см. заголовок группы) — если
+        # выбран SSO, пароля нет и здесь: у CalDAV в этом приложении нет
+        # отдельной поддержки Kerberos, проверка честно покажет ошибку входа.
+        caldav_account = caldav_sync.CalDavAccount(
+            url=url, username=self.user_edit.text().strip(), password=self.password_edit.text()
+        )
+        self.caldav_test_button.setEnabled(False)
+        self.caldav_test_status.setText("Проверка подключения…")
+
+        def connect_and_list_calendars() -> int:
+            session = caldav_sync.CalDavSession(caldav_account)
+            try:
+                return len(session.list_calendar_names())
+            finally:
+                session.close()
+
+        worker = _CallableWorker(connect_and_list_calendars, parent=self)
+
+        def on_success(calendar_count: object) -> None:
+            self.caldav_test_status.setText(f"Подключение успешно, календарей найдено: {calendar_count}")
+            self.caldav_test_button.setEnabled(True)
+            self._caldav_test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.caldav_test_status.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться (CalDAV)", error_text)
+            self.caldav_test_button.setEnabled(True)
+            self._caldav_test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._caldav_test_worker = worker
+        worker.start()
 
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())

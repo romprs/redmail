@@ -80,19 +80,34 @@ def build_email_message(message: OutgoingMessage) -> EmailMessage:
     return email_message
 
 
+def _connect_and_authenticate(account: SmtpAccount) -> smtplib.SMTP:
+    smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
+    client = smtp_cls(account.host, account.port, timeout=30)
+    if not account.use_ssl:
+        client.starttls()
+    if account.auth_type == "kerberos":
+        # Импорт внутри функции — см. imap_client.py._login: gssapi
+        # нужен только для SSO и не должен ломать обычный пароль там,
+        # где нет системных библиотек Kerberos.
+        from redmail import gssapi_sasl
+
+        gssapi_sasl.smtp_sasl_login(client, account.host, account.username)
+    else:
+        client.login(account.username, account.password)
+    return client
+
+
+def test_connection(account: SmtpAccount) -> None:
+    """Подключается и проходит аутентификацию, ничего не отправляя — для
+    кнопки "Проверить подключение" в настройках (жалоба-пожелание:
+    "может добавить кнопку проверки подключения для входящих, исходящих
+    и календаря?"). Успех — соединение установлено и закрыто без ошибок;
+    любая проблема (сеть, TLS, логин/SSO) всплывает как исключение."""
+    with _connect_and_authenticate(account):
+        pass
+
+
 def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
     email_message = build_email_message(message)
-    smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
-    with smtp_cls(account.host, account.port, timeout=30) as client:
-        if not account.use_ssl:
-            client.starttls()
-        if account.auth_type == "kerberos":
-            # Импорт внутри функции — см. imap_client.py._login: gssapi
-            # нужен только для SSO и не должен ломать обычный пароль там,
-            # где нет системных библиотек Kerberos.
-            from redmail import gssapi_sasl
-
-            gssapi_sasl.smtp_sasl_login(client, account.host, account.username)
-        else:
-            client.login(account.username, account.password)
+    with _connect_and_authenticate(account) as client:
         client.send_message(email_message)
