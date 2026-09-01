@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        19%{?dist}
+Release:        20%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,12 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 01 2026 RedMail dev <noreply@example.com> - 0.0.1-20
+- В «Параметры…» добавлена кнопка «Проверить подключение» отдельно
+  для входящей почты (IMAP), исходящей (SMTP) и календаря (CalDAV) —
+  проверяет подключение и вход (включая SSO), ничего не отправляя и
+  не блокируя окно
+
 * Tue Aug 25 2026 RedMail dev <noreply@example.com> - 0.0.1-19
 - Исправлена рамка карточки события в календаре (в прошлой сборке
   убралась не та рамка, оставив только цветную полосу слева) — теперь
