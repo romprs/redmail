@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        21%{?dist}
+Release:        22%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,13 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Wed Sep 02 2026 RedMail dev <noreply@example.com> - 0.0.1-22
+- SSO (Kerberos) для IMAP/SMTP теперь заранее проверяет, объявляет ли
+  сервер поддержку GSSAPI (по CAPABILITY/EHLO), и если нет — показывает
+  понятное сообщение с перечнем реально поддерживаемых способов входа,
+  вместо непонятной ошибки протокола "BAD invalid command"/"Invalid
+  command". Найдено при первой проверке на реальном сервере VK Mail.
+
 * Tue Sep 01 2026 RedMail dev <noreply@example.com> - 0.0.1-21
 - Исправлен импорт .vcf: если у карточки пустые FN и N, но ФИО лежит в
   NICKNAME (нестандартно, но встречается у реальных экспортёров) —
