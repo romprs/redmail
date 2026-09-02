@@ -60,6 +60,25 @@ class GssapiSaslContext:
 def imap_sasl_login(client, host: str, username: str) -> None:
     """Аутентифицирует уже открытую IMAPClient-сессию по Kerberos-билету
     вместо пароля."""
+    capabilities = client.capabilities()
+    if b"AUTH=GSSAPI" not in capabilities:
+        # Реальный сервер (VK Mail) на попытку "AUTHENTICATE GSSAPI"
+        # ответил "BAD invalid command" — то есть сам сервер не понял
+        # команду, а не отверг билет. Сервер вообще не заявляет
+        # поддержку GSSAPI в CAPABILITY — это не ошибка билета/сети,
+        # SSO по IMAP на этом сервере в принципе не работает, независимо
+        # от того, насколько корректен клиент. Показываем это явно
+        # вместо непонятного "BAD invalid command".
+        supported = ", ".join(
+            cap.decode("ascii", errors="replace")[len("AUTH=") :]
+            for cap in capabilities
+            if cap.startswith(b"AUTH=")
+        )
+        raise GssapiSaslError(
+            f"Сервер {host} не заявляет поддержку GSSAPI (SSO) по IMAP в CAPABILITY. "
+            f"Поддерживаемые способы входа: {supported or 'не объявлены'}. "
+            "SSO по этому протоколу здесь не сработает независимо от билета Kerberos."
+        )
     context = GssapiSaslContext(service="imap", host=host, authzid=username)
     client.sasl_login("GSSAPI", context.step)
 
@@ -74,6 +93,23 @@ def smtp_sasl_login(client: smtplib.SMTP, host: str, username: str) -> None:
     всегда содержит байты вне ASCII. Повторяем тот же цикл обмена AUTH
     вручную, base64 кодируем/декодируем сами (как это делает и сам
     smtplib.auth() под капотом, но с байтами, а не принудительно с str)."""
+    # EHLO мог быть не вызван вовсе (implicit TLS, порт 465 — в
+    # _connect_and_authenticate() для этого случая нет ни ehlo(), ни
+    # starttls()) — без него esmtp_features пуст, и проверка ниже ничего
+    # не найдёт. Повторный EHLO безопасен и идемпотентен.
+    client.ehlo()
+    supported_auth = client.esmtp_features.get("auth", "").lower().split()
+    if "gssapi" not in supported_auth:
+        # Реальный сервер (VK Mail) на "AUTH GSSAPI" ответил "500 Invalid
+        # command" — сервер не понял команду, а не отверг билет; он
+        # просто не объявляет GSSAPI в EHLO. SSO по SMTP на этом сервере
+        # не сработает независимо от билета Kerberos — показываем это
+        # прямо, а не как невнятную ошибку протокола.
+        raise GssapiSaslError(
+            f"Сервер {host} не заявляет поддержку GSSAPI (SSO) по SMTP в ответе EHLO. "
+            f"Поддерживаемые способы входа: {', '.join(supported_auth) or 'не объявлены'}. "
+            "SSO по этому протоколу здесь не сработает независимо от билета Kerberos."
+        )
     context = GssapiSaslContext(service="smtp", host=host, authzid=username)
     code, resp = client.docmd("AUTH", "GSSAPI")
     while code == 334:

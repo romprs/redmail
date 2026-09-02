@@ -104,6 +104,7 @@ def test_context_wraps_unwrap_errors_as_gssapi_sasl_error(fake_gssapi_sasl, monk
 
 def test_imap_sasl_login_authenticates_with_gssapi_mechanism(fake_gssapi_sasl) -> None:
     client = MagicMock()
+    client.capabilities.return_value = [b"IMAP4rev1", b"AUTH=GSSAPI", b"AUTH=PLAIN"]
     fake_gssapi_sasl.imap_sasl_login(client, "mail.corp.local", "ivan")
 
     args, _kwargs = client.sasl_login.call_args
@@ -111,8 +112,24 @@ def test_imap_sasl_login_authenticates_with_gssapi_mechanism(fake_gssapi_sasl) -
     assert callable(args[1])
 
 
+def test_imap_sasl_login_raises_clear_error_when_server_does_not_advertise_gssapi(fake_gssapi_sasl) -> None:
+    # Реальная находка на боевом сервере VK Mail: "AUTHENTICATE GSSAPI"
+    # получало "BAD invalid command" — сервер вовсе не заявляет GSSAPI в
+    # CAPABILITY. Раньше это всплывало как невнятная протокольная ошибка
+    # imapclient; теперь должно быть явное, понятное сообщение ДО самой
+    # попытки AUTHENTICATE.
+    client = MagicMock()
+    client.capabilities.return_value = [b"IMAP4rev1", b"AUTH=PLAIN", b"AUTH=LOGIN"]
+
+    with pytest.raises(fake_gssapi_sasl.GssapiSaslError, match="не заявляет поддержку GSSAPI"):
+        fake_gssapi_sasl.imap_sasl_login(client, "imap.vkm.corp.amurgpz.ru", "ivan")
+
+    client.sasl_login.assert_not_called()
+
+
 def test_smtp_sasl_login_completes_full_auth_exchange(fake_gssapi_sasl) -> None:
     client = MagicMock()
+    client.esmtp_features = {"auth": "gssapi plain"}
     client.docmd.side_effect = [
         (334, base64.b64encode(b"")),
         (334, base64.b64encode(b"server-tok")),
@@ -122,6 +139,7 @@ def test_smtp_sasl_login_completes_full_auth_exchange(fake_gssapi_sasl) -> None:
 
     fake_gssapi_sasl.smtp_sasl_login(client, "smtp.corp.local", "ivan")
 
+    client.ehlo.assert_called_once()
     assert client.docmd.call_count == 4
     client.docmd.assert_any_call("AUTH", "GSSAPI")
 
@@ -130,6 +148,7 @@ def test_smtp_sasl_login_raises_on_rejected_final_code(fake_gssapi_sasl) -> None
     import smtplib
 
     client = MagicMock()
+    client.esmtp_features = {"auth": "gssapi plain"}
     client.docmd.side_effect = [
         (334, base64.b64encode(b"")),
         (334, base64.b64encode(b"server-tok")),
@@ -139,3 +158,15 @@ def test_smtp_sasl_login_raises_on_rejected_final_code(fake_gssapi_sasl) -> None
 
     with pytest.raises(smtplib.SMTPAuthenticationError):
         fake_gssapi_sasl.smtp_sasl_login(client, "smtp.corp.local", "ivan")
+
+
+def test_smtp_sasl_login_raises_clear_error_when_server_does_not_advertise_gssapi(fake_gssapi_sasl) -> None:
+    # Аналогичная находка на боевом SMTP: "AUTH GSSAPI" получало "500
+    # Invalid command" — сервер не объявляет GSSAPI в EHLO вовсе.
+    client = MagicMock()
+    client.esmtp_features = {"auth": "plain login"}
+
+    with pytest.raises(fake_gssapi_sasl.GssapiSaslError, match="не заявляет поддержку GSSAPI"):
+        fake_gssapi_sasl.smtp_sasl_login(client, "smtp.vkm.corp.amurgpz.ru", "ivan")
+
+    client.docmd.assert_not_called()
