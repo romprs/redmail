@@ -1,13 +1,14 @@
 from __future__ import annotations
 
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
-from caldav.lib.error import NotFoundError
+from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
-from redmail.caldav_sync import CalDavAccount, CalDavSession, CalDavSyncError
+from redmail.caldav_sync import CalDavAccount, CalDavSession, CalDavSyncError, probe_auth_schemes
 from redmail.calendar_store import Attendee, Event
 
 
@@ -162,3 +163,54 @@ def test_list_calendar_names() -> None:
         names = session.list_calendar_names()
 
     assert names == ["Основной", "https://calendar.example.corp/caldav/other/"]
+
+
+def _http_401(schemes: list[str]) -> urllib.error.HTTPError:
+    headers = MagicMock()
+    headers.get_all.return_value = schemes
+    return urllib.error.HTTPError("https://calendar.example.corp/caldav/", 401, "Unauthorized", headers, None)
+
+
+def test_probe_auth_schemes_reads_www_authenticate_header() -> None:
+    with patch("redmail.caldav_sync.urllib.request.urlopen", side_effect=_http_401(["Negotiate", 'Basic realm="CalDAV"'])):
+        schemes = probe_auth_schemes("https://calendar.example.corp/caldav/")
+    assert schemes == ["Negotiate", "Basic"]
+
+
+def test_probe_auth_schemes_returns_empty_on_non_401() -> None:
+    error = urllib.error.HTTPError("https://calendar.example.corp/caldav/", 500, "Server Error", MagicMock(), None)
+    with patch("redmail.caldav_sync.urllib.request.urlopen", side_effect=error):
+        assert probe_auth_schemes("https://calendar.example.corp/caldav/") == []
+
+
+def test_probe_auth_schemes_returns_empty_on_network_error_instead_of_raising() -> None:
+    # Диагностика — best-effort: сетевая ошибка тут не должна маскировать
+    # или заменять собой исходную ошибку вызывающего кода.
+    with patch("redmail.caldav_sync.urllib.request.urlopen", side_effect=urllib.error.URLError("нет маршрута")):
+        assert probe_auth_schemes("https://calendar.example.corp/caldav/") == []
+
+
+def test_list_calendar_names_authorization_error_names_negotiate_if_offered() -> None:
+    # Реальный сценарий: тонкий веб-клиент (аналог OWA) для той же почты
+    # заходит через SSO — организация имеет Kerberos-инфраструктуру, но
+    # неясно, предлагает ли конкретно CalDAV-сервер Negotiate, пока не
+    # проверишь напрямую по заголовку ответа.
+    fake_client = MagicMock()
+    fake_client.principal.side_effect = AuthorizationError(url="https://calendar.example.corp/caldav/", reason="Unauthorized")
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.urllib.request.urlopen", side_effect=_http_401(["Negotiate", "Basic"])):
+        session = CalDavSession(_account())
+        with pytest.raises(CalDavSyncError, match="Negotiate"):
+            session.list_calendar_names()
+
+
+def test_list_calendar_names_authorization_error_without_negotiate_says_sso_unavailable() -> None:
+    fake_client = MagicMock()
+    fake_client.principal.side_effect = AuthorizationError(url="https://calendar.example.corp/caldav/", reason="Unauthorized")
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.urllib.request.urlopen", side_effect=_http_401(["Basic"])):
+        session = CalDavSession(_account())
+        with pytest.raises(CalDavSyncError, match="SSO .* недоступен"):
+            session.list_calendar_names()

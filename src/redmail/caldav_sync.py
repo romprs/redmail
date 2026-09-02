@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 
 import caldav
-from caldav.lib.error import NotFoundError
+from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
 from redmail.calendar_store import Event
@@ -33,6 +35,41 @@ class CalDavSyncError(Exception):
     """Ошибка подключения к серверу или синхронизации — показывается
     пользователю как есть, не проглатывается молча (тот же принцип, что и
     у остальных сетевых операций в проекте)."""
+
+
+def probe_auth_schemes(url: str) -> list[str]:
+    """Делает запрос без учётных данных к CalDAV-серверу и смотрит, какие
+    схемы аутентификации он предлагает в ответе 401 (заголовок
+    WWW-Authenticate) — чтобы понять, есть ли там Kerberos/SPNEGO
+    (Negotiate), а не гадать вслепую по одному лишь "Unauthorized".
+    Реальный повод: тонкий веб-клиент (аналог OWA) у той же почты
+    заходит через SSO, значит Kerberos-инфраструктура в организации
+    есть — но CalDAV в этом приложении сейчас умеет только логин и
+    пароль (Basic), и неясно, предлагает ли сам CalDAV-сервер вообще
+    Negotiate, пока не проверишь напрямую."""
+    req = urllib.request.Request(url, method="PROPFIND", headers={"Depth": "0"})
+    try:
+        urllib.request.urlopen(req, timeout=10)
+        return []  # ответил без 401 вовсе — не тот случай, для которого зовут эту функцию
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            return []
+        values = exc.headers.get_all("WWW-Authenticate") or []
+        return [v.split(None, 1)[0] for v in values if v.strip()]
+    except urllib.error.URLError:
+        return []  # диагностика best-effort — не должна маскировать исходную ошибку вызывающего кода
+
+
+def _auth_scheme_hint(url: str) -> str:
+    schemes = probe_auth_schemes(url)
+    if not schemes:
+        return ""
+    if any(s.lower() == "negotiate" for s in schemes):
+        return (
+            f" Сервер предлагает: {', '.join(schemes)} — включая Negotiate (Kerberos/SPNEGO), "
+            "но CalDAV в этом приложении пока умеет только обычный логин и пароль, не SSO."
+        )
+    return f" Сервер предлагает только: {', '.join(schemes)} — SSO (Negotiate) для CalDAV здесь недоступен."
 
 
 class CalDavSession:
@@ -80,6 +117,8 @@ class CalDavSession:
         try:
             principal = self._client.principal()
             return [cal.get_display_name() or str(cal.url) for cal in principal.calendars()]
+        except AuthorizationError as exc:
+            raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
 
