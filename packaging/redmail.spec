@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        22%{?dist}
+Release:        23%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,14 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Wed Sep 02 2026 RedMail dev <noreply@example.com> - 0.0.1-23
+- CalDAV: при ошибке входа теперь проверяется, какие схемы
+  аутентификации реально предлагает сервер (заголовок
+  WWW-Authenticate) — если сервер поддерживает Negotiate
+  (Kerberos/SPNEGO), сообщение об этом прямо скажет, что CalDAV в
+  приложении пока умеет только логин и пароль, а не молча покажет
+  "Unauthorized"
+
 * Wed Sep 02 2026 RedMail dev <noreply@example.com> - 0.0.1-22
 - SSO (Kerberos) для IMAP/SMTP теперь заранее проверяет, объявляет ли
   сервер поддержку GSSAPI (по CAPABILITY/EHLO), и если нет — показывает
