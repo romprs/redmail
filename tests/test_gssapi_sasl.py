@@ -127,6 +127,19 @@ def test_imap_sasl_login_raises_clear_error_when_server_does_not_advertise_gssap
     client.sasl_login.assert_not_called()
 
 
+def test_imap_sasl_login_wraps_protocol_error_when_server_advertises_but_fails(fake_gssapi_sasl) -> None:
+    # Реальная находка: сервер ЗАЯВЛЯЕТ AUTH=GSSAPI в CAPABILITY (проверка
+    # выше проходит), но сам обмен рвётся низкоуровневой ошибкой разбора
+    # ответа imaplib ("unexpected response: b'BAD invalid command'") —
+    # сервер объявляет способ входа, который фактически не работает.
+    client = MagicMock()
+    client.capabilities.return_value = [b"IMAP4rev1", b"AUTH=GSSAPI"]
+    client.sasl_login.side_effect = Exception("unexpected response: b'BAD invalid command'")
+
+    with pytest.raises(fake_gssapi_sasl.GssapiSaslError, match="заявляет поддержку GSSAPI.*но сам обмен"):
+        fake_gssapi_sasl.imap_sasl_login(client, "imap.vkm.corp.amurgpz.ru", "ivan")
+
+
 def test_smtp_sasl_login_completes_full_auth_exchange(fake_gssapi_sasl) -> None:
     client = MagicMock()
     client.esmtp_features = {"auth": "gssapi plain"}
@@ -158,6 +171,21 @@ def test_smtp_sasl_login_raises_on_rejected_final_code(fake_gssapi_sasl) -> None
 
     with pytest.raises(smtplib.SMTPAuthenticationError):
         fake_gssapi_sasl.smtp_sasl_login(client, "smtp.corp.local", "ivan")
+
+
+def test_smtp_sasl_login_raises_clear_error_when_immediately_rejected_despite_advertised_support(fake_gssapi_sasl) -> None:
+    # Реальная находка на VK Mail: сервер заявляет GSSAPI в EHLO, но сама
+    # команда "AUTH GSSAPI" отвергается сразу кодом 500, ни разу не дойдя
+    # до цикла challenge/response (не 334) — раньше всплывало как
+    # неинформативный smtplib.SMTPAuthenticationError(500, ...).
+    client = MagicMock()
+    client.esmtp_features = {"auth": "gssapi plain"}
+    client.docmd.return_value = (500, b"5.5.1 Invalid command")
+
+    with pytest.raises(fake_gssapi_sasl.GssapiSaslError, match="заявляет поддержку GSSAPI.*отвергнута сразу"):
+        fake_gssapi_sasl.smtp_sasl_login(client, "smtp.vkm.corp.amurgpz.ru", "ivan")
+
+    assert client.docmd.call_count == 1
 
 
 def test_smtp_sasl_login_raises_clear_error_when_server_does_not_advertise_gssapi(fake_gssapi_sasl) -> None:

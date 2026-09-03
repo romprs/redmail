@@ -80,7 +80,23 @@ def imap_sasl_login(client, host: str, username: str) -> None:
             "SSO по этому протоколу здесь не сработает независимо от билета Kerberos."
         )
     context = GssapiSaslContext(service="imap", host=host, authzid=username)
-    client.sasl_login("GSSAPI", context.step)
+    try:
+        client.sasl_login("GSSAPI", context.step)
+    except GssapiSaslError:
+        raise
+    except Exception as exc:
+        # Сервер ЗАЯВЛЯЕТ AUTH=GSSAPI в CAPABILITY (иначе сработала бы
+        # проверка выше), но сам обмен обрывается протокольной ошибкой
+        # ("unexpected response: b'BAD invalid command'" — это низкоуровневая
+        # ошибка разбора ответа сервера в imaplib, не имеющая отношения к
+        # imapclient/этому коду) — реальная находка: сервер объявляет
+        # поддержку механизма, который фактически не может завершить.
+        raise GssapiSaslError(
+            f"Сервер {host} заявляет поддержку GSSAPI (SSO) в CAPABILITY, но сам обмен "
+            f"аутентификацией прерывается протокольной ошибкой: {exc}. Похоже, сервер "
+            "объявляет этот способ входа, но не может фактически довести его до конца "
+            "(частичная/сломанная настройка GSSAPI на стороне сервера, а не билет Kerberos)."
+        ) from exc
 
 
 def smtp_sasl_login(client: smtplib.SMTP, host: str, username: str) -> None:
@@ -112,6 +128,19 @@ def smtp_sasl_login(client: smtplib.SMTP, host: str, username: str) -> None:
         )
     context = GssapiSaslContext(service="smtp", host=host, authzid=username)
     code, resp = client.docmd("AUTH", "GSSAPI")
+    if code not in (235, 334, 503):
+        # Сервер заявляет GSSAPI в EHLO (иначе сработала бы проверка выше),
+        # но сама команда "AUTH GSSAPI" отвергнута сразу же, до первого
+        # шага обмена (реальная находка на VK Mail: "500 5.5.1 Invalid
+        # command"). Раз до цикла challenge/response дело не дошло — это
+        # не отказ билету, а сервер объявляет способ входа, который
+        # фактически не работает.
+        raise GssapiSaslError(
+            f"Сервер {host} заявляет поддержку GSSAPI (SSO) в EHLO, но сама команда "
+            f"AUTH GSSAPI отвергнута сразу: ({code}, {resp!r}). Похоже, сервер объявляет "
+            "этот способ входа, но не может фактически его выполнить (частичная/сломанная "
+            "настройка GSSAPI на стороне сервера, а не билет Kerberos)."
+        )
     while code == 334:
         challenge = base64.decodebytes(resp) if resp.strip() else b""
         token = context.step(challenge)
