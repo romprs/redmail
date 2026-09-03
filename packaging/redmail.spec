@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        23%{?dist}
+Release:        24%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,14 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Sep 03 2026 RedMail dev <noreply@example.com> - 0.0.1-24
+- Исправлена подстановка адресата из адресной книги — лишний
+  набранный текст больше не прилипает к вставленному адресу после
+  выбора из выпадающего списка
+- В диалоге создания/редактирования встречи вложения теперь можно
+  открыть двойным кликом или сохранить через правую кнопку мыши — до
+  сих пор это работало только при просмотре чужого приглашения
+
 * Wed Sep 02 2026 RedMail dev <noreply@example.com> - 0.0.1-23
 - CalDAV: при ошибке входа теперь проверяется, какие схемы
   аутентификации реально предлагает сервер (заголовок
