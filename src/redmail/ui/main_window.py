@@ -443,11 +443,22 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
     completer.setFilterMode(Qt.MatchFlag.MatchContains)
     completer.setWidget(line_edit)
 
+    # activated() срабатывает уже ПОСЛЕ клика по выпадающему списку —
+    # на этот момент line_edit.cursorPosition() не всегда совпадает с
+    # тем местом, где курсор реально стоял во время набора текста
+    # (переключение фокуса на попап и обратно может его сместить).
+    # Раньше insert_completion() запрашивал позицию курсора заново
+    # именно в этот момент — жалоба: "лишний текст прилипал к
+    # подставленному адресу" (набранный кусок оставался в поле вместо
+    # замены). Запоминаем границы текущего сегмента в момент правки
+    # текста (textEdited, надёжно привязан к нажатиям клавиш) и
+    # используем именно их, а не переспрашиваем позицию заново.
+    state = {"prefix_start": 0, "cursor_pos": 0}
+
     def insert_completion(text: str) -> None:
         content = line_edit.text()
-        cursor_pos = line_edit.cursorPosition()
-        last_comma = content.rfind(",", 0, cursor_pos)
-        prefix_start = last_comma + 1
+        prefix_start = min(state["prefix_start"], len(content))
+        cursor_pos = min(state["cursor_pos"], len(content))
         new_text = content[:prefix_start].rstrip()
         if new_text:
             new_text += ", "
@@ -459,7 +470,10 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
     def update_prefix(text: str) -> None:
         cursor_pos = line_edit.cursorPosition()
         last_comma = text.rfind(",", 0, cursor_pos)
-        prefix = text[last_comma + 1 : cursor_pos].strip()
+        prefix_start = last_comma + 1
+        prefix = text[prefix_start:cursor_pos].strip()
+        state["prefix_start"] = prefix_start
+        state["cursor_pos"] = cursor_pos
         if prefix:
             completer.setCompletionPrefix(prefix)
             completer.complete()
@@ -1556,6 +1570,7 @@ class EventDialog(QDialog):
         self.resize(460, 560)
         self.attachments: list[Attachment] = list(event.attachments) if event else []
         self._color = event.color if event else None
+        self._temp_dirs: list[Path] = []
 
         self.summary_edit = QLineEdit(event.summary if event else "")
         self.summary_edit.setPlaceholderText("Придумайте название")
@@ -1619,6 +1634,13 @@ class EventDialog(QDialog):
         for attachment in self.attachments:
             self.attachments_list.addItem(f"{attachment.filename} ({_format_size(attachment.size)})")
         self.attachments_list.setVisible(bool(self.attachments))
+        # Раньше вложения можно было только прикрепить/убрать, но не
+        # открыть, пока событие ещё не сохранено (жалоба: "вложения в
+        # событие не открываются") — EventDetailsDialog (просмотр ЧУЖОГО
+        # события) уже умел это, здесь просто не было подключено вовсе.
+        self.attachments_list.itemDoubleClicked.connect(self._open_attachment)
+        self.attachments_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.attachments_list.customContextMenuRequested.connect(self._attachment_context_menu)
 
         attach_button = QPushButton("Прикрепить файл…", self)
         attach_button.clicked.connect(self._on_attach)
@@ -1766,6 +1788,41 @@ class EventDialog(QDialog):
         self.attachments_list.takeItem(row)
         del self.attachments[row]
         self.attachments_list.setVisible(bool(self.attachments))
+
+    def _open_attachment(self, item: QListWidgetItem) -> None:
+        attachment = self.attachments[self.attachments_list.row(item)]
+        try:
+            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_event_"))
+            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
+            temp_path.write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
+            return
+        self._temp_dirs.append(temp_dir)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+
+    def _attachment_context_menu(self, pos) -> None:
+        item = self.attachments_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self)
+        save_action = menu.addAction("Сохранить как…")
+        chosen = menu.exec(self.attachments_list.mapToGlobal(pos))
+        if chosen is not save_action:
+            return
+        attachment = self.attachments[self.attachments_list.row(item)]
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить вложение", _safe_attachment_filename(attachment.filename))
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(attachment.payload)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось сохранить", str(exc))
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        for temp_dir in self._temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        super().closeEvent(event)
 
     def summary(self) -> str:
         return self.summary_edit.text().strip()
