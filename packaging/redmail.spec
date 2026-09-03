@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        24%{?dist}
+Release:        25%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,13 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Sep 03 2026 RedMail dev <noreply@example.com> - 0.0.1-25
+- SSO (Kerberos): точнее диагностирует случай, когда сервер заявляет
+  поддержку GSSAPI (в CAPABILITY/EHLO), но реально не может завершить
+  обмен — теперь сообщение прямо говорит, что дело в неполной/сломанной
+  настройке GSSAPI на сервере, а не в билете Kerberos, вместо
+  непонятной протокольной ошибки ("unexpected response" и т.п.)
+
 * Thu Sep 03 2026 RedMail dev <noreply@example.com> - 0.0.1-24
 - Исправлена подстановка адресата из адресной книги — лишний
   набранный текст больше не прилипает к вставленному адресу после
