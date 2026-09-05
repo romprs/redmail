@@ -29,7 +29,7 @@ from redmail.config_store import (
     save_poll_interval_minutes,
     save_window_geometry,
 )
-from redmail.config_store import load_ews_accounts, save_ews_accounts
+from redmail.config_store import load_ews_accounts, load_theme, save_ews_accounts, save_theme
 from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
@@ -185,6 +185,26 @@ def test_font_scale_out_of_range_falls_back_to_default(tmp_path: Path) -> None:
     settings_file.write_text('{"font_scale": 9.0}', encoding="utf-8")
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         assert load_font_scale() == 1.0
+
+
+def test_theme_defaults_to_light(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_theme() == "light"
+
+
+def test_theme_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_theme("dark")
+        assert load_theme() == "dark"
+
+
+def test_theme_rejects_unknown_value(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text('{"theme": "solarized"}', encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_theme() == "light"
 
 
 def test_saving_one_setting_does_not_clobber_another(tmp_path: Path) -> None:

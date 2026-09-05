@@ -7,6 +7,7 @@ from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from redmail.calendar_store import Event
+from redmail.ui import theme
 
 # Недельная сетка "как в Google Calendar/Outlook" (см. присланный
 # пользователем скриншот) — часы по вертикали, дни по горизонтали, события
@@ -601,8 +602,15 @@ class MonthCellWidget(QFrame):
         self._apply_style()
 
     def _apply_style(self) -> None:
-        bg = "#ffffff" if self._in_month else "#f8f9fa"
-        border = f"2px solid {_SELECTED_DAY_COLOR}" if self._is_selected else "1px solid #e0e0e0"
+        # Свои цвета (не наследуются из общего QSS темы приложения, потому
+        # что inline setStyleSheet() на конкретном виджете всегда его
+        # перекрывает) — жёстко белые ячейки на тёмной теме выглядели бы
+        # инородно, поэтому здесь берём палитру по theme.is_dark().
+        dark = theme.is_dark()
+        in_month_bg, out_month_bg = ("#2b2c2e", "#232426") if dark else ("#ffffff", "#f8f9fa")
+        border_color = "#5f6368" if dark else "#e0e0e0"
+        bg = in_month_bg if self._in_month else out_month_bg
+        border = f"2px solid {_SELECTED_DAY_COLOR}" if self._is_selected else f"1px solid {border_color}"
         self.setStyleSheet(f"MonthCellWidget {{ background-color: {bg}; border: {border}; }}")
         if self._is_today:
             self.day_label.setStyleSheet(
@@ -610,7 +618,8 @@ class MonthCellWidget(QFrame):
                 f"font-weight: 600; padding: 0px 5px; max-width: 18px;"
             )
         else:
-            color = "#202124" if self._in_month else "#9aa0a6"
+            in_month_text, out_month_text = ("#e8eaed", "#80868b") if dark else ("#202124", "#9aa0a6")
+            color = in_month_text if self._in_month else out_month_text
             self.day_label.setStyleSheet(f"color: {color}; background: transparent;")
 
     def set_events(self, events: list[Event]) -> None:
@@ -685,6 +694,14 @@ class MonthGridWidget(QWidget):
     @property
     def blocks(self) -> list[_EventBlock]:
         return [block for cell in self._cells for block in cell._event_blocks]
+
+    def refresh_theme(self) -> None:
+        """Пересчитать инлайн-стили ячеек после смены темы приложения —
+        MonthCellWidget красит себя сам через setStyleSheet() (см.
+        _apply_style), это сильнее общего QSS приложения и не подхватывает
+        смену темы само по себе без повторного вызова."""
+        for cell in self._cells:
+            cell._apply_style()
 
     def set_month(self, month_anchor: date, events: list[Event]) -> None:
         self._month_anchor = month_anchor.replace(day=1)

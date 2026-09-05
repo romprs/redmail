@@ -104,6 +104,7 @@ from redmail.config_store import (
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
+    load_theme,
     load_window_geometry,
     save_accounts,
     save_archive_storage_dir,
@@ -115,6 +116,7 @@ from redmail.config_store import (
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
+    save_theme,
     save_window_geometry,
 )
 from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
@@ -137,6 +139,7 @@ from redmail.smtp_client import (
 # истинным (bool), не будучи настоящим SmtpAccount, чтобы все такие
 # проверки продолжали работать без изменений для EWS-аккаунтов тоже.
 _EWS_SEND_MARKER = object()
+from redmail.ui import theme as app_theme
 from redmail.ui.week_calendar import (
     AllDayRowWidget,
     MonthGridWidget,
@@ -827,6 +830,7 @@ class SettingsDialog(QDialog):
         pane_orientation: str = "vertical",
         caldav_url: str = "",
         archive_storage_dir: Path | None = None,
+        theme: str = "light",
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -907,10 +911,16 @@ class SettingsDialog(QDialog):
         else:
             self.orientation_vertical.setChecked(True)
 
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Светлая", "light")
+        self.theme_combo.addItem("Тёмная", "dark")
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(theme))
+
         general_form = QFormLayout()
         general_form.addRow("Проверять почту каждые", self.interval_edit)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
+        general_form.addRow("Тема оформления", self.theme_combo)
         general_group = QGroupBox("Общие")
         general_group.setLayout(general_form)
 
@@ -1132,6 +1142,9 @@ class SettingsDialog(QDialog):
 
     def pane_orientation(self) -> str:
         return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
+
+    def theme(self) -> str:
+        return self.theme_combo.currentData()
 
     def caldav_url(self) -> str:
         return self.caldav_url_edit.text().strip()
@@ -2251,6 +2264,7 @@ class MainWindow(QMainWindow):
         self._message_windows: list[QWidget] = []  # держим ссылки, пока окна открыты
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
+        self.theme = load_theme()
         self.caldav_url = load_caldav_url()
         self.archive_storage_dir = load_archive_storage_dir()
         self.mail_rules: list[MailRule] = load_mail_rules()
@@ -2427,6 +2441,13 @@ class MainWindow(QMainWindow):
         self.reading_pane.setReadOnly(True)
         self.reading_pane.setOpenExternalLinks(True)
         self.reading_pane.setPlaceholderText("Выберите письмо, чтобы увидеть текст")
+        # Всегда светлый фон независимо от темы приложения — тело письма
+        # почти всегда HTML, написанный в расчёте на белый фон (часто вовсе
+        # без явного background в разметке), и тёмная тема здесь означала бы
+        # тёмный текст на тёмном фоне у любого письма, которое сам фон не
+        # задаёт. Тот же принцип, что в веб-почте (Gmail и т.п.) — тёмная
+        # тема интерфейса не красит содержимое самих писем.
+        self.reading_pane.setStyleSheet("QTextBrowser { background-color: #ffffff; color: #202124; }")
 
         reading_container = QWidget(self)
         reading_layout = QVBoxLayout(reading_container)
@@ -3471,6 +3492,7 @@ class MainWindow(QMainWindow):
             pane_orientation=self.pane_orientation,
             caldav_url=self.caldav_url,
             archive_storage_dir=self.archive_storage_dir,
+            theme=self.theme,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -3479,15 +3501,25 @@ class MainWindow(QMainWindow):
         self.pane_orientation = dialog.pane_orientation()
         self.caldav_url = dialog.caldav_url()
         self.archive_storage_dir = dialog.archive_storage_dir()
+        new_theme = dialog.theme()
+        theme_changed = new_theme != self.theme
+        self.theme = new_theme
         try:
             save_poll_interval_minutes(self.poll_interval_minutes)
             save_pane_orientation(self.pane_orientation)
             save_caldav_url(self.caldav_url)
             save_archive_storage_dir(self.archive_storage_dir)
+            save_theme(self.theme)
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
         self._restart_poll_timer()
         self._apply_pane_orientation()
+        if theme_changed:
+            app_theme.apply_theme(QApplication.instance(), self.theme)
+            # Ячейки месячного вида красят себя сами через inline
+            # setStyleSheet() (см. MonthCellWidget._apply_style) — общий
+            # QSS приложения их не перекрашивает, нужно попросить явно.
+            self.calendar_month_grid.refresh_theme()
 
         new_account = dialog.account()
         if not new_account.host or not new_account.username:

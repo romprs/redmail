@@ -18,6 +18,7 @@ _KEYRING_SERVICE = "redmail"
 _DEFAULT_POLL_INTERVAL_MINUTES = 5
 _DEFAULT_PANE_ORIENTATION = "vertical"
 _DEFAULT_FONT_SCALE = 1.0
+_DEFAULT_THEME = "light"
 
 
 def _config_path() -> Path:
@@ -65,6 +66,22 @@ def load_pane_orientation() -> str:
 def save_pane_orientation(orientation: str) -> None:
     data = _load_settings_dict()
     data["pane_orientation"] = orientation
+    _save_settings_dict(data)
+
+
+def load_theme() -> str:
+    """Своя тема (светлая/тёмная), не зависящая от темы рабочего стола/GTK
+    хоста (жалоба: "сделай фон программы независимым") — раньше приложение
+    вообще не задавало стиль, и его вид определялся тем, что было настроено
+    в системе, вплоть до нечитаемых сочетаний (тёмная система + не
+    предусмотренные под неё жёстко белые фоны в календаре и т.п.)."""
+    value = _load_settings_dict().get("theme", _DEFAULT_THEME)
+    return value if value in ("light", "dark") else _DEFAULT_THEME
+
+
+def save_theme(theme: str) -> None:
+    data = _load_settings_dict()
+    data["theme"] = theme
     _save_settings_dict(data)
 
 
