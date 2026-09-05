@@ -459,11 +459,29 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
         content = line_edit.text()
         prefix_start = min(state["prefix_start"], len(content))
         cursor_pos = min(state["cursor_pos"], len(content))
+        # content[:prefix_start] уже включает разделяющую запятую сам(ой)
+        # предыдущей записи (prefix_start = позиция сразу за ней, см.
+        # update_prefix) — раньше сюда всё равно безусловно дописывалась
+        # ЕЩЁ одна ", ", получалась двойная запятая при вставке второго и
+        # далее адресата. Снимаем её перед тем, как добавить одну свою.
         new_text = content[:prefix_start].rstrip()
+        if new_text.endswith(","):
+            new_text = new_text[:-1].rstrip()
         if new_text:
             new_text += ", "
         new_text += text
         rest = content[cursor_pos:]
+        if not rest.strip():
+            # Ничего не следует за курсором (обычный случай — дописывали
+            # последнего адресата) — сразу ставим разделитель, чтобы можно
+            # было печатать следующего адресата без ручного набора запятой.
+            # Без этого второй адресат склеивался с первым в одну строку
+            # без запятой, и update_prefix() читал всё как один (ни с чем
+            # не совпадающий) префикс — автодополнение для второго
+            # адресата просто не появлялось (жалоба: "при выборе 1
+            # адресата подтягивается вариант..., но 2 адресат уже нет").
+            new_text += ", "
+            rest = ""
         line_edit.setText(new_text + rest)
         line_edit.setCursorPosition(len(new_text))
 
