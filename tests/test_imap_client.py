@@ -569,6 +569,40 @@ def test_move_messages_falls_back_without_move_capability() -> None:
     fake_client.expunge.assert_called_once()
 
 
+def test_move_messages_creates_missing_target_folder_and_retries() -> None:
+    fake_client = _client()
+    fake_client.has_capability.return_value = True
+    fake_client.move.side_effect = [
+        IMAPClientError("move failed: [TRYCREATE] Folder does not exist"),
+        None,
+    ]
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.move_messages("INBOX", [1, 2], "Archive/2026")
+
+    fake_client.create_folder.assert_called_once_with("Archive/2026")
+    assert fake_client.move.call_count == 2
+    fake_client.move.assert_called_with([1, 2], "Archive/2026")
+
+
+def test_move_messages_reraises_non_trycreate_errors() -> None:
+    fake_client = _client()
+    fake_client.has_capability.return_value = True
+    fake_client.move.side_effect = IMAPClientError("move failed: [CANNOT] Not a MOVE-capable server")
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        try:
+            session.move_messages("INBOX", [1, 2], "Trash")
+        except IMAPClientError:
+            pass
+        else:
+            raise AssertionError("expected IMAPClientError to propagate")
+
+    fake_client.create_folder.assert_not_called()
+
+
 def test_move_messages_noop_for_empty_list() -> None:
     fake_client = _client()
 

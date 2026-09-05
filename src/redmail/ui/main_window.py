@@ -1351,9 +1351,9 @@ class ComposeDialog(QDialog):
 class MailRuleEditDialog(QDialog):
     _FIELDS = (("from", "От кого"), ("subject", "Тема"))
 
-    def __init__(self, parent, folder_names: list[str]):
+    def __init__(self, parent, folder_names: list[str], rule: MailRule | None = None):
         super().__init__(parent)
-        self.setWindowTitle("Новое правило")
+        self.setWindowTitle("Изменить правило" if rule else "Новое правило")
 
         self.field_combo = QComboBox(self)
         for value, label in self._FIELDS:
@@ -1363,6 +1363,12 @@ class MailRuleEditDialog(QDialog):
         self.folder_combo = QComboBox(self)
         self.folder_combo.addItems(folder_names)
         self.folder_combo.setEditable(True)  # папка может ещё не существовать на момент создания правила
+
+        if rule is not None:
+            index = self.field_combo.findData(rule.field)
+            self.field_combo.setCurrentIndex(index if index >= 0 else 0)
+            self.contains_edit.setText(rule.contains)
+            self.folder_combo.setCurrentText(rule.target_folder)
 
         form = QFormLayout()
         form.addRow("Если", self.field_combo)
@@ -1416,14 +1422,22 @@ class MailRulesDialog(QDialog):
         self.table.verticalHeader().setVisible(False)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        # Раньше правило можно было только целиком удалить и создать
+        # заново — жалоба: "правила нельзя редактировать". Двойной клик —
+        # тот же путь, что и кнопка "Изменить…", для единообразия с
+        # остальными таблицами в приложении.
+        self.table.itemDoubleClicked.connect(lambda _item: self._on_edit())
         self._refresh_table()
 
         add_button = QPushButton("Добавить…", self)
         add_button.clicked.connect(self._on_add)
+        edit_button = QPushButton("Изменить…", self)
+        edit_button.clicked.connect(self._on_edit)
         remove_button = QPushButton("Удалить", self)
         remove_button.clicked.connect(self._on_remove)
         button_row = QHBoxLayout()
         button_row.addWidget(add_button)
+        button_row.addWidget(edit_button)
         button_row.addWidget(remove_button)
         button_row.addStretch(1)
 
@@ -1453,6 +1467,20 @@ class MailRulesDialog(QDialog):
             return
         self._rules.append(rule)
         self._refresh_table()
+
+    def _on_edit(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        dialog = MailRuleEditDialog(self, self._folder_names, self._rules[row])
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        rule = dialog.to_rule()
+        if not rule.contains or not rule.target_folder:
+            return
+        self._rules[row] = rule
+        self._refresh_table()
+        self.table.selectRow(row)
 
     def _on_remove(self) -> None:
         row = self.table.currentRow()

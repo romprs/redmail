@@ -365,10 +365,25 @@ class ImapSession:
     @_reconnecting
     def move_messages(self, folder: str, uids: list[int], target_folder: str) -> None:
         """Переносит письма в другую папку (например, в корзину) — атомарно,
-        если сервер поддерживает MOVE (RFC 6851), иначе COPY + удаление."""
+        если сервер поддерживает MOVE (RFC 6851), иначе COPY + удаление.
+
+        Если целевой папки ещё нет на сервере — создаёт её и повторяет
+        один раз, вместо того чтобы падать с сырым "[TRYCREATE] Folder
+        does not exist" (жалоба на правила сортировки почты: правило
+        может ссылаться на папку, которую пользователь только собирался
+        создать, а не создал заранее руками)."""
         if not uids:
             return
         self._select(folder)
+        try:
+            self._move_or_copy(uids, target_folder)
+        except IMAPClientError as exc:
+            if "TRYCREATE" not in str(exc).upper():
+                raise
+            self._client.create_folder(target_folder)
+            self._move_or_copy(uids, target_folder)
+
+    def _move_or_copy(self, uids: list[int], target_folder: str) -> None:
         if self._client.has_capability("MOVE"):
             self._client.move(uids, target_folder)
         else:
