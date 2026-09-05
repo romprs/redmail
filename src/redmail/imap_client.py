@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import imaplib
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header
@@ -39,8 +40,17 @@ def _reconnecting(method):
     следующая же операция падала с сырой сетевой ошибкой (жалоба
     пользователя: "после простоя часто выдаёт ошибку подключения").
     OSError — общий предок и для обрыва соединения, и для TLS-ошибок в
-    современном Python; imaplib.IMAP4.abort — imapclient/imaplib так
-    сигнализируют "соединение уже мертво". Настоящие протокольные ошибки
+    современном Python.
+
+    imaplib.IMAP4.abort — ОТДЕЛЬНО от OSError, хотя семантически это тот
+    же случай: сам imaplib документирует его как "Service errors - close
+    and retry" (imaplib.py), и на практике так оборачивает разрыв TLS
+    ("EOF occurred in violation of protocol") при чтении строки ответа —
+    `class error(Exception)` в стандартной библиотеке НЕ наследуется от
+    OSError, так что раньше это вообще не попадало под переподключение
+    (жалоба: "периодически выдаёт ошибки" при обновлении/чтении письма —
+    ошибка показывалась как есть с первого же раза, без единой попытки
+    восстановить соединение). Настоящие протокольные ошибки
     (IMAPClientError на команду, которую сервер понял, но отверг) НЕ
     перехватываются — переподключение их не лечит, показываем как есть."""
 
@@ -48,7 +58,7 @@ def _reconnecting(method):
     def wrapper(self, *args, **kwargs):
         try:
             return method(self, *args, **kwargs)
-        except (OSError, EOFError) as exc:
+        except (OSError, EOFError, imaplib.IMAP4.abort) as exc:
             try:
                 self._reconnect()
             except Exception:

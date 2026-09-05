@@ -238,6 +238,30 @@ def test_reconnects_and_retries_after_dead_connection() -> None:
     fresh_client.select_folder.assert_called_once_with("INBOX", readonly=False)
 
 
+def test_reconnects_and_retries_after_imaplib_abort() -> None:
+    # Реальная жалоба: "периодически выдаёт ошибки" при обновлении/чтении
+    # письма — сервер рвёт TLS-соединение (SSLEOFError), а imaplib сам
+    # оборачивает это в imaplib.IMAP4.abort ("socket error: EOF occurred
+    # in violation of protocol"). imaplib.IMAP4.error наследуется от
+    # голого Exception, НЕ от OSError — раньше это вообще не попадало под
+    # переподключение, ошибка показывалась с первой же попытки.
+    import imaplib
+
+    dead_client = MagicMock()
+    dead_client.select_folder.side_effect = imaplib.IMAP4.abort(
+        "socket error: EOF occurred in violation of protocol (_ssl.c:2437)"
+    )
+    fresh_client = _client(exists=3)
+    clients = [dead_client, fresh_client]
+
+    with patch("redmail.imap_client.IMAPClient", side_effect=lambda *a, **k: clients.pop(0)):
+        session = ImapSession(_account())
+        count = session.folder_message_count("INBOX")
+
+    assert count == 3
+    fresh_client.login.assert_called_once_with("ivan", "secret")
+
+
 def test_protocol_error_is_not_treated_as_dead_connection() -> None:
     # Настоящая протокольная ошибка (сервер понял команду и отверг) не
     # лечится переподключением — не должна его вызывать вообще.
