@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import smtplib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
@@ -80,6 +81,20 @@ def build_email_message(message: OutgoingMessage) -> EmailMessage:
     return email_message
 
 
+def _with_retry(operation: Callable[[], None]) -> None:
+    """Один повтор на свежем соединении при обрыве на любом этапе —
+    коннект, STARTTLS, аутентификация (в т.ч. GSSAPI) или сама отправка.
+    Раньше единичный обрыв TCP/TLS падал прямо в интерфейс сырым
+    "Connection unexpectedly closed" (smtplib.SMTPServerDisconnected,
+    который наследуется от OSError) — жалоба при отправке приглашения на
+    встречу: "Встреча сохранена, но не разослана". Тот же принцип, что
+    уже применён для IMAP в imap_client.py._reconnecting."""
+    try:
+        operation()
+    except (OSError, EOFError):
+        operation()
+
+
 def _connect_and_authenticate(account: SmtpAccount) -> smtplib.SMTP:
     smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
     client = smtp_cls(account.host, account.port, timeout=30)
@@ -103,11 +118,18 @@ def test_connection(account: SmtpAccount) -> None:
     "может добавить кнопку проверки подключения для входящих, исходящих
     и календаря?"). Успех — соединение установлено и закрыто без ошибок;
     любая проблема (сеть, TLS, логин/SSO) всплывает как исключение."""
-    with _connect_and_authenticate(account):
-        pass
+    def attempt() -> None:
+        with _connect_and_authenticate(account):
+            pass
+
+    _with_retry(attempt)
 
 
 def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
     email_message = build_email_message(message)
-    with _connect_and_authenticate(account) as client:
-        client.send_message(email_message)
+
+    def attempt() -> None:
+        with _connect_and_authenticate(account) as client:
+            client.send_message(email_message)
+
+    _with_retry(attempt)

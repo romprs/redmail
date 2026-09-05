@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import smtplib
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -239,3 +240,60 @@ def test_send_message_with_calendar_invite_carries_method_param() -> None:
     attachment = next(sent.iter_attachments())
     assert attachment.get_content_type() == "text/calendar"
     assert attachment.get_param("method") == "REQUEST"
+
+
+def _retry_account() -> SmtpAccount:
+    return SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+
+
+def _retry_message() -> OutgoingMessage:
+    return OutgoingMessage(sender="ivan@example.com", to=["petr@example.com"], subject="Тема", body="Текст")
+
+
+def _retry_client() -> MagicMock:
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.__exit__.return_value = False
+    return client
+
+
+def test_send_message_retries_once_after_unexpected_disconnect() -> None:
+    # Раньше единичный обрыв TCP/TLS падал прямо в интерфейс сырым
+    # "Connection unexpectedly closed" (жалоба при отправке приглашения на
+    # встречу: "Встреча сохранена, но не разослана") — сервер закрывает
+    # соединение без объяснений, но повтор на свежем соединении почти
+    # всегда проходит.
+    dead_client = _retry_client()
+    dead_client.send_message.side_effect = smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+    fresh_client = _retry_client()
+    clients = [dead_client, fresh_client]
+
+    with patch("redmail.smtp_client.smtplib.SMTP", side_effect=lambda *a, **k: clients.pop(0)):
+        send_message(_retry_account(), _retry_message())
+
+    fresh_client.send_message.assert_called_once()
+
+
+def test_send_message_reraises_after_second_failure() -> None:
+    dead_client = _retry_client()
+    dead_client.login.side_effect = smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=dead_client):
+        try:
+            send_message(_retry_account(), _retry_message())
+        except smtplib.SMTPServerDisconnected:
+            pass
+        else:
+            raise AssertionError("expected SMTPServerDisconnected to propagate after a second failed attempt")
+
+
+def test_test_connection_retries_once_after_unexpected_disconnect() -> None:
+    dead_client = _retry_client()
+    dead_client.starttls.side_effect = smtplib.SMTPServerDisconnected("Connection unexpectedly closed")
+    fresh_client = _retry_client()
+    clients = [dead_client, fresh_client]
+
+    with patch("redmail.smtp_client.smtplib.SMTP", side_effect=lambda *a, **k: clients.pop(0)):
+        smtp_test_connection(_retry_account())
+
+    fresh_client.login.assert_called_once_with("ivan", "secret")
