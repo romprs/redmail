@@ -83,6 +83,7 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextBrowser,
     QToolBar,
+    QToolButton,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -764,6 +765,42 @@ def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
             painter.drawLine(QPointF(cx, size * 0.42), QPointF(cx, size * 0.68))
             painter.drawLine(QPointF(cx - size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
             painter.drawLine(QPointF(cx + size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
+    elif kind == "today":
+        painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
+        painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
+        painter.drawLine(QPointF(size * 0.68, m), QPointF(size * 0.68, size * 0.28))
+        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawEllipse(QRectF(cx - size * 0.11, cy - size * 0.01, size * 0.22, size * 0.22))
+    elif kind in ("prev", "next"):
+        flip = kind == "next"
+        x0, x1 = (size * 0.36, size * 0.64) if flip else (size * 0.64, size * 0.36)
+        painter.drawLine(QPointF(x0, m), QPointF(x1, cy))
+        painter.drawLine(QPointF(x1, cy), QPointF(x0, size - m))
+    elif kind == "add":
+        painter.drawLine(QPointF(cx, m), QPointF(cx, size - m))
+        painter.drawLine(QPointF(m, cy), QPointF(size - m, cy))
+    elif kind == "cancel_event":
+        painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
+        painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
+        painter.drawLine(QPointF(size * 0.68, m), QPointF(size * 0.68, size * 0.28))
+        painter.drawLine(QPointF(size * 0.36, size * 0.46), QPointF(size * 0.64, size * 0.78))
+        painter.drawLine(QPointF(size * 0.64, size * 0.46), QPointF(size * 0.36, size * 0.78))
+    elif kind == "sync":
+        rect1 = QRectF(m, m, size * 0.56, size * 0.56)
+        rect2 = QRectF(size - m - size * 0.56, size - m - size * 0.56, size * 0.56, size * 0.56)
+        painter.drawArc(rect1, 30 * 16, 240 * 16)
+        painter.drawArc(rect2, 210 * 16, 240 * 16)
+        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setPen(Qt.PenStyle.NoPen)
+        a1 = math.radians(30)
+        ax1 = rect1.center().x() + (rect1.width() / 2) * math.cos(a1)
+        ay1 = rect1.center().y() - (rect1.height() / 2) * math.sin(a1)
+        painter.drawPolygon([QPointF(ax1 - 3.2, ay1 - 0.6), QPointF(ax1 + 1.6, ay1 - 3.4), QPointF(ax1 + 0.8, ay1 + 2.8)])
+        a2 = math.radians(210)
+        ax2 = rect2.center().x() + (rect2.width() / 2) * math.cos(a2)
+        ay2 = rect2.center().y() - (rect2.height() / 2) * math.sin(a2)
+        painter.drawPolygon([QPointF(ax2 + 3.2, ay2 + 0.6), QPointF(ax2 - 1.6, ay2 + 3.4), QPointF(ax2 - 0.8, ay2 - 2.8)])
     painter.end()
     return QIcon(pixmap)
 
@@ -2262,6 +2299,15 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
         header.sectionClicked.connect(self._set_filter_column)
+        # Ни одна колонка не Stretch (см. комментарий выше про "Тема") — без
+        # этого сумма ширин колонок не зависит от размера окна вовсе, и
+        # таблица оставляет пустую полосу справа вместо того, чтобы занять
+        # всё окно (жалоба: "таблица... не растягивается на все окно",
+        # особенно заметно при чтении справа — там панели письма ещё и
+        # делят с таблицей ширину, не только высоту). stretchLastSection
+        # отдаёт лишнее место последней колонке (Дата), не мешая
+        # Interactive-изменению ширины остальных колонок пользователем.
+        header.setStretchLastSection(True)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -2420,36 +2466,41 @@ class MainWindow(QMainWindow):
         self.calendar_view_combo.setMinimumWidth(90)
         self.calendar_view_combo.currentTextChanged.connect(self.on_calendar_view_mode_changed)
 
+        # Раньше все команды календаря были текстовыми подписями — с
+        # ростом их числа тулбар не помещался по ширине. Переведены на
+        # иконки с исходным текстом в подсказке (по просьбе пользователя),
+        # как уже сделано для писем/архива выше.
         calendar_toolbar = QToolBar("Календарь", self)
-        today_action = QAction("Сегодня", self)
+        calendar_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        today_action = QAction(_toolbar_icon("today"), "Сегодня", self)
         today_action.triggered.connect(self.on_calendar_today)
         calendar_toolbar.addAction(today_action)
-        prev_week_action = QAction("‹", self)
-        prev_week_action.setToolTip("Предыдущая неделя")
+        prev_week_action = QAction(_toolbar_icon("prev"), "Предыдущая неделя", self)
         prev_week_action.triggered.connect(self.on_calendar_prev_week)
         calendar_toolbar.addAction(prev_week_action)
-        next_week_action = QAction("›", self)
-        next_week_action.setToolTip("Следующая неделя")
+        next_week_action = QAction(_toolbar_icon("next"), "Следующая неделя", self)
         next_week_action.triggered.connect(self.on_calendar_next_week)
         calendar_toolbar.addAction(next_week_action)
         calendar_toolbar.addWidget(self.calendar_month_label)
         calendar_toolbar.addSeparator()
-        new_event_action = QAction("Новая встреча…", self)
+        new_event_action = QAction(_toolbar_icon("add"), "Новая встреча…", self)
         new_event_action.triggered.connect(self.on_new_event)
         calendar_toolbar.addAction(new_event_action)
-        cancel_event_action = QAction("Отменить встречу", self)
-        cancel_event_action.setToolTip("Только для встреч, которые организовали вы сами")
+        cancel_event_action = QAction(_toolbar_icon("cancel_event"), "Отменить встречу", self)
+        cancel_event_action.setToolTip("Отменить встречу — только для встреч, которые организовали вы сами")
         cancel_event_action.triggered.connect(self.on_cancel_event)
         calendar_toolbar.addAction(cancel_event_action)
-        import_ics_action = QAction("Импортировать .ics…", self)
-        import_ics_action.setToolTip("Загрузить выгрузку календаря (VK Mail, Google, Outlook)")
+        import_ics_action = QAction(_toolbar_icon("import"), "Импортировать .ics…", self)
+        import_ics_action.setToolTip("Импортировать .ics — загрузить выгрузку календаря (VK Mail, Google, Outlook)")
         import_ics_action.triggered.connect(self.on_import_ics)
         calendar_toolbar.addAction(import_ics_action)
-        calendar_refresh_action = QAction("Обновить", self)
+        calendar_refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
-        caldav_sync_action = QAction("Синхронизировать с CalDAV", self)
-        caldav_sync_action.setToolTip("Адрес сервера — в Параметрах. Логин/пароль — от почты.")
+        caldav_sync_action = QAction(_toolbar_icon("sync"), "Синхронизировать с CalDAV", self)
+        caldav_sync_action.setToolTip(
+            "Синхронизировать с CalDAV — адрес сервера в Параметрах, логин/пароль от почты"
+        )
         caldav_sync_action.triggered.connect(self.on_caldav_sync)
         calendar_toolbar.addAction(caldav_sync_action)
         calendar_toolbar.addWidget(self.calendar_view_combo)
@@ -2549,20 +2600,21 @@ class MainWindow(QMainWindow):
         self.contacts_table.itemDoubleClicked.connect(self.on_contact_double_clicked)
 
         contacts_toolbar = QToolBar("Контакты", self)
-        new_contact_action = QAction("Новый контакт…", self)
+        contacts_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        new_contact_action = QAction(_toolbar_icon("add"), "Новый контакт…", self)
         new_contact_action.triggered.connect(self.on_new_contact)
         contacts_toolbar.addAction(new_contact_action)
-        import_contacts_action = QAction("Импортировать…", self)
-        import_contacts_action.setToolTip("Импортировать vCard (.vcf) или CSV (экспорт из Outlook)")
+        import_contacts_action = QAction(_toolbar_icon("import"), "Импортировать…", self)
+        import_contacts_action.setToolTip("Импортировать — vCard (.vcf) или CSV (экспорт из Outlook)")
         import_contacts_action.triggered.connect(self.on_import_contacts)
         contacts_toolbar.addAction(import_contacts_action)
-        delete_contact_action = QAction("Удалить", self)
+        delete_contact_action = QAction(_toolbar_icon("delete"), "Удалить", self)
         delete_contact_action.triggered.connect(self.on_delete_contact)
         contacts_toolbar.addAction(delete_contact_action)
-        delete_all_contacts_action = QAction("Удалить все…", self)
+        delete_all_contacts_action = QAction(_toolbar_icon("delete"), "Удалить все…", self)
         delete_all_contacts_action.triggered.connect(self.on_delete_all_contacts)
         contacts_toolbar.addAction(delete_all_contacts_action)
-        contacts_refresh_action = QAction("Обновить", self)
+        contacts_refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         contacts_refresh_action.triggered.connect(self.refresh_contacts_view)
         contacts_toolbar.addAction(contacts_refresh_action)
 
@@ -2581,13 +2633,6 @@ class MainWindow(QMainWindow):
 
         toolbar = QToolBar("Основная", self)
         self.addToolBar(toolbar)
-        # Дополнительный ряд для менее частых действий (архив/импорт/параметры) —
-        # разнесены на вторую строку через addToolBarBreak(), а не оставлены в общем
-        # ряду с остальными: на обычной ширине окна один общий ряд с таким числом
-        # длинных кириллических подписей не помещался, и Qt прятал "лишние" кнопки
-        # за скрытую стрелку-развёртку ">>", из-за чего казалось, что кнопки
-        # "Параметры" и "Импортировать" вовсе пропали (жалоба пользователя после
-        # реального теста на VM). Два полных по ширине ряда решают это без обрезки.
 
         mode_group = QActionGroup(self)
         mode_group.setExclusive(True)
@@ -2610,52 +2655,71 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
-        refresh_action.triggered.connect(self.on_refresh)
-        toolbar.addAction(refresh_action)
-        # Почта/Календарь/Контакты — единственные подписи, оставленные
-        # текстом по явной просьбе пользователя; весь тулбар по умолчанию
-        # переведён на иконки (refresh_action ниже), поэтому для этих трёх
-        # действий стиль кнопки переопределяется отдельно.
+        # Параметры и Справка — раньше жили отдельно (Параметры во втором
+        # ряду тулбара, Справка отдельным пунктом нативного menuBar) — по
+        # просьбе пользователя перенесены в один ряд с Почта/Календарь/
+        # Контакты. Второй ряд тулбара (addToolBarBreak) стал не нужен: те
+        # действия, что в нём были (архив/импорт), переехали к кнопкам над
+        # списком писем (см. mail_actions_toolbar выше) — единственные
+        # оставшиеся здесь пункты снова помещаются в один ряд.
+        settings_action = QAction("Параметры…", self)
+        settings_action.setToolTip(
+            "Параметры — правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана); "
+            "там же добавление учётных записей и правила почты"
+        )
+        settings_action.triggered.connect(self.on_settings)
+        toolbar.addAction(settings_action)
+
+        help_button = QToolButton(self)
+        help_button.setText("Справка")
+        help_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        help_menu = QMenu(help_button)
+        about_action = QAction("О программе…", self)
+        about_action.triggered.connect(self.on_about)
+        help_menu.addAction(about_action)
+        help_button.setMenu(help_menu)
+        toolbar.addWidget(help_button)
+
+        # Почта/Календарь/Контакты/Параметры/Справка — единственные подписи,
+        # оставленные текстом по явной просьбе пользователя; весь остальной
+        # тулбар переведён на иконки.
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         for mode_action in (self.mail_mode_action, self.calendar_mode_action, self.contacts_mode_action):
             button = toolbar.widgetForAction(mode_action)
             if button is not None:
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        settings_button = toolbar.widgetForAction(settings_action)
+        if settings_button is not None:
+            settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        help_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
 
-        self.addToolBarBreak()
-        archive_toolbar = QToolBar("Архив", self)
-        self.addToolBar(archive_toolbar)
-        archive_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        # Открыть архив/Импортировать/Архивировать папку — были во втором
+        # ряду основного тулбара, перенесены к кнопкам над списком писем
+        # (по просьбе пользователя — "разместить аналогично кнопкам над
+        # списком писем"), в конец ряда через разделитель.
+        mail_actions_toolbar.addSeparator()
 
         open_archive_action = QAction(_toolbar_icon("open_archive"), "Открыть архив…", self)
         open_archive_action.triggered.connect(self.on_open_archive)
-        archive_toolbar.addAction(open_archive_action)
+        mail_actions_toolbar.addAction(open_archive_action)
 
         import_action = QAction(_toolbar_icon("import"), "Импортировать…", self)
         import_action.setToolTip("Импортировать — mbox/Maildir (Evolution) или .pst (Outlook) в архив")
         import_action.triggered.connect(self.on_import)
-        archive_toolbar.addAction(import_action)
+        mail_actions_toolbar.addAction(import_action)
 
         self.archive_folder_action = QAction(_toolbar_icon("archive_folder"), "Архивировать папку…", self)
         self.archive_folder_action.setToolTip("Архивировать папку — выгрузить в архив всю папку целиком или всё старше выбранной даты")
         self.archive_folder_action.triggered.connect(self.on_archive_folder)
-        archive_toolbar.addAction(self.archive_folder_action)
+        mail_actions_toolbar.addAction(self.archive_folder_action)
 
-        archive_toolbar.addSeparator()
-
-        settings_action = QAction("Параметры…", self)
-        settings_action.setToolTip("Правит ТЕКУЩУЮ учётную запись (ту, чья папка сейчас выбрана); там же — добавление учётных записей и правила почты")
-        settings_action.triggered.connect(self.on_settings)
-        archive_toolbar.addAction(settings_action)
-        settings_button = archive_toolbar.widgetForAction(settings_action)
-        if settings_button is not None:
-            settings_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-
-        help_menu = self.menuBar().addMenu("Справка")
-        about_action = QAction("О программе…", self)
-        about_action.triggered.connect(self.on_about)
-        help_menu.addAction(about_action)
+        # Обновить — была в основном тулбаре наверху, перенесена вниз к
+        # написать/ответить/переслать и поставлена первой (по просьбе
+        # пользователя). insertAction ставит её перед "Написать письмо…",
+        # а не в конец, куда её добавил бы addAction.
+        refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
+        refresh_action.triggered.connect(self.on_refresh)
+        mail_actions_toolbar.insertAction(compose_action, refresh_action)
 
         self.setStatusBar(QStatusBar(self))
 
@@ -4954,6 +5018,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Некорректное время", "Окончание должно быть позже начала.")
             return
 
+        # Только для НОВОГО начала — если существующее событие просто
+        # редактируют (описание, участники), не трогая время, не блокируем
+        # сохранение из-за того, что встреча объективно уже была в прошлом
+        # (жалоба касалась именно возможности НАЗНАЧИТЬ встречу задним
+        # числом, а не запрета редактировать историю). Сравниваем с
+        # точностью до минуты, а не миллисекунды в миллисекунду — поле
+        # start_edit (QDateTimeEdit) не хранит секунды/микросекунды вообще,
+        # так что простое round-trip события через диалог без единого
+        # изменения даты всё равно давало бы start != existing.dtstart
+        # из-за обрезанных микросекунд и ложно блокировало бы сохранение.
+        start_unchanged = existing is not None and start.replace(second=0, microsecond=0) == existing.dtstart.replace(
+            second=0, microsecond=0
+        )
+        if not start_unchanged:
+            now = datetime.now(timezone.utc)
+            past_cutoff = (
+                now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
+                if all_day
+                else now
+            )
+            if start < past_cutoff:
+                QMessageBox.warning(self, "Прошедшее время", "Нельзя запланировать встречу на прошедшую дату/время.")
+                return
+
         attendee_emails = dialog.attendee_emails()
         event = calendar_store.Event(
             uid=existing.uid if existing else calendar_store.new_uid(),
@@ -5064,6 +5152,10 @@ class MainWindow(QMainWindow):
         delta = timedelta(days=day_delta, minutes=minute_delta)
         new_start = event.dtstart + delta
         new_end = event.dtend + delta
+        if new_start < datetime.now(timezone.utc):
+            QMessageBox.warning(self, "Прошедшее время", "Нельзя перенести встречу на прошедшую дату/время.")
+            self.refresh_calendar_view()  # вернуть блок на исходное место
+            return
         when_text = new_start.astimezone().strftime("%d.%m.%Y %H:%M")
         confirm = QMessageBox.question(
             self,

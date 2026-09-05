@@ -36,6 +36,25 @@ def month_grid_range(anchor: date) -> tuple[date, date]:
     return grid_start, grid_start + timedelta(days=42)
 
 
+def _lighten_color(hex_color: str, factor: float = 3) -> str:
+    """Заливка карточки события — выбранный цвет, но "в 3 раза светлее"
+    (жалоба: заливка отсутствовала вовсе, был только цветной левый край на
+    белом фоне). QColor.lighter() тут не подходит — он умножает светлоту
+    (HSV V), а у насыщенных цветов палитры V и так близко к максимуму,
+    из-за чего ×3 почти всегда упирается в чистый белый и цвет вообще
+    теряется. Вместо этого сдвигаем каждый канал к белому на (1 − 1/factor)
+    расстояния — втрое светлее в смысле "оставшееся расстояние до белого
+    втрое меньше", и цвет остаётся узнаваемым бледным оттенком."""
+    color = QColor(hex_color)
+    blend = 1 - 1 / factor
+    channels = (
+        round(color.red() + (255 - color.red()) * blend),
+        round(color.green() + (255 - color.green()) * blend),
+        round(color.blue() + (255 - color.blue()) * blend),
+    )
+    return QColor(*channels).name()
+
+
 def _event_color(calendar_event: Event) -> str:
     # Ручной цвет (см. референс VK Mail — "Цвет события") имеет приоритет
     # над автоцветом по роли; автоцвет остаётся по умолчанию для событий,
@@ -201,8 +220,8 @@ class _EventBlock(QFrame):
         else:
             outline = "2px solid #1A73E8" if self._selected else "1px solid #dadce0"
             self.setStyleSheet(
-                f"background-color: #ffffff; border-radius: {self._radius}; border: {outline}; "
-                f"border-left: 4px solid {self._color};"
+                f"background-color: {_lighten_color(self._color)}; border-radius: {self._radius}; "
+                f"border: {outline}; border-left: 4px solid {self._color};"
             )
 
 
