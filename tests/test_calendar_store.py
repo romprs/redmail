@@ -343,3 +343,114 @@ def test_all_day_event_round_trip(tmp_path: Path) -> None:
     calendar_store.save_event(path, event)
     fetched = calendar_store.get_event(path, "allday@redmail")
     assert fetched.all_day is True
+
+
+def test_new_calendar_file_seeds_a_default_calendar(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendars = calendar_store.list_calendars(path)
+    assert len(calendars) == 1
+    assert calendars[0].id == calendar_store.DEFAULT_CALENDAR_ID
+    assert calendars[0].visible is True
+
+
+def test_events_default_to_the_default_calendar(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.save_event(path, _event())
+    fetched = calendar_store.get_event(path, "e1@redmail")
+    assert fetched.calendar_id == calendar_store.DEFAULT_CALENDAR_ID
+
+
+def test_create_user_calendar_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")
+    calendars = calendar_store.list_calendars(path)
+    names = {c.name for c in calendars}
+    assert names == {"Мои встречи", "Работа"}
+    assert created.color == "#2E7D32"
+    assert created.visible is True
+
+
+def test_rename_and_recolor_calendar(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")
+    calendar_store.rename_calendar(path, created.id, "Проекты")
+    calendar_store.set_calendar_color(path, created.id, "#D93025")
+    (updated,) = [c for c in calendar_store.list_calendars(path) if c.id == created.id]
+    assert updated.name == "Проекты"
+    assert updated.color == "#D93025"
+
+
+def test_set_calendar_visible_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    calendar_store.set_calendar_visible(path, calendar_store.DEFAULT_CALENDAR_ID, False)
+    (default_cal,) = [c for c in calendar_store.list_calendars(path) if c.id == calendar_store.DEFAULT_CALENDAR_ID]
+    assert default_cal.visible is False
+
+
+def test_delete_calendar_removes_its_events(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")
+    event = _event(uid="work-event@redmail")
+    event.calendar_id = created.id
+    event.attachments = [Attachment(filename="a.txt", content_type="text/plain", payload=b"x")]
+    calendar_store.save_event(path, event)
+
+    calendar_store.delete_calendar(path, created.id)
+
+    assert calendar_store.get_event(path, "work-event@redmail") is None
+    remaining_calendars = {c.id for c in calendar_store.list_calendars(path)}
+    assert created.id not in remaining_calendars
+    assert calendar_store.DEFAULT_CALENDAR_ID in remaining_calendars
+    with sqlite3.connect(path) as conn:
+        remaining_attachments = conn.execute(
+            "SELECT COUNT(*) FROM event_attachments WHERE event_uid = ?", ("work-event@redmail",)
+        ).fetchone()
+    assert remaining_attachments[0] == 0
+
+
+def test_existing_calendar_file_from_before_multi_calendar_migrates_cleanly(tmp_path: Path) -> None:
+    # Симулирует файл, записанный до появления calendar_id/таблицы
+    # calendars — миграция должна доехать без ошибок и не потерять
+    # существующие события.
+    path = tmp_path / "test.rmcal"
+    with sqlite3.connect(path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                uid TEXT NOT NULL UNIQUE,
+                sequence INTEGER NOT NULL DEFAULT 0,
+                summary TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                location TEXT NOT NULL DEFAULT '',
+                dtstart TEXT NOT NULL,
+                dtend TEXT NOT NULL,
+                all_day INTEGER NOT NULL DEFAULT 0,
+                organizer_email TEXT NOT NULL DEFAULT '',
+                organizer_name TEXT NOT NULL DEFAULT '',
+                is_organizer INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'confirmed',
+                my_participation TEXT NOT NULL DEFAULT 'needs-action',
+                attendees TEXT NOT NULL DEFAULT '[]',
+                raw_ics BLOB
+            );
+            CREATE TABLE event_attachments (
+                event_uid TEXT NOT NULL, filename TEXT NOT NULL,
+                content_type TEXT NOT NULL, payload BLOB NOT NULL
+            );
+            """
+        )
+        conn.execute("INSERT INTO meta (key, value) VALUES ('format_version', '2')")
+        conn.execute(
+            "INSERT INTO events (uid, summary, dtstart, dtend) VALUES (?, ?, ?, ?)",
+            ("old@redmail", "Старая встреча", "2026-01-01T10:00:00+00:00", "2026-01-01T11:00:00+00:00"),
+        )
+        conn.commit()
+
+    events = calendar_store.list_events(path)
+    assert len(events) == 1
+    assert events[0].calendar_id == calendar_store.DEFAULT_CALENDAR_ID
+    calendars = calendar_store.list_calendars(path)
+    assert len(calendars) == 1
+    assert calendars[0].id == calendar_store.DEFAULT_CALENDAR_ID

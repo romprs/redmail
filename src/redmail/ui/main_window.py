@@ -48,6 +48,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCalendarWidget,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QCompleter,
     QDateEdit,
@@ -699,6 +700,11 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
         for frac, shorten in ((0.28, 0.0), (0.5, 0.0), (0.72, size * 0.25)):
             y = m + frac * r
             painter.drawLine(QPointF(m, y), QPointF(size - m - shorten, y))
+    elif kind == "calendar":
+        painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
+        painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
+        painter.drawLine(QPointF(size * 0.68, m), QPointF(size * 0.68, size * 0.28))
+        painter.drawLine(QPointF(m, size * 0.42), QPointF(size - m, size * 0.42))
     painter.end()
     return QIcon(pixmap)
 
@@ -1669,6 +1675,7 @@ class EventDialog(QDialog):
         my_email: str = "",
         contacts: list[contact_store.Contact] | None = None,
         default_start: datetime | None = None,
+        calendars: list[calendar_store.Calendar] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
@@ -1676,6 +1683,23 @@ class EventDialog(QDialog):
         self.attachments: list[Attachment] = list(event.attachments) if event else []
         self._color = event.color if event else None
         self._temp_dirs: list[Path] = []
+
+        # Список "моих календарей" (жалоба: "в календаре нельзя сделать
+        # несколько календарей") — на какой календарь ляжет новое событие.
+        # Всегда хотя бы один пункт: если список не передали (старые
+        # вызовы диалога) или он пуст, показываем календарь по умолчанию,
+        # чтобы диалог не падал и не оставался без выбора вовсе.
+        calendars = calendars or [
+            calendar_store.Calendar(
+                id=calendar_store.DEFAULT_CALENDAR_ID, name="Мои встречи", color="#3B6FB6"
+            )
+        ]
+        self.calendar_combo = QComboBox(self)
+        for cal in calendars:
+            self.calendar_combo.addItem(_dot_icon(cal.color), cal.name, cal.id)
+        target_calendar_id = event.calendar_id if event else calendar_store.DEFAULT_CALENDAR_ID
+        index = self.calendar_combo.findData(target_calendar_id)
+        self.calendar_combo.setCurrentIndex(index if index >= 0 else 0)
 
         self.summary_edit = QLineEdit(event.summary if event else "")
         self.summary_edit.setPlaceholderText("Придумайте название")
@@ -1810,6 +1834,10 @@ class EventDialog(QDialog):
         attachments_list_row.addSpacing(22)
         attachments_list_row.addWidget(self.attachments_list)
 
+        calendar_row = QHBoxLayout()
+        calendar_row.addWidget(_icon_label("calendar", self))
+        calendar_row.addWidget(self.calendar_combo)
+
         color_row = QHBoxLayout()
         color_row.addSpacing(22)
         color_row.addWidget(self.color_button)
@@ -1819,6 +1847,7 @@ class EventDialog(QDialog):
         layout.addWidget(self.summary_edit)
         layout.addLayout(time_row)
         layout.addLayout(repeat_row)
+        layout.addLayout(calendar_row)
         layout.addLayout(attendees_row)
         layout.addLayout(location_row)
         layout.addLayout(description_row)
@@ -1873,6 +1902,9 @@ class EventDialog(QDialog):
 
     def color(self) -> str | None:
         return self._color
+
+    def calendar_id(self) -> str:
+        return self.calendar_combo.currentData()
 
     def _on_attach(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
@@ -2475,7 +2507,6 @@ class MainWindow(QMainWindow):
         self.calendar_week_start = week_start_for(date.today())
         self.selected_calendar_event: calendar_store.Event | None = None
         self._calendar_scrolled_to_now = False
-        self.calendar_show_events = True
 
         self.calendar_month_label = QLabel(self)
         self.calendar_month_label.setStyleSheet("font-weight: 600; font-size: 13pt;")
@@ -2534,12 +2565,26 @@ class MainWindow(QMainWindow):
         self.calendar_mini_picker.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
         self.calendar_mini_picker.clicked.connect(self.on_calendar_mini_picker_clicked)
 
-        self.calendar_show_checkbox = QCheckBox("Мои встречи", self)
-        self.calendar_show_checkbox.setChecked(True)
-        self.calendar_show_checkbox.toggled.connect(self.on_calendar_visibility_toggled)
+        # Раньше был единственный чекбокс "Мои встречи" — фактически один
+        # локальный календарь на всех (жалоба: "в календаре нельзя сделать
+        # несколько календарей"). Список ниже строится из хранилища
+        # (calendar_store.list_calendars) — заполняется по-настоящему в
+        # _refresh_calendars_list(), позже в __init__, когда self.calendar_path
+        # уже готов.
+        self._calendars_by_row: list[calendar_store.Calendar] = []
+        self._visible_calendar_ids: set[str] = set()
+        self.calendars_list = QListWidget(self)
+        self.calendars_list.setFrameShape(QFrame.Shape.NoFrame)
+        self.calendars_list.itemChanged.connect(self.on_calendar_item_changed)
+        self.calendars_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.calendars_list.customContextMenuRequested.connect(self.on_calendar_list_context_menu)
+        add_calendar_button = QPushButton("+ Добавить календарь", self)
+        add_calendar_button.clicked.connect(self.on_add_calendar)
         calendars_group = QGroupBox("Мои календари", self)
         calendars_group_layout = QVBoxLayout(calendars_group)
-        calendars_group_layout.addWidget(self.calendar_show_checkbox)
+        calendars_group_layout.addWidget(self.calendars_list)
+        calendars_group_layout.addWidget(add_calendar_button)
+        self._refresh_calendars_list()
 
         calendar_sidebar = QWidget(self)
         calendar_sidebar.setFixedWidth(240)
@@ -4766,8 +4811,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Не удалось загрузить календарь", str(exc))
             return
         events = [e for e in events if e.status != "cancelled"]
-        if not self.calendar_show_events:
-            events = []
+        events = [e for e in events if e.calendar_id in self._visible_calendar_ids]
 
         if self.calendar_view_mode == "month":
             self.calendar_month_label.setText(
@@ -4820,8 +4864,124 @@ class MainWindow(QMainWindow):
         finally:
             self._mini_picker_target_day = None
 
-    def on_calendar_visibility_toggled(self, checked: bool) -> None:
-        self.calendar_show_events = checked
+    def _refresh_calendars_list(self, *, select_id: str | None = None) -> None:
+        """Перестраивает список "Мои календари" из хранилища — вызывается
+        при старте и после любого добавления/переименования/удаления
+        календаря. select_id — какой календарь оставить/сделать текущим
+        выбором в списке (например, только что созданный)."""
+        try:
+            calendars = calendar_store.list_calendars(self.calendar_path)
+        except Exception:
+            calendars = []
+        self._calendars_by_row = calendars
+        self.calendars_list.blockSignals(True)
+        self.calendars_list.clear()
+        for cal in calendars:
+            item = QListWidgetItem(_dot_icon(cal.color), cal.name)
+            item.setData(Qt.ItemDataRole.UserRole, cal.id)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if cal.visible else Qt.CheckState.Unchecked)
+            self.calendars_list.addItem(item)
+            if select_id is not None and cal.id == select_id:
+                self.calendars_list.setCurrentItem(item)
+        self.calendars_list.blockSignals(False)
+        self._visible_calendar_ids = {cal.id for cal in calendars if cal.visible}
+
+    def on_calendar_item_changed(self, item: QListWidgetItem) -> None:
+        calendar_id = item.data(Qt.ItemDataRole.UserRole)
+        visible = item.checkState() == Qt.CheckState.Checked
+        try:
+            calendar_store.set_calendar_visible(self.calendar_path, calendar_id, visible)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось сохранить", str(exc))
+            return
+        if visible:
+            self._visible_calendar_ids.add(calendar_id)
+        else:
+            self._visible_calendar_ids.discard(calendar_id)
+        self.refresh_calendar_view()
+
+    def on_add_calendar(self) -> None:
+        name, ok = QInputDialog.getText(self, "Новый календарь", "Название календаря:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        used_colors = {cal.color for cal in self._calendars_by_row}
+        color = next(
+            (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
+            _EVENT_COLOR_PALETTE[len(self._calendars_by_row) % len(_EVENT_COLOR_PALETTE)][1],
+        )
+        try:
+            created = calendar_store.create_user_calendar(self.calendar_path, name, color)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось создать календарь", str(exc))
+            return
+        self._refresh_calendars_list(select_id=created.id)
+        self.refresh_calendar_view()
+
+    def on_calendar_list_context_menu(self, pos) -> None:
+        item = self.calendars_list.itemAt(pos)
+        if item is None:
+            return
+        calendar_id = item.data(Qt.ItemDataRole.UserRole)
+        menu = QMenu(self)
+        rename_action = menu.addAction("Переименовать…")
+        color_action = menu.addAction("Цвет…")
+        menu.addSeparator()
+        delete_action = menu.addAction("Удалить")
+        if len(self._calendars_by_row) <= 1:
+            delete_action.setEnabled(False)
+            delete_action.setToolTip("Нельзя удалить единственный оставшийся календарь")
+        chosen = menu.exec(self.calendars_list.mapToGlobal(pos))
+        if chosen is rename_action:
+            self._rename_calendar(calendar_id, item.text())
+        elif chosen is color_action:
+            self._recolor_calendar(calendar_id)
+        elif chosen is delete_action:
+            self._delete_calendar(calendar_id, item.text())
+
+    def _rename_calendar(self, calendar_id: str, current_name: str) -> None:
+        name, ok = QInputDialog.getText(self, "Переименовать календарь", "Название календаря:", text=current_name)
+        name = name.strip()
+        if not ok or not name or name == current_name:
+            return
+        try:
+            calendar_store.rename_calendar(self.calendar_path, calendar_id, name)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось переименовать", str(exc))
+            return
+        self._refresh_calendars_list(select_id=calendar_id)
+
+    def _recolor_calendar(self, calendar_id: str) -> None:
+        current = next((cal.color for cal in self._calendars_by_row if cal.id == calendar_id), "#3B6FB6")
+        color = QColorDialog.getColor(QColor(current), self, "Цвет календаря")
+        if not color.isValid():
+            return
+        try:
+            calendar_store.set_calendar_color(self.calendar_path, calendar_id, color.name())
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить цвет", str(exc))
+            return
+        self._refresh_calendars_list(select_id=calendar_id)
+        self.refresh_calendar_view()
+
+    def _delete_calendar(self, calendar_id: str, name: str) -> None:
+        if len(self._calendars_by_row) <= 1:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Удалить календарь",
+            f"Удалить календарь «{name}» вместе со всеми его событиями? Это действие нельзя отменить.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            calendar_store.delete_calendar(self.calendar_path, calendar_id)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось удалить", str(exc))
+            return
+        self._refresh_calendars_list()
         self.refresh_calendar_view()
 
     def _on_calendar_event_clicked(self, event: calendar_store.Event) -> None:
@@ -4840,11 +5000,21 @@ class MainWindow(QMainWindow):
                     self.on_copy_event(event)
             return
         dialog = EventDialog(
-            self, event=event, my_email=self.account.username if self.account else "", contacts=self._load_contacts()
+            self,
+            event=event,
+            my_email=self.account.username if self.account else "",
+            contacts=self._load_contacts(),
+            calendars=self._load_calendars(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=event)
+
+    def _load_calendars(self) -> list[calendar_store.Calendar]:
+        try:
+            return calendar_store.list_calendars(self.calendar_path)
+        except Exception:
+            return []
 
     def on_new_event(self, *, default_start: datetime | None = None) -> None:
         if not self.account:
@@ -4856,7 +5026,11 @@ class MainWindow(QMainWindow):
             # туда, а не всегда на "сейчас+час".
             default_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
         dialog = EventDialog(
-            self, my_email=self.account.username, contacts=self._load_contacts(), default_start=default_start
+            self,
+            my_email=self.account.username,
+            contacts=self._load_contacts(),
+            default_start=default_start,
+            calendars=self._load_calendars(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -4903,7 +5077,13 @@ class MainWindow(QMainWindow):
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
-        dialog = EventDialog(self, event=event, my_email=self.account.username, contacts=self._load_contacts())
+        dialog = EventDialog(
+            self,
+            event=event,
+            my_email=self.account.username,
+            contacts=self._load_contacts(),
+            calendars=self._load_calendars(),
+        )
         dialog.setWindowTitle("Копия встречи")
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -5090,6 +5270,7 @@ class MainWindow(QMainWindow):
             sequence=(existing.sequence + 1) if existing else 0,
             recurrence_rule=dialog.recurrence_rule(),
             color=dialog.color(),
+            calendar_id=dialog.calendar_id(),
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
             attachments=list(dialog.attachments),
         )

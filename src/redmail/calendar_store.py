@@ -23,13 +23,23 @@ from redmail.imap_client import Attachment
 # принятых приглашений и созданных пользователем встреч, а не что-то
 # регенерируемое с сервера. Поэтому новые поля добавляются через
 # ALTER TABLE-миграции (см. _MIGRATIONS), а не через wipe-on-mismatch.
-_FORMAT_VERSION = 2
+_FORMAT_VERSION = 3
+
+# Единственный календарь "по умолчанию", существовавший до появления
+# нескольких календарей (жалоба: "в календаре нельзя сделать несколько
+# календарей") — все уже сохранённые события молча остаются в нём же
+# (миграция ниже проставляет его им как DEFAULT), пользователю не нужно
+# ничего разбирать руками после обновления.
+DEFAULT_CALENDAR_ID = "default"
+_DEFAULT_CALENDAR_NAME = "Мои встречи"
+_DEFAULT_CALENDAR_COLOR = "#3B6FB6"
 
 # Столбцы, добавленные после первого релиза — CREATE TABLE IF NOT EXISTS их
 # для уже существующих файлов не создаст, поэтому досоздаём миграцией.
 _MIGRATIONS = (
     "ALTER TABLE events ADD COLUMN recurrence_rule TEXT",
     "ALTER TABLE events ADD COLUMN color TEXT",
+    f"ALTER TABLE events ADD COLUMN calendar_id TEXT NOT NULL DEFAULT '{DEFAULT_CALENDAR_ID}'",
 )
 
 _SCHEMA = """
@@ -56,6 +66,7 @@ CREATE TABLE IF NOT EXISTS events (
     attendees TEXT NOT NULL DEFAULT '[]',
     recurrence_rule TEXT,
     color TEXT,
+    calendar_id TEXT NOT NULL DEFAULT 'default',
     raw_ics BLOB
 );
 
@@ -65,12 +76,20 @@ CREATE TABLE IF NOT EXISTS event_attachments (
     content_type TEXT NOT NULL,
     payload BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS calendars (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    color TEXT NOT NULL,
+    visible INTEGER NOT NULL DEFAULT 1,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
 """
 
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
     "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-    "recurrence_rule, color, raw_ics"
+    "recurrence_rule, color, calendar_id, raw_ics"
 )
 
 
@@ -100,12 +119,26 @@ class Event:
     attendees: list[Attendee] = field(default_factory=list)
     recurrence_rule: str | None = None  # значение RRULE (RFC 5545), напр. "FREQ=DAILY"
     color: str | None = None  # ручной цвет события (#RRGGBB); None — автоцвет по роли (организатор/участник)
+    calendar_id: str = DEFAULT_CALENDAR_ID
     attachments: list[Attachment] = field(default_factory=list)
     raw_ics: bytes | None = None
 
 
+@dataclass
+class Calendar:
+    id: str
+    name: str
+    color: str
+    visible: bool = True
+    sort_order: int = 0
+
+
 def new_uid() -> str:
     return f"{uuid4()}@redmail"
+
+
+def new_calendar_id() -> str:
+    return str(uuid4())
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -123,13 +156,19 @@ def _connect(path: Path) -> sqlite3.Connection:
 def create_calendar(path: Path) -> None:
     """Создаёт пустой файл календаря, либо доводит уже существующий (в т.ч.
     записанный старой версией приложения) до текущей схемы — миграции уже
-    применены в _connect() выше, здесь только фиксируем текущую версию."""
+    применены в _connect() выше, здесь только фиксируем текущую версию и
+    гарантируем наличие календаря "по умолчанию" (INSERT OR IGNORE — не
+    перезаписывает, если пользователь его уже переименовал/перекрасил)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(_connect(path)) as conn:
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('format_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (str(_FORMAT_VERSION),),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO calendars (id, name, color, visible, sort_order) VALUES (?, ?, ?, 1, 0)",
+            (DEFAULT_CALENDAR_ID, _DEFAULT_CALENDAR_NAME, _DEFAULT_CALENDAR_COLOR),
         )
         conn.commit()
 
@@ -164,8 +203,9 @@ def _row_to_event(conn: sqlite3.Connection, row) -> Event:
         attendees=[Attendee(**a) for a in json.loads(row[14])],
         recurrence_rule=row[15],
         color=row[16],
+        calendar_id=row[17],
         attachments=_load_attachments(conn, row[1]),
-        raw_ics=row[17],
+        raw_ics=row[18],
     )
 
 
@@ -257,15 +297,15 @@ def save_event(path: Path, event: Event) -> None:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-            "recurrence_rule, color, raw_ics) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recurrence_rule, color, calendar_id, raw_ics) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
             "organizer_email=excluded.organizer_email, organizer_name=excluded.organizer_name, "
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
             "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
-            "raw_ics=excluded.raw_ics",
+            "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics",
             (
                 event.uid,
                 event.sequence,
@@ -283,6 +323,7 @@ def save_event(path: Path, event: Event) -> None:
                 json.dumps([a.__dict__ for a in event.attendees], ensure_ascii=False),
                 event.recurrence_rule,
                 event.color,
+                event.calendar_id,
                 event.raw_ics,
             ),
         )
@@ -359,3 +400,67 @@ def apply_reply(path: Path, uid: str, attendee_email: str, participation: str) -
         event.attendees.append(Attendee(email=attendee_email, participation=participation))
     save_event(path, event)
     return event
+
+
+def _row_to_calendar(row) -> Calendar:
+    return Calendar(id=row[0], name=row[1], color=row[2], visible=bool(row[3]), sort_order=row[4])
+
+
+def list_calendars(path: Path) -> list[Calendar]:
+    """Список "моих календарей" (жалоба: "в календаре нельзя сделать
+    несколько календарей") — всегда хотя бы один, calendar по умолчанию
+    создаётся в create_calendar() при первом обращении к файлу."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            "SELECT id, name, color, visible, sort_order FROM calendars ORDER BY sort_order, name"
+        ).fetchall()
+        return [_row_to_calendar(row) for row in rows]
+
+
+def create_user_calendar(path: Path, name: str, color: str) -> Calendar:
+    create_calendar(path)
+    calendar = Calendar(id=new_calendar_id(), name=name, color=color, visible=True, sort_order=len(list_calendars(path)))
+    with closing(_connect(path)) as conn:
+        conn.execute(
+            "INSERT INTO calendars (id, name, color, visible, sort_order) VALUES (?, ?, ?, ?, ?)",
+            (calendar.id, calendar.name, calendar.color, int(calendar.visible), calendar.sort_order),
+        )
+        conn.commit()
+    return calendar
+
+
+def rename_calendar(path: Path, calendar_id: str, name: str) -> None:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE calendars SET name = ? WHERE id = ?", (name, calendar_id))
+        conn.commit()
+
+
+def set_calendar_color(path: Path, calendar_id: str, color: str) -> None:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE calendars SET color = ? WHERE id = ?", (color, calendar_id))
+        conn.commit()
+
+
+def set_calendar_visible(path: Path, calendar_id: str, visible: bool) -> None:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE calendars SET visible = ? WHERE id = ?", (int(visible), calendar_id))
+        conn.commit()
+
+
+def delete_calendar(path: Path, calendar_id: str) -> None:
+    """Удаляет календарь вместе со всеми его событиями. Не запрещает
+    удалить последний оставшийся календарь на уровне хранилища — это
+    решение интерфейса (там же, где подтверждение), чтобы правило можно
+    было увидеть и изменить в одном месте."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        uids = [row[0] for row in conn.execute("SELECT uid FROM events WHERE calendar_id = ?", (calendar_id,))]
+        for uid in uids:
+            conn.execute("DELETE FROM event_attachments WHERE event_uid = ?", (uid,))
+        conn.execute("DELETE FROM events WHERE calendar_id = ?", (calendar_id,))
+        conn.execute("DELETE FROM calendars WHERE id = ?", (calendar_id,))
+        conn.commit()
