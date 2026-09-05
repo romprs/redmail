@@ -538,9 +538,18 @@ def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_st
     # getaddresses (не наивный split(",")) при разборе уже введённого — иначе
     # имя в кавычках со своей запятой внутри (см. _contact_candidates)
     # резалось бы пополам при пересборке поля.
+    #
+    # "if addr" одного было недостаточно: если пользователь начал вручную
+    # печатать второго адресата и не успел закончить (например, "Пе"),
+    # getaddresses() на таком обрывке без "@" всё равно кладёт что-то в
+    # "адрес" (некуда больше положить нераспознанный текст) — этот огрызок
+    # раньше сохранялся как отдельный "адресат" при выборе из адресной
+    # книги вместо того, чтобы быть замещённым (жалоба: "2 адресат не
+    # всегда корректно распознаётся"). "@" в адресе — грубый, но
+    # достаточный фильтр "похоже ли это вообще на email".
     existing_pairs = getaddresses([line_edit.text()]) if line_edit.text().strip() else []
-    entries = [_format_recipient_candidate(name, addr) for name, addr in existing_pairs if addr]
-    existing_addrs = {addr for _name, addr in existing_pairs if addr}
+    entries = [_format_recipient_candidate(name, addr) for name, addr in existing_pairs if addr and "@" in addr]
+    existing_addrs = {addr for _name, addr in existing_pairs if addr and "@" in addr}
     for candidate in picked:
         picked_pairs = getaddresses([candidate])
         addr = picked_pairs[0][1] if picked_pairs else ""
