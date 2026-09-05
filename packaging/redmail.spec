@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        26%{?dist}
+Release:        27%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,13 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 04 2026 RedMail dev <noreply@example.com> - 0.0.1-27
+- Отправка почты по SMTP (в т.ч. рассылка приглашений на встречу):
+  единичный обрыв соединения с сервером посреди разговора
+  ("Connection unexpectedly closed") теперь тоже приводит к
+  повторной попытке на свежем соединении, а не сразу к ошибке -
+  жалоба: "Встреча сохранена, но не разослана"
+
 * Fri Sep 04 2026 RedMail dev <noreply@example.com> - 0.0.1-26
 - Адресная книга: при выборе 2-го и последующих адресатов из списка
   теперь корректно подставляется разделитель и распознаётся именно
