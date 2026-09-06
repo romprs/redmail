@@ -297,3 +297,44 @@ def test_test_connection_retries_once_after_unexpected_disconnect() -> None:
         smtp_test_connection(_retry_account())
 
     fresh_client.login.assert_called_once_with("ivan", "secret")
+
+
+def test_send_message_with_html_body_and_inline_image() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(
+            sender="ivan@example.com",
+            to=["boss@example.com"],
+            subject="Форматированное письмо",
+            body="Обычный текст на случай, если получатель не понимает HTML",
+            html_body='<p><b>Жирный</b> текст и картинка: <img src="cid:pic1@redmail"></p>',
+            inline_images={"pic1@redmail": ("image/png", b"fake-png-bytes")},
+        )
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    assert sent.is_multipart()
+    plain_part = sent.get_body(preferencelist=("plain",))
+    assert "Обычный текст" in plain_part.get_content()
+    html_part = sent.get_body(preferencelist=("html",))
+    assert "<b>Жирный</b>" in html_part.get_content()
+    related_images = [p for p in sent.walk() if p.get_content_type() == "image/png"]
+    assert len(related_images) == 1
+    assert related_images[0].get_payload(decode=True) == b"fake-png-bytes"
+    assert related_images[0]["Content-Id"] == "<pic1@redmail>"
+
+
+def test_send_message_without_html_body_stays_plain_text_only() -> None:
+    fake_client = MagicMock()
+    fake_client.__enter__.return_value = fake_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", return_value=fake_client):
+        account = SmtpAccount(host="smtp.example.com", username="ivan", password="secret")
+        message = OutgoingMessage(sender="ivan@example.com", to=["a@example.com"], subject="S", body="B")
+        send_message(account, message)
+
+    sent = fake_client.send_message.call_args[0][0]
+    assert not sent.is_multipart() or sent.get_content_type() != "multipart/alternative"

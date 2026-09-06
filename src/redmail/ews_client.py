@@ -4,7 +4,7 @@ import zlib
 from dataclasses import dataclass
 from email import message_from_bytes
 
-from exchangelib import BASIC, DELEGATE, GSSAPI, NTLM
+from exchangelib import BASIC, DELEGATE, GSSAPI, HTMLBody, NTLM
 from exchangelib import Account as ExchangeAccount
 from exchangelib import Configuration, Credentials, FileAttachment, Folder, Mailbox
 from exchangelib.items import Message as EwsMessage
@@ -306,11 +306,18 @@ def send_message(session: EwsSession, message: OutgoingMessage) -> None:
     ews_message = EwsMessage(
         account=session._account,
         subject=message.subject,
-        body=message.body,
+        # Отредактированное форматирование из ComposeDialog (жалоба: "не
+        # даёт установить какие-либо шрифты") — exchangelib отличает
+        # HTML-тело от обычного текста через HTMLBody, а не по содержимому.
+        body=HTMLBody(message.html_body) if message.html_body else message.body,
         to_recipients=[Mailbox(email_address=addr) for addr in message.to],
         cc_recipients=[Mailbox(email_address=addr) for addr in message.cc] if message.cc else None,
         bcc_recipients=[Mailbox(email_address=addr) for addr in message.bcc] if message.bcc else None,
     )
+    for cid, (content_type, payload) in message.inline_images.items():
+        ews_message.attach(
+            FileAttachment(name=cid, content=payload, content_type=content_type, is_inline=True, content_id=cid)
+        )
     for attachment in message.attachments:
         ews_message.attach(
             FileAttachment(name=attachment.filename, content=attachment.payload, content_type=attachment.content_type)

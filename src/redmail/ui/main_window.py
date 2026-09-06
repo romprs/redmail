@@ -13,6 +13,7 @@ import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses
 from pathlib import Path
+from uuid import uuid4
 
 from PySide6.QtCore import (
     QByteArray,
@@ -43,6 +44,8 @@ from PySide6.QtGui import (
     QPainterPath,
     QPen,
     QPixmap,
+    QTextCharFormat,
+    QTextCursor,
     QTextDocument,
 )
 from PySide6.QtWidgets import (
@@ -58,6 +61,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QFontComboBox,
     QFormLayout,
     QFrame,
     QGroupBox,
@@ -85,6 +89,7 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
+    QTextEdit,
     QToolBar,
     QToolButton,
     QTreeWidget,
@@ -1374,12 +1379,18 @@ class ComposeDialog(QDialog):
         bcc: str = "",
         subject: str = "",
         body: str = "",
+        body_html: str | None = None,
+        inline_images: dict[str, tuple[str, bytes]] | None = None,
         contacts: list[contact_store.Contact] | None = None,
         attachments: list[OutgoingAttachment] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(560, 460)
+        # Шире, чем раньше (560) — панель форматирования (Ж/К/Ч + гарнитура
+        # + размер + "Вставить изображение…") на прежней ширине не
+        # помещалась и Qt прятал лишние кнопки за скрытую стрелку ">>",
+        # тем же образом, что уже однажды случилось с основным тулбаром.
+        self.resize(680, 480)
         self.attachments: list[OutgoingAttachment] = list(attachments) if attachments else []
 
         self._contacts = contacts or []
@@ -1389,7 +1400,84 @@ class ComposeDialog(QDialog):
         if contacts:
             _install_recipient_completer(self.to_edit, contacts)
         self.subject_edit = QLineEdit(subject)
-        self.body_edit = QPlainTextEdit(body)
+
+        # Раньше тело письма было простым QPlainTextEdit — жалоба: "нет
+        # возможности вставить картинку... редактор не даёт установить
+        # какие-либо шрифты или как-то иначе выделить письмо". QTextEdit
+        # умеет всё это из коробки (rich text + insertImage), нужна только
+        # небольшая панель инструментов сверху. setPlainText, а не передача
+        # текста в конструктор/setHtml — цитата ответа/пересылки может
+        # содержать "<"/">" (например, адрес в угловых скобках), который
+        # иначе разобрался бы как HTML-тег, а не как текст.
+        self.body_edit = QTextEdit()
+        self.body_edit.setAcceptRichText(True)
+        self._inline_images: dict[str, tuple[str, bytes]] = dict(inline_images) if inline_images else {}
+        if body_html:
+            # Черновик, открытый повторно, мог быть сохранён с картинками —
+            # регистрируем их как ресурсы ДО setHtml(), иначе <img
+            # src="cid:..."> в разметке ссылается на данные, которых
+            # документ ещё не знает, и картинка рисуется сломанной.
+            for cid, (_content_type, payload) in self._inline_images.items():
+                image = QImage.fromData(payload)
+                if not image.isNull():
+                    self.body_edit.document().addResource(
+                        QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image
+                    )
+            self.body_edit.setHtml(body_html)
+        else:
+            self.body_edit.setPlainText(body)
+
+        self.bold_action = QAction("Ж", self)
+        self.bold_action.setCheckable(True)
+        self.bold_action.setToolTip("Полужирный")
+        self.bold_action.toggled.connect(self._on_bold_toggled)
+        self.italic_action = QAction("К", self)
+        self.italic_action.setCheckable(True)
+        self.italic_action.setToolTip("Курсив")
+        self.italic_action.toggled.connect(self._on_italic_toggled)
+        self.underline_action = QAction("Ч", self)
+        self.underline_action.setCheckable(True)
+        self.underline_action.setToolTip("Подчёркнутый")
+        self.underline_action.toggled.connect(self._on_underline_toggled)
+
+        self.font_family_combo = QFontComboBox(self)
+        self.font_family_combo.setMaximumWidth(160)
+        self.font_family_combo.currentFontChanged.connect(self._on_font_family_changed)
+
+        self.font_size_combo = QComboBox(self)
+        self.font_size_combo.setEditable(True)
+        self.font_size_combo.setMaximumWidth(56)
+        for size in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48):
+            self.font_size_combo.addItem(str(size))
+        self.font_size_combo.setCurrentText(str(int(self.body_edit.fontPointSize()) or 12))
+        self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
+
+        insert_image_button = QPushButton("Вставить изображение…", self)
+        insert_image_button.clicked.connect(self._on_insert_image)
+
+        format_toolbar = QToolBar("Форматирование", self)
+        format_toolbar.addAction(self.bold_action)
+        format_toolbar.addAction(self.italic_action)
+        format_toolbar.addAction(self.underline_action)
+        # Буквы-подсказки Ж/К/Ч сами по себе рисуются полужирным/курсивом/
+        # подчёркнутым шрифтом — понятно без иконок, что каждая делает.
+        for action, tweak in (
+            (self.bold_action, lambda f: f.setBold(True)),
+            (self.italic_action, lambda f: f.setItalic(True)),
+            (self.underline_action, lambda f: f.setUnderline(True)),
+        ):
+            button = format_toolbar.widgetForAction(action)
+            if button is not None:
+                font = button.font()
+                tweak(font)
+                button.setFont(font)
+        format_toolbar.addWidget(self.font_family_combo)
+        format_toolbar.addWidget(self.font_size_combo)
+        format_toolbar.addSeparator()
+        format_toolbar.addWidget(insert_image_button)
+        self._format_toolbar = format_toolbar
+
+        self.body_edit.currentCharFormatChanged.connect(self._sync_format_toolbar)
 
         address_book_button = QPushButton("Адресная книга…", self)
         address_book_button.clicked.connect(lambda: _open_contact_picker(self, self.to_edit, self._contacts))
@@ -1457,6 +1545,7 @@ class ComposeDialog(QDialog):
         layout.addLayout(form)
         layout.addLayout(attach_row)
         layout.addWidget(self.attachments_list)
+        layout.addWidget(format_toolbar)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
 
@@ -1508,6 +1597,73 @@ class ComposeDialog(QDialog):
 
     def body(self) -> str:
         return self.body_edit.toPlainText()
+
+    def body_html(self) -> str:
+        return self.body_edit.toHtml()
+
+    def inline_images(self) -> dict[str, tuple[str, bytes]]:
+        return dict(self._inline_images)
+
+    def _on_bold_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Weight.Bold if checked else QFont.Weight.Normal)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def _on_italic_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(checked)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def _on_underline_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(checked)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def _on_font_family_changed(self, font: QFont) -> None:
+        self.body_edit.setFontFamily(font.family())
+        self.body_edit.setFocus()
+
+    def _on_font_size_changed(self, size_text: str) -> None:
+        try:
+            size = float(size_text)
+        except ValueError:
+            return
+        if size > 0:
+            self.body_edit.setFontPointSize(size)
+
+    def _sync_format_toolbar(self, fmt: QTextCharFormat) -> None:
+        # blockSignals — иначе programmatic setChecked() тут же снова
+        # дёрнул бы _on_*_toggled и слил бы формат курсора с самим собой
+        # (безвредно, но лишняя работа на каждое движение курсора).
+        self.bold_action.blockSignals(True)
+        self.bold_action.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
+        self.bold_action.blockSignals(False)
+        self.italic_action.blockSignals(True)
+        self.italic_action.setChecked(fmt.fontItalic())
+        self.italic_action.blockSignals(False)
+        self.underline_action.blockSignals(True)
+        self.underline_action.setChecked(fmt.fontUnderline())
+        self.underline_action.blockSignals(False)
+
+    def _on_insert_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Вставить изображение", filter="Изображения (*.png *.jpg *.jpeg *.gif *.bmp)"
+        )
+        if not path:
+            return
+        data = Path(path).read_bytes()
+        image = QImage.fromData(data)
+        if image.isNull():
+            QMessageBox.warning(self, "Не удалось вставить изображение", "Файл не распознан как изображение.")
+            return
+        content_type, _ = mimetypes.guess_type(path)
+        cid = f"{uuid4().hex}@redmail"
+        self._inline_images[cid] = (content_type or "image/png", data)
+        cursor = self.body_edit.textCursor()
+        cursor.insertImage(image, f"cid:{cid}")
 
 
 class MailRuleEditDialog(QDialog):
@@ -4287,6 +4443,8 @@ class MainWindow(QMainWindow):
                 bcc=content.bcc,
                 subject=content.subject or summary.subject,
                 body=content.text,
+                body_html=content.html or None,
+                inline_images=content.inline_images,
                 contacts=self._load_contacts(),
                 attachments=[
                     OutgoingAttachment(filename=a.filename, content_type=a.content_type, payload=a.payload)
@@ -5757,6 +5915,8 @@ class MainWindow(QMainWindow):
             bcc=dialog.bcc_recipients(),
             subject=dialog.subject(),
             body=dialog.body(),
+            html_body=dialog.body_html(),
+            inline_images=dialog.inline_images(),
             in_reply_to=in_reply_to,
             attachments=dialog.attachments,
         )
@@ -5814,6 +5974,8 @@ class MainWindow(QMainWindow):
             bcc=dialog.bcc_recipients(),
             subject=dialog.subject(),
             body=dialog.body(),
+            html_body=dialog.body_html(),
+            inline_images=dialog.inline_images(),
             attachments=dialog.attachments,
         )
         try:

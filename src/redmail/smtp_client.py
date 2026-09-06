@@ -42,6 +42,18 @@ class OutgoingMessage:
     in_reply_to: str | None = None
     references: list[str] = field(default_factory=list)
     attachments: list[OutgoingAttachment] = field(default_factory=list)
+    # Отредактированное форматирование/встроенные картинки из ComposeDialog
+    # (жалоба: "нет возможности вставить картинку... не даёт установить
+    # какие-либо шрифты"). None — письмо чисто текстовое, шлём как раньше;
+    # когда задано, `body` остаётся обычным текстовым fallback-содержимым
+    # (RFC 2046 multipart/alternative — получатели без поддержки HTML
+    # видят его), а html_body — реальное форматированное содержимое.
+    html_body: str | None = None
+    # cid -> (content_type, payload) — картинки, вставленные прямо в текст
+    # письма (не файловые вложения), связываются с html_body через
+    # <img src="cid:..."> так же, как их парсит imap_client.extract_content
+    # у входящей почты.
+    inline_images: dict[str, tuple[str, bytes]] = field(default_factory=dict)
 
 
 def build_email_message(message: OutgoingMessage) -> EmailMessage:
@@ -68,6 +80,13 @@ def build_email_message(message: OutgoingMessage) -> EmailMessage:
         email_message["In-Reply-To"] = message.in_reply_to
         email_message["References"] = " ".join([*message.references, message.in_reply_to])
     email_message.set_content(message.body)
+    if message.html_body:
+        email_message.add_alternative(message.html_body, subtype="html")
+        if message.inline_images:
+            html_part = email_message.get_payload()[-1]
+            for cid, (content_type, payload) in message.inline_images.items():
+                maintype, _, subtype = content_type.partition("/")
+                html_part.add_related(payload, maintype=maintype or "image", subtype=subtype or "png", cid=f"<{cid}>")
 
     for attachment in message.attachments:
         maintype, _, subtype = attachment.content_type.partition("/")
