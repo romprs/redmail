@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        38%{?dist}
+Release:        39%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,11 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-39
+- Убрана лишняя "рамка внутри карточки события" в календаре - карточка
+  событий теперь рисуется как единая скруглённая форма с полоской цвета
+  календаря слева, без артефакта из двух наложенных скруглённых фигур
+
 * Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-38
 - Событие в другом календаре теперь красится цветом ЭТОГО календаря, а не
   всегда одним и тем же цветом "я организатор" - раньше событие сохранялось
