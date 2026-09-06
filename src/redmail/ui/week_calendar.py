@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from redmail.calendar_store import Event
@@ -103,10 +103,18 @@ class _EventBlock(QFrame):
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
         self._color = _event_color(calendar_event, calendar_color)
-        self._radius = "11px" if pill else "4px"
+        self._radius = 11 if pill else 4
         self._pill = pill
         self._selected = False
-        self._apply_style()
+        # Фон/рамка/цветная полоска рисуются вручную в paintEvent, а не
+        # через QSS (setStyleSheet) — border-radius вместе с односторонним
+        # border-left в Qt-стилях рисуется криво: получаются ДВЕ отдельные
+        # скруглённые формы вместо одной цельной карточки с полоской слева
+        # (жалоба: "убери внутреннюю рамку в событии" — то, что выглядело
+        # как рамка ВНУТРИ карточки, было именно этим артефактом). Ручная
+        # отрисовка с обрезкой по единому скруглённому контуру (clipPath)
+        # исключает эту проблему в принципе.
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         # Перетаскивать можно только свои встречи (я организатор) — чужие
@@ -209,34 +217,55 @@ class _EventBlock(QFrame):
         # без какой-либо видимой подсветки — пользователь не мог понять,
         # какое событие сейчас выбрано. Белая рамка — видимый маркер выбора.
         self._selected = selected
-        self._apply_style()
+        self.update()
 
-    def _apply_style(self) -> None:
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         # Карточка события в сетке — светлый фон с цветной полосой слева и
         # тёмным текстом, а не сплошная заливка цветом: так выглядят
         # события в референсе (VK Mail), в отличие от прежнего сплошного
         # цветного блока с белым текстом. Таблетки "весь день" — маленькие
         # плашки, там сплошная заливка читается лучше (компактно, мало
         # текста), поэтому для них старый стиль сохранён.
-        # Была неверная догадка, что "внутренняя рамка" — это тонкая
-        # обводка самой карточки, и её убирали, оставляя только border-left
-        # (жалоба на результат: "убрал все рамки... оставив слева 2
-        # черты" — border-radius с односторонним border-left у Qt рисуется
-        # именно так, кривым обрубком). Внешняя обводка карточки — то, что
-        # нужно было оставить, — восстановлена как было; настоящая "рамка,
-        # обрамлявшая текст" — это стандартная рамка QPlainTextEdit у поля
-        # описания в EventDialog (см. description_edit.setFrameShape ниже).
+        #
+        # Рисуется вручную через QPainter с обрезкой по ОДНОМУ скруглённому
+        # контуру — раньше и фон, и полоска слева, и обводка задавались
+        # через QSS border-radius + border-left одновременно, а Qt рисует
+        # такое сочетание двумя отдельными скруглёнными фигурами вместо
+        # одной цельной карточки (жалоба "убери внутреннюю рамку в
+        # событии" — то, что выглядело как рамка ВНУТРИ карточки, было
+        # именно этим артефактом; более ранняя попытка просто убрать общую
+        # обводку и оставить только border-left тоже не помогла — жалоба на
+        # тот результат была "оставив слева 2 черты", тот же артефакт с
+        # другой стороны). Обрезка по единому clipPath исключает проблему в
+        # принципе — полоска слева рисуется ВНУТРИ уже скруглённого контура,
+        # а не как отдельная скруглённая фигура сама по себе.
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(rect, self._radius, self._radius)
+        painter.setClipPath(path)
+
         if self._pill:
-            outline = "2px solid #1A73E8" if self._selected else "1px solid transparent"
-            self.setStyleSheet(
-                f"background-color: {self._color}; border-radius: {self._radius}; border: {outline};"
-            )
+            painter.fillRect(self.rect(), QColor(self._color))
         else:
-            outline = "2px solid #1A73E8" if self._selected else "1px solid #dadce0"
-            self.setStyleSheet(
-                f"background-color: {_lighten_color(self._color)}; border-radius: {self._radius}; "
-                f"border: {outline}; border-left: 4px solid {self._color};"
-            )
+            painter.fillRect(self.rect(), QColor(_lighten_color(self._color)))
+            accent_width = min(4, self.width())
+            painter.fillRect(QRectF(0, 0, accent_width, self.height()), QColor(self._color))
+
+        painter.setClipping(False)
+        if self._selected:
+            pen = QPen(QColor("#1A73E8"), 2)
+        elif self._pill:
+            pen = QPen(Qt.PenStyle.NoPen)
+        else:
+            pen = QPen(QColor("#dadce0"), 1)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        if pen.style() != Qt.PenStyle.NoPen:
+            painter.drawRoundedRect(rect, self._radius, self._radius)
+        painter.end()
+        super().paintEvent(event)
 
 
 class WeekHeaderWidget(QWidget):
