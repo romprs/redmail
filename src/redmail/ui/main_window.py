@@ -6099,12 +6099,18 @@ class MainWindow(QMainWindow):
             second=0, microsecond=0
         )
         if not start_unchanged:
-            now = datetime.now(timezone.utc)
-            past_cutoff = (
-                now.astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc)
-                if all_day
-                else now
-            )
+            # Граница — начало СЕГОДНЯШНЕГО дня, а не точный текущий момент
+            # (раньше сравнивалось с now() без обрезки времени) — сама
+            # защита предназначалась против назначения встречи ЗАДНИМ ЧИСЛОМ
+            # (см. комментарий выше), а не против конкретного часа. С точным
+            # now() любой клик/двойной клик по ещё не наступившему сегодня
+            # часу (например, 9 утра, пока сейчас день) на пустом месте
+            # сетки недели молча отклонялся этой проверкой — воспринималось
+            # как "событие не создаётся" без какой-либо связи с выбранным
+            # календарём, хотя дело было именно в времени.
+            past_cutoff = datetime.now().astimezone().replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ).astimezone(timezone.utc)
             if start < past_cutoff:
                 QMessageBox.warning(self, "Прошедшее время", "Нельзя запланировать встречу на прошедшую дату/время.")
                 return
@@ -6220,7 +6226,14 @@ class MainWindow(QMainWindow):
         delta = timedelta(days=day_delta, minutes=minute_delta)
         new_start = event.dtstart + delta
         new_end = event.dtend + delta
-        if new_start < datetime.now(timezone.utc):
+        # Граница — начало сегодняшнего дня, не точный текущий момент (та же
+        # правка и по той же причине, что и в _save_event_from_dialog) —
+        # перенос встречи на ещё не наступивший сегодня час не должен
+        # считаться "переносом в прошлое".
+        past_cutoff = datetime.now().astimezone().replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ).astimezone(timezone.utc)
+        if new_start < past_cutoff:
             QMessageBox.warning(self, "Прошедшее время", "Нельзя перенести встречу на прошедшую дату/время.")
             self.refresh_calendar_view()  # вернуть блок на исходное место
             return
