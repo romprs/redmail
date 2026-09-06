@@ -45,6 +45,7 @@ from PySide6.QtGui import (
     QImage,
     QPainter,
     QPainterPath,
+    QPalette,
     QPen,
     QPixmap,
     QTextCharFormat,
@@ -186,6 +187,48 @@ COL_DATE = 6
 # Колонки, по которым имеет смысл искать текстом — по ним же переключается
 # фильтр, когда пользователь встаёт в соответствующую колонку/заголовок.
 _FILTER_COLUMNS: dict[int, str] = {COL_SENDER: "От кого", COL_SUBJECT: "Тема", COL_DATE: "Дата"}
+
+
+class _ThinCheckboxDelegate(QStyledItemDelegate):
+    """Свой рисунок чекбокса отметки письма вместо нативного индикатора
+    Fusion-стиля — у QSS (border: 0.5px) нет реального эффекта, дробная
+    ширина рамки в стилях Qt округляется до целого пикселя (проверено
+    эмпирически: border: 0.5px и border: 1px дают идентичный результат) —
+    единственный способ нарисовать рамку тоньше 1px это самому рисовать
+    линию через QPainter с сглаживанием (pen.setWidthF < 1) — только так
+    получается по-настоящему более тонкая (не просто того же 1px) линия."""
+
+    _SIZE = 13
+    _PEN_WIDTH = 0.6
+
+    def paint(self, painter, option, index) -> None:  # noqa: N802 - Qt override
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+
+        # Через QModelIndex.data() значение может прийти как int (0/1/2), а
+        # не как сам enum Qt.CheckState — сравнение по .value работает в
+        # обоих случаях.
+        state = index.data(Qt.ItemDataRole.CheckStateRole)
+        checked = int(state) == Qt.CheckState.Checked.value if state is not None else False
+        rect = option.rect
+        size = self._SIZE
+        square = QRectF(
+            rect.center().x() - size / 2 + 0.5, rect.center().y() - size / 2 + 0.5, size, size
+        )
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        accent = option.palette.color(QPalette.ColorRole.Highlight)
+        if checked:
+            painter.setBrush(accent)
+            painter.setPen(QPen(accent, self._PEN_WIDTH))
+        else:
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(option.palette.color(QPalette.ColorRole.Text), self._PEN_WIDTH))
+        painter.drawRoundedRect(square, 3, 3)
+        painter.restore()
 
 _FLAG_MARK = "⚑"
 _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
@@ -389,6 +432,14 @@ def _get_mail_web_profile() -> QWebEngineProfile:
             QWebEngineSettings.WebAttribute.FullScreenSupportEnabled,
         ):
             settings.setAttribute(attribute, False)
+        # Тело письма грузится с file:// (см. _render_mail_html) — Chromium
+        # по умолчанию НЕ разрешает содержимому с file:// обращаться к
+        # удалённым http(s)-адресам вовсе (защита от локальных файлов,
+        # ворующих данные по сети), из-за чего внешние картинки в письме
+        # молча не грузились (жалоба: "картинки не подгружаются"). Явно
+        # включаем — доступ к file:// ДРУГИХ файлов при этом всё равно
+        # закрыт отдельно, через _MailRequestInterceptor.
+        settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
         _mail_web_profile = profile
     return _mail_web_profile
 
@@ -2957,6 +3008,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
+        self.table.setItemDelegateForColumn(COL_CHECK, _ThinCheckboxDelegate(self.table))
         self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
