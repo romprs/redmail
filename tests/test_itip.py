@@ -267,3 +267,26 @@ def test_import_ics_saves_events_to_calendar_store(tmp_path: Path) -> None:
     stored = calendar_store.get_event(cal_path, "imported@calendar")
     assert stored is not None
     assert stored.summary == "Импортированное"
+    assert stored.calendar_id == calendar_store.DEFAULT_CALENDAR_ID
+
+
+def test_import_ics_with_calendar_id_tags_events(tmp_path: Path) -> None:
+    # Регрессия: раньше calendar_id всегда оставался default, даже если
+    # импорт делался как "календарь из другого источника" — не было способа
+    # отличить импортированные события от личных (жалоба: "не создаётся
+    # календарь из другого источника").
+    from redmail import calendar_store
+
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\n" + _bare_vevent_ics(
+        "imported2@calendar", "Из другого источника", start
+    ) + b"END:VCALENDAR\r\n"
+
+    cal_path = tmp_path / "test.rmcal"
+    calendar = calendar_store.create_user_calendar(cal_path, "Внешний", "#FF0000")
+    count = itip.import_ics(cal_path, ics, my_email="me@example.com", calendar_id=calendar.id)
+
+    assert count == 1
+    stored = calendar_store.get_event(cal_path, "imported2@calendar")
+    assert stored is not None
+    assert stored.calendar_id == calendar.id

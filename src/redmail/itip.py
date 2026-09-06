@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from email.message import Message
 from pathlib import Path
@@ -87,11 +87,21 @@ def parse_ics_events(ics_bytes: bytes, my_email: str) -> list[Event]:
     return events
 
 
-def import_ics(path: Path, ics_bytes: bytes, my_email: str = "") -> int:
+def import_ics(path: Path, ics_bytes: bytes, my_email: str = "", calendar_id: str | None = None) -> int:
     """Импортирует все события из .ics-файла (выгрузка целого календаря
     внешней системой — например, "Экспорт" из VK Mail/Google/Outlook, а
-    не одиночное приглашение) в локальный calendar_store."""
+    не одиночное приглашение) в локальный calendar_store.
+
+    calendar_id — куда положить импортированные события. Раньше не
+    передавался вовсе, и события всегда попадали в календарь по умолчанию,
+    смешиваясь с личными встречами — не было способа получить именно
+    "календарь из другого источника" отдельным списком со своим
+    цветом/видимостью (жалоба: "не создаётся календарь из другого
+    источника"). None — прежнее поведение (calendar_store.DEFAULT_CALENDAR_ID).
+    """
     events = parse_ics_events(ics_bytes, my_email)
+    if calendar_id is not None:
+        events = [replace(event, calendar_id=calendar_id) for event in events]
     for event in events:
         calendar_store.save_event(path, event)
     return len(events)

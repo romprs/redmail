@@ -16,11 +16,14 @@ from pathlib import Path
 from uuid import uuid4
 
 from PySide6.QtCore import (
+    QBuffer,
     QByteArray,
     QDate,
     QDateTime,
+    QIODevice,
     QObject,
     QPointF,
+    QRect,
     QRectF,
     QSize,
     Qt,
@@ -86,6 +89,8 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QStatusBar,
     QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -169,13 +174,6 @@ COL_ATTACHMENT = 3
 COL_SENDER = 4
 COL_SUBJECT = 5
 COL_DATE = 6
-# Пустая служебная колонка в самом конце — единственная цель её
-# существования - принять на себя setStretchLastSection (см. её
-# использование ниже). Если растягивать саму "Дату", Qt заодно запрещает
-# её вручную тянуть мышью (так уже работает stretchLastSection) — жалоба:
-# "не меняется ширина колонки дата и тема" после того, как "Дата" сама
-# была той растягиваемой колонкой.
-COL_FILLER = 7
 
 # Колонки, по которым имеет смысл искать текстом — по ним же переключается
 # фильтр, когда пользователь встаёт в соответствующую колонку/заголовок.
@@ -1381,6 +1379,32 @@ class EwsAccountDialog(QDialog):
         worker.start()
 
 
+class _ComposeBodyEdit(QTextEdit):
+    """QTextEdit тела письма с вставкой картинки из буфера обмена.
+
+    Обычный QTextEdit.insertFromMimeData игнорирует image/* MIME-данные
+    (скопированную в буфер картинку, а не путь к файлу) — вставлялся только
+    текст/HTML. Жалоба: "вставка изображения из буфера обмена не работает".
+    """
+
+    def __init__(self, on_image_paste, parent=None) -> None:
+        super().__init__(parent)
+        self._on_image_paste = on_image_paste
+
+    def canInsertFromMimeData(self, source) -> bool:  # noqa: N802 - Qt override
+        return source.hasImage() or super().canInsertFromMimeData(source)
+
+    def insertFromMimeData(self, source) -> None:  # noqa: N802 - Qt override
+        if source.hasImage():
+            image = source.imageData()
+            if not isinstance(image, QImage):
+                image = QImage(image)
+            if not image.isNull():
+                self._on_image_paste(image)
+                return
+        super().insertFromMimeData(source)
+
+
 class ComposeDialog(QDialog):
     def __init__(
         self,
@@ -1424,7 +1448,7 @@ class ComposeDialog(QDialog):
         # текста в конструктор/setHtml — цитата ответа/пересылки может
         # содержать "<"/">" (например, адрес в угловых скобках), который
         # иначе разобрался бы как HTML-тег, а не как текст.
-        self.body_edit = QTextEdit()
+        self.body_edit = _ComposeBodyEdit(lambda image: self._insert_image(image, "image/png"))
         self.body_edit.setAcceptRichText(True)
         self._inline_images: dict[str, tuple[str, bytes]] = dict(inline_images) if inline_images else {}
         if body_html:
@@ -1701,8 +1725,16 @@ class ComposeDialog(QDialog):
             QMessageBox.warning(self, "Не удалось вставить изображение", "Файл не распознан как изображение.")
             return
         content_type, _ = mimetypes.guess_type(path)
+        self._insert_image(image, content_type or "image/png", data)
+
+    def _insert_image(self, image: QImage, content_type: str, data: bytes | None = None) -> None:
+        if data is None:
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            image.save(buffer, "PNG")
+            data = bytes(buffer.data())
         cid = f"{uuid4().hex}@redmail"
-        self._inline_images[cid] = (content_type or "image/png", data)
+        self._inline_images[cid] = (content_type, data)
         cursor = self.body_edit.textCursor()
         cursor.insertImage(image, f"cid:{cid}")
 
@@ -2198,6 +2230,7 @@ class EventDialog(QDialog):
         contacts: list[contact_store.Contact] | None = None,
         default_start: datetime | None = None,
         calendars: list[calendar_store.Calendar] | None = None,
+        default_calendar_id: str | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
@@ -2219,7 +2252,14 @@ class EventDialog(QDialog):
         self.calendar_combo = QComboBox(self)
         for cal in calendars:
             self.calendar_combo.addItem(_dot_icon(cal.color), cal.name, cal.id)
-        target_calendar_id = event.calendar_id if event else calendar_store.DEFAULT_CALENDAR_ID
+        # Для НОВОГО события (event is None) — календарь, выбранный в списке
+        # "Мои календари" слева, а не всегда default: иначе, создав новый
+        # календарь и (например, скрыв старый чекбоксом) ожидая, что события
+        # теперь пойдут в него, пользователь получал событие молча
+        # сохранённым под default — который мог быть в этот момент скрыт, и
+        # событие выглядело как будто не создалось (жалоба: "событие не
+        # создаётся в новом календаре").
+        target_calendar_id = event.calendar_id if event else (default_calendar_id or calendar_store.DEFAULT_CALENDAR_ID)
         index = self.calendar_combo.findData(target_calendar_id)
         self.calendar_combo.setCurrentIndex(index if index >= 0 else 0)
 
@@ -2853,16 +2893,21 @@ class MainWindow(QMainWindow):
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
         self.filter_edit.textChanged.connect(self.on_filter_changed)
 
-        self.table = QTableWidget(0, 8, self)
-        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата", ""])
+        self.table = QTableWidget(0, 7, self)
+        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
         self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        # Тема — Interactive, а не Stretch: Qt не даёт вручную тянуть границу
-        # у Stretch-колонки, а пользователю нужно было именно это (жалоба:
-        # "не могу изменить ширину колонки тема"). Ширина по умолчанию —
-        # просто разумная стартовая, реальная запоминается между запусками
-        # через _restore_window_state()/mail_columns_state.
+        # И "Тема", и "Дата" — Interactive (пользователь может тянуть обе
+        # мышью), а не Qt-шный stretchLastSection: тот растягивает СТРОГО
+        # последнюю колонку, но заодно запрещает менять её ширину вручную —
+        # что бы туда ни поставить ("Дату" или пустую служебную колонку под
+        # неё), обязательно ловим жалобу либо "не меняется ширина колонки
+        # дата", либо "пустота после даты, тема не расширяется". Вместо
+        # этого — свой пересчёт: при каждом изменении размера окна "Тема"
+        # сама дотягивается до правого края (см. eventFilter/
+        # _stretch_subject_column), а тянуть её (или "Дату") мышью можно
+        # в любой момент как обычную Interactive-колонку.
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(COL_SUBJECT, 320)
         header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeMode.Interactive)
@@ -2870,17 +2915,6 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
         header.sectionClicked.connect(self._set_filter_column)
-        # Раньше растягивали саму "Дату" (stretchLastSection на последней
-        # реальной колонке) — без этого сумма ширин колонок не зависела от
-        # размера окна, и таблица оставляла пустую полосу справа (жалоба:
-        # "таблица... не растягивается на все окно"). Но stretchLastSection
-        # заодно запрещает пользователю вручную менять ширину той колонки,
-        # на которую он указывает — новая жалоба: "не меняется ширина
-        # колонки дата и тема". Решение — пустая служебная COL_FILLER в
-        # самом конце: она и растягивается, а "Дата"/"Тема" остаются
-        # обычными Interactive-колонками, как раньше.
-        header.setSectionResizeMode(COL_FILLER, QHeaderView.ResizeMode.Stretch)
-        header.setStretchLastSection(True)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -3025,6 +3059,10 @@ class MainWindow(QMainWindow):
         self.right_splitter.addWidget(reading_container)
         self.right_splitter.setStretchFactor(0, 2)
         self.right_splitter.setStretchFactor(1, 1)
+        # Перетаскивание сплиттера меняет доступную ширину таблицы без
+        # изменения размера самого окна (resizeEvent на него не сработает) —
+        # тоже должно пересчитывать "Тему" (см. _stretch_subject_column).
+        self.right_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_subject_column())
         self._apply_pane_orientation()
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -3033,6 +3071,7 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([220, 980])
+        main_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_subject_column())
 
         self.calendar_week_start = week_start_for(date.today())
         self.selected_calendar_event: calendar_store.Event | None = None
@@ -3123,7 +3162,13 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(calendars_group)
         sidebar_layout.addStretch(1)
 
-        self.calendar_selected_day: date | None = None
+        # По умолчанию — сегодня, а не None: иначе при первом открытии
+        # календаря highlighted_day в refresh_calendar_view() откатывался на
+        # начало недели/месяца (self.calendar_week_start/calendar_month_anchor),
+        # и мини-календарь слева подсвечивал не сегодняшнее число, а, например,
+        # понедельник текущей недели (жалоба: "при открытии календаря не
+        # устанавливается текущие месяц и число").
+        self.calendar_selected_day: date | None = date.today()
         self._mini_picker_target_day: date | None = None
         self.calendar_week_header = WeekHeaderWidget(self)
         self.calendar_week_header.dayClicked.connect(self.on_calendar_day_clicked)
@@ -3351,14 +3396,39 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # сохранённое расположение не подошло (например, число колонок изменилось) — не критично
         finally:
-            # restoreState() выше восстанавливает ВСЕ свойства заголовка из
-            # сохранённого состояния, включая stretchLastSection — у любого,
-            # кто уже пользовался приложением до этого исправления, в файле
-            # лежит старое состояние с этим флагом выключенным, и оно молча
-            # перетирало fix из setStretchLastSection(True) выше сразу же
-            # после его установки (жалоба: "табличная часть не
-            # растягивается" — уже после того, как это вроде бы исправили).
-            self.table.horizontalHeader().setStretchLastSection(True)
+            # Пересчитать "Тему" под фактическую ширину ПОСЛЕ восстановления
+            # геометрии — сохранённая ширина колонки могла быть посчитана
+            # под другой размер окна.
+            self._schedule_stretch_subject_column()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._schedule_stretch_subject_column()
+
+    def _schedule_stretch_subject_column(self) -> None:
+        # Отложено на следующий цикл событий: resizeEvent верхнего окна
+        # доставляется ДО того, как Qt пересчитает геометрию вложенных
+        # сплиттеров/таблицы — если читать self.table.viewport().width()
+        # прямо здесь, там ещё старое (или вовсе не размеченное) значение,
+        # и "Тема" застревала на минимальной ширине вместо реального
+        # растягивания (жалоба вернулась: "тема не расширяется", хотя код
+        # уже пытался это делать). К следующему тику раскладка уже готова.
+        QTimer.singleShot(0, self._stretch_subject_column)
+
+    def _stretch_subject_column(self) -> None:
+        # "Тема" — единственная колонка, которая тянется до правого края
+        # (жалоба: "таблица не растягивается на всё окно"), но обычным
+        # Qt-шным stretchLastSection этого не добиться без потери
+        # возможности потянуть её (или соседнюю "Дату") мышью — см.
+        # комментарий у создания self.table выше. Пересчитываем вручную по
+        # событию изменения размера: сколько места остаётся после всех
+        # ОСТАЛЬНЫХ колонок — столько и отдаём "Теме", не трогая их
+        # собственную, уже выставленную пользователем ширину.
+        header = self.table.horizontalHeader()
+        other_width = sum(header.sectionSize(col) for col in range(header.count()) if col != COL_SUBJECT)
+        available = self.table.viewport().width()
+        min_width = 120
+        header.resizeSection(COL_SUBJECT, max(min_width, available - other_width))
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
@@ -4209,6 +4279,10 @@ class MainWindow(QMainWindow):
             Qt.Orientation.Horizontal if self.pane_orientation == "horizontal" else Qt.Orientation.Vertical
         )
         self.right_splitter.setOrientation(orientation)
+        # Смена ориентации панели чтения меняет доступную под таблицу
+        # ширину (горизонтально — делит её с панелью письма, вертикально —
+        # нет), но не размер самого окна — resizeEvent на это не сработает.
+        self._schedule_stretch_subject_column()
 
     def on_font_scale_preview(self, value: int) -> None:
         self.font_scale_label.setText(f"{value}%")
@@ -4577,7 +4651,16 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(len(summaries))
         for row, summary in enumerate(summaries):
             check_item = QTableWidgetItem()
-            check_item.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            # ItemIsSelectable — без него Qt при selectRow()/выборе строки
+            # мышью не включает эту ячейку в выделение (QItemSelectionModel
+            # пропускает несовместимые с выделением индексы), и в столбце
+            # чекбокса оставался видимый "провал" на фоне подсвеченной
+            # остальной строки. Жалоба: "выбор письма в тёмной теме опять же
+            # невиден... но зато выделяется часть поля" — именно этот провал
+            # и был той "невыделенной частью".
+            check_item.setFlags(
+                Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+            )
             check_item.setCheckState(Qt.CheckState.Unchecked)
             check_item.setData(Qt.ItemDataRole.UserRole, summary.uid)
             self.table.setItem(row, COL_CHECK, check_item)
@@ -5267,6 +5350,7 @@ class MainWindow(QMainWindow):
     def on_calendar_today(self) -> None:
         self.calendar_week_start = week_start_for(date.today())
         self.calendar_month_anchor = date.today().replace(day=1)
+        self.calendar_selected_day = date.today()
         self.refresh_calendar_view()
 
     def on_calendar_view_mode_changed(self, text: str) -> None:
@@ -5291,14 +5375,36 @@ class MainWindow(QMainWindow):
         path_str, _ = QFileDialog.getOpenFileName(self, "Выбрать файл .ics", filter="iCalendar (*.ics)")
         if not path_str:
             return
+        # Раньше импорт всегда сваливал события в календарь по умолчанию,
+        # смешивая их с личными встречами — не было способа получить именно
+        # "календарь из другого источника" отдельным списком со своим
+        # именем/цветом/видимостью (жалоба: "не создаётся календарь из
+        # другого источника"). Теперь импорт создаёт для него отдельный
+        # календарь, по умолчанию названный по имени файла.
+        suggested_name = Path(path_str).stem
+        name, ok = QInputDialog.getText(
+            self, "Импорт календаря", "Название для импортированного календаря:", text=suggested_name
+        )
+        if not ok:
+            return
+        name = name.strip() or suggested_name
         try:
+            used_colors = {cal.color for cal in self._load_calendars()}
+            color = next(
+                (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
+                _EVENT_COLOR_PALETTE[0][1],
+            )
+            calendar = calendar_store.create_user_calendar(self.calendar_path, name, color)
             data = Path(path_str).read_bytes()
-            count = itip.import_ics(self.calendar_path, data, self.account.username if self.account else "")
+            count = itip.import_ics(
+                self.calendar_path, data, self.account.username if self.account else "", calendar_id=calendar.id
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка импорта", str(exc))
             return
+        self._refresh_calendars_list(select_id=calendar.id)
         self.refresh_calendar_view()
-        self.statusBar().showMessage(f"Импортировано событий: {count}", 5000)
+        self.statusBar().showMessage(f"Импортировано событий: {count} (календарь «{name}»)", 5000)
 
     def on_caldav_sync(self) -> None:
         """Ручная синхронизация по кнопке — не по таймеру. Сервер ни разу
@@ -5426,8 +5532,10 @@ class MainWindow(QMainWindow):
             anchor = self.calendar_week_start + timedelta(days=3)
             self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
             self.calendar_week_header.set_week_start(self.calendar_week_start)
+            self.calendar_week_header.set_selected_day(self.calendar_selected_day)
             self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
             self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
+            self.calendar_week_grid.set_selected_day(self.calendar_selected_day)
             # Раньше здесь всегда подставлялся понедельник недели — если
             # пользователь кликал в мини-календаре не по понедельнику
             # (например, 21.08 — пятница), тот же refresh_calendar_view()
@@ -5622,12 +5730,15 @@ class MainWindow(QMainWindow):
             # выбрал день в шапке календаря, событие по умолчанию ставим
             # туда, а не всегда на "сейчас+час".
             default_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
+        current_item = self.calendars_list.currentItem()
+        default_calendar_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
         dialog = EventDialog(
             self,
             my_email=self.account.username,
             contacts=self._load_contacts(),
             default_start=default_start,
             calendars=self._load_calendars(),
+            default_calendar_id=default_calendar_id,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

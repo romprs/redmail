@@ -68,6 +68,45 @@ def test_message_content_round_trip_with_attachment(tmp_path: Path) -> None:
         assert cached.attachments[0].payload == b"hello"
 
 
+def test_message_content_round_trip_with_html_and_inline_images(tmp_path: Path) -> None:
+    # Регрессия: get_message_content/save_message_content раньше сохраняли
+    # только content.text — html, inline_images и реквизиты (from_/to/cc/bcc)
+    # молча терялись, и при повторном открытии письма из кэша оно всегда
+    # показывалось как голый текст без картинок, даже если сервер отдавал
+    # полноценный HTML (жалоба: "Ошибка отображения осталась").
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        content = MessageContent(
+            text="Plain fallback",
+            html="<p>Привет <img src='cid:logo123'></p>",
+            inline_images={"logo123": ("image/png", b"\x89PNG...")},
+            from_="sender@example.com",
+            to="me@example.com",
+            cc="cc@example.com",
+            bcc="bcc@example.com",
+        )
+        cache_store.save_message_content("acc", "INBOX", 99, content)
+
+        cached = cache_store.get_message_content("acc", "INBOX", 99)
+        assert cached is not None
+        assert cached.html == "<p>Привет <img src='cid:logo123'></p>"
+        assert cached.inline_images == {"logo123": ("image/png", b"\x89PNG...")}
+        assert cached.from_ == "sender@example.com"
+        assert cached.to == "me@example.com"
+        assert cached.cc == "cc@example.com"
+        assert cached.bcc == "bcc@example.com"
+
+        # Повторное сохранение (например, письмо переоткрыли) не должно
+        # оставлять "хвост" старых inline-картинок от предыдущей версии.
+        cache_store.save_message_content(
+            "acc", "INBOX", 99, MessageContent(text="Plain fallback", html="<p>updated</p>")
+        )
+        cached_again = cache_store.get_message_content("acc", "INBOX", 99)
+        assert cached_again is not None
+        assert cached_again.html == "<p>updated</p>"
+        assert cached_again.inline_images == {}
+
+
 def test_message_content_can_be_cached_before_folder_is_listed(tmp_path: Path) -> None:
     # Например: письмо только что отправлено и сразу открыто, до того как
     # список папки вообще был закэширован.
