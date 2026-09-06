@@ -126,6 +126,7 @@ from redmail.config_store import (
     load_mail_columns_state,
     load_mail_date_column_pinned,
     load_mail_rules,
+    load_mail_splitters_state,
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
@@ -141,6 +142,7 @@ from redmail.config_store import (
     save_mail_columns_state,
     save_mail_date_column_pinned,
     save_mail_rules,
+    save_mail_splitters_state,
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
@@ -231,7 +233,9 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
             # Серый, а не палитровый Text (белый в тёмной теме/почти чёрный
             # в светлой — слишком контрастно на фоне и без того тонкой
             # линии) — светло-серый на тёмном фоне, тёмно-серый на светлом.
-            border_color = QColor("#8a8d91") if app_theme.is_dark() else QColor("#5f6368")
+            # На тёмном фоне светлее прежнего (жалоба: "рамку почти не
+            # видно, сделай на пару тонов ярче").
+            border_color = QColor("#a9adb3") if app_theme.is_dark() else QColor("#5f6368")
             painter.setPen(QPen(border_color, self._PEN_WIDTH))
         painter.drawRoundedRect(square, 3, 3)
         painter.restore()
@@ -3203,19 +3207,26 @@ class MainWindow(QMainWindow):
         self.right_splitter.addWidget(reading_container)
         self.right_splitter.setStretchFactor(0, 2)
         self.right_splitter.setStretchFactor(1, 1)
+        # setStretchFactor управляет только распределением ДОПОЛНИТЕЛЬНОГО
+        # места при последующих resize — без явного setSizes() сам QSplitter
+        # при первой раскладке делит место строго пополам между списком
+        # писем и панелью чтения (жалоба: "поле просмотра письма делится
+        # пополам"), пока пользователь ни разу не потянул границу вручную —
+        # ниже более уместные 2:1 умолчания на первый запуск.
+        self.right_splitter.setSizes([500, 250])
         # Перетаскивание сплиттера меняет доступную ширину таблицы без
         # изменения размера самого окна (resizeEvent на него не сработает) —
         # тоже должно пересчитывать "Дату" (см. _stretch_date_column).
         self.right_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_date_column())
         self._apply_pane_orientation()
 
-        main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        main_splitter.addWidget(self.folder_tree)
-        main_splitter.addWidget(self.right_splitter)
-        main_splitter.setStretchFactor(0, 0)
-        main_splitter.setStretchFactor(1, 1)
-        main_splitter.setSizes([220, 980])
-        main_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_date_column())
+        self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
+        self.main_splitter.addWidget(self.folder_tree)
+        self.main_splitter.addWidget(self.right_splitter)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([220, 980])
+        self.main_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_date_column())
 
         self.calendar_week_start = week_start_for(date.today())
         self.selected_calendar_event: calendar_store.Event | None = None
@@ -3411,7 +3422,7 @@ class MainWindow(QMainWindow):
         contacts_layout.addWidget(self.contacts_table)
 
         self.pages = QStackedWidget(self)
-        self.pages.addWidget(main_splitter)  # 0: почта
+        self.pages.addWidget(self.main_splitter)  # 0: почта
         self.pages.addWidget(calendar_page)  # 1: календарь
         self.pages.addWidget(contacts_page)  # 2: контакты
         self.setCentralWidget(self.pages)
@@ -3550,6 +3561,12 @@ class MainWindow(QMainWindow):
             geometry = load_window_geometry()
             if geometry:
                 self.restoreGeometry(QByteArray(geometry))
+            splitters_state = load_mail_splitters_state()
+            if splitters_state:
+                if "main" in splitters_state:
+                    self.main_splitter.restoreState(QByteArray(splitters_state["main"]))
+                if "right" in splitters_state:
+                    self.right_splitter.restoreState(QByteArray(splitters_state["right"]))
             columns_state = load_mail_columns_state()
             if columns_state:
                 self.table.horizontalHeader().restoreState(QByteArray(columns_state))
@@ -6665,6 +6682,21 @@ class MainWindow(QMainWindow):
         try:
             save_window_geometry(bytes(self.saveGeometry()))
             save_mail_columns_state(bytes(self.table.horizontalHeader().saveState()))
+            # Раньше положение сплиттеров (ширина списка папок, доля
+            # списка писем/панели чтения) нигде не сохранялось вовсе —
+            # всегда сбрасывалось на жёстко заданные умолчания при
+            # следующем запуске (жалоба: "настройка окна со списком почты
+            # не сохраняется"), а вместе с ЗАКРЕПЛЁННОЙ шириной "Даты" (см.
+            # _date_column_pinned) это давало особенно кривой результат:
+            # список писем сжимался в узкую полоску умолчаний, а "Дата"
+            # оставалась той же широкой, что и в прошлый раз, выдавливая
+            # остальные колонки.
+            save_mail_splitters_state(
+                {
+                    "main": bytes(self.main_splitter.saveState()),
+                    "right": bytes(self.right_splitter.saveState()),
+                }
+            )
         except Exception:
             pass  # расположение окна/колонок не запомнится между запусками — не критично
         super().closeEvent(event)

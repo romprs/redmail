@@ -238,6 +238,19 @@ def save_mail_date_column_pinned(pinned: bool) -> None:
     _save_settings_dict(settings)
 
 
+def load_mail_splitters_state() -> dict[str, bytes] | None:
+    value = _load_settings_dict().get("mail_splitters_state")
+    if not value:
+        return None
+    return {key: base64.b64decode(encoded) for key, encoded in value.items()}
+
+
+def save_mail_splitters_state(state: dict[str, bytes]) -> None:
+    settings = _load_settings_dict()
+    settings["mail_splitters_state"] = {key: base64.b64encode(data).decode("ascii") for key, data in state.items()}
+    _save_settings_dict(settings)
+
+
 def load_open_archives() -> list[str]:
     value = _load_settings_dict().get("open_archives", [])
     return [str(p) for p in value] if isinstance(value, list) else []
