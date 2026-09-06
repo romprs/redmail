@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        35%{?dist}
+Release:        36%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,15 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-36
+- HTML-письма теперь отрисовываются настоящим браузерным движком
+  (Chromium через QWebEngineView) вместо упрощённого текстового виджета
+  Qt - раньше сложные маркетинговые письма с картинками-подложками и
+  блоками рядом отображались криво (текст поверх картинки внахлёст).
+  Просмотр писем по-прежнему защищён: JavaScript, локальное хранилище и
+  cookie в письмах полностью отключены, клик по ссылке открывает
+  системный браузер, а не саму программу
+
 * Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-35
 - Список писем: при ручном сужении колонки "Тема" мышью справа больше не
   остаётся пустоты - освободившееся место теперь всегда забирает "Дата"
