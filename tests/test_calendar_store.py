@@ -370,6 +370,40 @@ def test_create_user_calendar_round_trip(tmp_path: Path) -> None:
     assert created.visible is True
 
 
+def test_create_user_calendar_defaults_to_local_source(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")
+    assert created.source_type == calendar_store.SOURCE_LOCAL
+    assert created.caldav_url == ""
+    (from_list,) = [c for c in calendar_store.list_calendars(path) if c.id == created.id]
+    assert from_list.source_type == calendar_store.SOURCE_LOCAL
+
+
+def test_create_caldav_calendar_round_trip(tmp_path: Path) -> None:
+    # Раньше был единственный CalDAV-адрес на весь аккаунт (в Параметрах) —
+    # теперь источник настраивается per-календарь, несколько внешних
+    # календарей могут сосуществовать с локальными.
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(
+        path, "Внешний", "#00897B", source_type=calendar_store.SOURCE_CALDAV, caldav_url="https://caldav.example.com/"
+    )
+    assert created.source_type == calendar_store.SOURCE_CALDAV
+    assert created.caldav_url == "https://caldav.example.com/"
+    (from_list,) = [c for c in calendar_store.list_calendars(path) if c.id == created.id]
+    assert from_list.source_type == calendar_store.SOURCE_CALDAV
+    assert from_list.caldav_url == "https://caldav.example.com/"
+
+
+def test_set_calendar_caldav_url_updates_existing_calendar(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    created = calendar_store.create_user_calendar(
+        path, "Внешний", "#00897B", source_type=calendar_store.SOURCE_CALDAV, caldav_url="https://old.example.com/"
+    )
+    calendar_store.set_calendar_caldav_url(path, created.id, "https://new.example.com/")
+    (updated,) = [c for c in calendar_store.list_calendars(path) if c.id == created.id]
+    assert updated.caldav_url == "https://new.example.com/"
+
+
 def test_rename_and_recolor_calendar(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcal"
     created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")

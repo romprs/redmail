@@ -5,6 +5,7 @@ import html
 import math
 import os
 from collections.abc import Callable
+from dataclasses import replace
 import mimetypes
 import re
 import shutil
@@ -1071,7 +1072,6 @@ class SettingsDialog(QDialog):
         smtp: SmtpAccount | None = None,
         poll_interval_minutes: int = 5,
         pane_orientation: str = "vertical",
-        caldav_url: str = "",
         archive_storage_dir: Path | None = None,
         theme: str = "light",
     ):
@@ -1167,22 +1167,6 @@ class SettingsDialog(QDialog):
         general_group = QGroupBox("Общие")
         general_group.setLayout(general_form)
 
-        self.caldav_url_edit = QLineEdit(caldav_url)
-        self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/ (необязательно)")
-
-        self.caldav_test_button = QPushButton("Проверить подключение")
-        self.caldav_test_button.clicked.connect(self._on_test_caldav)
-        self.caldav_test_status = QLabel("")
-        self.caldav_test_status.setWordWrap(True)
-        self._caldav_test_worker: object | None = None
-
-        caldav_form = QFormLayout()
-        caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
-        caldav_form.addRow(self.caldav_test_button)
-        caldav_form.addRow(self.caldav_test_status)
-        caldav_group = QGroupBox("Календарь (CalDAV) — логин и пароль те же, что для IMAP выше")
-        caldav_group.setLayout(caldav_form)
-
         self.archive_dir_edit = QLineEdit(str(archive_storage_dir or default_archive_storage_dir()))
         archive_dir_browse = QPushButton("Обзор…", self)
         archive_dir_browse.clicked.connect(self._on_browse_archive_dir)
@@ -1232,7 +1216,6 @@ class SettingsDialog(QDialog):
         layout.addWidget(imap_group)
         layout.addWidget(smtp_group)
         layout.addWidget(general_group)
-        layout.addWidget(caldav_group)
         layout.addWidget(archive_dir_group)
         layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
@@ -1298,45 +1281,6 @@ class SettingsDialog(QDialog):
         self._smtp_test_worker = worker
         worker.start()
 
-    def _on_test_caldav(self) -> None:
-        url = self.caldav_url_edit.text().strip()
-        if not url:
-            QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для проверки.")
-            return
-        # Логин/пароль — те же, что для IMAP (см. заголовок группы) — если
-        # выбран SSO, пароля нет и здесь: у CalDAV в этом приложении нет
-        # отдельной поддержки Kerberos, проверка честно покажет ошибку входа.
-        caldav_account = caldav_sync.CalDavAccount(
-            url=url, username=self.user_edit.text().strip(), password=self.password_edit.text()
-        )
-        self.caldav_test_button.setEnabled(False)
-        self.caldav_test_status.setText("Проверка подключения…")
-
-        def connect_and_list_calendars() -> int:
-            session = caldav_sync.CalDavSession(caldav_account)
-            try:
-                return len(session.list_calendar_names())
-            finally:
-                session.close()
-
-        worker = _CallableWorker(connect_and_list_calendars, parent=self)
-
-        def on_success(calendar_count: object) -> None:
-            self.caldav_test_status.setText(f"Подключение успешно, календарей найдено: {calendar_count}")
-            self.caldav_test_button.setEnabled(True)
-            self._caldav_test_worker = None
-
-        def on_failure(error_text: str) -> None:
-            self.caldav_test_status.setText("")
-            QMessageBox.critical(self, "Не удалось подключиться (CalDAV)", error_text)
-            self.caldav_test_button.setEnabled(True)
-            self._caldav_test_worker = None
-
-        worker.succeeded.connect(on_success)
-        worker.failed.connect(on_failure)
-        self._caldav_test_worker = worker
-        worker.start()
-
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
         if chosen:
@@ -1396,9 +1340,6 @@ class SettingsDialog(QDialog):
 
     def theme(self) -> str:
         return self.theme_combo.currentData()
-
-    def caldav_url(self) -> str:
-        return self.caldav_url_edit.text().strip()
 
 
 class EwsAccountDialog(QDialog):
@@ -2338,6 +2279,139 @@ _RECURRENCE_OPTIONS: list[tuple[str, str | None]] = [
 ]
 
 
+class AddCalendarDialog(QDialog):
+    """Новый календарь — локальный или подключённый к внешнему CalDAV-серверу.
+
+    Раньше адрес CalDAV-сервера был один на весь аккаунт и настраивался в
+    Параметрах — нельзя было подключить несколько внешних календарей и
+    смешивать их с локальными (пожелание: "лучше сделать настройку
+    календаря не в параметрах, а у самого календаря"). Google-календарь
+    показан в списке источников честно ОТКЛЮЧЁННЫМ пунктом, а не рабочей
+    заглушкой — у Google CalDAV давно урезан для новых интеграций, нужна
+    отдельная OAuth2-интеграция с Google Calendar API, которой здесь пока
+    нет и которую нет смысла изображать частично работающей."""
+
+    def __init__(self, parent=None, *, my_email: str = "", my_password: str = "", used_colors: set[str] | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Новый календарь")
+        self._my_email = my_email
+        self._my_password = my_password
+        self._test_workers: list[QThread] = []
+
+        self.name_edit = QLineEdit(self)
+        self.name_edit.setPlaceholderText("Например, «Работа»")
+
+        used_colors = used_colors or set()
+        self.color_combo = QComboBox(self)
+        for label, hexval in _EVENT_COLOR_PALETTE:
+            self.color_combo.addItem(_dot_icon(hexval), label, hexval)
+        default_color = next(
+            (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
+            _EVENT_COLOR_PALETTE[0][1],
+        )
+        default_index = self.color_combo.findData(default_color)
+        self.color_combo.setCurrentIndex(default_index if default_index >= 0 else 0)
+
+        self.source_combo = QComboBox(self)
+        self.source_combo.addItem("Локальный", calendar_store.SOURCE_LOCAL)
+        self.source_combo.addItem("CalDAV (VK Mail, Exchange и др.)", calendar_store.SOURCE_CALDAV)
+        self.source_combo.addItem("Google — пока не поддерживается", "google")
+        google_item = self.source_combo.model().item(self.source_combo.count() - 1)
+        google_item.setEnabled(False)
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+
+        self.caldav_url_edit = QLineEdit(self)
+        self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/")
+        caldav_hint_label = QLabel("Логин и пароль — те же, что для почты этого аккаунта.", self)
+        caldav_hint_label.setWordWrap(True)
+        self.caldav_test_button = QPushButton("Проверить подключение", self)
+        self.caldav_test_button.clicked.connect(self._on_test_connection)
+        self.caldav_test_status = QLabel("", self)
+        self.caldav_test_status.setWordWrap(True)
+
+        self.caldav_group = QGroupBox("Подключение CalDAV", self)
+        caldav_form = QFormLayout()
+        caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
+        caldav_form.addRow(caldav_hint_label)
+        caldav_form.addRow(self.caldav_test_button)
+        caldav_form.addRow(self.caldav_test_status)
+        self.caldav_group.setLayout(caldav_form)
+
+        form = QFormLayout()
+        form.addRow("Название", self.name_edit)
+        form.addRow("Цвет", self.color_combo)
+        form.addRow("Источник", self.source_combo)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self._on_accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.caldav_group)
+        layout.addStretch(1)
+        layout.addWidget(buttons)
+
+        self._on_source_changed()
+
+    def _on_source_changed(self) -> None:
+        self.caldav_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_CALDAV)
+
+    def _on_test_connection(self) -> None:
+        url = self.caldav_url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для проверки.")
+            return
+        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        self.caldav_test_button.setEnabled(False)
+        self.caldav_test_status.setText("Проверка подключения…")
+
+        def connect_and_list_calendars() -> int:
+            session = caldav_sync.CalDavSession(account)
+            try:
+                return len(session.list_calendar_names())
+            finally:
+                session.close()
+
+        worker = _CallableWorker(connect_and_list_calendars, parent=self)
+
+        def on_success(calendar_count: object) -> None:
+            self.caldav_test_status.setText(f"Подключение успешно, календарей найдено: {calendar_count}")
+            self.caldav_test_button.setEnabled(True)
+            self._test_workers.remove(worker)
+
+        def on_failure(error_text: str) -> None:
+            self.caldav_test_status.setText(f"Ошибка: {error_text}")
+            self.caldav_test_button.setEnabled(True)
+            self._test_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._test_workers.append(worker)
+        worker.start()
+
+    def _on_accept(self) -> None:
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Укажите название", "Название календаря обязательно.")
+            return
+        if self.source_combo.currentData() == calendar_store.SOURCE_CALDAV and not self.caldav_url_edit.text().strip():
+            QMessageBox.warning(self, "Укажите адрес", "Адрес CalDAV-сервера обязателен для этого источника.")
+            return
+        self.accept()
+
+    def name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def color(self) -> str:
+        return self.color_combo.currentData()
+
+    def source_type(self) -> str:
+        return self.source_combo.currentData()
+
+    def caldav_url(self) -> str:
+        return self.caldav_url_edit.text().strip()
+
+
 class EventDialog(QDialog):
     """Создание встречи и редактирование своей — тот же диалог: правка
     существующей организованной встречи это и есть перенос (см.
@@ -3001,7 +3075,6 @@ class MainWindow(QMainWindow):
         self.poll_interval_minutes = load_poll_interval_minutes()
         self.pane_orientation = load_pane_orientation()
         self.theme = load_theme()
-        self.caldav_url = load_caldav_url()
         self.archive_storage_dir = load_archive_storage_dir()
         self.mail_rules: list[MailRule] = load_mail_rules()
         self.signatures: list[Signature] = load_signatures()
@@ -3018,6 +3091,29 @@ class MainWindow(QMainWindow):
         # Один локальный календарь на пользователя (не на учётную запись —
         # как и почтовый кэш, это просто локальное состояние приложения).
         self.calendar_path = app_dir() / "calendar.rmcal"
+        # Разовая миграция: раньше был единственный общий адрес CalDAV на
+        # весь аккаунт (настраивался в Параметрах) — источник CalDAV теперь
+        # настраивается per-календарь (см. AddCalendarDialog), пожелание
+        # "лучше сделать настройку календаря не в параметрах, а у самого
+        # календаря". Чтобы уже настроенная синхронизация не пропала молча
+        # при обновлении, превращаем старую настройку в обычный
+        # CalDAV-календарь один раз и стираем её, чтобы не повторять
+        # миграцию при каждом запуске.
+        legacy_caldav_url = load_caldav_url()
+        if legacy_caldav_url:
+            try:
+                has_caldav_calendar = any(
+                    cal.source_type == calendar_store.SOURCE_CALDAV
+                    for cal in calendar_store.list_calendars(self.calendar_path)
+                )
+                if not has_caldav_calendar:
+                    calendar_store.create_user_calendar(
+                        self.calendar_path, "CalDAV", "#00897B",
+                        source_type=calendar_store.SOURCE_CALDAV, caldav_url=legacy_caldav_url,
+                    )
+                save_caldav_url("")
+            except Exception:
+                pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
         self.contacts_path = app_dir() / "contacts.rmcontacts"
         self.current_invite: itip.IncomingInvite | None = None
         self.selected_contact: contact_store.Contact | None = None
@@ -4389,7 +4485,6 @@ class MainWindow(QMainWindow):
             smtp=self.smtp_account,
             poll_interval_minutes=self.poll_interval_minutes,
             pane_orientation=self.pane_orientation,
-            caldav_url=self.caldav_url,
             archive_storage_dir=self.archive_storage_dir,
             theme=self.theme,
         )
@@ -4398,7 +4493,6 @@ class MainWindow(QMainWindow):
 
         self.poll_interval_minutes = dialog.poll_interval_minutes()
         self.pane_orientation = dialog.pane_orientation()
-        self.caldav_url = dialog.caldav_url()
         self.archive_storage_dir = dialog.archive_storage_dir()
         new_theme = dialog.theme()
         theme_changed = new_theme != self.theme
@@ -4406,7 +4500,6 @@ class MainWindow(QMainWindow):
         try:
             save_poll_interval_minutes(self.poll_interval_minutes)
             save_pane_orientation(self.pane_orientation)
-            save_caldav_url(self.caldav_url)
             save_archive_storage_dir(self.archive_storage_dir)
             save_theme(self.theme)
         except Exception as exc:
@@ -5655,51 +5748,66 @@ class MainWindow(QMainWindow):
         if not self.account:
             QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
             return
-        if not self.caldav_url:
+        caldav_calendars = [
+            cal for cal in calendar_store.list_calendars(self.calendar_path)
+            if cal.source_type == calendar_store.SOURCE_CALDAV
+        ]
+        if not caldav_calendars:
             QMessageBox.information(
-                self, "CalDAV не настроен", "Укажите адрес CalDAV-сервера в Параметрах (раздел «Календарь»)."
+                self, "CalDAV не настроен",
+                "Добавьте календарь с источником CalDAV через «+ Добавить календарь».",
             )
             return
 
-        account = caldav_sync.CalDavAccount(
-            url=self.caldav_url, username=self.account.username, password=self.account.password
-        )
+        username = self.account.username
+        password = getattr(self.account, "password", "")
         calendar_path = self.calendar_path
         window_start = datetime.now(timezone.utc) - timedelta(days=30)
         window_end = datetime.now(timezone.utc) + timedelta(days=180)
 
         def do_sync() -> tuple[int, int]:
-            session = caldav_sync.CalDavSession(account)
-            try:
-                # Сначала отправляем локальные изменения (свои встречи),
-                # потом забираем с сервера — если сделать наоборот, свежая
-                # локальная правка, ещё не отправленная, могла бы затереться
-                # устаревшей версией с сервера при получении.
-                pushed = 0
-                local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
-                for event in local_events:
-                    if event.is_organizer and event.status != "cancelled":
-                        session.push_event(event, account.username, account.username)
-                        pushed += 1
+            # Раньше был ровно один CalDAV-адрес на весь аккаунт — теперь
+            # календарей с источником CalDAV может быть несколько, каждый
+            # синхронизируется отдельно со своим сервером, а полученные
+            # события помечаются ИМЕННО тем calendar_id, к которому
+            # относится синхронизация (раньше calendar_id для них вообще
+            # не проставлялся, событие с сервера всегда попадало в default).
+            total_pushed = 0
+            total_pulled = 0
+            local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
+            for cal in caldav_calendars:
+                account = caldav_sync.CalDavAccount(url=cal.caldav_url, username=username, password=password)
+                session = caldav_sync.CalDavSession(account)
+                try:
+                    # Сначала отправляем локальные изменения (свои встречи
+                    # ЭТОГО календаря), потом забираем с сервера — если
+                    # сделать наоборот, свежая локальная правка, ещё не
+                    # отправленная, могла бы затереться устаревшей версией
+                    # с сервера при получении.
+                    for event in local_events:
+                        if event.calendar_id == cal.id and event.is_organizer and event.status != "cancelled":
+                            session.push_event(event, username, username)
+                            total_pushed += 1
 
-                pulled = 0
-                server_events = session.fetch_events(window_start, window_end, account.username)
-                for event in server_events:
-                    # CalDAV-сервер ничего не знает о наших полях, которых
-                    # нет в стандартном iCalendar (ручной цвет события) и
-                    # может не хранить произвольные вложения — не даём
-                    # синхронизации тихо стереть то, что есть только локально.
-                    existing_local = calendar_store.get_event(calendar_path, event.uid)
-                    if existing_local:
-                        if not event.attachments and existing_local.attachments:
-                            event.attachments = existing_local.attachments
-                        if not event.color and existing_local.color:
-                            event.color = existing_local.color
-                    calendar_store.save_event(calendar_path, event)
-                    pulled += 1
-                return pushed, pulled
-            finally:
-                session.close()
+                    server_events = session.fetch_events(window_start, window_end, username)
+                    for event in server_events:
+                        event = replace(event, calendar_id=cal.id)
+                        # CalDAV-сервер ничего не знает о наших полях,
+                        # которых нет в стандартном iCalendar (ручной цвет
+                        # события) и может не хранить произвольные
+                        # вложения — не даём синхронизации тихо стереть то,
+                        # что есть только локально.
+                        existing_local = calendar_store.get_event(calendar_path, event.uid)
+                        if existing_local:
+                            if not event.attachments and existing_local.attachments:
+                                event.attachments = existing_local.attachments
+                            if not event.color and existing_local.color:
+                                event.color = existing_local.color
+                        calendar_store.save_event(calendar_path, event)
+                        total_pulled += 1
+                finally:
+                    session.close()
+            return total_pushed, total_pulled
 
         self.statusBar().showMessage("Синхронизация с CalDAV…")
         worker = _CallableWorker(do_sync, parent=self)
@@ -5852,17 +5960,20 @@ class MainWindow(QMainWindow):
         self.refresh_calendar_view()
 
     def on_add_calendar(self) -> None:
-        name, ok = QInputDialog.getText(self, "Новый календарь", "Название календаря:")
-        name = name.strip()
-        if not ok or not name:
-            return
         used_colors = {cal.color for cal in self._calendars_by_row}
-        color = next(
-            (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
-            _EVENT_COLOR_PALETTE[len(self._calendars_by_row) % len(_EVENT_COLOR_PALETTE)][1],
+        dialog = AddCalendarDialog(
+            self,
+            my_email=self.account.username if self.account else "",
+            my_password=getattr(self.account, "password", "") if self.account else "",
+            used_colors=used_colors,
         )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
         try:
-            created = calendar_store.create_user_calendar(self.calendar_path, name, color)
+            created = calendar_store.create_user_calendar(
+                self.calendar_path, dialog.name(), dialog.color(),
+                source_type=dialog.source_type(), caldav_url=dialog.caldav_url(),
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось создать календарь", str(exc))
             return
@@ -5874,9 +5985,13 @@ class MainWindow(QMainWindow):
         if item is None:
             return
         calendar_id = item.data(Qt.ItemDataRole.UserRole)
+        calendar = next((cal for cal in self._calendars_by_row if cal.id == calendar_id), None)
         menu = QMenu(self)
         rename_action = menu.addAction("Переименовать…")
         color_action = menu.addAction("Цвет…")
+        connection_action = None
+        if calendar is not None and calendar.source_type == calendar_store.SOURCE_CALDAV:
+            connection_action = menu.addAction("Подключение…")
         menu.addSeparator()
         delete_action = menu.addAction("Удалить")
         if len(self._calendars_by_row) <= 1:
@@ -5887,8 +6002,22 @@ class MainWindow(QMainWindow):
             self._rename_calendar(calendar_id, item.text())
         elif chosen is color_action:
             self._recolor_calendar(calendar_id)
+        elif connection_action is not None and chosen is connection_action:
+            self._edit_calendar_connection(calendar_id, calendar.caldav_url)
         elif chosen is delete_action:
             self._delete_calendar(calendar_id, item.text())
+
+    def _edit_calendar_connection(self, calendar_id: str, current_url: str) -> None:
+        url, ok = QInputDialog.getText(self, "Подключение CalDAV", "Адрес сервера:", text=current_url)
+        url = url.strip()
+        if not ok or not url or url == current_url:
+            return
+        try:
+            calendar_store.set_calendar_caldav_url(self.calendar_path, calendar_id, url)
+        except Exception as exc:
+            QMessageBox.critical(self, "Не удалось сохранить", str(exc))
+            return
+        self._refresh_calendars_list(select_id=calendar_id)
 
     def _rename_calendar(self, calendar_id: str, current_name: str) -> None:
         name, ok = QInputDialog.getText(self, "Переименовать календарь", "Название календаря:", text=current_name)

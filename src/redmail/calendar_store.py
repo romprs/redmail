@@ -34,12 +34,17 @@ DEFAULT_CALENDAR_ID = "default"
 _DEFAULT_CALENDAR_NAME = "Мои встречи"
 _DEFAULT_CALENDAR_COLOR = "#3B6FB6"
 
+SOURCE_LOCAL = "local"
+SOURCE_CALDAV = "caldav"
+
 # Столбцы, добавленные после первого релиза — CREATE TABLE IF NOT EXISTS их
 # для уже существующих файлов не создаст, поэтому досоздаём миграцией.
 _MIGRATIONS = (
     "ALTER TABLE events ADD COLUMN recurrence_rule TEXT",
     "ALTER TABLE events ADD COLUMN color TEXT",
     f"ALTER TABLE events ADD COLUMN calendar_id TEXT NOT NULL DEFAULT '{DEFAULT_CALENDAR_ID}'",
+    f"ALTER TABLE calendars ADD COLUMN source_type TEXT NOT NULL DEFAULT '{SOURCE_LOCAL}'",
+    "ALTER TABLE calendars ADD COLUMN caldav_url TEXT NOT NULL DEFAULT ''",
 )
 
 _SCHEMA = """
@@ -82,7 +87,9 @@ CREATE TABLE IF NOT EXISTS calendars (
     name TEXT NOT NULL,
     color TEXT NOT NULL,
     visible INTEGER NOT NULL DEFAULT 1,
-    sort_order INTEGER NOT NULL DEFAULT 0
+    sort_order INTEGER NOT NULL DEFAULT 0,
+    source_type TEXT NOT NULL DEFAULT 'local',
+    caldav_url TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -131,6 +138,13 @@ class Calendar:
     color: str
     visible: bool = True
     sort_order: int = 0
+    # "local" — обычный календарь только в этом файле; "caldav" — синхронизируется
+    # с внешним CalDAV-сервером (см. caldav_url) через MainWindow.on_caldav_sync.
+    # Раньше адрес CalDAV-сервера был один на весь аккаунт (настраивался в
+    # Параметрах) — нельзя было подключить несколько внешних календарей и
+    # локальные вперемешку с внешними.
+    source_type: str = SOURCE_LOCAL
+    caldav_url: str = ""
 
 
 def new_uid() -> str:
@@ -403,7 +417,10 @@ def apply_reply(path: Path, uid: str, attendee_email: str, participation: str) -
 
 
 def _row_to_calendar(row) -> Calendar:
-    return Calendar(id=row[0], name=row[1], color=row[2], visible=bool(row[3]), sort_order=row[4])
+    return Calendar(
+        id=row[0], name=row[1], color=row[2], visible=bool(row[3]), sort_order=row[4],
+        source_type=row[5], caldav_url=row[6],
+    )
 
 
 def list_calendars(path: Path) -> list[Calendar]:
@@ -413,21 +430,41 @@ def list_calendars(path: Path) -> list[Calendar]:
     create_calendar(path)
     with closing(_connect(path)) as conn:
         rows = conn.execute(
-            "SELECT id, name, color, visible, sort_order FROM calendars ORDER BY sort_order, name"
+            "SELECT id, name, color, visible, sort_order, source_type, caldav_url "
+            "FROM calendars ORDER BY sort_order, name"
         ).fetchall()
         return [_row_to_calendar(row) for row in rows]
 
 
-def create_user_calendar(path: Path, name: str, color: str) -> Calendar:
+def create_user_calendar(
+    path: Path, name: str, color: str, *, source_type: str = SOURCE_LOCAL, caldav_url: str = ""
+) -> Calendar:
     create_calendar(path)
-    calendar = Calendar(id=new_calendar_id(), name=name, color=color, visible=True, sort_order=len(list_calendars(path)))
+    calendar = Calendar(
+        id=new_calendar_id(), name=name, color=color, visible=True, sort_order=len(list_calendars(path)),
+        source_type=source_type, caldav_url=caldav_url,
+    )
     with closing(_connect(path)) as conn:
         conn.execute(
-            "INSERT INTO calendars (id, name, color, visible, sort_order) VALUES (?, ?, ?, ?, ?)",
-            (calendar.id, calendar.name, calendar.color, int(calendar.visible), calendar.sort_order),
+            "INSERT INTO calendars (id, name, color, visible, sort_order, source_type, caldav_url) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                calendar.id, calendar.name, calendar.color, int(calendar.visible), calendar.sort_order,
+                calendar.source_type, calendar.caldav_url,
+            ),
         )
         conn.commit()
     return calendar
+
+
+def set_calendar_caldav_url(path: Path, calendar_id: str, caldav_url: str) -> None:
+    """Меняет адрес CalDAV-сервера у уже существующего календаря (пункт
+    "Подключение…" в меню календаря) — сам источник (local/caldav) не
+    меняется этой функцией, только адрес."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE calendars SET caldav_url = ? WHERE id = ?", (caldav_url, calendar_id))
+        conn.commit()
 
 
 def rename_calendar(path: Path, calendar_id: str, name: str) -> None:
