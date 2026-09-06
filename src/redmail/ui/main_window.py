@@ -2820,6 +2820,15 @@ class MainWindow(QMainWindow):
                 self.table.horizontalHeader().restoreState(QByteArray(columns_state))
         except Exception:
             pass  # сохранённое расположение не подошло (например, число колонок изменилось) — не критично
+        finally:
+            # restoreState() выше восстанавливает ВСЕ свойства заголовка из
+            # сохранённого состояния, включая stretchLastSection — у любого,
+            # кто уже пользовался приложением до этого исправления, в файле
+            # лежит старое состояние с этим флагом выключенным, и оно молча
+            # перетирало fix из setStretchLastSection(True) выше сразу же
+            # после его установки (жалоба: "табличная часть не
+            # растягивается" — уже после того, как это вроде бы исправили).
+            self.table.horizontalHeader().setStretchLastSection(True)
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
