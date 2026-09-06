@@ -117,6 +117,19 @@ def _build_palette(colors: dict[str, str]) -> QPalette:
     palette.setColor(QPalette.ColorRole.HighlightedText, accent_text)
     palette.setColor(QPalette.ColorRole.PlaceholderText, disabled_text)
     palette.setColor(QPalette.ColorRole.Link, accent)
+    # Без этого Light/Midlight/Dark/Mid/Shadow остаются на светлых
+    # умолчаниях Qt даже в тёмной теме — стиль Fusion рисует ими рамку и
+    # объёмную обводку у чекбоксов/кнопок (не текст и не заливку, те уже
+    # покрашены выше), и на тёмном фоне это выглядело как "невидно
+    # выделения писем для удаления" (чекбокс в столбце отметки почти не
+    # отличался от фона). Считаем от base, а не жёстко прописываем на
+    # тему — так рамка/тень всегда остаются на несколько тонов темнее и
+    # светлее самого фона, независимо от конкретных цветов темы.
+    palette.setColor(QPalette.ColorRole.Light, base.lighter(150))
+    palette.setColor(QPalette.ColorRole.Midlight, base.lighter(120))
+    palette.setColor(QPalette.ColorRole.Dark, base.darker(150))
+    palette.setColor(QPalette.ColorRole.Mid, base.darker(120))
+    palette.setColor(QPalette.ColorRole.Shadow, base.darker(200))
     for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
         palette.setColor(QPalette.ColorGroup.Disabled, role, disabled_text)
     return palette

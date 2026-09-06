@@ -159,6 +159,13 @@ COL_ATTACHMENT = 3
 COL_SENDER = 4
 COL_SUBJECT = 5
 COL_DATE = 6
+# Пустая служебная колонка в самом конце — единственная цель её
+# существования - принять на себя setStretchLastSection (см. её
+# использование ниже). Если растягивать саму "Дату", Qt заодно запрещает
+# её вручную тянуть мышью (так уже работает stretchLastSection) — жалоба:
+# "не меняется ширина колонки дата и тема" после того, как "Дата" сама
+# была той растягиваемой колонкой.
+COL_FILLER = 7
 
 # Колонки, по которым имеет смысл искать текстом — по ним же переключается
 # фильтр, когда пользователь встаёт в соответствующую колонку/заголовок.
@@ -2428,8 +2435,8 @@ class MainWindow(QMainWindow):
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
         self.filter_edit.textChanged.connect(self.on_filter_changed)
 
-        self.table = QTableWidget(0, 7, self)
-        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
+        self.table = QTableWidget(0, 8, self)
+        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата", ""])
         self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
@@ -2440,18 +2447,21 @@ class MainWindow(QMainWindow):
         # через _restore_window_state()/mail_columns_state.
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(COL_SUBJECT, 320)
+        header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeMode.Interactive)
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
         header.sectionClicked.connect(self._set_filter_column)
-        # Ни одна колонка не Stretch (см. комментарий выше про "Тема") — без
-        # этого сумма ширин колонок не зависит от размера окна вовсе, и
-        # таблица оставляет пустую полосу справа вместо того, чтобы занять
-        # всё окно (жалоба: "таблица... не растягивается на все окно",
-        # особенно заметно при чтении справа — там панели письма ещё и
-        # делят с таблицей ширину, не только высоту). stretchLastSection
-        # отдаёт лишнее место последней колонке (Дата), не мешая
-        # Interactive-изменению ширины остальных колонок пользователем.
+        # Раньше растягивали саму "Дату" (stretchLastSection на последней
+        # реальной колонке) — без этого сумма ширин колонок не зависела от
+        # размера окна, и таблица оставляла пустую полосу справа (жалоба:
+        # "таблица... не растягивается на все окно"). Но stretchLastSection
+        # заодно запрещает пользователю вручную менять ширину той колонки,
+        # на которую он указывает — новая жалоба: "не меняется ширина
+        # колонки дата и тема". Решение — пустая служебная COL_FILLER в
+        # самом конце: она и растягивается, а "Дата"/"Тема" остаются
+        # обычными Interactive-колонками, как раньше.
+        header.setSectionResizeMode(COL_FILLER, QHeaderView.ResizeMode.Stretch)
         header.setStretchLastSection(True)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -4619,7 +4629,14 @@ class MainWindow(QMainWindow):
                 document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
         thread_html = _build_thread_html(entries, summary.uid)
         self.reading_pane.setHtml(thread_html)
-        self.reading_pane.scrollToAnchor(f"msg-{summary.uid}")
+        # Отложено на следующий цикл событий: scrollToAnchor() сразу после
+        # setHtml() ищет якорь в ЕЩЁ не размеченном документе (Qt считает
+        # позиции анкоров лениво) и молча не находит его — пользователь
+        # оставался на самом верху общей ленты цепочки (обычно самое
+        # старое письмо) вместо только что открытого, и это выглядело так,
+        # будто открылось не то или "сломанное" письмо.
+        uid_to_scroll = summary.uid
+        QTimer.singleShot(0, lambda: self.reading_pane.scrollToAnchor(f"msg-{uid_to_scroll}"))
         token = self._message_select_token
         _load_remote_images_async(
             self.reading_pane, thread_html, self, self._background_workers,
