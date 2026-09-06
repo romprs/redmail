@@ -1,14 +1,14 @@
 from __future__ import annotations
 
+import base64
 import html
 import math
+import os
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
 import mimetypes
 import re
 import shutil
 import tempfile
-import urllib.request
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses
@@ -102,6 +102,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtWebEngineCore import (
+    QWebEnginePage,
+    QWebEngineProfile,
+    QWebEngineSettings,
+    QWebEngineUrlRequestInfo,
+    QWebEngineUrlRequestInterceptor,
+)
+from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail.config_store import (
@@ -318,143 +326,179 @@ def _build_thread_html(entries: list[tuple[MessageSummary, str]], current_uid: i
     return "".join(parts)
 
 
-_REMOTE_IMG_SRC_RE = re.compile(r'<img\b[^>]*?\bsrc\s*=\s*["\'](https?://[^"\']+)["\']', re.IGNORECASE)
-_MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024
+_CID_IMG_SRC_RE = re.compile(r'(\bsrc\s*=\s*["\'])cid:([^"\']+)(["\'])', re.IGNORECASE)
 
-# Кэш в оперативной памяти на время работы приложения (не на диске — эти
-# картинки не привязаны к конкретному письму/аккаунту, а просто по URL).
-# Без него повторное открытие УЖЕ прочитанного письма с внешними
-# картинками каждый раз заново качало их по сети (жалоба: "при
-# переключении между ранее прочитанными письмами они грузятся долго, хотя
-# должны быстро") — раньше это было незаметно, потому что кэш тела письма
-# не сохранял HTML вовсе и такие письма всегда падали в текстовый fallback
-# без единой попытки загрузить картинку.
-_remote_image_cache: dict[str, bytes] = {}
+_mail_web_profile: QWebEngineProfile | None = None
 
-
-def _find_remote_image_urls(html_content: str) -> list[str]:
-    seen: list[str] = []
-    for match in _REMOTE_IMG_SRC_RE.finditer(html_content):
-        url = html.unescape(match.group(1))
-        if url not in seen:
-            seen.append(url)
-    return seen
+# Пути временных html-файлов писем, которым разрешено грузиться как
+# file:// (см. _MailRequestInterceptor и _render_mail_html). Без этой
+# проверки письмо с <img src="file:///home/user/..."> или скрытым
+# <iframe src="file://...">, отрисованное через file://, могло бы читать
+# и показывать ЛЮБОЙ другой файл, доступный пользователю системы — file://
+# в Chromium имеет доступ к другим file://-ресурсам без ограничений
+# same-origin, а acceptNavigationRequest эту проверку не покрывает вовсе
+# (он видит только навигацию по фреймам, не подгрузку картинок/скриптов
+# как подресурсов).
+_allowed_local_html_paths: set[str] = set()
 
 
-def _apply_remote_images(browser: QTextBrowser, html_content: str, images: dict[str, bytes]) -> None:
-    document = browser.document()
-    for url, payload in images.items():
-        image = QImage.fromData(payload)
-        if not image.isNull():
-            document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), image)
-    browser.setHtml(html_content)
+class _MailRequestInterceptor(QWebEngineUrlRequestInterceptor):
+    def interceptRequest(self, info: QWebEngineUrlRequestInfo) -> None:  # noqa: N802
+        url = info.requestUrl()
+        if url.scheme() == "file" and url.toLocalFile() not in _allowed_local_html_paths:
+            info.block(True)
 
 
-def _load_remote_images_async(
-    browser: QTextBrowser,
-    html_content: str,
-    owner: QWidget,
-    workers: list[QThread],
-    *,
-    is_current: Callable[[], bool] | None = None,
-) -> None:
-    """Догружает внешние (не cid:) картинки письма в фоне и перерисовывает
-    после — раньше такие картинки просто не показывались вовсе (Qt сам не
-    подгружает удалённые ресурсы). По решению пользователя — без баннера
-    "Показать изображения" (это личный ящик, не нужно отдельное
-    подтверждение на каждое письмо, как в Gmail/Outlook против
-    отслеживания). Обязательно в фоновом потоке, а не синхронно — письмо с
-    внешней картинкой на медленном сервере иначе подвесило бы всё окно
-    точно так же, как уже было с самим телом письма (см.
-    on_message_selected). is_current — тот же принцип токена, что и там:
-    если пользователь успел открыть другое письмо, пока грузились картинки
-    этого, применять устаревший результат (перезаписывать reading_pane
-    чужим письмом) не нужно."""
-    urls = _find_remote_image_urls(html_content)
-    if not urls:
-        return
+def _get_mail_web_profile() -> QWebEngineProfile:
+    """Общий профиль для всех окон чтения писем (основная панель +
+    "Открыть в окне") — жёстко заблокирован под просмотр чужого HTML:
+    без JavaScript (в письме ему взяться неоткуда для добросовестной цели,
+    зато это первый вектор эксплойтов/трекинга), без localStorage и без
+    постоянных cookie (только диск-кэш самих картинок — тот же профиль
+    между письмами даёт настоящее кэширование HTTP, а не самодельное, как
+    было до перехода на QWebEngineView). Именованный (не off-the-record)
+    профиль специально — иначе Qt не включает дисковый кэш вовсе."""
+    global _mail_web_profile
+    if _mail_web_profile is None:
+        profile = QWebEngineProfile("redmail_html_render")
+        cache_dir = app_dir() / "webengine_cache"
+        profile.setCachePath(str(cache_dir))
+        profile.setPersistentStoragePath(str(cache_dir / "storage"))
+        profile.setHttpCacheType(QWebEngineProfile.HttpCacheType.DiskHttpCache)
+        profile.setPersistentCookiesPolicy(QWebEngineProfile.PersistentCookiesPolicy.NoPersistentCookies)
+        # NoPersistentCookies не сохраняет их на диск, но всё равно разрешает
+        # cookie в памяти — рекламная сеть может так связать открытие ДВУХ
+        # РАЗНЫХ писем в одном сеансе программы через один и тот же
+        # tracking-пиксель. Своим ящиком пользователь уже согласился на
+        # автозагрузку внешних картинок без баннера подтверждения, но cookie
+        # для этого не нужны вовсе — блокируем полностью, а не просто не
+        # сохраняем.
+        profile.cookieStore().setCookieFilter(lambda _request: False)
+        interceptor = _MailRequestInterceptor(profile)
+        profile.setUrlRequestInterceptor(interceptor)
+        profile._redmail_interceptor = interceptor  # держим ссылку — иначе Python соберёт объект
+        settings = profile.settings()
+        for attribute in (
+            QWebEngineSettings.WebAttribute.JavascriptEnabled,
+            QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows,
+            QWebEngineSettings.WebAttribute.JavascriptCanAccessClipboard,
+            QWebEngineSettings.WebAttribute.LocalStorageEnabled,
+            QWebEngineSettings.WebAttribute.PluginsEnabled,
+            QWebEngineSettings.WebAttribute.AllowRunningInsecureContent,
+            QWebEngineSettings.WebAttribute.AllowWindowActivationFromJavaScript,
+            QWebEngineSettings.WebAttribute.FullScreenSupportEnabled,
+        ):
+            settings.setAttribute(attribute, False)
+        _mail_web_profile = profile
+    return _mail_web_profile
 
-    # Уже всё есть в памяти (письмо открывали в этом сеансе раньше) — можно
-    # отрисовать сразу, без потока и сетевого обращения вовсе.
-    cached = {url: _remote_image_cache[url] for url in urls if url in _remote_image_cache}
-    if len(cached) == len(urls):
-        _apply_remote_images(browser, html_content, cached)
-        return
 
-    def fetch_one(url: str) -> tuple[str, bytes] | None:
-        if url in _remote_image_cache:
-            return url, _remote_image_cache[url]
-        try:
-            with urllib.request.urlopen(url, timeout=10) as response:
-                # Письмо не обязано быть добросовестным — ограничиваем
-                # размер одной "картинки", чтобы вредоносная/битая ссылка
-                # не забила память огромным ответом.
-                payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
-            if len(payload) <= _MAX_REMOTE_IMAGE_BYTES:
-                _remote_image_cache[url] = payload
-                return url, payload
-        except Exception:
-            pass  # одна недогрузившаяся картинка не должна портить всё письмо
+class _MailWebPage(QWebEnginePage):
+    """Клик по ссылке в письме открывает системный браузер, а не уводит
+    саму панель чтения на чужой сайт (та осталась бы без кнопок
+    ответить/переслать и без нашего профиля с выключенным JS) — это же
+    предотвращает и programmatic-навигацию, если бы JS всё-таки был
+    включён. Всплывающие окна (createWindow) тоже блокируются — письму
+    незачем их открывать."""
+
+    def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame: bool) -> bool:  # noqa: N802
+        if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
+            QDesktopServices.openUrl(url)
+            return False
+        return True
+
+    def createWindow(self, _web_window_type):  # noqa: N802 - Qt override
         return None
 
-    def fetch() -> dict[str, bytes]:
-        # Параллельно, а не по одной — в маркетинговых письмах картинок
-        # часто пять-шесть штук (логотип, баннер, иконки соцсетей), и
-        # последовательная загрузка растягивала бы общее время ожидания на
-        # сумму всех round trip'ов вместо самого медленного из них.
-        results: dict[str, bytes] = {}
-        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
-            for outcome in pool.map(fetch_one, urls):
-                if outcome is not None:
-                    url, payload = outcome
-                    results[url] = payload
-        return results
 
-    worker = _CallableWorker(fetch, parent=owner)
-
-    def on_success(images: object) -> None:
-        workers.remove(worker)
-        if is_current is not None and not is_current():
-            return  # пользователь уже открыл другое письмо — эти картинки ему не покажем
-        _apply_remote_images(browser, html_content, images)
-
-    def on_failure(_message: str) -> None:
-        workers.remove(worker)
-
-    worker.succeeded.connect(on_success)
-    worker.failed.connect(on_failure)
-    workers.append(worker)
-    worker.start()
+def _create_mail_browser(parent: QWidget) -> QWebEngineView:
+    view = QWebEngineView(parent)
+    view.setPage(_MailWebPage(_get_mail_web_profile(), view))
+    return view
 
 
-def _populate_body_browser(
-    browser: QTextBrowser,
-    content: MessageContent,
-    *,
-    owner: QWidget | None = None,
-    workers: list[QThread] | None = None,
-    is_current: Callable[[], bool] | None = None,
-) -> None:
-    """HTML-письма показываем как есть (с внедрёнными картинками из
-    cid:-вложений через addResource — без этого <img src="cid:..."> не
-    отрисуется); письма с обычным текстом — тоже через setHtml, но
-    экранированным и с активными ссылками (_linkify), чтобы голые
-    http(s)-ссылки в теле письма были кликабельны, как и в HTML-версии.
-    Внешние (не cid:) картинки Qt сам не подгружает по себе — если переданы
-    owner/workers, они дозагружаются асинхронно через
-    _load_remote_images_async. Общая для MainWindow.reading_pane и
-    MessageWindow — открытие письма в отдельном окне должно выглядеть так
-    же, как в основной панели чтения."""
-    document = browser.document()
-    document.clear()
-    for content_id, (_content_type, payload) in content.inline_images.items():
-        image = QImage.fromData(payload)
-        if not image.isNull():
-            document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
-    html_content = content.html if content.html else _linkify(content.text)
-    browser.setHtml(html_content)
-    if owner is not None and workers is not None:
-        _load_remote_images_async(browser, html_content, owner, workers, is_current=is_current)
+def _inline_images_to_data_uris(html_content: str, inline_images: dict[str, tuple[str, bytes]]) -> str:
+    """Заменяет <img src="cid:xxx"> на data:-URI прямо в разметке.
+
+    QWebEngineView не понимает QTextDocument.addResource() (это API
+    рич-текстового движка, у веб-движка нет такого понятия "ресурс
+    документа") — вместо реестра ресурсов картинку нужно встроить прямо в
+    HTML как data:-URI, единственный способ показать её без реального
+    HTTP-сервера, отдающего cid:-ссылки."""
+    if not inline_images:
+        return html_content
+
+    def replace(match: re.Match[str]) -> str:
+        prefix, content_id, suffix = match.group(1), match.group(2), match.group(3)
+        entry = inline_images.get(content_id)
+        if entry is None:
+            return match.group(0)
+        content_type, payload = entry
+        encoded = base64.b64encode(payload).decode("ascii")
+        return f"{prefix}data:{content_type};base64,{encoded}{suffix}"
+
+    return _CID_IMG_SRC_RE.sub(replace, html_content)
+
+
+def _render_mail_html(view: QWebEngineView, html_content: str, *, anchor: str | None = None) -> None:
+    """Показывает готовый HTML в панели чтения через временный файл, а не
+    view.setHtml() напрямую — у setHtml() задокументированный потолок
+    размера около 2 МБ (для писем со встроенными через data:-URI
+    картинками легко превышается), и он не умеет прокрутку к якорю.
+    Локальный файл снимает оба ограничения: обычная навигация браузера,
+    включая "#msg-N" во фрагменте URL, работает без единой строчки
+    JavaScript (JS в этом профиле выключен нарочно, см.
+    _get_mail_web_profile)."""
+    fd, path_str = tempfile.mkstemp(suffix=".html", prefix="redmail_body_")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(html_content)
+    path = Path(path_str)
+    url = QUrl.fromLocalFile(str(path))
+    # В белый список для _MailRequestInterceptor кладём то же значение,
+    # которое сам Chromium вернёт из url.toLocalFile() при проверке запроса
+    # — иначе строковое несовпадение (нормализация пути при round-trip
+    # через QUrl) заблокировало бы и наш ЖЕ собственный документ.
+    canonical_path = url.toLocalFile()
+    _allowed_local_html_paths.add(canonical_path)
+
+    old_path_str = view.property("_redmail_temp_html_path")
+    view.setProperty("_redmail_temp_html_path", str(path))
+    if old_path_str:
+        old_path = Path(old_path_str)
+        _allowed_local_html_paths.discard(QUrl.fromLocalFile(str(old_path)).toLocalFile())
+        if old_path.exists():
+            try:
+                old_path.unlink()
+            except OSError:
+                pass  # уже мог быть удалён/занят — не критично, это временный файл
+
+    if anchor:
+        url.setFragment(anchor)
+    view.load(url)
+
+
+_BODY_WRAP_TEMPLATE = (
+    '<html><head><meta charset="utf-8"></head>'
+    '<body style="background:#ffffff;color:#202124;margin:8px;'
+    'font-family:sans-serif;">{content}</body></html>'
+)
+
+
+def _populate_body_browser(view: QWebEngineView, content: MessageContent, *, anchor: str | None = None) -> None:
+    """HTML-письма показываем как есть (cid:-вложения превращены в
+    data:-URI, см. _inline_images_to_data_uris — без этого <img
+    src="cid:..."> не отрисуется); письма с обычным текстом — тоже как
+    HTML, но экранированным и с активными ссылками (_linkify), чтобы
+    голые http(s)-ссылки в теле письма были кликабельны, как и в
+    HTML-версии. Внешние (не cid:) картинки веб-движок загружает сам, как
+    обычный браузер — отдельная догрузка/кэш здесь не нужны. Общая для
+    MainWindow.reading_pane и MessageWindow — открытие письма в отдельном
+    окне должно выглядеть так же, как в основной панели чтения."""
+    if content.html:
+        html_content = _inline_images_to_data_uris(content.html, content.inline_images)
+    else:
+        html_content = _BODY_WRAP_TEMPLATE.format(content=_linkify(content.text))
+    _render_mail_html(view, html_content, anchor=anchor)
 
 
 class MessageWindow(QWidget):
@@ -469,10 +513,6 @@ class MessageWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._summary = summary
         self._content = content
-        # Держит ссылку на фоновый поток догрузки внешних картинок (см.
-        # _load_remote_images_async) — без этого Python может собрать
-        # QThread раньше, чем он реально завершится.
-        self._background_workers: list[QThread] = []
 
         sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
         lines = [f"<b>Тема:</b> {html.escape(content.subject or summary.subject or '(без темы)')}", f"<b>От:</b> {html.escape(sender)}"]
@@ -501,10 +541,8 @@ class MessageWindow(QWidget):
         button_row.addWidget(forward_button)
         button_row.addStretch(1)
 
-        body = QTextBrowser(self)
-        body.setReadOnly(True)
-        body.setOpenExternalLinks(True)
-        _populate_body_browser(body, content, owner=self, workers=self._background_workers)
+        body = _create_mail_browser(self)
+        _populate_body_browser(body, content)
 
         layout = QVBoxLayout(self)
         layout.addWidget(header_label)
@@ -3062,17 +3100,17 @@ class MainWindow(QMainWindow):
         # on_message_selected) — растёт при каждом клике по письму.
         self._message_select_token = 0
 
-        self.reading_pane = QTextBrowser(self)
-        self.reading_pane.setReadOnly(True)
-        self.reading_pane.setOpenExternalLinks(True)
-        self.reading_pane.setPlaceholderText("Выберите письмо, чтобы увидеть текст")
-        # Всегда светлый фон независимо от темы приложения — тело письма
-        # почти всегда HTML, написанный в расчёте на белый фон (часто вовсе
-        # без явного background в разметке), и тёмная тема здесь означала бы
-        # тёмный текст на тёмном фоне у любого письма, которое сам фон не
-        # задаёт. Тот же принцип, что в веб-почте (Gmail и т.п.) — тёмная
-        # тема интерфейса не красит содержимое самих писем.
-        self.reading_pane.setStyleSheet("QTextBrowser { background-color: #ffffff; color: #202124; }")
+        # QWebEngineView вместо QTextBrowser — у Qt-шного рич-текстового
+        # движка не было ни position:absolute/флексбоксов, ни нормальной
+        # CSS-вёрстки, которыми пользуются реальные маркетинговые письма
+        # (жалоба: "HTML содержимое отражается криво" — текст поверх
+        # картинки/карточки внахлёст, эти письма и на скриншотах). Фон у
+        # веб-движка по умолчанию белый для страницы без явного background,
+        # что и нужно — тело письма почти всегда HTML в расчёте на белый
+        # фон, тёмная тема интерфейса не должна красить содержимое самих
+        # писем (тот же принцип, что и в веб-почте — Gmail и т.п.).
+        self.reading_pane = _create_mail_browser(self)
+        _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content="Выберите письмо, чтобы увидеть текст"))
 
         reading_container = QWidget(self)
         reading_layout = QVBoxLayout(reading_container)
@@ -4654,7 +4692,7 @@ class MainWindow(QMainWindow):
         self._render_folder(summaries)
 
     def _clear_reading_pane(self) -> None:
-        self.reading_pane.clear()
+        _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content=""))
         self.selected_summary = None
         self.current_content = None
         self.current_attachments = []
@@ -5014,7 +5052,7 @@ class MainWindow(QMainWindow):
         source = self.active_source
         row = rows[0].row()
 
-        self.reading_pane.setPlainText("Загрузка…")
+        _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content="Загрузка…"))
         self.thread_list.hide()
         self.attachments_list.clear()
         self.attachments_list.hide()
@@ -5047,7 +5085,10 @@ class MainWindow(QMainWindow):
             self.current_body = ""
             self.current_attachments = []
             self.current_content = None
-            self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {error_text}")
+            _render_mail_html(
+                self.reading_pane,
+                _BODY_WRAP_TEMPLATE.format(content=html.escape(f"Не удалось загрузить письмо: {error_text}")),
+            )
 
         worker.succeeded.connect(on_success)
         worker.failed.connect(on_failure)
@@ -5096,9 +5137,17 @@ class MainWindow(QMainWindow):
     def _on_thread_item_clicked(self, item: QListWidgetItem) -> None:
         # Вся цепочка уже отрисована последовательно в reading_pane (см.
         # _render_thread) — переход к письму это просто прокрутка к его
-        # якорю, а не смена выбранной строки в таблице.
+        # якорю, а не смена выбранной строки в таблице. Перезагружаем ТОТ
+        # ЖЕ временный файл (путь запомнен как свойство view в
+        # _render_mail_html) с другим фрагментом — обычная навигация по
+        # якорю, без JavaScript.
         uid = item.data(Qt.ItemDataRole.UserRole)
-        self.reading_pane.scrollToAnchor(f"msg-{uid}")
+        path_str = self.reading_pane.property("_redmail_temp_html_path")
+        if not path_str:
+            return
+        url = QUrl.fromLocalFile(path_str)
+        url.setFragment(f"msg-{uid}")
+        self.reading_pane.load(url)
 
     def _render_thread(self, summary: MessageSummary, content: MessageContent) -> None:
         """Показывает письмо вместе со всей его цепочкой подряд, одной
@@ -5167,7 +5216,10 @@ class MainWindow(QMainWindow):
         entries: list[tuple[MessageSummary, str]] = []
         for other in all_in_thread:
             if other.uid == summary.uid:
-                entries.append((other, content.html or _linkify(content.text)))
+                body_html = content.html or _linkify(content.text)
+                if content.html:
+                    body_html = _inline_images_to_data_uris(body_html, content.inline_images)
+                entries.append((other, body_html))
                 continue
             other_content = self._thread_content_cache.get(other.uid)
             if other_content is None:
@@ -5178,27 +5230,13 @@ class MainWindow(QMainWindow):
             body = _linkify(other_content.text) if other_content.text.strip() else "<i>(письмо в формате HTML — предпросмотр недоступен в цепочке)</i>"
             entries.append((other, body))
 
-        document = self.reading_pane.document()
-        document.clear()
-        for content_id, (_content_type, payload) in content.inline_images.items():
-            image = QImage.fromData(payload)
-            if not image.isNull():
-                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
         thread_html = _build_thread_html(entries, summary.uid)
-        self.reading_pane.setHtml(thread_html)
-        # Отложено на следующий цикл событий: scrollToAnchor() сразу после
-        # setHtml() ищет якорь в ЕЩЁ не размеченном документе (Qt считает
-        # позиции анкоров лениво) и молча не находит его — пользователь
-        # оставался на самом верху общей ленты цепочки (обычно самое
-        # старое письмо) вместо только что открытого, и это выглядело так,
-        # будто открылось не то или "сломанное" письмо.
-        uid_to_scroll = summary.uid
-        QTimer.singleShot(0, lambda: self.reading_pane.scrollToAnchor(f"msg-{uid_to_scroll}"))
-        token = self._message_select_token
-        _load_remote_images_async(
-            self.reading_pane, thread_html, self, self._background_workers,
-            is_current=lambda: token == self._message_select_token,
-        )
+        wrapped_html = _BODY_WRAP_TEMPLATE.format(content=thread_html)
+        # Прокрутка к якорю передаётся прямо в URL (#msg-N) — обычная
+        # навигация браузера, срабатывает уже при самой загрузке страницы,
+        # без отдельного отложенного вызова после setHtml(), как было
+        # нужно для scrollToAnchor() у QTextDocument.
+        _render_mail_html(self.reading_pane, wrapped_html, anchor=f"msg-{summary.uid}")
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:
@@ -5212,11 +5250,7 @@ class MainWindow(QMainWindow):
         window.show()
 
     def _render_body(self, content: MessageContent) -> None:
-        token = self._message_select_token
-        _populate_body_browser(
-            self.reading_pane, content, owner=self, workers=self._background_workers,
-            is_current=lambda: token == self._message_select_token,
-        )
+        _populate_body_browser(self.reading_pane, content)
 
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
         try:
