@@ -56,13 +56,19 @@ def _lighten_color(hex_color: str, factor: float = 3) -> str:
     return QColor(*channels).name()
 
 
-def _event_color(calendar_event: Event) -> str:
-    # Ручной цвет (см. референс VK Mail — "Цвет события") имеет приоритет
-    # над автоцветом по роли; автоцвет остаётся по умолчанию для событий,
-    # где цвет никогда не задавали (включая все существующие до этой
-    # возможности).
+def _event_color(calendar_event: Event, calendar_color: str | None = None) -> str:
+    # Приоритет: ручной цвет события (см. референс VK Mail — "Цвет
+    # события") → цвет календаря, которому принадлежит событие → автоцвет
+    # по роли (для событий без календаря вовсе — старые данные до
+    # появления нескольких календарей). Раньше цвет календаря никогда не
+    # учитывался, и событие в НОВОМ календаре выглядело точно так же, как
+    # в календаре по умолчанию — привязка к календарю сохранялась в
+    # данных, но визуально была никак не видна (жалоба: "не видно связи
+    # события с календарём").
     if calendar_event.color:
         return calendar_event.color
+    if calendar_color:
+        return calendar_color
     if calendar_event.all_day:
         return _ALL_DAY_COLOR
     return _ORGANIZER_COLOR if calendar_event.is_organizer else _ATTENDEE_COLOR
@@ -80,7 +86,14 @@ class _EventBlock(QFrame):
     dragFinished = Signal(object, object, object)
     contextMenuRequested = Signal(object, object)  # (calendar_event, global_pos)
 
-    def __init__(self, calendar_event: Event, parent: QWidget | None = None, *, pill: bool = False):
+    def __init__(
+        self,
+        calendar_event: Event,
+        parent: QWidget | None = None,
+        *,
+        pill: bool = False,
+        calendar_color: str | None = None,
+    ):
         super().__init__(parent)
         # ВАЖНО: не называть этот атрибут self.event — QWidget.event() уже
         # существует как виртуальный метод самого Qt (обрабатывает всю
@@ -89,7 +102,7 @@ class _EventBlock(QFrame):
         # недр Qt падает с "'Event' object is not callable". Поймано именно
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
-        self._color = _event_color(calendar_event)
+        self._color = _event_color(calendar_event, calendar_color)
         self._radius = "11px" if pill else "4px"
         self._pill = pill
         self._selected = False
@@ -317,11 +330,16 @@ class AllDayRowWidget(QWidget):
         self._week_start = week_start_for(date.today())
         self._events: list[Event] = []
         self._blocks: list[_EventBlock] = []
+        self._calendar_colors: dict[str, str] = {}
         self.setMinimumHeight(1)
 
-    def set_week(self, week_start: date, all_day_events: list[Event]) -> None:
+    def set_week(
+        self, week_start: date, all_day_events: list[Event], calendar_colors: dict[str, str] | None = None
+    ) -> None:
         self._week_start = week_start
         self._events = all_day_events
+        if calendar_colors is not None:
+            self._calendar_colors = calendar_colors
         self._relayout()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -348,7 +366,7 @@ class AllDayRowWidget(QWidget):
             stack_by_day[day_index] = row + 1
             max_stack = max(max_stack, row + 1)
 
-            block = _EventBlock(ev, self, pill=True)
+            block = _EventBlock(ev, self, pill=True, calendar_color=self._calendar_colors.get(ev.calendar_id))
             x = self.TIME_AXIS_WIDTH + day_index * col_w
             block.setGeometry(int(x) + 2, row * (row_height + 2), int(col_w) - 4, row_height)
             block.clicked.connect(self.eventClicked.emit)
@@ -391,6 +409,7 @@ class WeekGridWidget(QWidget):
         self._events: list[Event] = []
         self._blocks: list[_EventBlock] = []
         self._selected_day: date | None = None
+        self._calendar_colors: dict[str, str] = {}
 
         # Красная линия "сейчас" должна сама сдвигаться, пока приложение
         # открыто — минутной точности достаточно, не гоняем чаще раза в минуту.
@@ -398,9 +417,13 @@ class WeekGridWidget(QWidget):
         self._now_timer.timeout.connect(self.update)
         self._now_timer.start(60_000)
 
-    def set_week(self, week_start: date, timed_events: list[Event]) -> None:
+    def set_week(
+        self, week_start: date, timed_events: list[Event], calendar_colors: dict[str, str] | None = None
+    ) -> None:
         self._week_start = week_start
         self._events = timed_events
+        if calendar_colors is not None:
+            self._calendar_colors = calendar_colors
         self._relayout()
 
     def set_selected_day(self, day: date | None) -> None:
@@ -433,7 +456,7 @@ class WeekGridWidget(QWidget):
             h = duration_minutes / 60 * self.HOUR_HEIGHT
             x = self.TIME_AXIS_WIDTH + day_index * col_w
 
-            block = _EventBlock(ev, self)
+            block = _EventBlock(ev, self, calendar_color=self._calendar_colors.get(ev.calendar_id))
             block.setGeometry(int(x) + 2, int(y), int(col_w) - 4, max(20, int(h)))
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
@@ -622,13 +645,14 @@ class MonthCellWidget(QFrame):
             color = in_month_text if self._in_month else out_month_text
             self.day_label.setStyleSheet(f"color: {color}; background: transparent;")
 
-    def set_events(self, events: list[Event]) -> None:
+    def set_events(self, events: list[Event], calendar_colors: dict[str, str] | None = None) -> None:
         for block in self._event_blocks:
             block.deleteLater()
         self._event_blocks = []
         visible = events[:_MONTH_CELL_MAX_EVENTS]
+        colors = calendar_colors or {}
         for ev in visible:
-            block = _EventBlock(ev, self, pill=True)
+            block = _EventBlock(ev, self, pill=True, calendar_color=colors.get(ev.calendar_id))
             block.setFixedHeight(15)
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
@@ -663,6 +687,7 @@ class MonthGridWidget(QWidget):
         self._month_anchor = date.today().replace(day=1)
         self._events: list[Event] = []
         self._selected_day: date | None = None
+        self._calendar_colors: dict[str, str] = {}
         self._cells: list[MonthCellWidget] = []
 
         grid = QGridLayout(self)
@@ -703,9 +728,13 @@ class MonthGridWidget(QWidget):
         for cell in self._cells:
             cell._apply_style()
 
-    def set_month(self, month_anchor: date, events: list[Event]) -> None:
+    def set_month(
+        self, month_anchor: date, events: list[Event], calendar_colors: dict[str, str] | None = None
+    ) -> None:
         self._month_anchor = month_anchor.replace(day=1)
         self._events = events
+        if calendar_colors is not None:
+            self._calendar_colors = calendar_colors
         self._relayout()
 
     def set_selected_day(self, day: date | None) -> None:
@@ -730,4 +759,4 @@ class MonthGridWidget(QWidget):
                 is_selected=(day == self._selected_day),
             )
             day_events = sorted(events_by_day.get(day, []), key=lambda e: (not e.all_day, e.dtstart))
-            cell.set_events(day_events)
+            cell.set_events(day_events, self._calendar_colors)

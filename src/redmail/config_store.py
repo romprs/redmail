@@ -228,6 +228,16 @@ def save_mail_columns_state(data: bytes) -> None:
     _save_settings_dict(settings)
 
 
+def load_mail_date_column_pinned() -> bool:
+    return bool(_load_settings_dict().get("mail_date_column_pinned", False))
+
+
+def save_mail_date_column_pinned(pinned: bool) -> None:
+    settings = _load_settings_dict()
+    settings["mail_date_column_pinned"] = pinned
+    _save_settings_dict(settings)
+
+
 def load_open_archives() -> list[str]:
     value = _load_settings_dict().get("open_archives", [])
     return [str(p) for p in value] if isinstance(value, list) else []

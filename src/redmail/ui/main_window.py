@@ -124,6 +124,7 @@ from redmail.config_store import (
     load_ews_accounts,
     load_font_scale,
     load_mail_columns_state,
+    load_mail_date_column_pinned,
     load_mail_rules,
     load_open_archives,
     load_pane_orientation,
@@ -138,6 +139,7 @@ from redmail.config_store import (
     save_ews_accounts,
     save_font_scale,
     save_mail_columns_state,
+    save_mail_date_column_pinned,
     save_mail_rules,
     save_open_archives,
     save_pane_orientation,
@@ -226,7 +228,11 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
             painter.setPen(QPen(accent, self._PEN_WIDTH))
         else:
             painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.setPen(QPen(option.palette.color(QPalette.ColorRole.Text), self._PEN_WIDTH))
+            # Серый, а не палитровый Text (белый в тёмной теме/почти чёрный
+            # в светлой — слишком контрастно на фоне и без того тонкой
+            # линии) — светло-серый на тёмном фоне, тёмно-серый на светлом.
+            border_color = QColor("#8a8d91") if app_theme.is_dark() else QColor("#5f6368")
+            painter.setPen(QPen(border_color, self._PEN_WIDTH))
         painter.drawRoundedRect(square, 3, 3)
         painter.restore()
 
@@ -2953,6 +2959,25 @@ class MainWindow(QMainWindow):
 
         self.account: Account | EwsAccount | None = None
         self.mailbox: CachedMailbox | None = None
+        # Растёт при каждом restoreState() сохранённых ширин колонок (см.
+        # _restore_window_state) — инвалидирует любой уже ЗАПЛАНИРОВАННЫЙ
+        # (через QTimer.singleShot(0, ...)) пересчёт авто-стретча "Даты",
+        # поставленный ДО восстановления (например, resizeEvent от самого
+        # первого показа окна с ещё дефолтным размером, до explicit
+        # restoreGeometry()) — иначе такой пересчёт срабатывал уже ПОСЛЕ
+        # restoreState() и затирал только что честно восстановленную
+        # пользователем ширину (жалоба: "опять не сохраняется настройка").
+        self._column_stretch_generation = 0
+        self._auto_stretching_date = False
+        # Как только пользователь САМ (мышью) хоть раз потянул границу
+        # "Даты" — колонка больше никогда не растягивается автоматически,
+        # это уже её собственный явный выбор ширины (переживает перезапуск,
+        # см. save_mail_date_column_pinned). Без этого ЛЮБОЙ последующий
+        # resize (включая совершенно обычный, не при восстановлении) снова
+        # пересчитывал бы "Дату" по формуле "остаток места" и заново стирал
+        # то, что человек только что сам выставил (жалоба: "опять не
+        # сохраняется настройка, я настраиваю ширину поля дата").
+        self._date_column_pinned = load_mail_date_column_pinned()
         self.account_root: QTreeWidgetItem | None = None
         self.archives: dict[str, ArchiveSource] = {}
         self.archive_tree_roots: dict[str, QTreeWidgetItem] = {}
@@ -3505,6 +3530,22 @@ class MainWindow(QMainWindow):
         self._restore_window_state()
 
     def _restore_window_state(self) -> None:
+        # restoreGeometry() ниже сама по себе синхронно доставляет
+        # resizeEvent (смена размера окна — это и есть resize) — без этого
+        # флага тот же самый auto-stretch пересчитывался бы через
+        # resizeEvent() ПОКА мы ещё внутри restoreGeometry()/restoreState(),
+        # затирая только что честно восстановленную ширину "Даты" ничуть не
+        # хуже старого безусловного вызова (жалоба: "опять не сохраняется
+        # настройка, я настраиваю ширину поля дата, а при повторном
+        # открытии настройки возвращаются обратно").
+        self._restoring_window_state = True
+        # Инвалидирует любой auto-stretch "Даты", уже поставленный в очередь
+        # ДО этого момента (например, от resizeEvent самого первого показа
+        # окна с ещё дефолтным размером) — иначе он сработает уже ПОСЛЕ
+        # restoreState() ниже и всё равно затрёт восстановленную ширину,
+        # несмотря на флаг _restoring_window_state (тот успеет вернуться в
+        # False к моменту срабатывания отложенного вызова).
+        self._column_stretch_generation += 1
         try:
             geometry = load_window_geometry()
             if geometry:
@@ -3512,28 +3553,50 @@ class MainWindow(QMainWindow):
             columns_state = load_mail_columns_state()
             if columns_state:
                 self.table.horizontalHeader().restoreState(QByteArray(columns_state))
+                # Ширины колонок восстановлены как есть — геометрия окна
+                # восстановлена той же строкой выше, под тот же размер, под
+                # который сохранялись и ширины колонок, пересчитывать
+                # заново нечего.
+                return
         except Exception:
             pass  # сохранённое расположение не подошло (например, число колонок изменилось) — не критично
         finally:
-            # Пересчитать "Дату" под фактическую ширину ПОСЛЕ восстановления
-            # геометрии — сохранённая ширина колонки могла быть посчитана
-            # под другой размер окна.
-            self._schedule_stretch_date_column()
+            self._restoring_window_state = False
+        # Сохранённого состояния нет (первый запуск) или оно не подошло —
+        # разложить "Дату" по ширине окна с нуля.
+        self._schedule_stretch_date_column()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
+        if getattr(self, "_restoring_window_state", False):
+            return
         self._schedule_stretch_date_column()
 
     def _on_mail_column_resized(self, logical_index: int, _old_size: int, _new_size: int) -> None:
+        if logical_index == COL_DATE:
+            # Если это не мы сами (см. _auto_stretching_date в
+            # _stretch_date_column) и не восстановление сохранённого
+            # состояния — значит, пользователь только что САМ потянул
+            # границу "Даты" мышью. С этого момента колонка больше никогда
+            # не растягивается автоматически — это её явный, осознанный
+            # выбор ширины, который должен пережить и обычный resize окна,
+            # и перезапуск программы (жалоба: "опять не сохраняется
+            # настройка, я настраиваю ширину поля дата, а при повторном
+            # открытии настройки возвращаются обратно").
+            if not self._auto_stretching_date and not getattr(self, "_restoring_window_state", False):
+                self._date_column_pinned = True
+                save_mail_date_column_pinned(True)
+            return
         # Ручное перетаскивание границы любой ДРУГОЙ колонки (чаще всего —
         # "Тема") мышью не проходит через resizeEvent окна — без этого
         # хука пересчёт "Даты" срабатывал только при изменении размера
         # самого окна, и сужение "Темы" мышью оставляло пустоту справа от
         # "Даты" до следующего resize (жалоба: "при изменении ширины темы
-        # появляется пустота справа"). Пропускаем изменения самой "Даты" —
-        # иначе наш же resizeSection() ниже вызывал бы этот обработчик
-        # заново и зацикливался.
-        if logical_index == COL_DATE:
+        # появляется пустота справа").
+        # header.restoreState() тоже шлёт sectionResized на каждую
+        # восстанавливаемую колонку — без этой проверки тут же затирался бы
+        # только что восстановленный размер "Даты" (см. _restore_window_state).
+        if getattr(self, "_restoring_window_state", False):
             return
         self._schedule_stretch_date_column()
 
@@ -3545,7 +3608,20 @@ class MainWindow(QMainWindow):
         # и колонка застревала на минимальной ширине вместо реального
         # растягивания (жалоба вернулась: "тема не расширяется", хотя код
         # уже пытался это делать). К следующему тику раскладка уже готова.
-        QTimer.singleShot(0, self._stretch_date_column)
+        #
+        # Поколение захватывается СЕЙЧАС, а не в момент срабатывания —
+        # если между планированием и следующим тиком событий успеет
+        # пройти restoreState() сохранённых ширин (см. _restore_window_state),
+        # он увеличит _column_stretch_generation, и этот, уже устаревший,
+        # вызов просто ничего не сделает вместо того, чтобы затереть только
+        # что восстановленную пользователем ширину "Даты".
+        generation = self._column_stretch_generation
+        QTimer.singleShot(0, lambda: self._stretch_date_column_if_current(generation))
+
+    def _stretch_date_column_if_current(self, generation: int) -> None:
+        if generation != self._column_stretch_generation:
+            return
+        self._stretch_date_column()
 
     def _stretch_date_column(self) -> None:
         # "Дата" (последняя колонка) тянется до правого края (жалоба:
@@ -3555,11 +3631,20 @@ class MainWindow(QMainWindow):
         # self.table выше. Пересчитываем вручную: сколько места остаётся
         # после всех ОСТАЛЬНЫХ колонок — столько и отдаём "Дате", не трогая
         # их собственную, уже выставленную пользователем ширину.
+        if self._date_column_pinned:
+            # Пользователь уже задал ширину "Даты" сам — с этого момента
+            # это НЕ авто-стретчащаяся колонка, трогать её нельзя (см.
+            # _on_mail_column_resized).
+            return
         header = self.table.horizontalHeader()
         other_width = sum(header.sectionSize(col) for col in range(header.count()) if col != COL_DATE)
         available = self.table.viewport().width()
         min_width = 90
-        header.resizeSection(COL_DATE, max(min_width, available - other_width))
+        self._auto_stretching_date = True
+        try:
+            header.resizeSection(COL_DATE, max(min_width, available - other_width))
+        finally:
+            self._auto_stretching_date = False
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
@@ -5642,12 +5727,19 @@ class MainWindow(QMainWindow):
             return
         events = [e for e in events if e.status != "cancelled"]
         events = [e for e in events if e.calendar_id in self._visible_calendar_ids]
+        # calendar_id -> цвет календаря — раньше карточка события всегда
+        # красилась по роли (я организатор/меня пригласили), без единой
+        # привязки к тому, в каком именно календаре событие лежит, и
+        # событие в НОВОМ календаре выглядело неотличимо от события в
+        # календаре по умолчанию (жалоба: "не видно связи события с
+        # календарём"). См. _event_color в week_calendar.py.
+        calendar_colors = {cal.id: cal.color for cal in self._calendars_by_row}
 
         if self.calendar_view_mode == "month":
             self.calendar_month_label.setText(
                 f"{_MONTH_NAMES[self.calendar_month_anchor.month - 1]} {self.calendar_month_anchor.year}"
             )
-            self.calendar_month_grid.set_month(self.calendar_month_anchor, events)
+            self.calendar_month_grid.set_month(self.calendar_month_anchor, events, calendar_colors)
             self.calendar_month_grid.set_selected_day(self.calendar_selected_day)
             highlighted_day = self._mini_picker_target_day or self.calendar_selected_day or self.calendar_month_anchor
         else:
@@ -5660,8 +5752,8 @@ class MainWindow(QMainWindow):
             self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
             self.calendar_week_header.set_week_start(self.calendar_week_start)
             self.calendar_week_header.set_selected_day(self.calendar_selected_day)
-            self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events)
-            self.calendar_week_grid.set_week(self.calendar_week_start, timed_events)
+            self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events, calendar_colors)
+            self.calendar_week_grid.set_week(self.calendar_week_start, timed_events, calendar_colors)
             self.calendar_week_grid.set_selected_day(self.calendar_selected_day)
             # Раньше здесь всегда подставлялся понедельник недели — если
             # пользователь кликал в мини-календаре не по понедельнику
