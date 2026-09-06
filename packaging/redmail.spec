@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        36%{?dist}
+Release:        37%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,15 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-37
+- Внешние картинки в HTML-письмах снова показываются - Chromium по
+  умолчанию не даёт странице, открытой с диска, качать что-либо по сети,
+  из-за чего они молча не грузились
+- Рамка чекбокса отметки письма в списке стала ещё тоньше
+- Клик по ещё не наступившему сегодня часу в сетке календаря (например,
+  утро, если сейчас день) больше не отклоняется молча как "прошедшее
+  время" - раньше это выглядело как "событие не создаётся"
+
 * Sun Sep 06 2026 RedMail dev <noreply@example.com> - 0.0.1-36
 - HTML-письма теперь отрисовываются настоящим браузерным движком
   (Chromium через QWebEngineView) вместо упрощённого текстового виджета
