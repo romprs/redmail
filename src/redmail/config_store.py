@@ -85,6 +85,47 @@ def save_theme(theme: str) -> None:
     _save_settings_dict(data)
 
 
+@dataclass
+class Signature:
+    id: str
+    name: str
+    body_html: str
+
+
+def load_signatures() -> list[Signature]:
+    """Подписи для писем (жалоба: "нет возможности задать подпись или
+    несколько подписей и выбрать нужную") — хранятся тем же способом, что
+    и MailRule выше: список словарей в settings.json, повреждённые записи
+    молча пропускаются, а не валят загрузку всех остальных."""
+    raw = _load_settings_dict().get("signatures", [])
+    if not isinstance(raw, list):
+        return []
+    signatures = []
+    for item in raw:
+        try:
+            signatures.append(Signature(id=item["id"], name=item["name"], body_html=item["body_html"]))
+        except (TypeError, KeyError):
+            continue
+    return signatures
+
+
+def save_signatures(signatures: list[Signature]) -> None:
+    data = _load_settings_dict()
+    data["signatures"] = [asdict(sig) for sig in signatures]
+    _save_settings_dict(data)
+
+
+def load_default_signature_id() -> str | None:
+    value = _load_settings_dict().get("default_signature_id")
+    return value if isinstance(value, str) else None
+
+
+def save_default_signature_id(signature_id: str | None) -> None:
+    data = _load_settings_dict()
+    data["default_signature_id"] = signature_id
+    _save_settings_dict(data)
+
+
 def load_caldav_url() -> str:
     """Адрес CalDAV-сервера — вводится пользователем вручную (закрытая
     корпоративная сеть, автоопределить неоткуда), логин/пароль берутся из

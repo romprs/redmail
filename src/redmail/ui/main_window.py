@@ -101,10 +101,12 @@ from PySide6.QtWidgets import (
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail.config_store import (
     MailRule,
+    Signature,
     default_archive_storage_dir,
     load_accounts,
     load_archive_storage_dir,
     load_caldav_url,
+    load_default_signature_id,
     load_ews_accounts,
     load_font_scale,
     load_mail_columns_state,
@@ -112,11 +114,13 @@ from redmail.config_store import (
     load_open_archives,
     load_pane_orientation,
     load_poll_interval_minutes,
+    load_signatures,
     load_theme,
     load_window_geometry,
     save_accounts,
     save_archive_storage_dir,
     save_caldav_url,
+    save_default_signature_id,
     save_ews_accounts,
     save_font_scale,
     save_mail_columns_state,
@@ -124,6 +128,7 @@ from redmail.config_store import (
     save_open_archives,
     save_pane_orientation,
     save_poll_interval_minutes,
+    save_signatures,
     save_theme,
     save_window_geometry,
 )
@@ -1084,11 +1089,15 @@ class SettingsDialog(QDialog):
         mail_rules_button.clicked.connect(self._on_mail_rules)
         apply_rules_button = QPushButton("Применить правила к текущей папке", self)
         apply_rules_button.clicked.connect(self._on_apply_mail_rules)
+        signatures_button = QPushButton("Подписи…", self)
+        signatures_button.setToolTip("Одна или несколько подписей для писем — выбираются при написании письма")
+        signatures_button.clicked.connect(self._on_manage_signatures)
         accounts_rules_layout = QVBoxLayout()
         accounts_rules_layout.addWidget(add_account_button)
         accounts_rules_layout.addWidget(add_ews_account_button)
         accounts_rules_layout.addWidget(mail_rules_button)
         accounts_rules_layout.addWidget(apply_rules_button)
+        accounts_rules_layout.addWidget(signatures_button)
         accounts_rules_group = QGroupBox("Учётные записи и правила почты", self)
         accounts_rules_group.setLayout(accounts_rules_layout)
 
@@ -1231,6 +1240,10 @@ class SettingsDialog(QDialog):
     def _on_apply_mail_rules(self) -> None:
         if self.parent() is not None:
             self.parent().on_apply_mail_rules()
+
+    def _on_manage_signatures(self) -> None:
+        if self.parent() is not None:
+            self.parent().on_manage_signatures()
 
     def account(self) -> Account:
         auth_type = self.auth_combo.currentData()
@@ -1383,6 +1396,8 @@ class ComposeDialog(QDialog):
         inline_images: dict[str, tuple[str, bytes]] | None = None,
         contacts: list[contact_store.Contact] | None = None,
         attachments: list[OutgoingAttachment] | None = None,
+        signatures: list[Signature] | None = None,
+        default_signature_id: str | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -1426,6 +1441,26 @@ class ComposeDialog(QDialog):
             self.body_edit.setHtml(body_html)
         else:
             self.body_edit.setPlainText(body)
+
+        # Подпись (жалоба: "нет возможности задать подпись или несколько
+        # подписей и выбрать нужную") — подставляется автоматически только
+        # для СВЕЖЕГО письма (body_html не задан, т.е. не черновик/не уже
+        # готовое содержимое); при редактировании черновика повторная
+        # автоподстановка задвоила бы уже сохранённую подпись. Смена в
+        # комбобоксе всегда доступна — переключиться можно в любой момент.
+        self._signatures = signatures or []
+        self._signature_range: tuple[int, int] | None = None
+        self.signature_combo: QComboBox | None = None
+        if self._signatures:
+            self.signature_combo = QComboBox(self)
+            self.signature_combo.addItem("Без подписи", None)
+            for sig in self._signatures:
+                self.signature_combo.addItem(sig.name, sig.id)
+            self.signature_combo.currentIndexChanged.connect(self._on_signature_changed)
+            if body_html is None and default_signature_id:
+                index = self.signature_combo.findData(default_signature_id)
+                if index >= 0:
+                    self.signature_combo.setCurrentIndex(index)
 
         self.bold_action = QAction("Ж", self)
         self.bold_action.setCheckable(True)
@@ -1545,6 +1580,12 @@ class ComposeDialog(QDialog):
         layout.addLayout(form)
         layout.addLayout(attach_row)
         layout.addWidget(self.attachments_list)
+        if self.signature_combo is not None:
+            signature_row = QHBoxLayout()
+            signature_row.addWidget(QLabel("Подпись:", self))
+            signature_row.addWidget(self.signature_combo)
+            signature_row.addStretch(1)
+            layout.addLayout(signature_row)
         layout.addWidget(format_toolbar)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
@@ -1664,6 +1705,225 @@ class ComposeDialog(QDialog):
         self._inline_images[cid] = (content_type or "image/png", data)
         cursor = self.body_edit.textCursor()
         cursor.insertImage(image, f"cid:{cid}")
+
+    def _on_signature_changed(self, _index: int) -> None:
+        # Точный диапазон позиций, а не поиск по тексту/HTML — Qt не
+        # сохраняет произвольную разметку (например, HTML-комментарии как
+        # маркер) через цикл setHtml()/toHtml(), у него своё, более узкое
+        # подмножество HTML. Запоминая (начало, конец) вставленной подписи
+        # в документе, можно надёжно убрать именно её при переключении на
+        # другую или на "Без подписи", не трогая остальной текст письма.
+        cursor = self.body_edit.textCursor()
+        if self._signature_range is not None:
+            start, end = self._signature_range
+            doc_end = self.body_edit.document().characterCount() - 1
+            cursor.setPosition(min(start, doc_end))
+            cursor.setPosition(min(end, doc_end), QTextCursor.MoveMode.KeepAnchor)
+            cursor.removeSelectedText()
+            self._signature_range = None
+        sig_id = self.signature_combo.currentData()
+        if sig_id:
+            signature = next((s for s in self._signatures if s.id == sig_id), None)
+            if signature is not None:
+                cursor.movePosition(QTextCursor.MoveOperation.End)
+                self.body_edit.setTextCursor(cursor)
+                start_pos = cursor.position()
+                cursor.insertHtml("<br><br>" + signature.body_html)
+                self._signature_range = (start_pos, cursor.position())
+        self.body_edit.setTextCursor(cursor)
+
+
+class SignatureEditDialog(QDialog):
+    """Название + тело подписи — своя, более лёгкая панель форматирования
+    (только Ж/К/Ч, без гарнитуры/размера — подпись обычно короткая, полный
+    набор ComposeDialog тут был бы избыточен)."""
+
+    def __init__(self, parent, signature: Signature | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Изменить подпись" if signature else "Новая подпись")
+        self.resize(480, 320)
+
+        self.name_edit = QLineEdit(signature.name if signature else "")
+        self.name_edit.setPlaceholderText("Например, «Рабочая»")
+
+        self.body_edit = QTextEdit()
+        self.body_edit.setAcceptRichText(True)
+        if signature:
+            self.body_edit.setHtml(signature.body_html)
+
+        self.bold_action = QAction("Ж", self)
+        self.bold_action.setCheckable(True)
+        self.bold_action.setToolTip("Полужирный")
+        self.bold_action.toggled.connect(self._on_bold_toggled)
+        self.italic_action = QAction("К", self)
+        self.italic_action.setCheckable(True)
+        self.italic_action.setToolTip("Курсив")
+        self.italic_action.toggled.connect(self._on_italic_toggled)
+        self.underline_action = QAction("Ч", self)
+        self.underline_action.setCheckable(True)
+        self.underline_action.setToolTip("Подчёркнутый")
+        self.underline_action.toggled.connect(self._on_underline_toggled)
+
+        toolbar = QToolBar("Форматирование", self)
+        toolbar.addAction(self.bold_action)
+        toolbar.addAction(self.italic_action)
+        toolbar.addAction(self.underline_action)
+        for action, tweak in (
+            (self.bold_action, lambda f: f.setBold(True)),
+            (self.italic_action, lambda f: f.setItalic(True)),
+            (self.underline_action, lambda f: f.setUnderline(True)),
+        ):
+            button = toolbar.widgetForAction(action)
+            if button is not None:
+                font = button.font()
+                tweak(font)
+                button.setFont(font)
+
+        form = QFormLayout()
+        form.addRow("Название", self.name_edit)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(toolbar)
+        layout.addWidget(self.body_edit)
+        layout.addWidget(buttons)
+
+    def _on_bold_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontWeight(QFont.Weight.Bold if checked else QFont.Weight.Normal)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def _on_italic_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontItalic(checked)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def _on_underline_toggled(self, checked: bool) -> None:
+        fmt = QTextCharFormat()
+        fmt.setFontUnderline(checked)
+        self.body_edit.mergeCurrentCharFormat(fmt)
+        self.body_edit.setFocus()
+
+    def name(self) -> str:
+        return self.name_edit.text().strip()
+
+    def body_html(self) -> str:
+        return self.body_edit.toHtml()
+
+
+class SignaturesDialog(QDialog):
+    """Список подписей (жалоба: "нет возможности задать подпись или
+    несколько подписей и выбрать нужную") — тот же принцип, что и
+    MailRulesDialog: список + Добавить/Изменить/Удалить, плюс отметка
+    "по умолчанию" (та, что автоматически подставляется в новое письмо)."""
+
+    def __init__(self, parent, signatures: list[Signature], default_signature_id: str | None):
+        super().__init__(parent)
+        self.setWindowTitle("Подписи")
+        self.resize(420, 320)
+        self._signatures = list(signatures)
+        self._default_id = default_signature_id
+
+        self.table = QTableWidget(0, 2, self)
+        self.table.setHorizontalHeaderLabels(["Название", "По умолчанию"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.itemDoubleClicked.connect(lambda _item: self._on_edit())
+        self._refresh_table()
+
+        add_button = QPushButton("Добавить…", self)
+        add_button.clicked.connect(self._on_add)
+        edit_button = QPushButton("Изменить…", self)
+        edit_button.clicked.connect(self._on_edit)
+        remove_button = QPushButton("Удалить", self)
+        remove_button.clicked.connect(self._on_remove)
+        default_button = QPushButton("Сделать по умолчанию", self)
+        default_button.clicked.connect(self._on_make_default)
+        button_row = QHBoxLayout()
+        button_row.addWidget(add_button)
+        button_row.addWidget(edit_button)
+        button_row.addWidget(remove_button)
+        button_row.addWidget(default_button)
+        button_row.addStretch(1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.rejected.connect(self.accept)
+        buttons.accepted.connect(self.accept)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(button_row)
+        layout.addWidget(self.table)
+        layout.addWidget(buttons)
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self._signatures))
+        for row, sig in enumerate(self._signatures):
+            self.table.setItem(row, 0, QTableWidgetItem(sig.name))
+            self.table.setItem(row, 1, QTableWidgetItem("✓" if sig.id == self._default_id else ""))
+
+    def _on_add(self) -> None:
+        dialog = SignatureEditDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name()
+        if not name:
+            return
+        sig = Signature(id=str(uuid4()), name=name, body_html=dialog.body_html())
+        self._signatures.append(sig)
+        if self._default_id is None:
+            self._default_id = sig.id  # первая созданная подпись сразу становится подписью по умолчанию
+        self._refresh_table()
+
+    def _on_edit(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        dialog = SignatureEditDialog(self, self._signatures[row])
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name = dialog.name()
+        if not name:
+            return
+        existing = self._signatures[row]
+        self._signatures[row] = Signature(id=existing.id, name=name, body_html=dialog.body_html())
+        self._refresh_table()
+
+    def _on_remove(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        sig = self._signatures[row]
+        confirm = QMessageBox.question(
+            self, "Удалить подпись", f"Удалить подпись «{sig.name}»?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        del self._signatures[row]
+        if self._default_id == sig.id:
+            self._default_id = self._signatures[0].id if self._signatures else None
+        self._refresh_table()
+
+    def _on_make_default(self) -> None:
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self._default_id = self._signatures[row].id
+        self._refresh_table()
+
+    def signatures(self) -> list[Signature]:
+        return list(self._signatures)
+
+    def default_signature_id(self) -> str | None:
+        return self._default_id
 
 
 class MailRuleEditDialog(QDialog):
@@ -2562,6 +2822,8 @@ class MainWindow(QMainWindow):
         self.caldav_url = load_caldav_url()
         self.archive_storage_dir = load_archive_storage_dir()
         self.mail_rules: list[MailRule] = load_mail_rules()
+        self.signatures: list[Signature] = load_signatures()
+        self.default_signature_id: str | None = load_default_signature_id()
         # Держим ссылки на фоновые потоки (импорт архивов, отправка
         # приглашений) — без этого Python может собрать QThread раньше, чем
         # он реально завершится, даже если у него есть родитель-QObject.
@@ -3717,6 +3979,17 @@ class MainWindow(QMainWindow):
             self._render_folder(summaries)
         self.statusBar().showMessage(f"По правилам перемещено писем: {moved_total}", 5000)
 
+    def on_manage_signatures(self) -> None:
+        dialog = SignaturesDialog(self, self.signatures, self.default_signature_id)
+        dialog.exec()
+        self.signatures = dialog.signatures()
+        self.default_signature_id = dialog.default_signature_id()
+        try:
+            save_signatures(self.signatures)
+            save_default_signature_id(self.default_signature_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Не удалось сохранить подписи", str(exc))
+
     def on_archive_folder(self) -> None:
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             QMessageBox.information(
@@ -4450,6 +4723,8 @@ class MainWindow(QMainWindow):
                     OutgoingAttachment(filename=a.filename, content_type=a.content_type, payload=a.payload)
                     for a in content.attachments
                 ],
+                signatures=self.signatures,
+                default_signature_id=self.default_signature_id,
             )
             self._exec_compose(dialog, source_draft=(self.current_folder, summary.uid))
             return
@@ -5812,7 +6087,13 @@ class MainWindow(QMainWindow):
                 "Сначала подключитесь и укажите сервер SMTP в настройках учётной записи.",
             )
             return
-        dialog = ComposeDialog(self, title="Новое письмо", contacts=self._load_contacts())
+        dialog = ComposeDialog(
+            self,
+            title="Новое письмо",
+            contacts=self._load_contacts(),
+            signatures=self.signatures,
+            default_signature_id=self.default_signature_id,
+        )
         self._exec_compose(dialog)
 
     def on_reply(self) -> None:
@@ -5839,7 +6120,14 @@ class MainWindow(QMainWindow):
         body = f"\n\n{quote_header}\n{quoted}"
 
         dialog = ComposeDialog(
-            self, title="Ответить", to=summary.sender_email, subject=subject, body=body, contacts=self._load_contacts()
+            self,
+            title="Ответить",
+            to=summary.sender_email,
+            subject=subject,
+            body=body,
+            contacts=self._load_contacts(),
+            signatures=self.signatures,
+            default_signature_id=self.default_signature_id,
         )
         self._exec_compose(dialog, in_reply_to=summary.message_id or None)
 
@@ -5886,6 +6174,8 @@ class MainWindow(QMainWindow):
                 )
                 for a in content.attachments
             ],
+            signatures=self.signatures,
+            default_signature_id=self.default_signature_id,
         )
         self._exec_compose(dialog)
 

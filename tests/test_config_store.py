@@ -29,7 +29,17 @@ from redmail.config_store import (
     save_poll_interval_minutes,
     save_window_geometry,
 )
-from redmail.config_store import load_ews_accounts, load_theme, save_ews_accounts, save_theme
+from redmail.config_store import (
+    Signature,
+    load_default_signature_id,
+    load_ews_accounts,
+    load_signatures,
+    load_theme,
+    save_default_signature_id,
+    save_ews_accounts,
+    save_signatures,
+    save_theme,
+)
 from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
@@ -424,6 +434,47 @@ def test_mail_rules_skips_corrupt_entries(tmp_path: Path) -> None:
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         rules = load_mail_rules()
     assert rules == [MailRule(field="subject", contains="y", target_folder="Z")]
+
+
+def test_signatures_default_to_empty(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_signatures() == []
+
+
+def test_signatures_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    signatures = [
+        Signature(id="s1", name="Рабочая", body_html="<p><b>Иван</b><br>Менеджер</p>"),
+        Signature(id="s2", name="Личная", body_html="<p>Иван</p>"),
+    ]
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_signatures(signatures)
+        assert load_signatures() == signatures
+
+
+def test_signatures_skips_corrupt_entries(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(
+        '{"signatures": [{"id": "s1", "name": "x"}, {"id": "s2", "name": "y", "body_html": "z"}]}',
+        encoding="utf-8",
+    )
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        signatures = load_signatures()
+    assert signatures == [Signature(id="s2", name="y", body_html="z")]
+
+
+def test_default_signature_id_defaults_to_none(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert load_default_signature_id() is None
+
+
+def test_default_signature_id_round_trip(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_default_signature_id("s1")
+        assert load_default_signature_id() == "s1"
 
 
 def test_open_archives_defaults_to_empty(tmp_path: Path) -> None:
