@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        28%{?dist}
+Release:        29%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,13 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 05 2026 RedMail dev <noreply@example.com> - 0.0.1-29
+- Устранено сильное замедление интерфейса, появившееся в 0.0.1-28
+  из-за темы оформления - жалоба: письма читаются медленно,
+  переключение между окнами тоже. Причина - слишком широкий стиль
+  на все виджеты сразу; тема переведена на палитру Qt (быстрый
+  штатный механизм) без потери светлой/тёмной темы
+
 * Sat Sep 05 2026 RedMail dev <noreply@example.com> - 0.0.1-28
 - Список писем теперь всегда растягивается на всю ширину панели
   (не оставляет пустую полосу справа), особенно заметно было при
