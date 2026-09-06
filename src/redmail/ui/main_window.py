@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import math
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import mimetypes
 import re
 import shutil
@@ -316,7 +317,12 @@ def _find_remote_image_urls(html_content: str) -> list[str]:
 
 
 def _load_remote_images_async(
-    browser: QTextBrowser, html_content: str, owner: QWidget, workers: list[QThread]
+    browser: QTextBrowser,
+    html_content: str,
+    owner: QWidget,
+    workers: list[QThread],
+    *,
+    is_current: Callable[[], bool] | None = None,
 ) -> None:
     """Догружает внешние (не cid:) картинки письма в фоне и перерисовывает
     после — раньше такие картинки просто не показывались вовсе (Qt сам не
@@ -326,30 +332,46 @@ def _load_remote_images_async(
     отслеживания). Обязательно в фоновом потоке, а не синхронно — письмо с
     внешней картинкой на медленном сервере иначе подвесило бы всё окно
     точно так же, как уже было с самим телом письма (см.
-    on_message_selected)."""
+    on_message_selected). is_current — тот же принцип токена, что и там:
+    если пользователь успел открыть другое письмо, пока грузились картинки
+    этого, применять устаревший результат (перезаписывать reading_pane
+    чужим письмом) не нужно."""
     urls = _find_remote_image_urls(html_content)
     if not urls:
         return
 
+    def fetch_one(url: str) -> tuple[str, bytes] | None:
+        try:
+            with urllib.request.urlopen(url, timeout=10) as response:
+                # Письмо не обязано быть добросовестным — ограничиваем
+                # размер одной "картинки", чтобы вредоносная/битая ссылка
+                # не забила память огромным ответом.
+                payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
+            if len(payload) <= _MAX_REMOTE_IMAGE_BYTES:
+                return url, payload
+        except Exception:
+            pass  # одна недогрузившаяся картинка не должна портить всё письмо
+        return None
+
     def fetch() -> dict[str, bytes]:
+        # Параллельно, а не по одной — в маркетинговых письмах картинок
+        # часто пять-шесть штук (логотип, баннер, иконки соцсетей), и
+        # последовательная загрузка растягивала бы общее время ожидания на
+        # сумму всех round trip'ов вместо самого медленного из них.
         results: dict[str, bytes] = {}
-        for url in urls:
-            try:
-                with urllib.request.urlopen(url, timeout=10) as response:
-                    # Письмо не обязано быть добросовестным — ограничиваем
-                    # размер одной "картинки", чтобы вредоносная/битая
-                    # ссылка не забила память огромным ответом.
-                    payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
-                if len(payload) <= _MAX_REMOTE_IMAGE_BYTES:
+        with ThreadPoolExecutor(max_workers=min(8, len(urls))) as pool:
+            for outcome in pool.map(fetch_one, urls):
+                if outcome is not None:
+                    url, payload = outcome
                     results[url] = payload
-            except Exception:
-                pass  # одна недогрузившаяся картинка не должна портить всё письмо
         return results
 
     worker = _CallableWorker(fetch, parent=owner)
 
     def on_success(images: object) -> None:
         workers.remove(worker)
+        if is_current is not None and not is_current():
+            return  # пользователь уже открыл другое письмо — эти картинки ему не покажем
         document = browser.document()
         for url, payload in images.items():
             image = QImage.fromData(payload)
@@ -367,7 +389,12 @@ def _load_remote_images_async(
 
 
 def _populate_body_browser(
-    browser: QTextBrowser, content: MessageContent, *, owner: QWidget | None = None, workers: list[QThread] | None = None
+    browser: QTextBrowser,
+    content: MessageContent,
+    *,
+    owner: QWidget | None = None,
+    workers: list[QThread] | None = None,
+    is_current: Callable[[], bool] | None = None,
 ) -> None:
     """HTML-письма показываем как есть (с внедрёнными картинками из
     cid:-вложений через addResource — без этого <img src="cid:..."> не
@@ -388,7 +415,7 @@ def _populate_body_browser(
     html_content = content.html if content.html else _linkify(content.text)
     browser.setHtml(html_content)
     if owner is not None and workers is not None:
-        _load_remote_images_async(browser, html_content, owner, workers)
+        _load_remote_images_async(browser, html_content, owner, workers, is_current=is_current)
 
 
 class MessageWindow(QWidget):
@@ -4593,7 +4620,11 @@ class MainWindow(QMainWindow):
         thread_html = _build_thread_html(entries, summary.uid)
         self.reading_pane.setHtml(thread_html)
         self.reading_pane.scrollToAnchor(f"msg-{summary.uid}")
-        _load_remote_images_async(self.reading_pane, thread_html, self, self._background_workers)
+        token = self._message_select_token
+        _load_remote_images_async(
+            self.reading_pane, thread_html, self, self._background_workers,
+            is_current=lambda: token == self._message_select_token,
+        )
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:
@@ -4607,7 +4638,11 @@ class MainWindow(QMainWindow):
         window.show()
 
     def _render_body(self, content: MessageContent) -> None:
-        _populate_body_browser(self.reading_pane, content, owner=self, workers=self._background_workers)
+        token = self._message_select_token
+        _populate_body_browser(
+            self.reading_pane, content, owner=self, workers=self._background_workers,
+            is_current=lambda: token == self._message_select_token,
+        )
 
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
         try:
