@@ -7,6 +7,7 @@ import mimetypes
 import re
 import shutil
 import tempfile
+import urllib.request
 import zlib
 from datetime import date, datetime, timedelta, timezone
 from email.utils import getaddresses
@@ -301,26 +302,93 @@ def _build_thread_html(entries: list[tuple[MessageSummary, str]], current_uid: i
     return "".join(parts)
 
 
-def _populate_body_browser(browser: QTextBrowser, content: MessageContent) -> None:
+_REMOTE_IMG_SRC_RE = re.compile(r'<img\b[^>]*?\bsrc\s*=\s*["\'](https?://[^"\']+)["\']', re.IGNORECASE)
+_MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024
+
+
+def _find_remote_image_urls(html_content: str) -> list[str]:
+    seen: list[str] = []
+    for match in _REMOTE_IMG_SRC_RE.finditer(html_content):
+        url = html.unescape(match.group(1))
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def _load_remote_images_async(
+    browser: QTextBrowser, html_content: str, owner: QWidget, workers: list[QThread]
+) -> None:
+    """Догружает внешние (не cid:) картинки письма в фоне и перерисовывает
+    после — раньше такие картинки просто не показывались вовсе (Qt сам не
+    подгружает удалённые ресурсы). По решению пользователя — без баннера
+    "Показать изображения" (это личный ящик, не нужно отдельное
+    подтверждение на каждое письмо, как в Gmail/Outlook против
+    отслеживания). Обязательно в фоновом потоке, а не синхронно — письмо с
+    внешней картинкой на медленном сервере иначе подвесило бы всё окно
+    точно так же, как уже было с самим телом письма (см.
+    on_message_selected)."""
+    urls = _find_remote_image_urls(html_content)
+    if not urls:
+        return
+
+    def fetch() -> dict[str, bytes]:
+        results: dict[str, bytes] = {}
+        for url in urls:
+            try:
+                with urllib.request.urlopen(url, timeout=10) as response:
+                    # Письмо не обязано быть добросовестным — ограничиваем
+                    # размер одной "картинки", чтобы вредоносная/битая
+                    # ссылка не забила память огромным ответом.
+                    payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
+                if len(payload) <= _MAX_REMOTE_IMAGE_BYTES:
+                    results[url] = payload
+            except Exception:
+                pass  # одна недогрузившаяся картинка не должна портить всё письмо
+        return results
+
+    worker = _CallableWorker(fetch, parent=owner)
+
+    def on_success(images: object) -> None:
+        workers.remove(worker)
+        document = browser.document()
+        for url, payload in images.items():
+            image = QImage.fromData(payload)
+            if not image.isNull():
+                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), image)
+        browser.setHtml(html_content)
+
+    def on_failure(_message: str) -> None:
+        workers.remove(worker)
+
+    worker.succeeded.connect(on_success)
+    worker.failed.connect(on_failure)
+    workers.append(worker)
+    worker.start()
+
+
+def _populate_body_browser(
+    browser: QTextBrowser, content: MessageContent, *, owner: QWidget | None = None, workers: list[QThread] | None = None
+) -> None:
     """HTML-письма показываем как есть (с внедрёнными картинками из
     cid:-вложений через addResource — без этого <img src="cid:..."> не
     отрисуется); письма с обычным текстом — тоже через setHtml, но
     экранированным и с активными ссылками (_linkify), чтобы голые
     http(s)-ссылки в теле письма были кликабельны, как и в HTML-версии.
-    Внешние (не cid:) картинки Qt сам не подгружает — не течём в сеть на
-    отрисовку письма. Общая для MainWindow.reading_pane и MessageWindow —
-    открытие письма в отдельном окне должно выглядеть так же, как в
-    основной панели чтения."""
+    Внешние (не cid:) картинки Qt сам не подгружает по себе — если переданы
+    owner/workers, они дозагружаются асинхронно через
+    _load_remote_images_async. Общая для MainWindow.reading_pane и
+    MessageWindow — открытие письма в отдельном окне должно выглядеть так
+    же, как в основной панели чтения."""
     document = browser.document()
     document.clear()
     for content_id, (_content_type, payload) in content.inline_images.items():
         image = QImage.fromData(payload)
         if not image.isNull():
             document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
-    if content.html:
-        browser.setHtml(content.html)
-    else:
-        browser.setHtml(_linkify(content.text))
+    html_content = content.html if content.html else _linkify(content.text)
+    browser.setHtml(html_content)
+    if owner is not None and workers is not None:
+        _load_remote_images_async(browser, html_content, owner, workers)
 
 
 class MessageWindow(QWidget):
@@ -335,6 +403,10 @@ class MessageWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self._summary = summary
         self._content = content
+        # Держит ссылку на фоновый поток догрузки внешних картинок (см.
+        # _load_remote_images_async) — без этого Python может собрать
+        # QThread раньше, чем он реально завершится.
+        self._background_workers: list[QThread] = []
 
         sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
         lines = [f"<b>Тема:</b> {html.escape(content.subject or summary.subject or '(без темы)')}", f"<b>От:</b> {html.escape(sender)}"]
@@ -366,7 +438,7 @@ class MessageWindow(QWidget):
         body = QTextBrowser(self)
         body.setReadOnly(True)
         body.setOpenExternalLinks(True)
-        _populate_body_browser(body, content)
+        _populate_body_browser(body, content, owner=self, workers=self._background_workers)
 
         layout = QVBoxLayout(self)
         layout.addWidget(header_label)
@@ -2468,6 +2540,9 @@ class MainWindow(QMainWindow):
         # ещё тот же (иначе пользователь уже открыл что-то другое, а
         # устаревший ответ из сети может прийти позже).
         self._thread_render_token = 0
+        # Тот же принцип токена, но для самого выбора письма (см.
+        # on_message_selected) — растёт при каждом клике по письму.
+        self._message_select_token = 0
 
         self.reading_pane = QTextBrowser(self)
         self.reading_pane.setReadOnly(True)
@@ -3518,12 +3593,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"{verb} в архив: {exported}", 5000)
 
     def on_about(self) -> None:
-        try:
-            from importlib.metadata import PackageNotFoundError, version
+        # Локальный импорт — та же причина, что у остальных ленивых
+        # импортов в этом файле: main_window.py не должен тянуть за собой
+        # __main__.py на верхнем уровне модуля (циклический импорт, ведь
+        # именно __main__.py импортирует MainWindow при старте программы).
+        from redmail.__main__ import app_version as get_app_version
 
-            app_version = version("redmail")
-        except PackageNotFoundError:
-            app_version = "?"
+        app_version = get_app_version()
         QMessageBox.about(
             self,
             "О программе",
@@ -4329,35 +4405,60 @@ class MainWindow(QMainWindow):
         self.selected_summary = summary
         self.current_invite = None
         self.invite_bar.hide()
-        try:
-            content = self.active_source.message_content(self.current_folder, summary.uid)
-        except Exception as exc:
+
+        # Загрузка тела письма — сетевой запрос при первом (ещё не
+        # закэшированном) открытии письма, раньше выполнялся синхронно
+        # прямо тут. На перегруженной/медленной сети это подвешивало ВСЁ
+        # окно целиком, не только чтение письма (жалоба: "программа
+        # подвисает... не реагирует на клики мыши"). Токен — та же защита
+        # от гонки, что и в _render_thread: если пользователь успел
+        # выбрать другое письмо, пока это грузилось, устаревший ответ
+        # применять не нужно.
+        self._message_select_token += 1
+        token = self._message_select_token
+        folder = self.current_folder
+        source = self.active_source
+        row = rows[0].row()
+
+        self.reading_pane.setPlainText("Загрузка…")
+        self.thread_list.hide()
+        self.attachments_list.clear()
+        self.attachments_list.hide()
+        self.message_header_widget.hide()
+
+        worker = _CallableWorker(source.message_content, folder, summary.uid, parent=self)
+
+        def on_success(content: object) -> None:
+            self._background_workers.remove(worker)
+            if token != self._message_select_token:
+                return  # пользователь уже открыл другое письмо — этот ответ больше не актуален
+            self.current_body = content.text
+            self.current_attachments = content.attachments
+            self.current_content = content
+            self._render_message_header(summary, content)
+            self._render_thread(summary, content)
+            self._update_invite_bar(content)
+            self._refresh_attachments_list()
+
+            if not summary.is_read:
+                # Отложено на следующий цикл событий: сама отметка
+                # "прочитано" на сервере — это тоже сетевой запрос (STORE);
+                # письмо сначала показывается, а запрос уходит следом.
+                QTimer.singleShot(0, lambda: self._set_message_read(row, summary, True))
+
+        def on_failure(error_text: str) -> None:
+            self._background_workers.remove(worker)
+            if token != self._message_select_token:
+                return
             self.current_body = ""
             self.current_attachments = []
             self.current_content = None
-            self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {exc}")
-            self.attachments_list.clear()
-            self.attachments_list.hide()
-            self.message_header_widget.hide()
-            return
-        self.current_body = content.text
-        self.current_attachments = content.attachments
-        self.current_content = content
-        self._render_message_header(summary, content)
-        self._render_thread(summary, content)
-        self._update_invite_bar(content)
-        self._refresh_attachments_list()
+            self.reading_pane.setPlainText(f"Не удалось загрузить письмо: {error_text}")
 
-        if not summary.is_read:
-            # Отложено на следующий цикл событий: сама отметка "прочитано"
-            # на сервере — это блокирующий сетевой запрос (STORE), и раньше
-            # он выполнялся прямо здесь, ДО того как письмо успевало
-            # отрисоваться — на реальной корпоративной сети с заметной
-            # задержкой это ощущалось как "переключение между письмами
-            # тормозит" при каждом непрочитанном письме. Так письмо сначала
-            # показывается, а запрос уходит следом.
-            row = rows[0].row()
-            QTimer.singleShot(0, lambda: self._set_message_read(row, summary, True))
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _render_message_header(self, summary: MessageSummary, content: MessageContent) -> None:
         subject = content.subject or summary.subject or "(без темы)"
@@ -4489,8 +4590,10 @@ class MainWindow(QMainWindow):
             image = QImage.fromData(payload)
             if not image.isNull():
                 document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{content_id}"), image)
-        self.reading_pane.setHtml(_build_thread_html(entries, summary.uid))
+        thread_html = _build_thread_html(entries, summary.uid)
+        self.reading_pane.setHtml(thread_html)
         self.reading_pane.scrollToAnchor(f"msg-{summary.uid}")
+        _load_remote_images_async(self.reading_pane, thread_html, self, self._background_workers)
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:
@@ -4504,7 +4607,7 @@ class MainWindow(QMainWindow):
         window.show()
 
     def _render_body(self, content: MessageContent) -> None:
-        _populate_body_browser(self.reading_pane, content)
+        _populate_body_browser(self.reading_pane, content, owner=self, workers=self._background_workers)
 
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
         try:

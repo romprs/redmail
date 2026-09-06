@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -17,6 +18,25 @@ _SPLASH_FG = "white"
 
 
 def app_version() -> str:
+    """Версия для заставки и "О программе" — жалоба: "добавь в справку о
+    программе версию, сейчас там 0.0.1", т.е. одна и та же версия пакета
+    для КАЖДОЙ сборки (в pyproject.toml она не меняется между RPM-релизами,
+    там всегда "0.0.1" — реальный номер сборки живёт только в Release: у
+    .spec). На RED OS сначала спрашиваем сам установленный RPM-пакет
+    (даёт "0.0.1-30", ровно то, что нужно, чтобы отличить сборки друг от
+    друга); вне RED OS (разработка, другой дистрибутив) rpm просто нет —
+    тогда версия пакета Python как раньше."""
+    try:
+        result = subprocess.run(
+            ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", "redmail"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
     try:
         return version("redmail")
     except PackageNotFoundError:
