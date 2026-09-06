@@ -99,13 +99,13 @@ QSplitter::handle {{
 QTableView::indicator {{
     width: 14px;
     height: 14px;
-    border: 2px solid {text};
+    border: 1px solid {text};
     border-radius: 3px;
     background-color: transparent;
 }}
 QTableView::indicator:checked {{
     background-color: {accent};
-    border: 2px solid {accent};
+    border: 1px solid {accent};
 }}
 """
 

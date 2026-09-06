@@ -321,6 +321,16 @@ def _build_thread_html(entries: list[tuple[MessageSummary, str]], current_uid: i
 _REMOTE_IMG_SRC_RE = re.compile(r'<img\b[^>]*?\bsrc\s*=\s*["\'](https?://[^"\']+)["\']', re.IGNORECASE)
 _MAX_REMOTE_IMAGE_BYTES = 15 * 1024 * 1024
 
+# Кэш в оперативной памяти на время работы приложения (не на диске — эти
+# картинки не привязаны к конкретному письму/аккаунту, а просто по URL).
+# Без него повторное открытие УЖЕ прочитанного письма с внешними
+# картинками каждый раз заново качало их по сети (жалоба: "при
+# переключении между ранее прочитанными письмами они грузятся долго, хотя
+# должны быстро") — раньше это было незаметно, потому что кэш тела письма
+# не сохранял HTML вовсе и такие письма всегда падали в текстовый fallback
+# без единой попытки загрузить картинку.
+_remote_image_cache: dict[str, bytes] = {}
+
 
 def _find_remote_image_urls(html_content: str) -> list[str]:
     seen: list[str] = []
@@ -329,6 +339,15 @@ def _find_remote_image_urls(html_content: str) -> list[str]:
         if url not in seen:
             seen.append(url)
     return seen
+
+
+def _apply_remote_images(browser: QTextBrowser, html_content: str, images: dict[str, bytes]) -> None:
+    document = browser.document()
+    for url, payload in images.items():
+        image = QImage.fromData(payload)
+        if not image.isNull():
+            document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), image)
+    browser.setHtml(html_content)
 
 
 def _load_remote_images_async(
@@ -355,7 +374,16 @@ def _load_remote_images_async(
     if not urls:
         return
 
+    # Уже всё есть в памяти (письмо открывали в этом сеансе раньше) — можно
+    # отрисовать сразу, без потока и сетевого обращения вовсе.
+    cached = {url: _remote_image_cache[url] for url in urls if url in _remote_image_cache}
+    if len(cached) == len(urls):
+        _apply_remote_images(browser, html_content, cached)
+        return
+
     def fetch_one(url: str) -> tuple[str, bytes] | None:
+        if url in _remote_image_cache:
+            return url, _remote_image_cache[url]
         try:
             with urllib.request.urlopen(url, timeout=10) as response:
                 # Письмо не обязано быть добросовестным — ограничиваем
@@ -363,6 +391,7 @@ def _load_remote_images_async(
                 # не забила память огромным ответом.
                 payload = response.read(_MAX_REMOTE_IMAGE_BYTES + 1)
             if len(payload) <= _MAX_REMOTE_IMAGE_BYTES:
+                _remote_image_cache[url] = payload
                 return url, payload
         except Exception:
             pass  # одна недогрузившаяся картинка не должна портить всё письмо
@@ -387,12 +416,7 @@ def _load_remote_images_async(
         workers.remove(worker)
         if is_current is not None and not is_current():
             return  # пользователь уже открыл другое письмо — эти картинки ему не покажем
-        document = browser.document()
-        for url, payload in images.items():
-            image = QImage.fromData(payload)
-            if not image.isNull():
-                document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(url), image)
-        browser.setHtml(html_content)
+        _apply_remote_images(browser, html_content, images)
 
     def on_failure(_message: str) -> None:
         workers.remove(worker)
@@ -2904,10 +2928,14 @@ class MainWindow(QMainWindow):
         # что бы туда ни поставить ("Дату" или пустую служебную колонку под
         # неё), обязательно ловим жалобу либо "не меняется ширина колонки
         # дата", либо "пустота после даты, тема не расширяется". Вместо
-        # этого — свой пересчёт: при каждом изменении размера окна "Тема"
-        # сама дотягивается до правого края (см. eventFilter/
-        # _stretch_subject_column), а тянуть её (или "Дату") мышью можно
-        # в любой момент как обычную Interactive-колонку.
+        # этого — свой пересчёт: "Дата" (последняя колонка) сама дотягивается
+        # до правого края при изменении размера окна И при ручном
+        # перетаскивании границы ЛЮБОЙ другой колонки мышью (см.
+        # _stretch_date_column/_on_mail_column_resized) — раньше тянулась
+        # "Тема", но при ручном сужении именно её справа оставалась пустота
+        # (пересчёт срабатывал только на resize окна, а не на перетаскивание
+        # границы колонки мышью). "Дата" ближе к правому краю, поэтому
+        # естественно забирает освободившееся место.
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(COL_SUBJECT, 320)
         header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeMode.Interactive)
@@ -2915,6 +2943,7 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionsMovable(True)
         header.sectionClicked.connect(self._set_filter_column)
+        header.sectionResized.connect(self._on_mail_column_resized)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -3061,8 +3090,8 @@ class MainWindow(QMainWindow):
         self.right_splitter.setStretchFactor(1, 1)
         # Перетаскивание сплиттера меняет доступную ширину таблицы без
         # изменения размера самого окна (resizeEvent на него не сработает) —
-        # тоже должно пересчитывать "Тему" (см. _stretch_subject_column).
-        self.right_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_subject_column())
+        # тоже должно пересчитывать "Дату" (см. _stretch_date_column).
+        self.right_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_date_column())
         self._apply_pane_orientation()
 
         main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
@@ -3071,7 +3100,7 @@ class MainWindow(QMainWindow):
         main_splitter.setStretchFactor(0, 0)
         main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([220, 980])
-        main_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_subject_column())
+        main_splitter.splitterMoved.connect(lambda *_args: self._schedule_stretch_date_column())
 
         self.calendar_week_start = week_start_for(date.today())
         self.selected_calendar_event: calendar_store.Event | None = None
@@ -3396,39 +3425,51 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # сохранённое расположение не подошло (например, число колонок изменилось) — не критично
         finally:
-            # Пересчитать "Тему" под фактическую ширину ПОСЛЕ восстановления
+            # Пересчитать "Дату" под фактическую ширину ПОСЛЕ восстановления
             # геометрии — сохранённая ширина колонки могла быть посчитана
             # под другой размер окна.
-            self._schedule_stretch_subject_column()
+            self._schedule_stretch_date_column()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
         super().resizeEvent(event)
-        self._schedule_stretch_subject_column()
+        self._schedule_stretch_date_column()
 
-    def _schedule_stretch_subject_column(self) -> None:
+    def _on_mail_column_resized(self, logical_index: int, _old_size: int, _new_size: int) -> None:
+        # Ручное перетаскивание границы любой ДРУГОЙ колонки (чаще всего —
+        # "Тема") мышью не проходит через resizeEvent окна — без этого
+        # хука пересчёт "Даты" срабатывал только при изменении размера
+        # самого окна, и сужение "Темы" мышью оставляло пустоту справа от
+        # "Даты" до следующего resize (жалоба: "при изменении ширины темы
+        # появляется пустота справа"). Пропускаем изменения самой "Даты" —
+        # иначе наш же resizeSection() ниже вызывал бы этот обработчик
+        # заново и зацикливался.
+        if logical_index == COL_DATE:
+            return
+        self._schedule_stretch_date_column()
+
+    def _schedule_stretch_date_column(self) -> None:
         # Отложено на следующий цикл событий: resizeEvent верхнего окна
         # доставляется ДО того, как Qt пересчитает геометрию вложенных
         # сплиттеров/таблицы — если читать self.table.viewport().width()
         # прямо здесь, там ещё старое (или вовсе не размеченное) значение,
-        # и "Тема" застревала на минимальной ширине вместо реального
+        # и колонка застревала на минимальной ширине вместо реального
         # растягивания (жалоба вернулась: "тема не расширяется", хотя код
         # уже пытался это делать). К следующему тику раскладка уже готова.
-        QTimer.singleShot(0, self._stretch_subject_column)
+        QTimer.singleShot(0, self._stretch_date_column)
 
-    def _stretch_subject_column(self) -> None:
-        # "Тема" — единственная колонка, которая тянется до правого края
-        # (жалоба: "таблица не растягивается на всё окно"), но обычным
-        # Qt-шным stretchLastSection этого не добиться без потери
-        # возможности потянуть её (или соседнюю "Дату") мышью — см.
-        # комментарий у создания self.table выше. Пересчитываем вручную по
-        # событию изменения размера: сколько места остаётся после всех
-        # ОСТАЛЬНЫХ колонок — столько и отдаём "Теме", не трогая их
-        # собственную, уже выставленную пользователем ширину.
+    def _stretch_date_column(self) -> None:
+        # "Дата" (последняя колонка) тянется до правого края (жалоба:
+        # "таблица не растягивается на всё окно"), но обычным Qt-шным
+        # stretchLastSection этого не добиться без потери возможности
+        # потянуть её (или "Тему") мышью — см. комментарий у создания
+        # self.table выше. Пересчитываем вручную: сколько места остаётся
+        # после всех ОСТАЛЬНЫХ колонок — столько и отдаём "Дате", не трогая
+        # их собственную, уже выставленную пользователем ширину.
         header = self.table.horizontalHeader()
-        other_width = sum(header.sectionSize(col) for col in range(header.count()) if col != COL_SUBJECT)
+        other_width = sum(header.sectionSize(col) for col in range(header.count()) if col != COL_DATE)
         available = self.table.viewport().width()
-        min_width = 120
-        header.resizeSection(COL_SUBJECT, max(min_width, available - other_width))
+        min_width = 90
+        header.resizeSection(COL_DATE, max(min_width, available - other_width))
 
     def _restart_poll_timer(self) -> None:
         self.poll_timer.start(self.poll_interval_minutes * 60_000)
@@ -4282,7 +4323,7 @@ class MainWindow(QMainWindow):
         # Смена ориентации панели чтения меняет доступную под таблицу
         # ширину (горизонтально — делит её с панелью письма, вертикально —
         # нет), но не размер самого окна — resizeEvent на это не сработает.
-        self._schedule_stretch_subject_column()
+        self._schedule_stretch_date_column()
 
     def on_font_scale_preview(self, value: int) -> None:
         self.font_scale_label.setText(f"{value}%")
@@ -5540,8 +5581,17 @@ class MainWindow(QMainWindow):
             # пользователь кликал в мини-календаре не по понедельнику
             # (например, 21.08 — пятница), тот же refresh_calendar_view()
             # тут же откатывал выделение обратно на 17.08 и день визуально
-            # "не выбирался".
-            highlighted_day = self._mini_picker_target_day or self.calendar_week_start
+            # "не выбирался". Позже забыли добавить сюда же
+            # calendar_selected_day (он уже используется в ветке "месяц" и
+            # проставлен по умолчанию на сегодня) — из-за этого при первом
+            # открытии календаря (режим "неделя" по умолчанию) мини-календарь
+            # слева подсвечивал понедельник ТЕКУЩЕЙ недели, а не сегодняшнее
+            # число (жалоба: "не исправил отображение месяца, показывает 31
+            # августа" — 31.08.2026 и есть понедельник недели, в которую
+            # попадает сегодняшнее 06.09.2026).
+            highlighted_day = (
+                self._mini_picker_target_day or self.calendar_selected_day or self.calendar_week_start
+            )
 
         self.calendar_mini_picker.setSelectedDate(
             QDate(highlighted_day.year, highlighted_day.month, highlighted_day.day)
@@ -5728,8 +5778,19 @@ class MainWindow(QMainWindow):
         if default_start is None and self.calendar_selected_day is not None:
             # Кнопка "Новое событие" на панели — если пользователь кликом
             # выбрал день в шапке календаря, событие по умолчанию ставим
-            # туда, а не всегда на "сейчас+час".
-            default_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
+            # туда, а не всегда на "сейчас+час". Но calendar_selected_day
+            # теперь ВСЕГДА заполнен (по умолчанию — сегодня, см. фикс
+            # "при открытии календаря не устанавливается текущее число"),
+            # а не только после явного клика по дню — из-за этого "сегодня
+            # в 9:00" почти всегда оказывается уже в прошлом (сейчас позже
+            # 9 утра), и _save_event_from_dialog ниже молча отклонял
+            # сохранение проверкой на прошедшее время (жалоба: "событие не
+            # создаётся"). Берём такой дефолт только если он ещё не прошёл;
+            # иначе просто оставляем None — EventDialog сам подставит
+            # "сейчас + 1 час".
+            candidate_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
+            if candidate_start > datetime.now().astimezone():
+                default_start = candidate_start
         current_item = self.calendars_list.currentItem()
         default_calendar_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
         dialog = EventDialog(
