@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        50%{?dist}
+Release:        51%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-51
+- Иконки тулбаров и папок заменены на Material Symbols (тот же стиль, что на референсе дизайна)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-50
 - Дерево папок: своя иконка для каждой роли папки (входящие/отправленные/черновики/корзина/спам/важное/помеченные/вся почта)
 - Дерево папок: число непрочитанных писем рядом с названием папки
