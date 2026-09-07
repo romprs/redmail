@@ -27,7 +27,10 @@ _LIGHT = {
     "border": "#dadce0",
     "accent": "#1a73e8",
     "accent_text": "#ffffff",
-    "disabled_text": "#9aa0a6",
+    # WCAG 2.2 AA (4.5:1 для обычного текста) — прежний #9aa0a6 давал только
+    # 2.44:1 на белом фоне (см. дизайн-аудит: "WCAG 2.2 AA Compliant"),
+    # реально проваливая контраст даже для крупного текста (нужно ≥3:1).
+    "disabled_text": "#5f6368",
 }
 
 _DARK = {
@@ -38,7 +41,9 @@ _DARK = {
     "border": "#5f6368",
     "accent": "#8ab4f8",
     "accent_text": "#202124",
-    "disabled_text": "#80868b",
+    # См. комментарий у _LIGHT: прежний #80868b давал 4.37:1/3.79:1 на
+    # window/base — чуть ниже требуемых 4.5:1 для обычного текста.
+    "disabled_text": "#9096a0",
 }
 
 _QSS_TEMPLATE = """

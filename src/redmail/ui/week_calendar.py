@@ -670,7 +670,9 @@ class MonthCellWidget(QFrame):
                 f"font-weight: 600; padding: 0px 5px; max-width: 18px;"
             )
         else:
-            in_month_text, out_month_text = ("#e8eaed", "#80868b") if dark else ("#202124", "#9aa0a6")
+            # Те же цвета, что disabled_text в theme.py — единый WCAG AA
+            # контраст для приглушённого текста по всему приложению.
+            in_month_text, out_month_text = ("#e8eaed", "#9096a0") if dark else ("#202124", "#5f6368")
             color = in_month_text if self._in_month else out_month_text
             self.day_label.setStyleSheet(f"color: {color}; background: transparent;")
 
