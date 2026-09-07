@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        43%{?dist}
+Release:        44%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-44
+- Редактор подписи: вставка изображений и выбор гарнитуры/размера шрифта, как в окне письма
+- Редактор подписи: узкое поле ввода на 4 строки вместо растянутого на весь диалог
 * Sun Sep 07 2026 redmail <redmail@example.com> - 0.0.1-43
 - CalDAV: нейтральный User-Agent вместо приметного python-caldav
 - CalDAV: проверка подключения теперь реально пишет и удаляет тестовое событие, а не только читает список календарей
