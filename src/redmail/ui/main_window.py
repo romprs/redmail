@@ -481,6 +481,15 @@ class _MailWebPage(QWebEnginePage):
 def _create_mail_browser(parent: QWidget) -> QWebEngineView:
     view = QWebEngineView(parent)
     view.setPage(_MailWebPage(_get_mail_web_profile(), view))
+    # Жалоба: "масштаб в правом нижнем углу не работает" — слайдер
+    # масштаба (_apply_font_scale) двигает только QApplication.font(),
+    # которого движок Chromium внутри QWebEngineView вообще не видит (у
+    # него собственный, полностью отдельный стек рендеринга/шрифтов) — то
+    # есть текст самого письма, самое заметное место в интерфейсе, никак
+    # не реагировал. setZoomFactor — уже собственный, chromium-овый способ
+    # масштабирования, применяем сохранённое значение сразу при создании
+    # (для окна "Открыть в письмо в окне" оно больше нигде не обновляется).
+    view.setZoomFactor(load_font_scale())
     return view
 
 
@@ -4808,6 +4817,12 @@ class MainWindow(QMainWindow):
         font = app.font()
         font.setPointSizeF(self._base_font_point_size * scale)
         app.setFont(font)
+        # Тело письма рендерится в QWebEngineView (Chromium), который не
+        # видит QApplication.font() вообще — без этого ползунок в статус-баре
+        # менял размер шрифта везде, КРОМЕ самого письма (см. _create_mail_browser).
+        reading_pane = getattr(self, "reading_pane", None)
+        if reading_pane is not None:
+            reading_pane.setZoomFactor(scale)
 
     def _set_filter_column(self, column: int) -> None:
         if column == COL_FLAG:
