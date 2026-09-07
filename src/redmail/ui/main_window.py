@@ -106,6 +106,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWebEngineCore import (
     QWebEnginePage,
     QWebEngineProfile,
@@ -1029,115 +1030,97 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
     return QIcon(pixmap)
 
 
-def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
-    """Монохромные значки для панелей инструментов (та же техника, что и
-    _calendar_icon выше — рисуем сами через QPainter, не полагаясь на
-    системную тему/эмодзи-шрифт). Команды переведены с текстовых подписей
-    на иконки с подсказками по явной просьбе пользователя — экономит место
-    в тулбаре (кроме почты/календаря/контактов/параметров/справки, которые
-    намеренно оставлены текстом)."""
+# Иконки — Material Symbols (Google, Apache License 2.0,
+# https://github.com/google/material-design-icons), контур ("d" у <path>)
+# каждого глифа скопирован как есть из официального npm-пакета
+# @material-symbols/svg-400 (вариант "outlined", viewBox "0 -960 960 960").
+# По мотивам дизайн-ревью ("самодельные иконки выглядят убого на фоне
+# референса") — вместо геометрических фигур, нарисованных вручную через
+# QPainter, используется тот же узнаваемый набор, что и на скриншотах-
+# референсах, отрисованный через QSvgRenderer и перекрашенный в цвет
+# _ICON_COLOR.
+_MATERIAL_ICON_PATHS: dict[str, str] = {
+    "edit": "M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z",
+    "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
+    "forward": "m644-288-43-43 193-193-193-193 43-43 236 236-236 236ZM81-200v-156q0-85 56.5-141.5T279-554h305L421-717l43-43 236 236-236 236-43-43 163-163H279q-60 0-99 39t-39 99v156H81Z",
+    "delete": "M261-120q-24.75 0-42.37-17.63Q201-155.25 201-180v-570h-41v-60h188v-30h264v30h188v60h-41v570q0 24-18 42t-42 18H261Zm438-630H261v570h438v-570ZM367-266h60v-399h-60v399Zm166 0h60v-399h-60v399ZM261-750v570-570Z",
+    "refresh": "M480-160q-133 0-226.5-93.5T160-480q0-133 93.5-226.5T480-800q85 0 149 34.5T740-671v-129h60v254H546v-60h168q-38-60-97-97t-137-37q-109 0-184.5 75.5T220-480q0 109 75.5 184.5T480-220q83 0 152-47.5T728-393h62q-29 105-115 169t-195 64Z",
+    "archive": "m480-270 156-156-40-40-86 86v-201h-60v201l-86-86-40 40 156 156ZM180-674v494h600v-494H180Zm0 554q-24.75 0-42.37-17.63Q120-155.25 120-180v-529q0-9.88 3-19.06 3-9.18 9-16.94l52-71q8-11 20.94-17.5Q217.88-840 232-840h495q14.12 0 27.06 6.5T775-816l53 71q6 7.76 9 16.94 3 9.18 3 19.06v529q0 24.75-17.62 42.37Q804.75-120 780-120H180Zm17-614h565l-36.41-46H233l-36 46Zm283 307Z",
+    "download": "M480-313 287-506l43-43 120 120v-371h60v371l120-120 43 43-193 193ZM220-160q-24 0-42-18t-18-42v-143h60v143h520v-143h60v143q0 24-18 42t-42 18H220Z",
+    "today": "M180-80q-24 0-42-18t-18-42v-620q0-24 18-42t42-18h65v-60h65v60h340v-60h65v60h65q24 0 42 18t18 42v620q0 24-18 42t-42 18H180Zm0-60h600v-430H180v430Zm0-490h600v-130H180v130Zm0 0v-130 130Z",
+    "chevron_left": "M561-240 320-481l241-241 43 43-198 198 198 198-43 43Z",
+    "chevron_right": "M530-481 332-679l43-43 241 241-241 241-43-43 198-198Z",
+    "add": "M450-450H200v-60h250v-250h60v250h250v60H510v250h-60v-250Z",
+    "event_busy": "m381-218-43-43 100-99-100-99 43-43 99 100 99-100 43 43-100 99 100 99-43 43-99-100-99 100ZM180-80q-24 0-42-18t-18-42v-620q0-24 18-42t42-18h65v-60h65v60h340v-60h65v60h65q24 0 42 18t18 42v620q0 24-18 42t-42 18H180Zm0-60h600v-430H180v430Zm0-490h600v-130H180v130Zm0 0v-130 130Z",
+    "sync": "M167-160v-60h130l-15-12q-64-51-93-111t-29-134q0-106 62.5-190.5T387-784v62q-75 29-121 96.5T220-477q0 63 23.5 109.5T307-287l30 21v-124h60v230H167Zm407-15v-63q76-29 121-96.5T740-483q0-48-23.5-97.5T655-668l-29-26v124h-60v-230h230v60H665l15 14q60 56 90 120t30 123q0 106-62 191T574-175Z",
+    "search": "M796-121 533-384q-30 26-70 40.5T378-329q-108 0-183-75t-75-181q0-106 75-181t182-75q106 0 180.5 75T632-585q0 43-14 83t-42 75l264 262-44 44ZM377-389q81 0 138-57.5T572-585q0-81-57-138.5T377-781q-82 0-139.5 57.5T180-585q0 81 57.5 138.5T377-389Z",
+    "mail": "M140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h680q24 0 42 18t18 42v520q0 24-18 42t-42 18H140Zm340-302L140-685v465h680v-465L480-462Zm0-60 336-218H145l335 218ZM140-685v-55 520-465Z",
+    "inbox": "M180-120q-24 0-42-18t-18-42v-600q0-24 18-42t42-18h600q24 0 42 18t18 42v600q0 24-18 42t-42 18H180Zm0-60h600v-136H634q-26 40-67.5 61.5T480-233q-45 0-86.5-21.5T326-316H180v136Zm374-136.5q33-23.5 56-59.5h170v-404H180v404h170q23 36 56.25 59.5 33.24 23.5 74 23.5Q521-293 554-316.5ZM180-180h600-600Z",
+    "all_inbox": "M260-260h560v-163H676q-18 40-54.5 63.5T540-336q-45 0-81-23.5T404-423H260v163Zm280-136q38 0 65.02-25.56 27.02-25.55 27.02-61.44H820v-337H260v337h188q0 35.89 27.02 61.44Q502.05-396 540-396ZM260-200q-24 0-42-18t-18-42v-560q0-24 18-42t42-18h560q24 0 42 18t18 42v560q0 24-18 42t-42 18H260ZM140-80q-24 0-42-18t-18-42v-620h60v620h620v60H140Zm120-180h560-560Z",
+    "send": "M120-160v-640l760 320-760 320Zm60-93 544-227-544-230v168l242 62-242 60v167Zm0 0v-457 457Z",
+    "drafts": "m480-920 371 222q17 9 23 24.5t6 30.5v463q0 24-18 42t-42 18H140q-24 0-42-18t-18-42v-463q0-15 6.5-30.5T109-698l371-222Zm0 466 336-197-336-202-336 202 336 197Zm0 67L140-587v407h680v-407L480-387Zm0 207h340-680 340Z",
+    "report": "M480-281q14 0 24.5-10.5T515-316q0-14-10.5-24.5T480-351q-14 0-24.5 10.5T445-316q0 14 10.5 24.5T480-281Zm-30-144h60v-263h-60v263ZM330-120 120-330v-300l210-210h300l210 210v300L630-120H330Zm25-60h250l175-175v-250L605-780H355L180-605v250l175 175Zm125-300Z",
+    "star": "m323-245 157-94 157 95-42-178 138-120-182-16-71-168-71 167-182 16 138 120-42 178Zm-90 125 65-281L80-590l288-25 112-265 112 265 288 25-218 189 65 281-247-149-247 149Zm247-355Z",
+    "flag": "M200-120v-680h343l19 86h238v370H544l-18.93-85H260v309h-60Zm300-452Zm95 168h145v-250H511l-19-86H260v251h316l19 85Z",
+    "folder": "M140-160q-24 0-42-18.5T80-220v-520q0-23 18-41.5t42-18.5h281l60 60h339q23 0 41.5 18.5T880-680v460q0 23-18.5 41.5T820-160H140Zm0-60h680v-460H456l-60-60H140v520Zm0 0v-520 520Z",
+    "more_vert": "M479.86-160Q460-160 446-174.14t-14-34Q432-228 446.14-242t34-14Q500-256 514-241.86t14 34Q528-188 513.86-174t-34 14Zm0-272Q460-432 446-446.14t-14-34Q432-500 446.14-514t34-14Q500-528 514-513.86t14 34Q528-460 513.86-446t-34 14Zm0-272Q460-704 446-718.14t-14-34Q432-772 446.14-786t34-14Q500-800 514-785.86t14 34Q528-732 513.86-718t-34 14Z",
+}
+
+# redmail-овое имя команды/роли -> имя глифа Material Symbols выше.
+_TOOLBAR_ICON_MATERIAL: dict[str, str] = {
+    "compose": "edit",
+    "reply": "reply",
+    "forward": "forward",
+    "delete": "delete",
+    "refresh": "refresh",
+    "open_archive": "archive",
+    "archive_folder": "archive",
+    "archive": "archive",
+    "import": "download",
+    "today": "today",
+    "prev": "chevron_left",
+    "next": "chevron_right",
+    "add": "add",
+    "cancel_event": "event_busy",
+    "sync": "sync",
+    "search": "search",
+    "more": "more_vert",
+}
+
+_FOLDER_ICON_MATERIAL: dict[str, str] = {
+    "inbox": "inbox",
+    "sent": "send",
+    "drafts": "drafts",
+    "trash": "delete",
+    "spam": "report",
+    "important": "star",
+    "flagged": "flag",
+    "all": "all_inbox",
+}
+
+
+def _material_icon(name: str, size: int, color: str = _ICON_COLOR) -> QIcon:
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960">'
+        f'<path d="{_MATERIAL_ICON_PATHS[name]}" fill="{color}"/></svg>'
+    )
+    renderer = QSvgRenderer(QByteArray(svg.encode("utf-8")))
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(_ICON_COLOR))
-    pen.setWidthF(1.4)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    m = size * 0.16
-    cx, cy = size / 2, size / 2
-
-    if kind == "compose":
-        painter.drawLine(QPointF(m, size - m), QPointF(size * 0.55, size * 0.45))
-        painter.drawPolyline([
-            QPointF(size * 0.55, size * 0.45), QPointF(size - m, m),
-            QPointF(size - m * 0.4, m + m * 0.6), QPointF(size * 0.62, size * 0.52),
-        ])
-        painter.drawLine(QPointF(m, size - m), QPointF(m + m * 0.6, size - m * 1.4))
-    elif kind in ("reply", "forward"):
-        flip = kind == "forward"
-        x0, x1 = (size - m, m) if flip else (m, size - m)
-        painter.drawLine(QPointF(x0, cy), QPointF(x1, cy))
-        dx = -1 if flip else 1
-        painter.drawLine(QPointF(x0, cy), QPointF(x0 + dx * size * 0.30, cy - size * 0.22))
-        painter.drawLine(QPointF(x0, cy), QPointF(x0 + dx * size * 0.30, cy + size * 0.22))
-        painter.drawArc(QRectF(cx - size * 0.05, m, size * 0.42, size * 0.42), -20 * 16, 200 * 16)
-    elif kind == "delete":
-        painter.drawRect(QRectF(size * 0.24, size * 0.30, size * 0.52, size * 0.56))
-        painter.drawLine(QPointF(size * 0.16, size * 0.30), QPointF(size * 0.84, size * 0.30))
-        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.60, size * 0.16))
-        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.40, size * 0.30))
-        painter.drawLine(QPointF(size * 0.60, size * 0.16), QPointF(size * 0.60, size * 0.30))
-        painter.drawLine(QPointF(size * 0.38, size * 0.42), QPointF(size * 0.38, size * 0.76))
-        painter.drawLine(QPointF(size * 0.5, size * 0.42), QPointF(size * 0.5, size * 0.76))
-        painter.drawLine(QPointF(size * 0.62, size * 0.42), QPointF(size * 0.62, size * 0.76))
-    elif kind == "refresh":
-        rect = QRectF(m, m, size - 2 * m, size - 2 * m)
-        painter.drawArc(rect, 20 * 16, 280 * 16)
-        angle = math.radians(20)
-        ax = cx + (rect.width() / 2) * math.cos(angle)
-        ay = cy - (rect.height() / 2) * math.sin(angle)
-        painter.setBrush(QColor(_ICON_COLOR))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawPolygon([QPointF(ax - 3.4, ay - 0.8), QPointF(ax + 1.6, ay - 3.8), QPointF(ax + 0.8, ay + 3.2)])
-    elif kind in ("open_archive", "archive_folder", "import", "archive"):
-        painter.drawPolyline([
-            QPointF(m, size * 0.34), QPointF(m, size - m), QPointF(size - m, size - m), QPointF(size - m, size * 0.34),
-        ])
-        painter.drawPolyline([
-            QPointF(m, size * 0.34), QPointF(size * 0.40, size * 0.34), QPointF(size * 0.46, size * 0.22),
-            QPointF(size * 0.60, size * 0.22), QPointF(size * 0.66, size * 0.34), QPointF(size - m, size * 0.34),
-        ])
-        if kind in ("import", "archive"):
-            painter.drawLine(QPointF(cx, size * 0.42), QPointF(cx, size * 0.68))
-            painter.drawLine(QPointF(cx - size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
-            painter.drawLine(QPointF(cx + size * 0.12, size * 0.58), QPointF(cx, size * 0.70))
-    elif kind == "today":
-        painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
-        painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
-        painter.drawLine(QPointF(size * 0.68, m), QPointF(size * 0.68, size * 0.28))
-        painter.setBrush(QColor(_ICON_COLOR))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(cx - size * 0.11, cy - size * 0.01, size * 0.22, size * 0.22))
-    elif kind in ("prev", "next"):
-        flip = kind == "next"
-        x0, x1 = (size * 0.36, size * 0.64) if flip else (size * 0.64, size * 0.36)
-        painter.drawLine(QPointF(x0, m), QPointF(x1, cy))
-        painter.drawLine(QPointF(x1, cy), QPointF(x0, size - m))
-    elif kind == "add":
-        painter.drawLine(QPointF(cx, m), QPointF(cx, size - m))
-        painter.drawLine(QPointF(m, cy), QPointF(size - m, cy))
-    elif kind == "cancel_event":
-        painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
-        painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
-        painter.drawLine(QPointF(size * 0.68, m), QPointF(size * 0.68, size * 0.28))
-        painter.drawLine(QPointF(size * 0.36, size * 0.46), QPointF(size * 0.64, size * 0.78))
-        painter.drawLine(QPointF(size * 0.64, size * 0.46), QPointF(size * 0.36, size * 0.78))
-    elif kind == "sync":
-        rect1 = QRectF(m, m, size * 0.56, size * 0.56)
-        rect2 = QRectF(size - m - size * 0.56, size - m - size * 0.56, size * 0.56, size * 0.56)
-        painter.drawArc(rect1, 30 * 16, 240 * 16)
-        painter.drawArc(rect2, 210 * 16, 240 * 16)
-        painter.setBrush(QColor(_ICON_COLOR))
-        painter.setPen(Qt.PenStyle.NoPen)
-        a1 = math.radians(30)
-        ax1 = rect1.center().x() + (rect1.width() / 2) * math.cos(a1)
-        ay1 = rect1.center().y() - (rect1.height() / 2) * math.sin(a1)
-        painter.drawPolygon([QPointF(ax1 - 3.2, ay1 - 0.6), QPointF(ax1 + 1.6, ay1 - 3.4), QPointF(ax1 + 0.8, ay1 + 2.8)])
-        a2 = math.radians(210)
-        ax2 = rect2.center().x() + (rect2.width() / 2) * math.cos(a2)
-        ay2 = rect2.center().y() - (rect2.height() / 2) * math.sin(a2)
-        painter.drawPolygon([QPointF(ax2 + 3.2, ay2 + 0.6), QPointF(ax2 - 1.6, ay2 + 3.4), QPointF(ax2 - 0.8, ay2 - 2.8)])
-    elif kind == "search":
-        r = size * 0.28
-        circle_center = QPointF(cx - size * 0.06, cy - size * 0.06)
-        painter.drawEllipse(circle_center, r, r)
-        handle_start = QPointF(circle_center.x() + r * 0.72, circle_center.y() + r * 0.72)
-        painter.drawLine(handle_start, QPointF(size - m * 0.9, size - m * 0.9))
+    renderer.render(painter)
     painter.end()
     return QIcon(pixmap)
+
+
+def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
+    """Иконки панелей инструментов — см. _MATERIAL_ICON_PATHS выше. Команды
+    переведены с текстовых подписей на иконки с подсказками по явной
+    просьбе пользователя — экономит место в тулбаре (кроме почты/
+    календаря/контактов/параметров/справки, которые намеренно оставлены
+    текстом)."""
+    return _material_icon(_TOOLBAR_ICON_MATERIAL[kind], size)
 
 
 # Роль папки по её "сырому" IMAP-имени — по мотивам дизайн-ревью ("у каждой
@@ -1171,82 +1154,7 @@ def _folder_role(raw_name: str) -> str | None:
 
 
 def _folder_icon(role: str | None, size: int = 16) -> QIcon:
-    """Монохромные значки папок — та же техника, что и _toolbar_icon."""
-    pixmap = QPixmap(size, size)
-    pixmap.fill(Qt.GlobalColor.transparent)
-    painter = QPainter(pixmap)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(_ICON_COLOR))
-    pen.setWidthF(1.3)
-    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    painter.setPen(pen)
-    painter.setBrush(Qt.BrushStyle.NoBrush)
-    m = size * 0.14
-    cx, cy = size / 2, size / 2
-
-    def envelope(rect: QRectF) -> None:
-        painter.drawRoundedRect(rect, size * 0.06, size * 0.06)
-        painter.drawLine(QPointF(rect.left(), rect.top()), QPointF(rect.center().x(), rect.center().y() + rect.height() * 0.12))
-        painter.drawLine(QPointF(rect.right(), rect.top()), QPointF(rect.center().x(), rect.center().y() + rect.height() * 0.12))
-
-    if role == "inbox":
-        envelope(QRectF(m, size * 0.28, size - 2 * m, size * 0.5))
-    elif role == "sent":
-        painter.drawLine(QPointF(m, size - m), QPointF(size - m, m))
-        painter.drawPolyline([QPointF(size * 0.52, m), QPointF(size - m, m), QPointF(size - m, size * 0.48)])
-    elif role == "drafts":
-        painter.drawLine(QPointF(m, size - m), QPointF(size * 0.55, size * 0.45))
-        painter.drawPolyline([
-            QPointF(size * 0.55, size * 0.45), QPointF(size - m, m),
-            QPointF(size - m * 0.4, m + m * 0.6), QPointF(size * 0.62, size * 0.52),
-        ])
-    elif role == "trash":
-        painter.drawRect(QRectF(size * 0.24, size * 0.30, size * 0.52, size * 0.56))
-        painter.drawLine(QPointF(size * 0.16, size * 0.30), QPointF(size * 0.84, size * 0.30))
-        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.60, size * 0.16))
-        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.40, size * 0.30))
-        painter.drawLine(QPointF(size * 0.60, size * 0.16), QPointF(size * 0.60, size * 0.30))
-    elif role == "spam":
-        painter.drawEllipse(QRectF(m, m, size - 2 * m, size - 2 * m))
-        painter.drawLine(QPointF(cx, size * 0.32), QPointF(cx, size * 0.58))
-        painter.drawPoint(QPointF(cx, size * 0.72))
-    elif role == "important":
-        points = []
-        for i in range(10):
-            angle = math.radians(-90 + i * 36)
-            r = size * 0.42 if i % 2 == 0 else size * 0.19
-            points.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
-        painter.drawPolygon(points)
-    elif role == "flagged":
-        painter.drawLine(QPointF(size * 0.28, size * 0.14), QPointF(size * 0.28, size * 0.86))
-        painter.drawPolyline([
-            QPointF(size * 0.28, size * 0.18), QPointF(size * 0.78, size * 0.18),
-            QPointF(size * 0.60, size * 0.36), QPointF(size * 0.78, size * 0.54), QPointF(size * 0.28, size * 0.54),
-        ])
-    elif role == "all":
-        envelope(QRectF(m * 1.6, size * 0.36, size - 3.2 * m, size * 0.46))
-        envelope(QRectF(m, size * 0.22, size - 2 * m, size * 0.46))
-    else:
-        painter.drawPath(_folder_tab_path(size, m))
-    painter.end()
-    return QIcon(pixmap)
-
-
-def _folder_tab_path(size: float, m: float) -> QPainterPath:
-    path = QPainterPath()
-    path.moveTo(m, size * 0.30)
-    path.lineTo(size * 0.40, size * 0.30)
-    path.lineTo(size * 0.48, size * 0.20)
-    path.lineTo(size - m, size * 0.20)
-    path.lineTo(size - m, size * 0.20)
-    path.moveTo(m, size * 0.30)
-    path.lineTo(m, size - m)
-    path.lineTo(size - m, size - m)
-    path.lineTo(size - m, size * 0.34)
-    path.lineTo(size * 0.48, size * 0.34)
-    path.closeSubpath()
-    return path
+    return _material_icon(_FOLDER_ICON_MATERIAL.get(role, "folder"), size)
 
 
 def _icon_label(kind: str, parent: QWidget | None = None) -> QLabel:
