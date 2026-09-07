@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        48%{?dist}
+Release:        49%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,10 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-49
+- Дизайн: кнопки-иконки тулбаров получили рамку и больший зазор между собой
+- Дизайн: поле поиска/фильтра оформлено как скруглённая таблетка со значком лупы
+- Дизайн: скруглённое выделение текущей папки в дереве папок
 * Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-48
 - Доступность: контраст приглушённого текста поднят до WCAG AA (плейсхолдеры, дни вне месяца в календаре)
 - Дизайн: главное действие диалога (Отправить, Сохранить) теперь выделено акцентной кнопкой
