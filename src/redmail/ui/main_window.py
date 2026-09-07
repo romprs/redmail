@@ -5,7 +5,7 @@ import html
 import math
 import os
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 import mimetypes
 import re
 import shutil
@@ -155,6 +155,7 @@ from redmail.config_store import (
 )
 from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
 from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
+from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
 from redmail.smtp_client import (
@@ -349,6 +350,22 @@ def _normalize_subject(subject: str) -> str:
         if stripped == normalized:
             return normalized
         normalized = stripped
+
+
+def _mail_rule_moves(summaries: list[MessageSummary], rules: list[MailRule]) -> dict[str, list[int]]:
+    """Какие письма куда переехали бы по правилам сортировки: целевая
+    папка → список UID. Вынесено из MainWindow.on_apply_mail_rules отдельной
+    чистой функцией, потому что тем же подбором пользуется команда
+    apply_mail_rules локального канала управления (см. ipc_server.py) — и
+    заодно её можно проверить тестом без единого виджета."""
+    moves: dict[str, list[int]] = {}
+    for summary in summaries:
+        for rule in rules:
+            haystack = summary.sender_email if rule.field == "from" else summary.subject
+            if rule.contains.lower() in (haystack or "").lower():
+                moves.setdefault(rule.target_folder, []).append(summary.uid)
+                break  # первое подходящее правило — не проверяем остальные для этого письма
+    return moves
 
 
 # Сколько последних писем цепочки показываем подряд при последовательном
@@ -3982,6 +3999,19 @@ class MainWindow(QMainWindow):
         self.poll_timer.timeout.connect(self._on_periodic_refresh)
         self._restart_poll_timer()
 
+        # Локальный канал управления (см. ipc_server.py): через него внешняя
+        # программа — прежде всего будущий голосовой ассистент — просит уже
+        # запущенное окно открыть письмо/встречу с заполненными полями.
+        # Поднимается последним и целиком необязателен: если имя сокета
+        # занято живым соседним экземпляром или ОС не дала его создать,
+        # приложение обязано работать дальше как обычно, поэтому здесь и
+        # проверка результата, и защита от исключения.
+        self.ipc_server = IpcServer(self, parent=self)
+        try:
+            self.ipc_server.start()
+        except Exception:
+            pass
+
         QTimer.singleShot(0, self._restore_saved_account)
         QTimer.singleShot(0, self._restore_saved_archives)
         self._restore_window_state()
@@ -4757,13 +4787,7 @@ class MainWindow(QMainWindow):
             return
 
         source_folder = self.current_folder
-        moves: dict[str, list[int]] = {}
-        for summary in self.current_summaries:
-            for rule in self.mail_rules:
-                haystack = summary.sender_email if rule.field == "from" else summary.subject
-                if rule.contains.lower() in (haystack or "").lower():
-                    moves.setdefault(rule.target_folder, []).append(summary.uid)
-                    break  # первое подходящее правило — не проверяем остальные для этого письма
+        moves = _mail_rule_moves(self.current_summaries, self.mail_rules)
         if not moves:
             self.statusBar().showMessage("Правила не подошли ни к одному письму в этой папке", 5000)
             return
@@ -7315,7 +7339,231 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # письмо уже отправлено — то, что старая черновая копия не убралась, не критично
 
+    # ------------------------------------------------------------------
+    # Локальный канал управления (ipc_server.py)
+    #
+    # Всё, что ОТПРАВЛЯЕТ что-либо наружу (письмо, приглашение, отмену
+    # встречи), обязано пройти через обычное экранное подтверждение —
+    # ipc_* методы только ОТКРЫВАЮТ штатный диалог с заполненными полями,
+    # а «Отправить»/«Сохранить»/«Да» жмёт человек. Отдельного пути
+    # «отправить сразу, без подтверждения» здесь нет и не должно
+    # появляться: команда приходит из распознанной речи, ошибиться она
+    # может как угодно.
+    #
+    # Немедленно, без подтверждения, выполняются только команды, которые
+    # ничего не шлют наружу: focus, list_mail_rules и apply_mail_rules
+    # (перекладывание писем между папками того же ящика).
+    # ------------------------------------------------------------------
+
+    def _ipc_later(self, action: Callable[[], None]) -> None:
+        """Отложить показ модального диалога до выхода из обработчика сокета.
+
+        QDialog.exec() крутит вложенный цикл событий и не возвращается, пока
+        окно не закроют. Вызванный прямо из readyRead он задержал бы запись
+        ответа клиенту на всё время, что открыт диалог, и позволил бы
+        обработать внутри себя следующие запросы рекурсивно.
+        singleShot(0) ставит вызов в очередь того же (GUI) потока — он
+        выполнится сразу после того, как ответ уже отправлен."""
+        QTimer.singleShot(0, action)
+
+    def ipc_focus(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def ipc_compose_email(
+        self, *, to: str, subject: str = "", body: str = "", cc: str = "", bcc: str = ""
+    ) -> None:
+        if not self.smtp_account:
+            raise RuntimeError(
+                "Исходящая почта не настроена: подключитесь и укажите сервер SMTP в настройках."
+            )
+        # Тот же самый диалог и те же аргументы, что у кнопки «Написать
+        # письмо…» (on_compose) — отличаются только заранее заполненные поля.
+        dialog = ComposeDialog(
+            self,
+            title="Новое письмо",
+            to=to,
+            cc=cc,
+            bcc=bcc,
+            subject=subject,
+            body=body,
+            contacts=self._load_contacts(),
+            signatures=self.signatures,
+            default_signature_id=self.default_signature_id,
+        )
+        self.ipc_focus()
+        self._ipc_later(lambda: self._exec_compose(dialog))
+
+    def _ipc_default_calendar_id(self) -> str:
+        item = self.calendars_list.currentItem()
+        value = item.data(Qt.ItemDataRole.UserRole) if item else None
+        return value or calendar_store.DEFAULT_CALENDAR_ID
+
+    def _ipc_event_dialog(self, event: calendar_store.Event, *, title: str) -> EventDialog:
+        """EventDialog с уже заполненными полями.
+
+        Диалог умеет заполняться только из готового Event (аргумент event=),
+        поэтому и для НОВОЙ встречи собираем черновой Event — ровно так же,
+        как это давно делает on_copy_event: конструирует диалог из события,
+        меняет заголовок окна и сохраняет потом с existing=None."""
+        dialog = EventDialog(
+            self,
+            event=event,
+            my_email=self.account.username if self.account else "",
+            contacts=self._load_contacts(),
+            calendars=self._load_calendars(),
+        )
+        dialog.setWindowTitle(title)
+        return dialog
+
+    def _ipc_exec_event_dialog(
+        self, dialog: EventDialog, *, existing: calendar_store.Event | None
+    ) -> None:
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._save_event_from_dialog(dialog, existing=existing)
+
+    def ipc_create_event(
+        self,
+        *,
+        summary: str,
+        start: datetime,
+        duration_minutes: int,
+        participants: list[str] | None = None,
+        description: str = "",
+        location: str = "",
+    ) -> None:
+        if not self.account:
+            raise RuntimeError("Нет учётной записи: сначала подключитесь к почте в настройках.")
+        draft = calendar_store.Event(
+            uid=calendar_store.new_uid(),
+            summary=summary,
+            dtstart=start,
+            dtend=start + timedelta(minutes=duration_minutes),
+            description=description,
+            location=location,
+            organizer_email=self.account.username,
+            organizer_name=self.account.username,
+            is_organizer=True,
+            my_participation="accepted",
+            calendar_id=self._ipc_default_calendar_id(),
+            attendees=[calendar_store.Attendee(email=email) for email in (participants or [])],
+        )
+        dialog = self._ipc_event_dialog(draft, title="Новая встреча")
+        self.ipc_focus()
+        self._ipc_later(lambda: self._ipc_exec_event_dialog(dialog, existing=None))
+
+    def ipc_update_event(
+        self,
+        uid: str,
+        *,
+        summary: str | None = None,
+        start: datetime | None = None,
+        duration_minutes: int | None = None,
+        participants: list[str] | None = None,
+        description: str | None = None,
+        location: str | None = None,
+    ) -> None:
+        if not self.account:
+            raise RuntimeError("Нет учётной записи: сначала подключитесь к почте в настройках.")
+        existing = calendar_store.get_event(self.calendar_path, uid)
+        if existing is None:
+            raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+        if not existing.is_organizer:
+            # Тот же принцип, что у двойного клика по чужой встрече в сетке:
+            # редактировать можно только то, что организовали вы сами.
+            raise PermissionError("Изменить можно только встречу, которую организовали вы сами.")
+        new_start = start if start is not None else existing.dtstart
+        if duration_minutes is not None:
+            new_end = new_start + timedelta(minutes=duration_minutes)
+        else:
+            # Длительность не задана — сохраняем прежнюю, а не «час по умолчанию»:
+            # перенос встречи не должен молча менять её продолжительность.
+            new_end = new_start + (existing.dtend - existing.dtstart)
+        merged = replace(
+            existing,
+            summary=summary if summary is not None else existing.summary,
+            description=description if description is not None else existing.description,
+            location=location if location is not None else existing.location,
+            dtstart=new_start,
+            dtend=new_end,
+            attendees=(
+                [calendar_store.Attendee(email=email) for email in participants]
+                if participants is not None
+                else existing.attendees
+            ),
+        )
+        dialog = self._ipc_event_dialog(merged, title="Изменить встречу")
+        self.ipc_focus()
+        self._ipc_later(lambda: self._ipc_exec_event_dialog(dialog, existing=existing))
+
+    def ipc_cancel_event(self, uid: str) -> None:
+        event = calendar_store.get_event(self.calendar_path, uid)
+        if event is None:
+            raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+        if not event.is_organizer:
+            raise PermissionError("Отменить можно только встречу, которую организовали вы сами.")
+        # Дальше — ровно тот же путь, что у пункта «Отменить встречу» в
+        # контекстном меню события: on_cancel_event сама спросит «Отменить
+        # «...» и уведомить участников?» и только по «Да» разошлёт CANCEL.
+        # Здесь мы лишь выбираем встречу, как это сделал бы клик по ней.
+        self.selected_calendar_event = event
+        self._apply_calendar_selection_highlight()
+        self.ipc_focus()
+        self._ipc_later(self.on_cancel_event)
+
+    def ipc_apply_mail_rules(self, folder: str | None = None) -> dict:
+        """Применение правил сортировки — единственная команда со сразу
+        видимым результатом без подтверждения: письма только переезжают
+        между папками ОДНОГО и того же ящика, наружу ничего не уходит."""
+        if self.mailbox is None or self.active_source is not self.mailbox:
+            raise RuntimeError("Применение правил работает только в папках живого ящика.")
+        source_folder = folder or self.current_folder
+        if not source_folder:
+            raise RuntimeError("Не выбрана папка: укажите folder или откройте папку в окне.")
+        if not self.mail_rules:
+            raise RuntimeError(
+                "Правила сортировки не заданы: Параметры → «Правила сортировки почты…»."
+            )
+        if source_folder == self.current_folder:
+            summaries = self.current_summaries
+        else:
+            summaries = self.mailbox.folder_summaries(source_folder)
+        moves = _mail_rule_moves(summaries, self.mail_rules)
+
+        moved_total = 0
+        failure: Exception | None = None
+        try:
+            for target_folder, uids in moves.items():
+                self.mailbox.move_to_folder(source_folder, uids, target_folder)
+                moved_total += len(uids)
+        except Exception as exc:
+            failure = exc
+        if source_folder == self.current_folder:
+            try:
+                summaries = self.mailbox.refresh_folder(source_folder)
+            except Exception:
+                summaries = None
+            if summaries is not None:
+                self._render_folder(summaries)
+        if failure is not None:
+            raise RuntimeError(f"{failure} (перемещено до сбоя: {moved_total})") from failure
+        self.statusBar().showMessage(f"По правилам перемещено писем: {moved_total}", 5000)
+        return {
+            "folder": source_folder,
+            "moved": moved_total,
+            "moves": {target: len(uids) for target, uids in moves.items()},
+        }
+
+    def ipc_list_mail_rules(self) -> list[dict]:
+        return [asdict(rule) for rule in self.mail_rules]
+
     def closeEvent(self, event) -> None:
+        try:
+            self.ipc_server.stop()
+        except Exception:
+            pass  # закрытие окна не должно падать из-за необязательного канала
         self.poll_timer.stop()
         for mailbox in self.mailboxes.values():
             mailbox.close()
