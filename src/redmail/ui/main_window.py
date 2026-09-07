@@ -834,6 +834,8 @@ class ContactPickerDialog(QDialog):
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("Поиск по имени или email")
         self.filter_edit.textChanged.connect(self._apply_filter)
+        self.filter_edit.setObjectName("searchField")
+        self.filter_edit.addAction(_toolbar_icon("search", 14), QLineEdit.ActionPosition.LeadingPosition)
 
         self.list_widget = QListWidget(self)
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
@@ -1123,6 +1125,12 @@ def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
         ax2 = rect2.center().x() + (rect2.width() / 2) * math.cos(a2)
         ay2 = rect2.center().y() - (rect2.height() / 2) * math.sin(a2)
         painter.drawPolygon([QPointF(ax2 + 3.2, ay2 + 0.6), QPointF(ax2 - 1.6, ay2 + 3.4), QPointF(ax2 - 0.8, ay2 - 2.8)])
+    elif kind == "search":
+        r = size * 0.28
+        circle_center = QPointF(cx - size * 0.06, cy - size * 0.06)
+        painter.drawEllipse(circle_center, r, r)
+        handle_start = QPointF(circle_center.x() + r * 0.72, circle_center.y() + r * 0.72)
+        painter.drawLine(handle_start, QPointF(size - m * 0.9, size - m * 0.9))
     painter.end()
     return QIcon(pixmap)
 
@@ -3341,6 +3349,8 @@ class MainWindow(QMainWindow):
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
         self.filter_edit.textChanged.connect(self.on_filter_changed)
+        self.filter_edit.setObjectName("searchField")
+        self.filter_edit.addAction(_toolbar_icon("search", 14), QLineEdit.ActionPosition.LeadingPosition)
 
         self.table = QTableWidget(0, 7, self)
         self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])

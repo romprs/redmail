@@ -50,13 +50,17 @@ _QSS_TEMPLATE = """
 QToolBar {{
     background-color: {alt_base};
     border: none;
-    spacing: 2px;
+    spacing: 6px;
 }}
+/* Кнопки-иконки с явной рамкой, а не полностью "невидимые" до наведения
+   (по мотивам дизайн-ревью: на референсе иконки инструментов — не голые
+   значки в ряд, а отдельные обозначенные кнопки с границей и увеличенным
+   зазором между ними). */
 QToolButton {{
     background-color: transparent;
-    border: none;
+    border: 1px solid {border};
     padding: 4px 6px;
-    border-radius: 4px;
+    border-radius: 6px;
 }}
 QToolButton:hover, QToolButton:pressed {{
     background-color: {border};
@@ -64,6 +68,7 @@ QToolButton:hover, QToolButton:pressed {{
 QToolButton:checked {{
     background-color: {accent};
     color: {accent_text};
+    border: 1px solid {accent};
 }}
 QMenu {{
     border: 1px solid {border};
@@ -91,6 +96,32 @@ QScrollBar::handle {{
 }}
 QSplitter::handle {{
     background-color: {border};
+}}
+/* Поле поиска/фильтра — скруглённая "таблетка" со значком лупы слева
+   (addAction в LeadingPosition, см. main_window.py), а не обычное прямое
+   текстовое поле — по референсу дизайн-системы. Только по имени объекта
+   "searchField", остальные QLineEdit (Тема, Кому и т.п.) не затронуты. */
+QLineEdit#searchField {{
+    border: 1px solid {border};
+    border-radius: 13px;
+    padding: 3px 10px;
+    background-color: {base};
+}}
+QLineEdit#searchField:focus {{
+    border: 1px solid {accent};
+}}
+/* Дерево папок: скруглённое выделение текущей папки вместо прямоугольной
+   заливки палитрой во всю ширину строки. */
+QTreeView::item {{
+    padding: 3px 4px;
+    border-radius: 4px;
+}}
+QTreeView::item:selected {{
+    background-color: {accent};
+    color: {accent_text};
+}}
+QTreeView::item:hover:!selected {{
+    background-color: {alt_base};
 }}
 /* Чекбокс отметки письма: на Fusion-стиле индикатор рисуется другой, гораздо
    более тёмной заливкой, когда сама строка выделена - получался сплошной
