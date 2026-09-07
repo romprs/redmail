@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
@@ -122,6 +123,43 @@ def test_push_event_updates_existing_when_found_on_server() -> None:
     fake_calendar.save_event.assert_not_called()
     existing_obj.save.assert_called_once()
     assert "UID:e1@redmail" in existing_obj.data
+
+
+def test_push_event_retries_once_on_connection_error() -> None:
+    # Жалоба: "не синхронизируется календарь, при этом проверка подключения
+    # проходит" — "Remote end closed connection without response" на
+    # реальном сервере при push, хотя более лёгкий PROPFIND (проверка
+    # подключения) при этом отвечал нормально. Один повтор на свежем
+    # соединении — стандартное лечение для устаревшего keep-alive.
+    fake_client = MagicMock()
+    fake_calendar = MagicMock()
+    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
+    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.save_event.side_effect = [
+        requests.exceptions.ConnectionError("Remote end closed connection without response"),
+        None,
+    ]
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        session = CalDavSession(_account())
+        session.push_event(_event(), "ivan@example.com", "Иван")
+
+    assert fake_calendar.save_event.call_count == 2
+
+
+def test_push_event_raises_clear_error_when_connection_fails_twice() -> None:
+    fake_client = MagicMock()
+    fake_calendar = MagicMock()
+    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
+    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.save_event.side_effect = requests.exceptions.ConnectionError("still closed")
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        session = CalDavSession(_account())
+        with pytest.raises(CalDavSyncError):
+            session.push_event(_event(), "ivan@example.com", "Иван")
+
+    assert fake_calendar.save_event.call_count == 2
 
 
 def test_delete_event_deletes_when_found() -> None:

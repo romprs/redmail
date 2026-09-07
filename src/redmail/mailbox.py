@@ -70,6 +70,10 @@ class CachedMailbox:
         self.session.set_read(folder, uid, read)
         cache_store.set_read(self._account_key, folder, uid, read)
 
+    def set_answered(self, folder: str, uid: int) -> None:
+        self.session.set_answered(folder, uid)
+        cache_store.set_answered(self._account_key, folder, uid)
+
     def move_to_trash(self, folder: str, uids: list[int], trash_folder: str) -> None:
         self.move_to_folder(folder, uids, trash_folder)
 
@@ -117,6 +121,9 @@ class ArchiveSource:
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:
         pass  # архив всегда "прочитан" (см. folder_summaries) — переключать нечего
+
+    def set_answered(self, folder: str, uid: int) -> None:
+        pass  # архив — статичный снимок, отвечать "заново" на его письма нельзя
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         archive_store.delete_messages(self.path, uids)

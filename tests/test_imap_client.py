@@ -675,6 +675,42 @@ def test_format_address_decodes_rfc2047_display_name() -> None:
     assert summaries[0].sender_email == "noreply@avito.ru"
 
 
+def test_fetch_folder_summaries_includes_recipients_for_sent_folder_display() -> None:
+    # "Кому" в списке "Отправленные" (жалоба: "в отправленных нет поля
+    # адресат, невозможно понять кому писали") — достаётся из того же
+    # ENVELOPE, что уже фетчится для From, без дополнительного запроса.
+    fake_client = _client(exists=1)
+    envelope = SimpleNamespace(
+        subject=None,
+        from_=[_address(None, b"me", b"example.com")],
+        to=[_address(b"Ivan Petrov", b"ivan", b"example.com"), _address(None, b"anna", b"example.com")],
+        date=None,
+        message_id=None,
+    )
+    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"UID": 1}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summaries = ImapSession(_account()).fetch_folder_summaries()
+
+    assert summaries[0].to == "Ivan Petrov <ivan@example.com>, anna@example.com"
+
+
+def test_fetch_folder_summaries_no_to_field_is_empty_string() -> None:
+    fake_client = _client(exists=1)
+    envelope = SimpleNamespace(
+        subject=None,
+        from_=[_address(None, b"me", b"example.com")],
+        date=None,
+        message_id=None,
+    )
+    fake_client.fetch.return_value = {1: {b"ENVELOPE": envelope, b"UID": 1}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        summaries = ImapSession(_account()).fetch_folder_summaries()
+
+    assert summaries[0].to == ""
+
+
 def test_format_address_without_display_name() -> None:
     fake_client = _client(exists=1)
     envelope = SimpleNamespace(
@@ -752,6 +788,87 @@ def test_fetch_message_content_extracts_attachment() -> None:
     assert attachment.filename == "notes.txt"
     assert attachment.payload == b"file-bytes-here"
     assert attachment.size == len(b"file-bytes-here")
+
+
+def test_fetch_message_content_forwarded_email_as_attachment() -> None:
+    # Пересланное письмо целиком как вложение (Outlook и другие клиенты
+    # часто пересылают именно так) — жалоба: "у письма есть вложение, но
+    # его нет в просмотре и при открытии". Message.walk() у стандартной
+    # библиотеки считает message/rfc822 "multipart" (её единственный
+    # payload — вложенный Message) и лезет внутрь неё, из-за чего текст
+    # ПЕРЕСЫЛАЕМОГО письма раньше подмешивался в тело ИСХОДНОГО, а само
+    # пересланное письмо никогда не попадало в attachments.
+    from email.message import EmailMessage
+
+    nested = EmailMessage()
+    nested["From"] = "boss@example.com"
+    nested["Subject"] = "Original message"
+    nested.set_content("Original body text here.")
+
+    outer = EmailMessage()
+    outer["From"] = "ivan@example.com"
+    outer["Subject"] = "Fwd: something"
+    outer.set_content("See forwarded message below.")
+    outer.add_attachment(nested, subtype="rfc822")
+    raw = outer.as_bytes()
+
+    fake_client = _client()
+    fake_client.fetch.return_value = {5: {b"BODY[]": raw}}
+
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        content = ImapSession(_account()).fetch_message_content("INBOX", 5)
+
+    # Тело ИСХОДНОГО письма — ровно то, что написал пересылающий, без
+    # примеси текста пересылаемого письма.
+    assert content.text.strip() == "See forwarded message below."
+    assert "Original body text here" not in content.text
+    assert len(content.attachments) == 1
+    attachment = content.attachments[0]
+    assert attachment.content_type == "message/rfc822"
+    assert b"Original body text here" in attachment.payload
+    assert b"boss@example.com" in attachment.payload
+
+
+def test_body_has_attachment_detects_forwarded_message_without_explicit_disposition() -> None:
+    # Некоторые клиенты не выставляют Content-Disposition: attachment на
+    # part'е message/rfc822 вовсе — тип message/rfc822 сам по себе уже
+    # однозначно означает вложение.
+    plain_part = BodyData((b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 50, 2, None, None, None))
+    nested_bodystructure = BodyData(
+        (b"TEXT", b"PLAIN", (b"CHARSET", b"UTF-8"), None, None, b"7BIT", 100, 5, None, None, None)
+    )
+    rfc822_part = BodyData(
+        (
+            b"MESSAGE", b"RFC822", (b"NAME", b"Untitled.eml"), None, None, b"7BIT", 5000,
+            None, nested_bodystructure, 120, None, None,
+        )
+    )
+    bodystructure = BodyData(([plain_part, rfc822_part], b"MIXED", (b"BOUNDARY", b"abc"), None, None))
+
+    from redmail.imap_client import _body_has_attachment
+
+    assert _body_has_attachment(bodystructure) is True
+
+
+def test_extract_content_falls_back_to_placeholder_when_decoded_text_is_empty() -> None:
+    # get_payload(decode=True) может вернуть None (например, сервер не
+    # осилил конкретную кодировку/чарсет) — _decode_payload превращает это
+    # в "", а раньше content.text оставался буквально пустой строкой
+    # вместо понятной подписи, и панель чтения выглядела молча пустой,
+    # хотя реальный веб-интерфейс почты показывал текст письма (жалоба:
+    # "некоторые письма открываются так [пусто], а на самом деле они
+    # такие [с текстом]").
+    from email.message import EmailMessage
+
+    built = EmailMessage()
+    built["From"] = "ivan@example.com"
+    built["Subject"] = "Empty decode"
+    built.set_content("irrelevant, будет подменено")
+
+    with patch("redmail.imap_client._decode_payload", return_value=""):
+        content = extract_content(built)
+
+    assert content.text == "(нет текстового содержимого)"
 
 
 def test_create_folder() -> None:

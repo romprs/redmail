@@ -19,7 +19,12 @@ from redmail.paths import app_dir
 # отдавал корректный HTML. Старые кэшированные строки этих полей никогда не
 # содержали, поэтому их нужно не мигрировать, а стереть — переисправит save
 # при следующей загрузке письма с сервера.
-_SCHEMA_VERSION = 5
+#
+# Версия 6: MessageSummary.to (адресаты — нужны для колонки "Кому" в папке
+# "Отправленные", жалоба: "в отправленных нет поля адресат") и is_answered
+# (флаг \Answered — жалоба: "если мы ответили на письмо, это никак не
+# отражается") — старые закэшированные сводки папок этих полей не содержат.
+_SCHEMA_VERSION = 6
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -49,6 +54,8 @@ CREATE TABLE IF NOT EXISTS messages (
     importance TEXT NOT NULL DEFAULT 'normal',
     is_read INTEGER NOT NULL DEFAULT 0,
     body TEXT,
+    recipients_to TEXT NOT NULL DEFAULT '',
+    is_answered INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account, folder, uid)
 );
 
@@ -83,6 +90,8 @@ _MIGRATIONS = (
     "ALTER TABLE messages ADD COLUMN content_to TEXT",
     "ALTER TABLE messages ADD COLUMN content_cc TEXT",
     "ALTER TABLE messages ADD COLUMN content_bcc TEXT",
+    "ALTER TABLE messages ADD COLUMN recipients_to TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE messages ADD COLUMN is_answered INTEGER NOT NULL DEFAULT 0",
 )
 
 
@@ -133,7 +142,8 @@ def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
     with closing(_connect()) as conn:
         rows = conn.execute(
             "SELECT uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, "
-            "importance, is_read FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
+            "importance, is_read, recipients_to, is_answered "
+            "FROM messages WHERE account = ? AND folder = ? ORDER BY position ASC",
             (account_key, folder),
         ).fetchall()
     return [
@@ -148,9 +158,11 @@ def get_folder_summaries(account_key: str, folder: str) -> list[MessageSummary]:
             marker_color=marker_color,
             importance=importance,
             is_read=bool(is_read),
+            to=recipients_to,
+            is_answered=bool(is_answered),
         )
-        for uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance, is_read
-        in rows
+        for uid, subject, sender, sender_email, date, message_id, has_attachments, marker_color, importance, is_read,
+        recipients_to, is_answered in rows
     ]
 
 
@@ -177,20 +189,31 @@ def save_folder_summaries(
         conn.executemany(
             "INSERT INTO messages "
             "(account, folder, uid, position, subject, sender, sender_email, date, message_id, "
-            "has_attachments, marker_color, importance, is_read) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "has_attachments, marker_color, importance, is_read, recipients_to, is_answered) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(account, folder, uid) DO UPDATE SET "
             "position = excluded.position, subject = excluded.subject, sender = excluded.sender, "
             "sender_email = excluded.sender_email, date = excluded.date, message_id = excluded.message_id, "
             "has_attachments = excluded.has_attachments, marker_color = excluded.marker_color, "
-            "importance = excluded.importance, is_read = excluded.is_read",
+            "importance = excluded.importance, is_read = excluded.is_read, recipients_to = excluded.recipients_to, "
+            "is_answered = excluded.is_answered",
             [
                 (
                     account_key, folder, s.uid, position, s.subject, s.sender, s.sender_email, s.date,
-                    s.message_id, int(s.has_attachments), s.marker_color, s.importance, int(s.is_read),
+                    s.message_id, int(s.has_attachments), s.marker_color, s.importance, int(s.is_read), s.to,
+                    int(s.is_answered),
                 )
                 for position, s in enumerate(summaries)
             ],
+        )
+        conn.commit()
+
+
+def set_answered(account_key: str, folder: str, uid: int) -> None:
+    with closing(_connect()) as conn:
+        conn.execute(
+            "UPDATE messages SET is_answered = 1 WHERE account = ? AND folder = ? AND uid = ?",
+            (account_key, folder, uid),
         )
         conn.commit()
 

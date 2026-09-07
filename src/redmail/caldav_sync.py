@@ -6,10 +6,33 @@ from dataclasses import dataclass
 from datetime import datetime
 
 import caldav
+import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
 from redmail.calendar_store import Event
+
+
+def _with_connection_retry(func, *args, **kwargs):
+    """Один повтор САМОГО сетевого вызова при ConnectionError ("Remote end
+    closed connection without response" и т.п.) — жалоба: "не
+    синхронизируется календарь, при этом проверка подключения проходит".
+    Проверка подключения — это единственный лёгкий PROPFIND, а сама
+    синхронизация — несколько последовательных запросов (push каждой
+    встречи, потом fetch) через пул соединений requests/caldav; сервер
+    (или прокси/балансировщик перед ним в закрытой корпоративной сети)
+    вполне может закрыть простаивающее keep-alive-соединение между
+    запросами, не ответив на очередной — классический случай устаревшего
+    соединения, который в подавляющем большинстве случаев лечится одним
+    повтором на свежем соединении, а не признак настоящей неполадки с
+    сервером или данными. Обёрнуто вокруг КОНКРЕТНОГО вызова caldav/requests,
+    а не всего метода целиком — иначе к моменту, когда метод сам ловит
+    Exception и заворачивает его в CalDavSyncError, исходный
+    requests.exceptions.ConnectionError уже не различить."""
+    try:
+        return func(*args, **kwargs)
+    except requests.exceptions.ConnectionError:
+        return func(*args, **kwargs)
 
 # CalDAV с сервером клиента (VK Mail/Exchange) — сеть закрытая корпоративная,
 # у самого redmail нет прямого способа её нащупать заранее, поэтому адрес
@@ -105,7 +128,7 @@ class CalDavSession:
         if self._calendar is None:
             try:
                 principal = self._client.principal()
-                calendars = principal.calendars()
+                calendars = _with_connection_retry(principal.calendars)
             except Exception as exc:
                 raise CalDavSyncError(f"Не удалось подключиться к CalDAV-серверу: {exc}") from exc
             if not calendars:
@@ -116,7 +139,7 @@ class CalDavSession:
     def list_calendar_names(self) -> list[str]:
         try:
             principal = self._client.principal()
-            return [cal.get_display_name() or str(cal.url) for cal in principal.calendars()]
+            return [cal.get_display_name() or str(cal.url) for cal in _with_connection_retry(principal.calendars)]
         except AuthorizationError as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
@@ -129,7 +152,7 @@ class CalDavSession:
         одного и того же формата."""
         calendar = self._primary_calendar()
         try:
-            results = calendar.date_search(start, end)
+            results = _with_connection_retry(calendar.date_search, start, end)
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось получить события с сервера: {exc}") from exc
 
@@ -149,7 +172,7 @@ class CalDavSession:
         calendar = self._primary_calendar()
         ics_text = itip.build_caldav_ics(event, organizer_email, organizer_name).decode("utf-8")
         try:
-            existing = calendar.get_event_by_uid(event.uid)
+            existing = _with_connection_retry(calendar.get_event_by_uid, event.uid)
         except NotFoundError:
             existing = None
         except Exception as exc:
@@ -158,22 +181,22 @@ class CalDavSession:
         try:
             if existing is not None:
                 existing.data = ics_text
-                existing.save()
+                _with_connection_retry(existing.save)
             else:
-                calendar.save_event(ics_text)
+                _with_connection_retry(calendar.save_event, ics_text)
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось сохранить событие на сервере: {exc}") from exc
 
     def delete_event(self, uid: str) -> None:
         calendar = self._primary_calendar()
         try:
-            existing = calendar.get_event_by_uid(uid)
+            existing = _with_connection_retry(calendar.get_event_by_uid, uid)
         except NotFoundError:
             return  # уже нет на сервере — нечего удалять, не ошибка
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось найти событие на сервере: {exc}") from exc
         try:
-            existing.delete()
+            _with_connection_retry(existing.delete)
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось удалить событие на сервере: {exc}") from exc
 

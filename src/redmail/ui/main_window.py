@@ -243,6 +243,11 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
 
 _FLAG_MARK = "⚑"
 _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
+_REPLIED_MARK = "↩"  # ↩ — письмо, на которое уже отправлен ответ (флаг \Answered)
+
+
+def _subject_display_text(summary: MessageSummary) -> str:
+    return f"{_REPLIED_MARK} {summary.subject}" if summary.is_answered else summary.subject
 
 # Gmail заворачивает Отправленные/Корзину и т.п. в служебный контейнер
 # "[Gmail]" — сам по себе не открывается (см. \Noselect в list_folders),
@@ -577,16 +582,21 @@ class MessageWindow(QWidget):
         self._content = content
 
         sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
-        lines = [f"<b>Тема:</b> {html.escape(content.subject or summary.subject or '(без темы)')}", f"<b>От:</b> {html.escape(sender)}"]
-        if content.to:
-            lines.append(f"<b>Кому:</b> {html.escape(content.to)}")
-        if content.cc:
-            lines.append(f"<b>Копия:</b> {html.escape(content.cc)}")
-        if summary.date:
-            lines.append(f"<b>Дата:</b> {html.escape(summary.date)}")
-        header_label = QLabel("<br>".join(lines), self)
+        header_label = QLabel(
+            _build_message_header_html(
+                content.subject or summary.subject or "(без темы)", sender, content.to, content.cc, summary.date
+            ),
+            self,
+        )
         header_label.setWordWrap(True)
-        header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        header_label.linkActivated.connect(
+            lambda href: _show_full_recipient_list(self, "Кому" if href == "recipients:to" else "Копия",
+                                                    content.to if href == "recipients:to" else content.cc)
+            if href in ("recipients:to", "recipients:cc") else None
+        )
 
         # Раньше здесь не было ни ответить, ни переслать вовсе — окно было
         # только для чтения (жалоба: "при открытии письма в отдельном окне
@@ -638,6 +648,40 @@ def _format_event_time(event: calendar_store.Event) -> str:
     if start_local.date() == end_local.date():
         return f"{start_local.strftime('%d.%m.%Y %H:%M')}–{end_local.strftime('%H:%M')}"
     return f"{start_local.strftime('%d.%m.%Y %H:%M')} – {end_local.strftime('%d.%m.%Y %H:%M')}"
+
+
+def _truncate_recipient_field(value: str, max_items: int = 3) -> tuple[str, int]:
+    """(сокращённый HTML-список, число скрытых адресов) — не более
+    max_items, остальные разворачиваются по клику на "и ещё N" (жалоба:
+    "если много адресатов, поле растягивается на всю ширину" — реальные
+    рассылки на полсотни человек делали заголовок письма выше самого
+    письма)."""
+    pairs = [(name, addr) for name, addr in getaddresses([value]) if addr]
+    if len(pairs) <= max_items:
+        return html.escape(value), 0
+    shown_text = ", ".join(html.escape(_format_recipient_candidate(name, addr)) for name, addr in pairs[:max_items])
+    return shown_text, len(pairs) - max_items
+
+
+def _build_message_header_html(subject: str, sender: str, to: str, cc: str, date: str) -> str:
+    lines = [f"<b>Тема:</b> {html.escape(subject)}", f"<b>От:</b> {html.escape(sender)}"]
+    if to:
+        shown, hidden = _truncate_recipient_field(to)
+        suffix = f' <a href="recipients:to">и ещё {hidden}…</a>' if hidden else ""
+        lines.append(f"<b>Кому:</b> {shown}{suffix}")
+    if cc:
+        shown, hidden = _truncate_recipient_field(cc)
+        suffix = f' <a href="recipients:cc">и ещё {hidden}…</a>' if hidden else ""
+        lines.append(f"<b>Копия:</b> {shown}{suffix}")
+    if date:
+        lines.append(f"<b>Дата:</b> {html.escape(date)}")
+    return "<br>".join(lines)
+
+
+def _show_full_recipient_list(parent: QWidget, title: str, value: str) -> None:
+    pairs = [(name, addr) for name, addr in getaddresses([value]) if addr]
+    text = "\n".join(_format_recipient_candidate(name, addr) for name, addr in pairs)
+    QMessageBox.information(parent, title, text)
 
 
 def _format_recipient_candidate(name: str, email: str) -> str:
@@ -2841,6 +2885,17 @@ class EventDetailsDialog(QDialog):
         going_button.clicked.connect(lambda: self._respond("accepted"))
         not_going_button.clicked.connect(lambda: self._respond("declined"))
         maybe_button.clicked.connect(lambda: self._respond("tentative"))
+        # Кнопка, уже совпадающая с текущим ответом (при повторном открытии
+        # уже отвеченного события) — сделана недоступной, чтобы было видно,
+        # что ответ уже учтён, а не выглядело, будто клик ничего не делает
+        # (жалоба: "если приняли приглашение на событие, должны пропасть
+        # кнопки"). Отклонённые события теперь и вовсе не показываются в
+        # календаре (см. refresh_calendar_view) — эта дверь остаётся именно
+        # для "Иду"/"Может быть".
+        for button, participation in ((going_button, "accepted"), (not_going_button, "declined"), (maybe_button, "tentative")):
+            if event.my_participation == participation:
+                button.setEnabled(False)
+                button.setToolTip("Уже выбрано")
         rsvp_row.addWidget(going_button)
         rsvp_row.addWidget(not_going_button)
         rsvp_row.addWidget(maybe_button)
@@ -3241,7 +3296,12 @@ class MainWindow(QMainWindow):
         header_layout.setContentsMargins(6, 4, 6, 4)
         self.message_header_label = QLabel(self.message_header_widget)
         self.message_header_label.setWordWrap(True)
-        self.message_header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.message_header_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        self.message_header_label.linkActivated.connect(self._on_header_link_activated)
+        self._header_to = ""
+        self._header_cc = ""
         header_layout.addWidget(self.message_header_label, 1)
         self.open_message_window_button = QPushButton("Открыть в окне", self.message_header_widget)
         self.open_message_window_button.setToolTip("Открыть письмо в отдельном окне")
@@ -4974,7 +5034,27 @@ class MainWindow(QMainWindow):
         # строки после каждого setItem(), и индекс row перестаёт совпадать
         # с тем, что мы только что туда положили.
         self.table.setSortingEnabled(False)
+        # Выделение в Qt индексное, а не по содержимому — просто заменить
+        # содержимое строк через setItem() недостаточно: если, скажем,
+        # строка 0 была выделена в предыдущей папке, она остаётся "выделена"
+        # и после того, как в неё легли данные СОВСЕМ другого письма из
+        # новой папки, потому что сам индекс (0) не поменялся. При этом
+        # itemSelectionChanged не срабатывает (набор выделенных индексов не
+        # изменился), и панель чтения так и показывает старое/пустое
+        # содержимое, хотя строка визуально выглядит выбранной (жалоба:
+        # "при переключении между папками выделенное письмо не
+        # открывается"). Ниже уже есть код, который заново выделяет нужную
+        # строку по uid, если он есть в новой папке — например, при простом
+        # обновлении текущей папки.
+        self.table.clearSelection()
         self.table.setRowCount(len(summaries))
+        # В "Отправленных" "От кого" — всегда сам пользователь, бесполезная
+        # колонка; вместо неё показываем "Кому" (жалоба: "в отправленных
+        # нет поля адресат, невозможно понять кому писали, а кому нет").
+        is_sent_folder = self.current_folder is not None and self.current_folder == self.sent_folder_name
+        sender_header_item = self.table.horizontalHeaderItem(COL_SENDER)
+        if sender_header_item is not None:
+            sender_header_item.setText("Кому" if is_sent_folder else "От кого")
         for row, summary in enumerate(summaries):
             check_item = QTableWidgetItem()
             # ItemIsSelectable — без него Qt при selectRow()/выборе строки
@@ -5000,8 +5080,8 @@ class MainWindow(QMainWindow):
             self.table.setItem(
                 row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
             )
-            sender_item = QTableWidgetItem(summary.sender)
-            subject_item = QTableWidgetItem(summary.subject)
+            sender_item = QTableWidgetItem(summary.to if is_sent_folder else summary.sender)
+            subject_item = QTableWidgetItem(_subject_display_text(summary))
             if not summary.is_read:
                 # Непрочитанное — жирным, как в любом другом почтовом клиенте.
                 bold_font = sender_item.font()
@@ -5345,19 +5425,19 @@ class MainWindow(QMainWindow):
     def _render_message_header(self, summary: MessageSummary, content: MessageContent) -> None:
         subject = content.subject or summary.subject or "(без темы)"
         sender = content.from_ or (f"{summary.sender} <{summary.sender_email}>" if summary.sender_email else summary.sender)
-        lines = [
-            f"<b>Тема:</b> {html.escape(subject)}",
-            f"<b>От:</b> {html.escape(sender)}",
-        ]
-        if content.to:
-            lines.append(f"<b>Кому:</b> {html.escape(content.to)}")
-        if content.cc:
-            lines.append(f"<b>Копия:</b> {html.escape(content.cc)}")
-        if summary.date:
-            lines.append(f"<b>Дата:</b> {html.escape(summary.date)}")
-        self.message_header_label.setText("<br>".join(lines))
+        self._header_to = content.to
+        self._header_cc = content.cc
+        self.message_header_label.setText(
+            _build_message_header_html(subject, sender, content.to, content.cc, summary.date)
+        )
         self.message_header_widget.show()
         self._render_thread_list(summary)
+
+    def _on_header_link_activated(self, href: str) -> None:
+        if href == "recipients:to":
+            _show_full_recipient_list(self, "Кому", self._header_to)
+        elif href == "recipients:cc":
+            _show_full_recipient_list(self, "Копия", self._header_cc)
 
     def _thread_summaries_for(self, summary: MessageSummary) -> list[MessageSummary]:
         """Остальные письма текущей папки с той же темой (без Re:/Fwd:/
@@ -5510,6 +5590,25 @@ class MainWindow(QMainWindow):
             font = item.font()
             font.setBold(not read)
             item.setFont(font)
+
+    def _mark_summary_answered(self, source: object, folder: str, uid: int) -> None:
+        """Ставит \\Answered на письмо, на которое только что отправлен
+        ответ, и сразу же обновляет строку в таблице, если это письмо всё
+        ещё в текущей открытой папке (жалоба: "если мы ответили на письмо,
+        это никак не отражается, нужен какой-то признак")."""
+        try:
+            source.set_answered(folder, uid)
+        except Exception:
+            pass  # необязательная отметка — письмо уже реально отправлено
+        if self.current_folder != folder or self.active_source is not source:
+            return
+        for row, summary in enumerate(self.current_summaries):
+            if summary.uid == uid:
+                summary.is_answered = True
+                item = self.table.item(row, COL_SUBJECT)
+                if item is not None:
+                    item.setText(_subject_display_text(summary))
+                break
 
     def _update_invite_bar(self, content: MessageContent) -> None:
         calendar_part = next((a for a in content.attachments if a.content_type == "text/calendar"), None)
@@ -5852,6 +5951,12 @@ class MainWindow(QMainWindow):
             return
         events = [e for e in events if e.status != "cancelled"]
         events = [e for e in events if e.calendar_id in self._visible_calendar_ids]
+        # Отклонённое приглашение (я не организатор и явно отказался) больше
+        # не показывается в сетке вовсе — жалоба: "если приняли приглашение
+        # на событие, то либо должны пропасть кнопки, либо при отказе —
+        # пропадать событие из календаря". Свои же встречи (is_organizer)
+        # participation ко мне не относится — их decline не бывает.
+        events = [e for e in events if e.is_organizer or e.my_participation != "declined"]
         # calendar_id -> цвет календаря — раньше карточка события всегда
         # красилась по роли (я организатор/меня пригласили), без единой
         # привязки к тому, в каком именно календаре событие лежит, и
@@ -6638,7 +6743,12 @@ class MainWindow(QMainWindow):
             signatures=self.signatures,
             default_signature_id=self.default_signature_id,
         )
-        self._exec_compose(dialog, in_reply_to=summary.message_id or None)
+        reply_source = (
+            (self.active_source, self.current_folder, summary.uid)
+            if self.active_source is not None and self.current_folder is not None
+            else None
+        )
+        self._exec_compose(dialog, in_reply_to=summary.message_id or None, reply_source=reply_source)
 
     def on_forward(self) -> None:
         if not self.selected_summary or not self.active_source or not self.current_folder:
@@ -6694,6 +6804,7 @@ class MainWindow(QMainWindow):
         *,
         in_reply_to: str | None = None,
         source_draft: tuple[str, int] | None = None,
+        reply_source: tuple[object, str, int] | None = None,
     ) -> None:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -6724,6 +6835,28 @@ class MainWindow(QMainWindow):
             self._append_sent_copy(message)
             if source_draft is not None:
                 self._delete_draft(source_draft)
+            if reply_source is not None:
+                self._mark_summary_answered(*reply_source)
+            # "Отправленные" раньше обновлялись только по кнопке "Обновить"
+            # (жалоба: "папка отправленные обновляется только принудительно,
+            # должна сразу после отправки") — folder_summaries() при обычном
+            # переключении на папку безусловно доверяет кэшу, не проверяя
+            # exists_count на сервере, поэтому только что добавленное копией
+            # письмо не появлялось само по себе. Мы только что сами
+            # добавили его в "Отправленные" (см. _append_sent_copy) —
+            # обновляем кэш этой папки сразу, не дожидаясь следующего
+            # ручного "Обновить" или счастливого совпадения exists_count.
+            if self.account_protocol == "imap" and self.sent_folder_name and self.mailbox is not None:
+                try:
+                    sent_summaries = self.mailbox.refresh_folder(self.sent_folder_name)
+                except Exception:
+                    sent_summaries = None
+                if (
+                    sent_summaries is not None
+                    and self.current_folder == self.sent_folder_name
+                    and self.active_source is self.mailbox
+                ):
+                    self._render_folder(sent_summaries)
 
         # Раньше отправка шла синхронно прямо здесь — окно подвисало на
         # время SMTP-разговора с сервером, как и у календарных приглашений

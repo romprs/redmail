@@ -100,6 +100,15 @@ class MessageSummary:
     marker_color: str | None = None
     importance: str = "normal"  # "high" | "normal" | "low"
     is_read: bool = False
+    # Только для списка "Отправленные" — там "От кого" всегда сам
+    # пользователь, бесполезная колонка (жалоба: "в отправленных нет поля
+    # адресат, невозможно понять кому писали"). Достаётся бесплатно — те же
+    # данные ENVELOPE, что уже фетчатся для sender, просто ещё одно поле.
+    to: str = ""
+    # Стандартный IMAP-флаг \Answered — раньше нигде не читался и не
+    # проставлялся (жалоба: "если мы ответили на письмо, это никак не
+    # отражается, нужен какой-то признак").
+    is_answered: bool = False
 
 
 @dataclass
@@ -312,6 +321,14 @@ class ImapSession:
             self._client.remove_flags([uid], [b"\\Seen"])
 
     @_reconnecting
+    def set_answered(self, folder: str, uid: int) -> None:
+        """Ставит стандартный флаг \\Answered на письмо, на которое только
+        что был отправлен ответ — не снимается обратно (как и в других
+        почтовых клиентах, "ответили" необратимо для этого письма)."""
+        self._select(folder)
+        self._client.add_flags([uid], [b"\\Answered"])
+
+    @_reconnecting
     def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         """Ставит/снимает \\Flagged + наш цветной keyword-флаг.
 
@@ -407,6 +424,22 @@ class ImapSession:
             self._selected_folder = folder
 
 
+def _iter_body_parts(message: Message):
+    """Как Message.walk(), но НЕ спускается внутрь message/rfc822
+    (пересланное письмо целиком как вложение) — Message.walk() у стандартной
+    библиотеки считает такую часть "multipart" (её единственный payload —
+    вложенный Message-объект) и лезет внутрь неё саму же, вместо того
+    чтобы отдать её как один цельный узел вызывающему коду."""
+    if message.get_content_type() == "message/rfc822":
+        yield message
+        return
+    if message.is_multipart():
+        for part in message.get_payload():
+            yield from _iter_body_parts(part)
+    else:
+        yield message
+
+
 def extract_content(message: Message) -> MessageContent:
     # Заголовки живут на верхнем уровне сообщения независимо от того,
     # multipart оно или нет — читаем их один раз, а не в каждой из веток
@@ -423,7 +456,15 @@ def extract_content(message: Message) -> MessageContent:
 
     if not message.is_multipart():
         if message.get_content_type() == "text/plain":
-            return MessageContent(text=_decode_payload(message), **header_kwargs)
+            # "or" — не просто "если текста вообще не было" (None), но и
+            # "если он декодировался в пустую строку" (например,
+            # get_payload(decode=True) не осилил конкретную кодировку и
+            # вернул None → _decode_payload даёт "") — иначе панель чтения
+            # оставалась молча пустой безо всякой подсказки, хотя реальный
+            # веб-интерфейс почты то же письмо показывал с текстом (жалоба:
+            # "некоторые письма открываются так [пусто], а на самом деле
+            # они такие [с текстом]").
+            return MessageContent(text=_decode_payload(message) or "(нет текстового содержимого)", **header_kwargs)
         if message.get_content_type() == "text/html":
             return MessageContent(
                 text="(письмо в формате HTML — предпросмотр текста недоступен)",
@@ -441,8 +482,27 @@ def extract_content(message: Message) -> MessageContent:
     attachments: list[Attachment] = []
     inline_images: dict[str, tuple[str, bytes]] = {}
 
-    for part in message.walk():
-        if part.is_multipart():
+    for part in _iter_body_parts(message):
+        if part.get_content_type() == "message/rfc822":
+            # Пересланное письмо целиком как вложение (Outlook и другие
+            # клиенты часто пересылают именно так, без явного
+            # Content-Disposition: attachment на этой части) — раньше
+            # message.walk() спускался ВНУТРЬ него (Python считает
+            # message/rfc822 "multipart", раз её единственный payload —
+            # вложенный Message), и текст/HTML пересылаемого письма
+            # подмешивался в тело исходного вместо того, чтобы стать одним
+            # отдельным вложением — жалоба: "у письма есть вложение, но
+            # его нет в просмотре и при открытии".
+            nested = part.get_payload(0)
+            nested_subject = _decode_header_text(nested.get("Subject")) if nested else ""
+            filename = _decode_filename(part.get_filename()) or f"{nested_subject or 'Пересланное письмо'}.eml"
+            attachments.append(
+                Attachment(
+                    filename=filename,
+                    content_type="message/rfc822",
+                    payload=nested.as_bytes() if nested else (part.get_payload(decode=True) or b""),
+                )
+            )
             continue
 
         filename = _decode_filename(part.get_filename())
@@ -491,8 +551,13 @@ def extract_content(message: Message) -> MessageContent:
         elif content_type == "text/html" and html is None:
             html = _decode_payload(part)
 
-    if text is None:
-        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html is not None else "(нет текстового содержимого)"
+    if not text:
+        # "not text", а не "text is None" — часть text/plain могла найтись,
+        # но не осилить декодирование (get_payload(decode=True) вернул
+        # None → _decode_payload дала "") и оставить панель чтения молча
+        # пустой без единой подсказки (жалоба: "некоторые письма
+        # открываются так [пусто], а на самом деле они такие [с текстом]").
+        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html else "(нет текстового содержимого)"
 
     return MessageContent(
         text=text,
@@ -555,6 +620,8 @@ def _to_summary(data: dict) -> MessageSummary:
         marker_color=marker_color,
         importance=parse_importance(message_from_bytes(data.get(b"BODY[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]", b""))),
         is_read=b"\\Seen" in flags,
+        to=_format_address_list(getattr(envelope, "to", None)),
+        is_answered=b"\\Answered" in flags,
     )
 
 
@@ -573,7 +640,20 @@ def _body_has_attachment(structure) -> bool:
         if _disposition_is_attachment(rest):
             return True
         return any(_body_has_attachment(part) for part in parts)
+    # message/rfc822 (пересланное письмо целиком) — общепринято вложение
+    # само по себе, независимо от явного Content-Disposition: attachment
+    # (многие клиенты, включая Outlook, его не выставляют на такой части) —
+    # без этого скрепка в списке писем не показывалась вовсе (жалоба:
+    # "у письма есть вложение, но его нет в просмотре и при открытии").
+    if len(structure) >= 2 and _field_upper(structure[0]) == "MESSAGE" and _field_upper(structure[1]) == "RFC822":
+        return True
     return _disposition_is_attachment(structure)
+
+
+def _field_upper(value) -> str:
+    if isinstance(value, bytes):
+        return value.decode("ascii", errors="replace").upper()
+    return str(value).upper()
 
 
 def _disposition_is_attachment(fields) -> bool:
@@ -616,6 +696,22 @@ def _decode_rfc2047(raw: bytes) -> str:
         chunk.decode(encoding or "utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
         for chunk, encoding in parts
     )
+
+
+def _format_address_list(addresses) -> str:
+    """Все адреса списка (To/Cc), через запятую — используется только для
+    отображения в списке писем, не для машинного разбора (см.
+    _parse_recipient_list в main_window.py для этого)."""
+    if not addresses:
+        return ""
+    parts = []
+    for address in addresses:
+        mailbox = address.mailbox.decode("utf-8", errors="replace") if address.mailbox else ""
+        host = address.host.decode("utf-8", errors="replace") if address.host else ""
+        email = f"{mailbox}@{host}" if mailbox and host else mailbox
+        name = _decode_rfc2047(address.name) if address.name else ""
+        parts.append(f"{name} <{email}>" if name and email else (email or name))
+    return ", ".join(parts)
 
 
 def _format_address(addresses) -> tuple[str, str]:
