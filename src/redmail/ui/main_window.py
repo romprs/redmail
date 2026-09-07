@@ -85,6 +85,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QSpinBox,
     QSplitter,
@@ -93,6 +94,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
+    QToolTip,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -606,6 +608,13 @@ class MessageWindow(QWidget):
                                                     content.to if href == "recipients:to" else content.cc)
             if href in ("recipients:to", "recipients:cc") else None
         )
+        header_label.linkHovered.connect(
+            lambda href: QToolTip.showText(
+                QCursor.pos(), _full_recipient_list_text(content.to if href == "recipients:to" else content.cc), header_label
+            )
+            if href in ("recipients:to", "recipients:cc") else QToolTip.hideText()
+        )
+        header_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
 
         # Раньше здесь не было ни ответить, ни переслать вовсе — окно было
         # только для чтения (жалоба: "при открытии письма в отдельном окне
@@ -687,10 +696,13 @@ def _build_message_header_html(subject: str, sender: str, to: str, cc: str, date
     return "<br>".join(lines)
 
 
-def _show_full_recipient_list(parent: QWidget, title: str, value: str) -> None:
+def _full_recipient_list_text(value: str) -> str:
     pairs = [(name, addr) for name, addr in getaddresses([value]) if addr]
-    text = "\n".join(_format_recipient_candidate(name, addr) for name, addr in pairs)
-    QMessageBox.information(parent, title, text)
+    return "\n".join(_format_recipient_candidate(name, addr) for name, addr in pairs)
+
+
+def _show_full_recipient_list(parent: QWidget, title: str, value: str) -> None:
+    QMessageBox.information(parent, title, _full_recipient_list_text(value))
 
 
 def _format_recipient_candidate(name: str, email: str) -> str:
@@ -3432,6 +3444,7 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse | Qt.TextInteractionFlag.LinksAccessibleByMouse
         )
         self.message_header_label.linkActivated.connect(self._on_header_link_activated)
+        self.message_header_label.linkHovered.connect(self._on_header_link_hovered)
         self._header_to = ""
         self._header_cc = ""
         header_layout.addWidget(self.message_header_label, 1)
@@ -3439,6 +3452,15 @@ class MainWindow(QMainWindow):
         self.open_message_window_button.setToolTip("Открыть письмо в отдельном окне")
         self.open_message_window_button.clicked.connect(self.on_open_message_window)
         header_layout.addWidget(self.open_message_window_button)
+        # Жалоба: "заголовок письма... занимает от 50% до 100%, должен
+        # занимать 4 строки" — без явной политики размера QVBoxLayout ниже
+        # (reading_layout) мог отдавать этому виджету всё "лишнее" место
+        # вместо тела письма, если reading_pane почему-то не забирал его
+        # первым (например, до первой загрузки контента). Fixed по вертикали
+        # заставляет виджет всегда занимать РОВНО столько, сколько нужно
+        # для его реального содержимого (sizeHint пересчитывается заново
+        # при каждой смене текста/ширины), и ни пикселем больше.
+        self.message_header_widget.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         self.message_header_widget.hide()
 
         # Список остальных писем той же цепочки (по теме, без Re:/Fwd:) —
@@ -5592,6 +5614,18 @@ class MainWindow(QMainWindow):
             _show_full_recipient_list(self, "Кому", self._header_to)
         elif href == "recipients:cc":
             _show_full_recipient_list(self, "Копия", self._header_cc)
+
+    def _on_header_link_hovered(self, href: str) -> None:
+        # Жалоба: "если много получателей — скрывать за многоточием,
+        # показывать при наведении в сплывающем окне" — клик по ссылке "и
+        # ещё N…" уже открывал полный список (см. _on_header_link_activated),
+        # но наведение мышью само по себе никак не реагировало.
+        if href == "recipients:to":
+            QToolTip.showText(QCursor.pos(), _full_recipient_list_text(self._header_to), self.message_header_label)
+        elif href == "recipients:cc":
+            QToolTip.showText(QCursor.pos(), _full_recipient_list_text(self._header_cc), self.message_header_label)
+        else:
+            QToolTip.hideText()
 
     def _thread_summaries_for(self, summary: MessageSummary) -> list[MessageSummary]:
         """Остальные письма текущей папки с той же темой (без Re:/Fwd:/
