@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        46%{?dist}
+Release:        47%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-47
+- Заголовок письма (Тема/От/Кому/Дата) больше не растягивается на 50-100 процентов поля просмотра, занимает ровно свою высоту
+- Список "и ещё N..." получателей теперь показывается всплывающей подсказкой при наведении, а не только по клику
 * Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-46
 - Масштаб шрифта: размер теперь явно применяется ко всем открытым виджетам окна, а не только к новым
 * Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-45
