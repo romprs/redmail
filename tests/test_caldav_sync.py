@@ -41,7 +41,8 @@ def test_session_creates_client_with_account_credentials() -> None:
     with patch("redmail.caldav_sync.caldav.DAVClient") as client_cls:
         CalDavSession(_account())
     client_cls.assert_called_once_with(
-        "https://calendar.example.corp/caldav/", username="ivan", password="secret", timeout=30
+        "https://calendar.example.corp/caldav/", username="ivan", password="secret", timeout=30,
+        headers={"User-Agent": "redmail-caldav-client/1.0"},
     )
 
 
@@ -160,6 +161,38 @@ def test_push_event_raises_clear_error_when_connection_fails_twice() -> None:
             session.push_event(_event(), "ivan@example.com", "Иван")
 
     assert fake_calendar.save_event.call_count == 2
+
+
+def test_write_access_saves_and_deletes_test_event() -> None:
+    fake_client = MagicMock()
+    fake_calendar = MagicMock()
+    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
+    cleanup_obj = MagicMock()
+    fake_calendar.get_event_by_uid.return_value = cleanup_obj
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        session = CalDavSession(_account())
+        session.test_write_access()
+
+    fake_calendar.save_event.assert_called_once()
+    ics_text = fake_calendar.save_event.call_args[0][0]
+    assert "redmail-conntest-" in ics_text
+    cleanup_obj.delete.assert_called_once()
+
+
+def test_write_access_raises_clear_error_when_save_fails() -> None:
+    # Настоящая жалоба: чтение (проверка подключения) проходит, а запись
+    # (реальная синхронизация) — нет. Проверка подключения должна ловить это
+    # заранее, а не только чтение.
+    fake_client = MagicMock()
+    fake_calendar = MagicMock()
+    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
+    fake_calendar.save_event.side_effect = requests.exceptions.ConnectionError("Remote end closed connection without response")
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        session = CalDavSession(_account())
+        with pytest.raises(CalDavSyncError, match="Запись на сервер не удалась"):
+            session.test_write_access()
 
 
 def test_delete_event_deletes_when_found() -> None:

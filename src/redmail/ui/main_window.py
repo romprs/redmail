@@ -2410,17 +2410,36 @@ class AddCalendarDialog(QDialog):
         self.caldav_test_button.setEnabled(False)
         self.caldav_test_status.setText("Проверка подключения…")
 
-        def connect_and_list_calendars() -> int:
+        def connect_and_check() -> tuple[int, str | None]:
+            # Проверяем чтение и запись ОТДЕЛЬНО и обе по-настоящему (запись —
+            # реальным одноразовым PUT+DELETE тестового события), а не только
+            # чтение — иначе получается ровно та путаница, из-за которой всё
+            # началось: "проверка подключения проходит, а синхронизация нет",
+            # потому что раньше проверялось только чтение (PROPFIND).
             session = caldav_sync.CalDavSession(account)
             try:
-                return len(session.list_calendar_names())
+                calendar_count = len(session.list_calendar_names())
+                write_error: str | None = None
+                try:
+                    session.test_write_access()
+                except caldav_sync.CalDavSyncError as exc:
+                    write_error = str(exc)
+                return calendar_count, write_error
             finally:
                 session.close()
 
-        worker = _CallableWorker(connect_and_list_calendars, parent=self)
+        worker = _CallableWorker(connect_and_check, parent=self)
 
-        def on_success(calendar_count: object) -> None:
-            self.caldav_test_status.setText(f"Подключение успешно, календарей найдено: {calendar_count}")
+        def on_success(result: object) -> None:
+            calendar_count, write_error = result
+            if write_error is None:
+                self.caldav_test_status.setText(
+                    f"Подключение успешно, календарей найдено: {calendar_count}. Чтение и запись — OK."
+                )
+            else:
+                self.caldav_test_status.setText(
+                    f"Чтение — OK (календарей: {calendar_count}). Запись — ОШИБКА: {write_error}"
+                )
             self.caldav_test_button.setEnabled(True)
             self._test_workers.remove(worker)
 

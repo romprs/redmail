@@ -3,7 +3,8 @@ from __future__ import annotations
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from uuid import uuid4
 
 import caldav
 import requests
@@ -11,6 +12,18 @@ from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
 from redmail.calendar_store import Event
+
+# Некоторые корпоративные прокси/WAF перед CalDAV-сервером отличают
+# автоматизированные HTTP-библиотеки от обычных десктопных клиентов именно
+# по User-Agent и применяют к ним более строгую политику — жалоба
+# "из Evolution и через веб событие создаётся нормально, а из этого клиента
+# нет, хотя проверка подключения (чтение) проходит" указывает ровно на такую
+# избирательную фильтрацию по заголовку, а не на блокировку метода PUT как
+# такового (раз PUT работает у других клиентов на этом же сервере). Библиотека
+# caldav по умолчанию подставляет "python-caldav/<версия>" — максимально
+# узнаваемую сигнатуру скриптовой библиотеки; заменяем её на нейтральную,
+# не выдающую, что это python-скрипт, но и не выдающую себя за чужой продукт.
+_CALDAV_USER_AGENT = "redmail-caldav-client/1.0"
 
 
 def _with_connection_retry(func, *args, **kwargs):
@@ -118,7 +131,8 @@ class CalDavSession:
                 # теперь выполняется в фоновом потоке, но таймаут всё равно
                 # нужен: без него поток просто завис бы бесконечно вместо
                 # того, чтобы сообщить об ошибке.
-                account.url, username=account.username, password=account.password, timeout=30
+                account.url, username=account.username, password=account.password, timeout=30,
+                headers={"User-Agent": _CALDAV_USER_AGENT},
             )
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось создать CalDAV-соединение: {exc}") from exc
@@ -186,6 +200,40 @@ class CalDavSession:
                 _with_connection_retry(calendar.save_event, ics_text)
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось сохранить событие на сервере: {exc}") from exc
+
+    def test_write_access(self) -> None:
+        """Настоящая проверка записи: создаёт одноразовое тестовое событие на
+        сервере и сразу удаляет его. В отличие от одной лишь проверки чтения
+        (PROPFIND/список календарей), это ловит именно ту ситуацию, из-за
+        которой возникла путаница — "проверка подключения проходит, а
+        синхронизация нет": проверка подключения раньше проверяла только
+        чтение, поэтому расхождение между чтением и записью (например,
+        избирательная фильтрация PUT на стороне сети по каким-то признакам
+        запроса) не обнаруживалось заранее, а всплывало только при реальной
+        синхронизации. Бросает CalDavSyncError с текстом самой сетевой
+        ошибки, если запись не удалась — чтение при этом может быть исправно."""
+        calendar = self._primary_calendar()
+        test_uid = f"redmail-conntest-{uuid4()}@redmail"
+        start = datetime.now(timezone.utc).replace(microsecond=0)
+        test_event = Event(
+            uid=test_uid,
+            summary="redmail: проверка подключения (можно удалить)",
+            dtstart=start,
+            dtend=start + timedelta(minutes=1),
+            organizer_email=self.account.username,
+            organizer_name=self.account.username,
+            is_organizer=True,
+        )
+        ics_text = itip.build_caldav_ics(test_event, test_event.organizer_email, test_event.organizer_name).decode("utf-8")
+        try:
+            _with_connection_retry(calendar.save_event, ics_text)
+        except Exception as exc:
+            raise CalDavSyncError(f"Запись на сервер не удалась: {exc}") from exc
+        try:
+            existing = _with_connection_retry(calendar.get_event_by_uid, test_uid)
+            _with_connection_retry(existing.delete)
+        except Exception:
+            pass  # уборка тестового события — не критично, если не получилось
 
     def delete_event(self, uid: str) -> None:
         calendar = self._primary_calendar()
