@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import keyring
@@ -90,6 +90,11 @@ class Signature:
     id: str
     name: str
     body_html: str
+    # Картинки, вставленные в подпись (жалоба: "редактор подписи не даёт
+    # вставлять картинку... сделай как при создании письма") — тот же приём
+    # cid-ссылок, что у черновиков/писем: body_html ссылается на них как
+    # <img src="cid:...">, а сами байты хранятся отдельно.
+    inline_images: dict[str, tuple[str, bytes]] = field(default_factory=dict)
 
 
 def load_signatures() -> list[Signature]:
@@ -103,7 +108,12 @@ def load_signatures() -> list[Signature]:
     signatures = []
     for item in raw:
         try:
-            signatures.append(Signature(id=item["id"], name=item["name"], body_html=item["body_html"]))
+            inline_images = {}
+            for cid, entry in (item.get("inline_images") or {}).items():
+                inline_images[cid] = (entry["content_type"], base64.b64decode(entry["data"]))
+            signatures.append(
+                Signature(id=item["id"], name=item["name"], body_html=item["body_html"], inline_images=inline_images)
+            )
         except (TypeError, KeyError):
             continue
     return signatures
@@ -111,7 +121,18 @@ def load_signatures() -> list[Signature]:
 
 def save_signatures(signatures: list[Signature]) -> None:
     data = _load_settings_dict()
-    data["signatures"] = [asdict(sig) for sig in signatures]
+    data["signatures"] = [
+        {
+            "id": sig.id,
+            "name": sig.name,
+            "body_html": sig.body_html,
+            "inline_images": {
+                cid: {"content_type": content_type, "data": base64.b64encode(payload).decode("ascii")}
+                for cid, (content_type, payload) in sig.inline_images.items()
+            },
+        }
+        for sig in signatures
+    ]
     _save_settings_dict(data)
 
 

@@ -453,6 +453,19 @@ def test_signatures_round_trip(tmp_path: Path) -> None:
         assert load_signatures() == signatures
 
 
+def test_signatures_round_trip_with_inline_image(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    signatures = [
+        Signature(
+            id="s1", name="Рабочая", body_html='<p>Иван</p><img src="cid:logo@redmail">',
+            inline_images={"logo@redmail": ("image/png", b"\x89PNG\r\n\x1a\nfakepngdata")},
+        ),
+    ]
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        save_signatures(signatures)
+        assert load_signatures() == signatures
+
+
 def test_signatures_skips_corrupt_entries(tmp_path: Path) -> None:
     settings_file = tmp_path / "settings.json"
     settings_file.write_text(

@@ -1865,6 +1865,19 @@ class ComposeDialog(QDialog):
         if sig_id:
             signature = next((s for s in self._signatures if s.id == sig_id), None)
             if signature is not None:
+                # Картинки подписи регистрируем как ресурсы ДО insertHtml —
+                # иначе <img src="cid:..."> внутри разметки подписи ссылался
+                # бы на данные, которых документ ещё не знает, и рисовался
+                # бы сломанным (тот же приём, что при открытии черновика).
+                # Также добавляем их в _inline_images письма, чтобы они
+                # реально ушли вложениями при отправке.
+                for cid, (content_type, payload) in signature.inline_images.items():
+                    image = QImage.fromData(payload)
+                    if not image.isNull():
+                        self.body_edit.document().addResource(
+                            QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image
+                        )
+                        self._inline_images[cid] = (content_type, payload)
                 cursor.movePosition(QTextCursor.MoveOperation.End)
                 self.body_edit.setTextCursor(cursor)
                 start_pos = cursor.position()
@@ -1874,22 +1887,38 @@ class ComposeDialog(QDialog):
 
 
 class SignatureEditDialog(QDialog):
-    """Название + тело подписи — своя, более лёгкая панель форматирования
-    (только Ж/К/Ч, без гарнитуры/размера — подпись обычно короткая, полный
-    набор ComposeDialog тут был бы избыточен)."""
+    """Название + тело подписи — та же панель форматирования, что в
+    ComposeDialog: Ж/К/Ч, гарнитура, размер и вставка изображения (жалоба:
+    "редактор подписи не даёт вставлять картинку и изменять шрифт, сделай
+    как при создании письма"). Само поле ввода — узкое и невысокое, на 4
+    строки, а не растянутое на весь диалог (жалоба: "зачем такое широкое
+    поле") — подпись обычно короткая, места под неё нужно немного."""
 
     def __init__(self, parent, signature: Signature | None = None):
         super().__init__(parent)
         self.setWindowTitle("Изменить подпись" if signature else "Новая подпись")
-        self.resize(480, 320)
+        # Ширина — не ради самого поля ввода (оно как раз узкое, см. ниже),
+        # а чтобы панель форматирования не пряталась под скрытую стрелку
+        # ">>" от нехватки места (тот же эффект, что уже был в ComposeDialog
+        # и в основном тулбаре при недостаточной ширине).
+        self.resize(560, 260)
 
         self.name_edit = QLineEdit(signature.name if signature else "")
         self.name_edit.setPlaceholderText("Например, «Рабочая»")
 
-        self.body_edit = QTextEdit()
+        self.body_edit = _ComposeBodyEdit(lambda image: self._insert_image(image, "image/png"))
         self.body_edit.setAcceptRichText(True)
+        self._inline_images: dict[str, tuple[str, bytes]] = dict(signature.inline_images) if signature else {}
         if signature:
+            for cid, (_content_type, payload) in self._inline_images.items():
+                image = QImage.fromData(payload)
+                if not image.isNull():
+                    self.body_edit.document().addResource(
+                        QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image
+                    )
             self.body_edit.setHtml(signature.body_html)
+        line_height = self.body_edit.fontMetrics().lineSpacing()
+        self.body_edit.setFixedHeight(line_height * 4 + 24)
 
         self.bold_action = QAction("Ж", self)
         self.bold_action.setCheckable(True)
@@ -1903,6 +1932,21 @@ class SignatureEditDialog(QDialog):
         self.underline_action.setCheckable(True)
         self.underline_action.setToolTip("Подчёркнутый")
         self.underline_action.toggled.connect(self._on_underline_toggled)
+
+        self.font_family_combo = QFontComboBox(self)
+        self.font_family_combo.setMaximumWidth(160)
+        self.font_family_combo.currentFontChanged.connect(self._on_font_family_changed)
+
+        self.font_size_combo = QComboBox(self)
+        self.font_size_combo.setEditable(True)
+        self.font_size_combo.setMaximumWidth(56)
+        for size in (8, 9, 10, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48):
+            self.font_size_combo.addItem(str(size))
+        self.font_size_combo.setCurrentText(str(int(self.body_edit.fontPointSize()) or 12))
+        self.font_size_combo.currentTextChanged.connect(self._on_font_size_changed)
+
+        insert_image_button = QPushButton("Вставить изображение…", self)
+        insert_image_button.clicked.connect(self._on_insert_image)
 
         toolbar = QToolBar("Форматирование", self)
         toolbar.addAction(self.bold_action)
@@ -1918,6 +1962,12 @@ class SignatureEditDialog(QDialog):
                 font = button.font()
                 tweak(font)
                 button.setFont(font)
+        toolbar.addWidget(self.font_family_combo)
+        toolbar.addWidget(self.font_size_combo)
+        toolbar.addSeparator()
+        toolbar.addWidget(insert_image_button)
+
+        self.body_edit.currentCharFormatChanged.connect(self._sync_format_toolbar)
 
         form = QFormLayout()
         form.addRow("Название", self.name_edit)
@@ -1930,6 +1980,7 @@ class SignatureEditDialog(QDialog):
         layout.addLayout(form)
         layout.addWidget(toolbar)
         layout.addWidget(self.body_edit)
+        layout.addStretch(1)
         layout.addWidget(buttons)
 
     def _on_bold_toggled(self, checked: bool) -> None:
@@ -1950,11 +2001,62 @@ class SignatureEditDialog(QDialog):
         self.body_edit.mergeCurrentCharFormat(fmt)
         self.body_edit.setFocus()
 
+    def _on_font_family_changed(self, font: QFont) -> None:
+        self.body_edit.setFontFamily(font.family())
+        self.body_edit.setFocus()
+
+    def _on_font_size_changed(self, size_text: str) -> None:
+        try:
+            size = float(size_text)
+        except ValueError:
+            return
+        if size > 0:
+            self.body_edit.setFontPointSize(size)
+
+    def _sync_format_toolbar(self, fmt: QTextCharFormat) -> None:
+        self.bold_action.blockSignals(True)
+        self.bold_action.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
+        self.bold_action.blockSignals(False)
+        self.italic_action.blockSignals(True)
+        self.italic_action.setChecked(fmt.fontItalic())
+        self.italic_action.blockSignals(False)
+        self.underline_action.blockSignals(True)
+        self.underline_action.setChecked(fmt.fontUnderline())
+        self.underline_action.blockSignals(False)
+
+    def _on_insert_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Вставить изображение", filter="Изображения (*.png *.jpg *.jpeg *.gif *.bmp)"
+        )
+        if not path:
+            return
+        data = Path(path).read_bytes()
+        image = QImage.fromData(data)
+        if image.isNull():
+            QMessageBox.warning(self, "Не удалось вставить изображение", "Файл не распознан как изображение.")
+            return
+        content_type, _ = mimetypes.guess_type(path)
+        self._insert_image(image, content_type or "image/png", data)
+
+    def _insert_image(self, image: QImage, content_type: str, data: bytes | None = None) -> None:
+        if data is None:
+            buffer = QBuffer()
+            buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+            image.save(buffer, "PNG")
+            data = bytes(buffer.data())
+        cid = f"{uuid4().hex}@redmail"
+        self._inline_images[cid] = (content_type, data)
+        cursor = self.body_edit.textCursor()
+        cursor.insertImage(image, f"cid:{cid}")
+
     def name(self) -> str:
         return self.name_edit.text().strip()
 
     def body_html(self) -> str:
         return self.body_edit.toHtml()
+
+    def inline_images(self) -> dict[str, tuple[str, bytes]]:
+        return dict(self._inline_images)
 
 
 class SignaturesDialog(QDialog):
@@ -2016,7 +2118,7 @@ class SignaturesDialog(QDialog):
         name = dialog.name()
         if not name:
             return
-        sig = Signature(id=str(uuid4()), name=name, body_html=dialog.body_html())
+        sig = Signature(id=str(uuid4()), name=name, body_html=dialog.body_html(), inline_images=dialog.inline_images())
         self._signatures.append(sig)
         if self._default_id is None:
             self._default_id = sig.id  # первая созданная подпись сразу становится подписью по умолчанию
@@ -2033,7 +2135,9 @@ class SignaturesDialog(QDialog):
         if not name:
             return
         existing = self._signatures[row]
-        self._signatures[row] = Signature(id=existing.id, name=name, body_html=dialog.body_html())
+        self._signatures[row] = Signature(
+            id=existing.id, name=name, body_html=dialog.body_html(), inline_images=dialog.inline_images()
+        )
         self._refresh_table()
 
     def _on_remove(self) -> None:
