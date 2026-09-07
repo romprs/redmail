@@ -4814,9 +4814,25 @@ class MainWindow(QMainWindow):
 
     def _apply_font_scale(self, scale: float) -> None:
         app = QApplication.instance()
+        new_size = self._base_font_point_size * scale
         font = app.font()
-        font.setPointSizeF(self._base_font_point_size * scale)
+        font.setPointSizeF(new_size)
         app.setFont(font)
+        # Жалоба: "надо менять весь шрифт в окне, раньше работало" —
+        # QApplication.setFont() каскадируется автоматически только на
+        # виджеты БЕЗ собственного явно установленного шрифта; часть
+        # виджетов в этом приложении такой явный шрифт получила (кнопки
+        # Ж/К/Ч и т.п.) либо уже отрисована и не переполисовывается сама
+        # по себе — они просто не подхватывали смену размера. Проходим по
+        # всем СУЩЕСТВУЮЩИМ виджетам явно (меняя только размер, а не
+        # гарнитуру/жирность/курсив — они у каждого виджета свои) — так
+        # масштаб гарантированно применяется везде в уже открытом окне, а
+        # не только к тому, что будет создано позже.
+        for widget in app.allWidgets():
+            widget_font = widget.font()
+            if widget_font.pointSizeF() > 0:
+                widget_font.setPointSizeF(new_size)
+                widget.setFont(widget_font)
         # Тело письма рендерится в QWebEngineView (Chromium), который не
         # видит QApplication.font() вообще — без этого ползунок в статус-баре
         # менял размер шрифта везде, КРОМЕ самого письма (см. _create_mail_browser).
