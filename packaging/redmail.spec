@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        42%{?dist}
+Release:        43%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 07 2026 redmail <redmail@example.com> - 0.0.1-43
+- CalDAV: нейтральный User-Agent вместо приметного python-caldav
+- CalDAV: проверка подключения теперь реально пишет и удаляет тестовое событие, а не только читает список календарей
 * Mon Sep 07 2026 RedMail dev <noreply@example.com> - 0.0.1-42
 - Длинный список адресатов в заголовке письма теперь сокращается до первых
   3 с кликабельной ссылкой "и ещё N", а не растягивает заголовок на всё окно
