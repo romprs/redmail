@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        45%{?dist}
+Release:        46%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-46
+- Масштаб шрифта: размер теперь явно применяется ко всем открытым виджетам окна, а не только к новым
 * Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-45
 - Масштаб шрифта (ползунок в статус-баре) теперь применяется и к тексту письма в области просмотра
 * Mon Sep 07 2026 redmail <redmail@example.com> - 0.0.1-44
