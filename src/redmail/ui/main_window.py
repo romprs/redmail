@@ -705,6 +705,16 @@ def _show_full_recipient_list(parent: QWidget, title: str, value: str) -> None:
     QMessageBox.information(parent, title, _full_recipient_list_text(value))
 
 
+def _mark_primary(button: QPushButton) -> None:
+    """Визуально выделяет ГЛАВНОЕ действие диалога (Отправить/Сохранить и
+    т.п.) акцентным цветом — вместо того, чтобы все кнопки в ряду выглядели
+    одинаково значимыми (компонент "Primary Button" дизайн-системы: одно
+    чёткое основное действие, остальные — второстепенные)."""
+    button.setProperty("primary", True)
+    button.style().unpolish(button)
+    button.style().polish(button)
+
+
 def _format_recipient_candidate(name: str, email: str) -> str:
     """"Имя <email>", в кавычках, если имя само содержит запятую (частый
     формат "Фамилия, Имя") — без этого такое имя в поле "Кому" ломало
@@ -1717,6 +1727,7 @@ class ComposeDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Отправить")
+        _mark_primary(buttons.button(QDialogButtonBox.StandardButton.Ok))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -2727,6 +2738,7 @@ class EventDialog(QDialog):
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        _mark_primary(buttons.button(QDialogButtonBox.StandardButton.Ok))
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)

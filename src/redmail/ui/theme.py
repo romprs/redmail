@@ -112,11 +112,33 @@ QTableView::indicator:checked {{
     background-color: {accent};
     border: 1px solid {accent};
 }}
+/* "Primary Button" компонент дизайн-системы — одно чёткое основное
+   действие диалога (Отправить/Сохранить), выделенное акцентным цветом,
+   вместо ряда одинаковых по виду кнопок (жалоба по мотивам дизайн-ревью:
+   борьба с визуальным шумом, единая система компонентов). Только для
+   QPushButton с явно проставленным свойством primary=true (см.
+   _mark_primary в main_window.py) — обычные кнопки не затронуты. */
+QPushButton[primary="true"] {{
+    background-color: {accent};
+    color: {accent_text};
+    border: none;
+    border-radius: 4px;
+    padding: 5px 14px;
+    font-weight: 600;
+}}
+QPushButton[primary="true"]:hover {{
+    background-color: {accent_hover};
+}}
+QPushButton[primary="true"]:disabled {{
+    background-color: {border};
+    color: {disabled_text};
+}}
 """
 
 
 def _qss(palette: dict[str, str]) -> str:
-    return _QSS_TEMPLATE.format(**palette)
+    accent_hover = QColor(palette["accent"]).darker(112).name()
+    return _QSS_TEMPLATE.format(**palette, accent_hover=accent_hover)
 
 
 def _build_palette(colors: dict[str, str]) -> QPalette:
