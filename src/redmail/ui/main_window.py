@@ -261,6 +261,11 @@ _HIDDEN_PATH_SEGMENTS = {"[Gmail]", "[Google Mail]"}
 # по-русски она подписывается иначе только в дереве папок.
 _DISPLAY_NAMES: dict[str, str] = {"INBOX": "Входящие"}
 
+# Название папки в дереве без суффикса "(N непрочитанных)" — хранится
+# отдельным data-слотом, чтобы при каждом обновлении счётчика не пытаться
+# распарсить/отрезать предыдущий суффикс из текста элемента.
+_FOLDER_BASE_LABEL_ROLE = Qt.ItemDataRole.UserRole + 1
+
 _PARTICIPATION_LABELS: dict[str, str] = {
     "accepted": "Принял(а) участие",
     "declined": "Отклонил(а)",
@@ -1133,6 +1138,115 @@ def _toolbar_icon(kind: str, size: int = 18) -> QIcon:
         painter.drawLine(handle_start, QPointF(size - m * 0.9, size - m * 0.9))
     painter.end()
     return QIcon(pixmap)
+
+
+# Роль папки по её "сырому" IMAP-имени — по мотивам дизайн-ревью ("у каждой
+# папки свой значок") и жалобы "подписывать количество писем тоже".
+# Trash/Sent/Drafts уже надёжно определяются отдельно через SPECIAL-USE
+# (см. ImapSession._special_folder) и используются в другой логике
+# (перемещение в корзину, копия в отправленные и т.п.) — здесь то же самое
+# распознавание по подстроке имени нужно ТОЛЬКО для выбора иконки, поэтому
+# не завязано на self.trash_folder_name и т.п., а работает по каждому
+# имени независимо, включая роли, которых больше нигде в приложении нет
+# (спам/важное/помеченные/вся почта).
+_FOLDER_ROLE_HINTS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sent", ("sent", "отправленн")),
+    ("drafts", ("draft", "черновик")),
+    ("trash", ("trash", "корзин")),
+    ("spam", ("spam", "junk", "спам")),
+    ("important", ("important", "важн")),
+    ("flagged", ("flagged", "starred", "помеч")),
+    ("all", ("all mail", "вся почта")),
+)
+
+
+def _folder_role(raw_name: str) -> str | None:
+    if raw_name == "INBOX":
+        return "inbox"
+    lowered = raw_name.lower()
+    for role, hints in _FOLDER_ROLE_HINTS:
+        if any(hint in lowered for hint in hints):
+            return role
+    return None
+
+
+def _folder_icon(role: str | None, size: int = 16) -> QIcon:
+    """Монохромные значки папок — та же техника, что и _toolbar_icon."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor(_ICON_COLOR))
+    pen.setWidthF(1.3)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    m = size * 0.14
+    cx, cy = size / 2, size / 2
+
+    def envelope(rect: QRectF) -> None:
+        painter.drawRoundedRect(rect, size * 0.06, size * 0.06)
+        painter.drawLine(QPointF(rect.left(), rect.top()), QPointF(rect.center().x(), rect.center().y() + rect.height() * 0.12))
+        painter.drawLine(QPointF(rect.right(), rect.top()), QPointF(rect.center().x(), rect.center().y() + rect.height() * 0.12))
+
+    if role == "inbox":
+        envelope(QRectF(m, size * 0.28, size - 2 * m, size * 0.5))
+    elif role == "sent":
+        painter.drawLine(QPointF(m, size - m), QPointF(size - m, m))
+        painter.drawPolyline([QPointF(size * 0.52, m), QPointF(size - m, m), QPointF(size - m, size * 0.48)])
+    elif role == "drafts":
+        painter.drawLine(QPointF(m, size - m), QPointF(size * 0.55, size * 0.45))
+        painter.drawPolyline([
+            QPointF(size * 0.55, size * 0.45), QPointF(size - m, m),
+            QPointF(size - m * 0.4, m + m * 0.6), QPointF(size * 0.62, size * 0.52),
+        ])
+    elif role == "trash":
+        painter.drawRect(QRectF(size * 0.24, size * 0.30, size * 0.52, size * 0.56))
+        painter.drawLine(QPointF(size * 0.16, size * 0.30), QPointF(size * 0.84, size * 0.30))
+        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.60, size * 0.16))
+        painter.drawLine(QPointF(size * 0.40, size * 0.16), QPointF(size * 0.40, size * 0.30))
+        painter.drawLine(QPointF(size * 0.60, size * 0.16), QPointF(size * 0.60, size * 0.30))
+    elif role == "spam":
+        painter.drawEllipse(QRectF(m, m, size - 2 * m, size - 2 * m))
+        painter.drawLine(QPointF(cx, size * 0.32), QPointF(cx, size * 0.58))
+        painter.drawPoint(QPointF(cx, size * 0.72))
+    elif role == "important":
+        points = []
+        for i in range(10):
+            angle = math.radians(-90 + i * 36)
+            r = size * 0.42 if i % 2 == 0 else size * 0.19
+            points.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
+        painter.drawPolygon(points)
+    elif role == "flagged":
+        painter.drawLine(QPointF(size * 0.28, size * 0.14), QPointF(size * 0.28, size * 0.86))
+        painter.drawPolyline([
+            QPointF(size * 0.28, size * 0.18), QPointF(size * 0.78, size * 0.18),
+            QPointF(size * 0.60, size * 0.36), QPointF(size * 0.78, size * 0.54), QPointF(size * 0.28, size * 0.54),
+        ])
+    elif role == "all":
+        envelope(QRectF(m * 1.6, size * 0.36, size - 3.2 * m, size * 0.46))
+        envelope(QRectF(m, size * 0.22, size - 2 * m, size * 0.46))
+    else:
+        painter.drawPath(_folder_tab_path(size, m))
+    painter.end()
+    return QIcon(pixmap)
+
+
+def _folder_tab_path(size: float, m: float) -> QPainterPath:
+    path = QPainterPath()
+    path.moveTo(m, size * 0.30)
+    path.lineTo(size * 0.40, size * 0.30)
+    path.lineTo(size * 0.48, size * 0.20)
+    path.lineTo(size - m, size * 0.20)
+    path.lineTo(size - m, size * 0.20)
+    path.moveTo(m, size * 0.30)
+    path.lineTo(m, size - m)
+    path.lineTo(size - m, size - m)
+    path.lineTo(size - m, size * 0.34)
+    path.lineTo(size * 0.48, size * 0.34)
+    path.closeSubpath()
+    return path
 
 
 def _icon_label(kind: str, parent: QWidget | None = None) -> QLabel:
@@ -4158,18 +4272,76 @@ class MainWindow(QMainWindow):
                 path = path + (part,)
                 node = nodes.get(path)
                 if node is None:
-                    node = QTreeWidgetItem([_DISPLAY_NAMES.get(part, part)])
+                    label = _DISPLAY_NAMES.get(part, part)
+                    node = QTreeWidgetItem([label])
+                    node.setData(0, _FOLDER_BASE_LABEL_ROLE, label)
+                    node.setIcon(0, _folder_icon(None))
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
             parent.setData(0, Qt.ItemDataRole.UserRole, (key, info.name))
+            # Роль/иконка по полному "сырому" имени папки на сервере — сама
+            # папка может быть значима (Отправленные, Спам...), даже если
+            # промежуточные сегменты пути в дереве — просто контейнеры.
+            parent.setIcon(0, _folder_icon(_folder_role(info.name)))
             if first_selectable is None:
                 first_selectable = parent
             if info.name == "INBOX":
                 inbox_item = parent
 
         self.folder_tree.expandAll()
+        self._refresh_folder_unread_counts(key, folders)
         return inbox_item or first_selectable
+
+    def _refresh_folder_unread_counts(self, key: str, folders: list[FolderInfo]) -> None:
+        """Число непрочитанных в каждой папке — фоновый STATUS-опрос всех
+        папок сразу после построения дерева (жалоба: "подписывать
+        количество писем тоже"). Одна папка без ответа/с ошибкой не должна
+        оставлять счётчики остальных пустыми — см. fetch_counts ниже."""
+        mailbox = self.mailboxes.get(key)
+        if mailbox is None:
+            return
+
+        def fetch_counts() -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for info in folders:
+                try:
+                    counts[info.name] = mailbox.session.folder_unseen_count(info.name)
+                except Exception:
+                    continue
+            return counts
+
+        worker = _CallableWorker(fetch_counts, parent=self)
+
+        def on_success(counts: object) -> None:
+            self._apply_folder_unread_counts(key, counts)
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        def on_failure(_error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
+
+    def _apply_folder_unread_counts(self, key: str, counts: dict[str, int]) -> None:
+        root = self.mailbox_tree_roots.get(key)
+        if root is None:
+            return
+
+        def walk(item: QTreeWidgetItem) -> None:
+            data = item.data(0, Qt.ItemDataRole.UserRole)
+            if isinstance(data, tuple) and len(data) == 2 and data[0] == key:
+                base = item.data(0, _FOLDER_BASE_LABEL_ROLE) or item.text(0)
+                count = counts.get(data[1], 0)
+                item.setText(0, f"{base} ({count})" if count else base)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        walk(root)
 
     def on_open_archive(self) -> None:
         dialog = QFileDialog(self, "Открыть или создать архив")

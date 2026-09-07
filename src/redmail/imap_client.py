@@ -260,6 +260,20 @@ class ImapSession:
         return self._selected_exists
 
     @_reconnecting
+    def folder_unseen_count(self, folder: str) -> int:
+        """Число непрочитанных писем в папке — жалоба: "подписывать
+        количество писем" рядом с папкой в дереве. STATUS, а не
+        select_folder/SEARCH: не переключает "текущую" папку сессии
+        (folder_message_count это делает) и не сканирует письма — можно
+        дёшево опросить сразу много папок подряд при построении дерева."""
+        status = self._client.folder_status(folder, ["UNSEEN"])
+        for key, value in status.items():
+            key_name = key.decode("ascii", errors="replace") if isinstance(key, bytes) else str(key)
+            if key_name.upper() == "UNSEEN":
+                return int(value)
+        return 0
+
+    @_reconnecting
     def fetch_summaries(self, limit: int = 50) -> list[MessageSummary]:
         """Сводки последних `limit` писем уже выбранной папки.
 
