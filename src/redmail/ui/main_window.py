@@ -3427,7 +3427,8 @@ class MainWindow(QMainWindow):
         # таблицей, а не в общем тулбаре наверху окна. Сами QAction создаём
         # здесь (а не в основном тулбаре ниже по __init__), потому что
         # именно здесь строится их видимая панель.
-        compose_action = QAction(_toolbar_icon("compose"), "Написать письмо…", self)
+        compose_action = QAction(_toolbar_icon("compose"), "Написать", self)
+        compose_action.setToolTip("Написать письмо…")
         compose_action.triggered.connect(self.on_compose)
 
         self.reply_action = QAction(_toolbar_icon("reply"), "Ответить", self)
@@ -3448,6 +3449,15 @@ class MainWindow(QMainWindow):
         mail_actions_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         for action in (compose_action, self.reply_action, self.forward_action, self.delete_action, self.archive_selected_action):
             mail_actions_toolbar.addAction(action)
+        # Написать/Ответить/Переслать/Удалить — с подписью рядом с иконкой
+        # (по референсу пользователя), а не только иконка. Остальные
+        # действия в этой панели (В архив и то, что добавляется ниже —
+        # Обновить/В архив.../Импорт...) остаются только иконкой — тем же
+        # способом экономии места, что и раньше.
+        for labelled_action in (compose_action, self.reply_action, self.forward_action, self.delete_action):
+            button = mail_actions_toolbar.widgetForAction(labelled_action)
+            if button is not None:
+                button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
         table_container = QWidget(self)
         table_layout = QVBoxLayout(table_container)
