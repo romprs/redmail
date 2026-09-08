@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        53%{?dist}
+Release:        54%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 09 2026 redmail <redmail@example.com> - 0.0.1-54
+- CalDAV: обнаружение расшаренных календарей на сервере (VK Mail и др.) при добавлении календаря
+- CalDAV: исправлен баг — второй настроенный календарь того же аккаунта синхронизировался с тем же самым первым календарём
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-53
 - Написать/Ответить/Переслать/Удалить теперь с подписью рядом с иконкой (по референсу)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-52
