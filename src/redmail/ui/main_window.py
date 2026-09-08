@@ -963,7 +963,12 @@ def _attendee_avatar_letter(name: str, email: str) -> str:
     return source[0] if source else "?"
 
 
-_ICON_COLOR = "#5f6368"
+def _icon_color() -> str:
+    """Жалоба: 'на тёмном фоне значки поярче нужно' — фиксированный
+    тёмно-серый (#5f6368) был рассчитан на светлую тему и еле виден на
+    тёмном фоне тулбаров/диалогов. В тёмной теме используется светлый
+    оттенок, в светлой — прежний."""
+    return "#c4c7c5" if app_theme.is_dark() else "#5f6368"
 _EVENT_COLOR_PALETTE: tuple[tuple[str, str], ...] = (
     ("Синий", "#3B6FB6"),
     ("Фиолетовый", "#8B5CB6"),
@@ -984,7 +989,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor(_ICON_COLOR))
+    pen = QPen(QColor(_icon_color()))
     pen.setWidthF(1.3)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -1002,7 +1007,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
         angle = math.radians(25)
         ax = cx + (r / 2) * math.cos(angle)
         ay = cy - (r / 2) * math.sin(angle)
-        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setBrush(QColor(_icon_color()))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawPolygon([QPointF(ax - 3.2, ay - 0.8), QPointF(ax + 1.6, ay - 3.6), QPointF(ax + 0.8, ay + 3.0)])
     elif kind == "people":
@@ -1014,7 +1019,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
         path.cubicTo(size * 0.16, size * 0.55, size * 0.16, size * 0.14, cx, size * 0.12)
         path.cubicTo(size * 0.84, size * 0.14, size * 0.84, size * 0.55, cx, size * 0.88)
         painter.drawPath(path)
-        painter.setBrush(QColor(_ICON_COLOR))
+        painter.setBrush(QColor(_icon_color()))
         painter.setPen(Qt.PenStyle.NoPen)
         painter.drawEllipse(QRectF(cx - size * 0.10, size * 0.27, size * 0.20, size * 0.20))
     elif kind == "description":
@@ -1038,7 +1043,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
 # референса") — вместо геометрических фигур, нарисованных вручную через
 # QPainter, используется тот же узнаваемый набор, что и на скриншотах-
 # референсах, отрисованный через QSvgRenderer и перекрашенный в цвет
-# _ICON_COLOR.
+# _icon_color().
 _MATERIAL_ICON_PATHS: dict[str, str] = {
     "edit": "M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z",
     "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
@@ -1099,7 +1104,9 @@ _FOLDER_ICON_MATERIAL: dict[str, str] = {
 }
 
 
-def _material_icon(name: str, size: int, color: str = _ICON_COLOR) -> QIcon:
+def _material_icon(name: str, size: int, color: str | None = None) -> QIcon:
+    if color is None:
+        color = _icon_color()
     svg = (
         f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 -960 960 960">'
         f'<path d="{_MATERIAL_ICON_PATHS[name]}" fill="{color}"/></svg>'
