@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        52%{?dist}
+Release:        53%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-53
+- Написать/Ответить/Переслать/Удалить теперь с подписью рядом с иконкой (по референсу)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-52
 - Иконки тулбаров и папок ярче в тёмной теме (лучше контраст)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-51
