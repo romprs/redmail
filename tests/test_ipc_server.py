@@ -9,7 +9,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -35,10 +35,11 @@ class FakeController:
     """Подставной MainWindow: запоминает, что и с какими аргументами у него
     попросили. Так проверяется весь разбор запроса без единого виджета."""
 
-    def __init__(self, *, rules=None, apply_result=None):
+    def __init__(self, *, rules=None, apply_result=None, found_events=None):
         self.calls: list[tuple[str, dict]] = []
         self._rules = rules if rules is not None else []
         self._apply_result = apply_result or {"folder": "INBOX", "moved": 0, "moves": {}}
+        self._found_events = found_events if found_events is not None else []
 
     def ipc_focus(self):
         self.calls.append(("focus", {}))
@@ -51,6 +52,10 @@ class FakeController:
 
     def ipc_update_event(self, uid, **kwargs):
         self.calls.append(("update_event", dict(kwargs, uid=uid)))
+
+    def ipc_find_events(self, *, subject=None, on_date=None):
+        self.calls.append(("find_events", {"subject": subject, "on_date": on_date}))
+        return self._found_events
 
     def ipc_cancel_event(self, uid):
         self.calls.append(("cancel_event", {"uid": uid}))
@@ -239,6 +244,34 @@ def test_update_event_distinguishes_empty_string_from_absent() -> None:
 def test_update_event_requires_uid() -> None:
     response = handle_request(FakeController(), {"action": "update_event", "args": {}})
     assert response["ok"] is False and "uid" in response["error"]
+
+
+def test_find_events_passes_subject_and_explicit_date() -> None:
+    controller = FakeController(found_events=[{"uid": "u1", "summary": "Планёрка"}])
+    response = handle_request(
+        controller,
+        {"action": "find_events", "args": {"subject": "планёрка", "date": "2026-09-10"}},
+    )
+    assert response == {"ok": True, "events": [{"uid": "u1", "summary": "Планёрка"}]}
+    assert controller.calls == [
+        ("find_events", {"subject": "планёрка", "on_date": date(2026, 9, 10)})
+    ]
+
+
+def test_find_events_defaults_date_to_today() -> None:
+    controller = FakeController()
+    fixed_now = datetime(2026, 9, 8, 21, 0, tzinfo=timezone.utc).astimezone()
+    with patch("redmail.ipc_server.datetime") as mock_datetime:
+        mock_datetime.now.return_value = fixed_now
+        mock_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        handle_request(controller, {"action": "find_events", "args": {}})
+    assert controller.calls == [("find_events", {"subject": None, "on_date": fixed_now.date()})]
+
+
+def test_find_events_empty_subject_becomes_none() -> None:
+    controller = FakeController()
+    handle_request(controller, {"action": "find_events", "args": {"date": "2026-09-10"}})
+    assert controller.calls[0][1]["subject"] is None
 
 
 def test_cancel_event() -> None:

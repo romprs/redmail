@@ -35,7 +35,7 @@ QTimer.singleShot(0, ...) — он выполнится, когда мы уже 
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from PySide6.QtCore import QObject
@@ -145,6 +145,19 @@ def parse_iso_datetime(value: str, field: str = "start") -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
+def parse_iso_date(value, field: str = "date") -> date:
+    """"YYYY-MM-DD" → date. Отдельно от parse_iso_datetime: find_events ищет
+    события ЗА ДЕНЬ, а не в конкретный момент времени, и голосовая сторона
+    для темы вроде «перенеси встречу ... на завтра» знает только дату, не час."""
+    text = _text(value, field)
+    if not text:
+        raise ValueError(f"{field} обязателен: дата в формате YYYY-MM-DD")
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise ValueError(f"{field}: не разобрать дату (ожидается YYYY-MM-DD): {value!r}") from None
+
+
 # --------------------------------------------------------------------------
 # Команды
 # --------------------------------------------------------------------------
@@ -224,6 +237,18 @@ def _handle_update_event(controller, args) -> dict:
     return {"opened": "update_event", "uid": uid}
 
 
+def _handle_find_events(controller, args) -> dict:
+    subject = _text(args.get("subject"), "subject")
+    date_arg = args.get("date")
+    # Дата опущена — берём сегодняшнюю (по местному времени этой машины):
+    # так реализуется "Если дата опущена - берём текущую" из голосовой
+    # команды "перенеси встречу <тема> на ...", не заставляя каждый вызов
+    # с голосовой стороны самому подставлять сегодняшнее число.
+    on_date = parse_iso_date(date_arg, "date") if date_arg else datetime.now().astimezone().date()
+    events = controller.ipc_find_events(subject=subject or None, on_date=on_date)
+    return {"events": events}
+
+
 def _handle_cancel_event(controller, args) -> dict:
     uid = _text(args.get("uid"), "uid")
     if not uid:
@@ -247,6 +272,7 @@ _HANDLERS = {
     "compose_email": _handle_compose_email,
     "create_event": _handle_create_event,
     "update_event": _handle_update_event,
+    "find_events": _handle_find_events,
     "cancel_event": _handle_cancel_event,
     "apply_mail_rules": _handle_apply_mail_rules,
     "list_mail_rules": _handle_list_mail_rules,

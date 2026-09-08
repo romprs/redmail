@@ -11,7 +11,7 @@ import re
 import shutil
 import tempfile
 import zlib
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from email.utils import getaddresses
 from pathlib import Path
 from uuid import uuid4
@@ -7497,6 +7497,38 @@ class MainWindow(QMainWindow):
         dialog = self._ipc_event_dialog(merged, title="Изменить встречу")
         self.ipc_focus()
         self._ipc_later(lambda: self._ipc_exec_event_dialog(dialog, existing=existing))
+
+    def ipc_find_events(self, *, subject: str | None = None, on_date: date | None = None) -> list[dict]:
+        """Поиск встреч по подстроке темы и/или дню.
+
+        Нужен потому, что update_event/cancel_event требуют uid, а голосовая
+        команда «перенеси встречу ...» знает только тему (и, может быть,
+        старую дату) — этим методом голосовая сторона сначала находит uid,
+        а уже потом вызывает update_event. Ничего не отправляет наружу и не
+        трогает окно — читается сразу, без QTimer.singleShot, как
+        list_mail_rules/apply_mail_rules."""
+        if on_date is not None:
+            day_start = datetime.combine(on_date, time.min).astimezone(timezone.utc)
+            day_end = day_start + timedelta(days=1)
+            events = calendar_store.list_events(self.calendar_path, start=day_start, end=day_end)
+        else:
+            events = calendar_store.list_events(self.calendar_path)
+        needle = (subject or "").strip().lower()
+        if needle:
+            events = [event for event in events if needle in event.summary.lower()]
+        return [
+            {
+                "uid": event.uid,
+                "summary": event.summary,
+                "start": event.dtstart.isoformat(),
+                "end": event.dtend.isoformat(),
+                "calendar_id": event.calendar_id,
+                "location": event.location,
+                "is_organizer": event.is_organizer,
+                "status": event.status,
+            }
+            for event in events
+        ]
 
     def ipc_cancel_event(self, uid: str) -> None:
         event = calendar_store.get_event(self.calendar_path, uid)

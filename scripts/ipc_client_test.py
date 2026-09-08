@@ -23,6 +23,7 @@ QLocalServer.fullServerName() в <каталог настроек>/ipc-endpoint.
     python3 scripts/ipc_client_test.py create_event --subject "Планёрка" \\
         --start 2026-09-10T15:00 --duration 30 --participants a@e.com,b@e.com
     python3 scripts/ipc_client_test.py update_event --uid <UID> --start 2026-09-10T16:00
+    python3 scripts/ipc_client_test.py find_events --subject Планёрка --date 2026-09-10
     python3 scripts/ipc_client_test.py cancel_event --uid <UID>
     python3 scripts/ipc_client_test.py apply_mail_rules --folder INBOX
     python3 scripts/ipc_client_test.py list_mail_rules
@@ -193,6 +194,11 @@ def build_request(ns: argparse.Namespace) -> dict:
             args["description"] = ns.description
         if ns.location:
             args["location"] = ns.location
+    elif action == "find_events":
+        if ns.subject:
+            args["subject"] = ns.subject
+        if ns.date:
+            args["date"] = ns.date
     elif action == "cancel_event":
         args["uid"] = ns.uid
     elif action == "apply_mail_rules":
@@ -233,6 +239,10 @@ def main(argv: list[str] | None = None) -> int:
         event.add_argument("--participants", default=None, help="адреса через запятую")
         event.add_argument("--description", default="")
         event.add_argument("--location", default="")
+
+    find = sub.add_parser("find_events", help="найти встречи по теме и/или дню (без подтверждения)")
+    find.add_argument("--subject", default="", help="подстрока темы")
+    find.add_argument("--date", default="", help="YYYY-MM-DD; по умолчанию — сегодня")
 
     cancel = sub.add_parser("cancel_event", help="запустить отмену встречи по UID (с подтверждением в окне)")
     cancel.add_argument("--uid", required=True)

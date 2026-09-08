@@ -26,13 +26,19 @@ python -m venv .venv
 Протокол построчный JSON: одна строка `{"action": ..., "args": {...}}` —
 одна строка ответа `{"ok": true, ...}` либо `{"ok": false, "error": "..."}`.
 Команды: `ping`, `focus`, `compose_email`, `create_event`, `update_event`,
-`cancel_event`, `apply_mail_rules`, `list_mail_rules`.
+`find_events`, `cancel_event`, `apply_mail_rules`, `list_mail_rules`.
+
+`update_event`/`cancel_event` требуют `uid` встречи — голосовая сторона его
+не знает, у неё есть только тема (и, возможно, дата). `find_events` (`subject`
+— подстрока темы, необязательно; `date` — `YYYY-MM-DD`, если не задана, берётся
+сегодняшняя) возвращает список подходящих встреч с `uid`, по которому уже
+можно вызвать `update_event`/`cancel_event`.
 
 Всё, что отправляет что-либо наружу (письмо, приглашение, отмена встречи),
 только ОТКРЫВАЕТ обычный диалог с заполненными полями — «Отправить»/
 «Сохранить»/«Да» нажимает человек. Без подтверждения выполняются лишь
-`focus`, `list_mail_rules` и `apply_mail_rules` (перекладывание писем между
-папками того же ящика).
+`focus`, `find_events`, `list_mail_rules` и `apply_mail_rules` (перекладывание
+писем между папками того же ящика).
 
 Проверить руками, пока голосовой части нет:
 
