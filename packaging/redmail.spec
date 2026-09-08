@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        51%{?dist}
+Release:        52%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-52
+- Иконки тулбаров и папок ярче в тёмной теме (лучше контраст)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-51
 - Иконки тулбаров и папок заменены на Material Symbols (тот же стиль, что на референсе дизайна)
 * Tue Sep 08 2026 redmail <redmail@example.com> - 0.0.1-50
