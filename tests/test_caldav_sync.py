@@ -49,10 +49,10 @@ def test_session_creates_client_with_account_credentials() -> None:
 def test_fetch_events_parses_server_objects_into_events() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.date_search.return_value = [_fake_calendar_obj_for(_event())]
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         start = datetime(2026, 9, 1, tzinfo=timezone.utc)
         end = start + timedelta(days=7)
@@ -67,12 +67,12 @@ def test_fetch_events_parses_server_objects_into_events() -> None:
 def test_fetch_events_skips_broken_object_without_failing_whole_sync() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     broken = MagicMock()
     broken.data = "not a valid ics at all"
     fake_calendar.date_search.return_value = [broken, _fake_calendar_obj_for(_event())]
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         events = session.fetch_events(
             datetime(2026, 9, 1, tzinfo=timezone.utc), datetime(2026, 9, 8, tzinfo=timezone.utc), "ivan@example.com"
@@ -82,25 +82,13 @@ def test_fetch_events_skips_broken_object_without_failing_whole_sync() -> None:
     assert events[0].uid == "e1@redmail"
 
 
-def test_no_calendars_raises_clear_error() -> None:
-    fake_client = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = []
-
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
-        session = CalDavSession(_account())
-        with pytest.raises(CalDavSyncError):
-            session.fetch_events(
-                datetime(2026, 9, 1, tzinfo=timezone.utc), datetime(2026, 9, 8, tzinfo=timezone.utc), "ivan@example.com"
-            )
-
-
 def test_push_event_creates_new_when_not_found_on_server() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.push_event(_event(), "ivan@example.com", "Иван")
 
@@ -113,11 +101,11 @@ def test_push_event_creates_new_when_not_found_on_server() -> None:
 def test_push_event_updates_existing_when_found_on_server() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     existing_obj = MagicMock()
     fake_calendar.get_event_by_uid.return_value = existing_obj
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.push_event(_event(), "ivan@example.com", "Иван")
 
@@ -134,14 +122,14 @@ def test_push_event_retries_once_on_connection_error() -> None:
     # соединении — стандартное лечение для устаревшего keep-alive.
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
     fake_calendar.save_event.side_effect = [
         requests.exceptions.ConnectionError("Remote end closed connection without response"),
         None,
     ]
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.push_event(_event(), "ivan@example.com", "Иван")
 
@@ -151,11 +139,11 @@ def test_push_event_retries_once_on_connection_error() -> None:
 def test_push_event_raises_clear_error_when_connection_fails_twice() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
     fake_calendar.save_event.side_effect = requests.exceptions.ConnectionError("still closed")
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         with pytest.raises(CalDavSyncError):
             session.push_event(_event(), "ivan@example.com", "Иван")
@@ -166,11 +154,11 @@ def test_push_event_raises_clear_error_when_connection_fails_twice() -> None:
 def test_write_access_saves_and_deletes_test_event() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     cleanup_obj = MagicMock()
     fake_calendar.get_event_by_uid.return_value = cleanup_obj
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.test_write_access()
 
@@ -186,10 +174,10 @@ def test_write_access_raises_clear_error_when_save_fails() -> None:
     # заранее, а не только чтение.
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.save_event.side_effect = requests.exceptions.ConnectionError("Remote end closed connection without response")
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         with pytest.raises(CalDavSyncError, match="Запись на сервер не удалась"):
             session.test_write_access()
@@ -198,11 +186,11 @@ def test_write_access_raises_clear_error_when_save_fails() -> None:
 def test_delete_event_deletes_when_found() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     existing_obj = MagicMock()
     fake_calendar.get_event_by_uid.return_value = existing_obj
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.delete_event("e1@redmail")
 
@@ -212,10 +200,10 @@ def test_delete_event_deletes_when_found() -> None:
 def test_delete_event_is_noop_when_not_found() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_client.principal.return_value.calendars.return_value = [fake_calendar]
     fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
 
-    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
+         patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
         session = CalDavSession(_account())
         session.delete_event("missing@redmail")  # не должно бросить исключение
 
@@ -234,6 +222,90 @@ def test_list_calendar_names() -> None:
         names = session.list_calendar_names()
 
     assert names == ["Основной", "https://calendar.example.corp/caldav/other/"]
+
+
+def _propfind_response(xml: str):
+    """DAVResponse настоящей caldav-библиотеки, собранный из сырого XML
+    (как реально пришёл бы multistatus от сервера) — используем её
+    собственный parse_propfind(), а не свой мини-парсер: current-user-
+    privilege-set caldav не разбирает в удобный список (вложенные
+    <privilege><write/></privilege> не подходят под общий разбор
+    свойств) и приходит "сырым" lxml-элементом — это стоит проверять на
+    поведении настоящей библиотеки, а не на предположении о нём."""
+    from caldav.response import DAVResponse
+    import lxml.etree as etree
+
+    response = object.__new__(DAVResponse)
+    response.tree = etree.XML(xml.encode("utf-8"))
+    response.status = 207
+    response.huge_tree = False
+    response.results = response.parse_propfind()
+    return response
+
+
+_SHARED_CALENDARS_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/calendars/ivan@corp.ru/personal/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Личный</d:displayname>
+        <d:owner><d:href>/principals/ivan@corp.ru/</d:href></d:owner>
+        <d:current-user-privilege-set>
+          <d:privilege><d:write/></d:privilege>
+          <d:privilege><d:read/></d:privilege>
+        </d:current-user-privilege-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/calendars/ivan@corp.ru/shared-by-coworker/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+        <d:displayname>Отдел продаж</d:displayname>
+        <d:owner><d:href>/principals/coworker@corp.ru/</d:href></d:owner>
+        <d:current-user-privilege-set>
+          <d:privilege><d:read/></d:privilege>
+        </d:current-user-privilege-set>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/calendars/ivan@corp.ru/</d:href>
+    <d:propstat>
+      <d:prop>
+        <d:resourcetype><d:collection/></d:resourcetype>
+      </d:prop>
+      <d:status>HTTP/1.1 200 OK</d:status>
+    </d:propstat>
+  </d:response>
+</d:multistatus>'''
+
+
+def test_list_calendars_detailed_marks_shared_calendar_and_privileges() -> None:
+    fake_client = MagicMock()
+    fake_client.url = "https://calendar.example.corp/"
+    fake_client.principal.return_value.calendar_home_set.url = "https://calendar.example.corp/calendars/ivan@corp.ru/"
+    fake_client.principal.return_value.url = "https://calendar.example.corp/principals/ivan@corp.ru/"
+    fake_client.propfind.return_value = _propfind_response(_SHARED_CALENDARS_XML)
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        session = CalDavSession(_account())
+        calendars = session.list_calendars_detailed()
+
+    assert len(calendars) == 2  # calendar-home-set сам по себе (без c:calendar в resourcetype) отфильтрован
+    own, shared = calendars
+    assert own.name == "Личный"
+    assert own.is_shared is False
+    assert own.read_only is False
+    assert shared.name == "Отдел продаж"
+    assert shared.owner == "/principals/coworker@corp.ru/"
+    assert shared.is_shared is True
+    assert shared.read_only is True
 
 
 def _http_401(schemes: list[str]) -> urllib.error.HTTPError:

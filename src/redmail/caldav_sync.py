@@ -4,6 +4,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import caldav
@@ -108,6 +109,51 @@ def _auth_scheme_hint(url: str) -> str:
     return f" Сервер предлагает только: {', '.join(schemes)} — SSO (Negotiate) для CalDAV здесь недоступен."
 
 
+@dataclass
+class CalDavCalendarInfo:
+    """Один календарь, обнаруженный на сервере при обходе calendar-home-set —
+    задача "настроить получение расшаренных календарей для VK Mail". У VK
+    (и вообще по CalDAV, см. переписку с пользователем) нет делегирования
+    всего аккаунта (calendar-proxy, как у Apple/Nextcloud) — есть только
+    пошаренные по отдельности календари, и после того как коллега
+    расшарил календарь и приглашение принято В ВЕБ-ИНТЕРФЕЙСЕ VK (accept-
+    invite по CalDAV не бывает), сервер сам кладёт этот календарь в НАШ
+    calendar-home-set как обычную коллекцию — единственное, что остаётся
+    сделать здесь, это её ОБНАРУЖИТЬ и показать, чей это календарь."""
+
+    url: str
+    name: str
+    owner: str | None
+    is_shared: bool
+    read_only: bool
+
+
+def _href_path(href: str) -> str:
+    """Путь без схемы/хоста и завершающего слэша — owner может прийти и
+    абсолютным URL, и просто путём, сравнивать нужно только путь."""
+    return unquote(urlparse(href).path).rstrip("/")
+
+
+def _has_write_privilege(value: object) -> bool:
+    """current-user-privilege-set не разбирается caldav-библиотекой в
+    удобный список (вложенные <privilege><write/></privilege> не подходят
+    под её общий разбор свойств) — приходит как есть, "сырым" XML-
+    элементом, ищем write/all прямо в нём. Свойство отсутствует вовсе
+    (None) — не считаем календарь урезанным без причины: сервер и так
+    отклонит PUT 403-м, если прав на самом деле нет, а свойство мог просто
+    не отдать (см. переписку: cs:invite/cs:shared-url у VK могут прийти
+    404 — не факт, что current-user-privilege-set при этом тоже не будет)."""
+    if value is None:
+        return True
+    if not hasattr(value, "iter"):
+        return False
+    for child in value.iter():
+        local = child.tag.rsplit("}", 1)[-1] if isinstance(child.tag, str) else ""
+        if local in ("write", "all", "write-content"):
+            return True
+    return False
+
+
 class CalDavSession:
     """Одно CalDAV-соединение на сессию синхронизации — тот же принцип, что
     у ImapSession: подключение переиспользуется, а не открывается заново на
@@ -140,14 +186,18 @@ class CalDavSession:
 
     def _primary_calendar(self):
         if self._calendar is None:
-            try:
-                principal = self._client.principal()
-                calendars = _with_connection_retry(principal.calendars)
-            except Exception as exc:
-                raise CalDavSyncError(f"Не удалось подключиться к CalDAV-серверу: {exc}") from exc
-            if not calendars:
-                raise CalDavSyncError("На сервере CalDAV не найдено ни одного календаря")
-            self._calendar = calendars[0]
+            # account.url — это URL КОНКРЕТНОГО календаря (см.
+            # list_calendars_detailed для обнаружения таких URL, включая
+            # расшаренные другими пользователями), обращаемся к нему
+            # напрямую. Раньше здесь было principal.calendars()[0] —
+            # дискавери первого попавшегося календаря аккаунта НЕЗАВИСИМО
+            # от того, какой именно caldav_url был настроен: из-за этого
+            # ЛЮБОЙ второй настроенный CalDAV-календарь того же аккаунта
+            # молча синхронизировался бы с тем же самым первым календарём,
+            # что и делало поддержку нескольких/расшаренных календарей
+            # бессмысленной — без этого исправления задача "получение
+            # расшаренных календарей для VK Mail" попросту не работала бы.
+            self._calendar = caldav.Calendar(client=self._client, url=self.account.url)
         return self._calendar
 
     def list_calendar_names(self) -> list[str]:
@@ -158,6 +208,53 @@ class CalDavSession:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
+
+    def list_calendars_detailed(self) -> list[CalDavCalendarInfo]:
+        """Все календари в calendar-home-set, включая те, что расшарены нам
+        коллегами (не только собственные) — owner коллекции указывает на
+        ЧУЖОЙ принципал, если это так. См. CalDavCalendarInfo — задача
+        "настроить получение расшаренных календарей для VK Mail"."""
+        try:
+            principal = self._client.principal()
+            home_url = str(principal.calendar_home_set.url)
+            response = _with_connection_retry(
+                self._client.propfind,
+                home_url,
+                [
+                    "{DAV:}resourcetype",
+                    "{DAV:}displayname",
+                    "{DAV:}owner",
+                    "{DAV:}current-user-privilege-set",
+                ],
+                1,
+            )
+        except AuthorizationError as exc:
+            raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
+        except Exception as exc:
+            raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
+
+        my_principal_path = _href_path(str(principal.url))
+        infos: list[CalDavCalendarInfo] = []
+        for result in response.results:
+            if result.status not in (200, 207):
+                continue
+            resourcetype = result.properties.get("{DAV:}resourcetype") or []
+            tags = resourcetype if isinstance(resourcetype, list) else [resourcetype]
+            if not any("calendar" in str(tag).lower() for tag in tags):
+                continue  # сам calendar-home-set, адресная книга и т.п. — не календарь
+            name = result.properties.get("{DAV:}displayname") or result.href
+            owner_raw = result.properties.get("{DAV:}owner")
+            owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
+            is_shared = owner is not None and _href_path(owner) != my_principal_path
+            read_only = not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set"))
+            infos.append(CalDavCalendarInfo(
+                url=str(self._client.url.join(result.href)),
+                name=name,
+                owner=owner,
+                is_shared=is_shared,
+                read_only=read_only,
+            ))
+        return infos
 
     def fetch_events(self, start: datetime, end: datetime, my_email: str) -> list[Event]:
         """События сервера в окне [start, end). Разбор VEVENT переиспользует

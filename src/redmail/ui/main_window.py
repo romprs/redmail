@@ -2496,6 +2496,49 @@ _RECURRENCE_OPTIONS: list[tuple[str, str | None]] = [
 ]
 
 
+class _CalendarPickerDialog(QDialog):
+    """Список календарей, обнаруженных на CalDAV-сервере (свои и
+    расшаренные коллегами) — задача "получение расшаренных календарей для
+    VK Mail". У VK (и вообще по CalDAV) нет делегирования всего аккаунта —
+    только пошаренные по отдельности календари, и после того, как
+    приглашение принято В ВЕБ-ИНТЕРФЕЙСЕ VK, сервер сам кладёт чужой
+    календарь в наш calendar-home-set как обычную коллекцию; здесь он
+    просто отображается в общем списке, отмеченный тем, чей он."""
+
+    def __init__(self, parent, calendars: list["caldav_sync.CalDavCalendarInfo"]):
+        super().__init__(parent)
+        self.setWindowTitle("Календари на сервере")
+        self.resize(440, 320)
+
+        self.list_widget = QListWidget(self)
+        for info in calendars:
+            if info.is_shared:
+                suffix = f" — общий, от {info.owner or 'неизвестно'}"
+                if info.read_only:
+                    suffix += ", только чтение"
+            else:
+                suffix = " — только чтение" if info.read_only else ""
+            item = QListWidgetItem(f"{info.name}{suffix}")
+            item.setData(Qt.ItemDataRole.UserRole, info)
+            self.list_widget.addItem(item)
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Выберите календарь для подключения:", self))
+        layout.addWidget(self.list_widget)
+        layout.addWidget(buttons)
+
+    def selected(self) -> "caldav_sync.CalDavCalendarInfo | None":
+        item = self.list_widget.currentItem()
+        return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+
 class AddCalendarDialog(QDialog):
     """Новый календарь — локальный или подключённый к внешнему CalDAV-серверу.
 
@@ -2539,10 +2582,22 @@ class AddCalendarDialog(QDialog):
 
         self.caldav_url_edit = QLineEdit(self)
         self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/")
-        caldav_hint_label = QLabel("Логин и пароль — те же, что для почты этого аккаунта.", self)
+        caldav_hint_label = QLabel(
+            "Логин и пароль — те же, что для почты этого аккаунта. Сюда можно ввести любой "
+            "адрес сервера (не обязательно точный адрес нужного календаря) и найти на нём все "
+            "доступные календари, включая расшаренные коллегами, кнопкой ниже.",
+            self,
+        )
         caldav_hint_label.setWordWrap(True)
         self.caldav_test_button = QPushButton("Проверить подключение", self)
         self.caldav_test_button.clicked.connect(self._on_test_connection)
+        # Жалоба/задача: "настроить получение расшаренных календарей для VK
+        # Mail" — по CalDAV расшаренный коллегой календарь просто попадает
+        # в наш calendar-home-set как обычная коллекция (принятие
+        # приглашения происходит в веб-интерфейсе VK, не по CalDAV), нужно
+        # только его ОБНАРУЖИТЬ, а не вручную подбирать точный URL.
+        self.caldav_discover_button = QPushButton("Найти календари на сервере…", self)
+        self.caldav_discover_button.clicked.connect(self._on_discover_calendars)
         self.caldav_test_status = QLabel("", self)
         self.caldav_test_status.setWordWrap(True)
 
@@ -2550,6 +2605,7 @@ class AddCalendarDialog(QDialog):
         caldav_form = QFormLayout()
         caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
         caldav_form.addRow(caldav_hint_label)
+        caldav_form.addRow(self.caldav_discover_button)
         caldav_form.addRow(self.caldav_test_button)
         caldav_form.addRow(self.caldav_test_status)
         self.caldav_group.setLayout(caldav_form)
@@ -2619,6 +2675,49 @@ class AddCalendarDialog(QDialog):
         def on_failure(error_text: str) -> None:
             self.caldav_test_status.setText(f"Ошибка: {error_text}")
             self.caldav_test_button.setEnabled(True)
+            self._test_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._test_workers.append(worker)
+        worker.start()
+
+    def _on_discover_calendars(self) -> None:
+        url = self.caldav_url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
+            return
+        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        self.caldav_discover_button.setEnabled(False)
+        self.caldav_test_status.setText("Ищу календари на сервере…")
+
+        def discover() -> list[caldav_sync.CalDavCalendarInfo]:
+            session = caldav_sync.CalDavSession(account)
+            try:
+                return session.list_calendars_detailed()
+            finally:
+                session.close()
+
+        worker = _CallableWorker(discover, parent=self)
+
+        def on_success(calendars: object) -> None:
+            self.caldav_discover_button.setEnabled(True)
+            self._test_workers.remove(worker)
+            if not calendars:
+                self.caldav_test_status.setText("На сервере не найдено ни одного календаря.")
+                return
+            picker = _CalendarPickerDialog(self, calendars)
+            if picker.exec() == QDialog.DialogCode.Accepted:
+                chosen = picker.selected()
+                if chosen is not None:
+                    self.caldav_url_edit.setText(chosen.url)
+                    if not self.name_edit.text().strip():
+                        self.name_edit.setText(chosen.name)
+                    self.caldav_test_status.setText(f"Выбран календарь: {chosen.name}")
+
+        def on_failure(error_text: str) -> None:
+            self.caldav_discover_button.setEnabled(True)
+            self.caldav_test_status.setText(f"Ошибка поиска: {error_text}")
             self._test_workers.remove(worker)
 
         worker.succeeded.connect(on_success)
