@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        56%{?dist}
+Release:        57%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-57
+- CalDAV: вход по Kerberos (SPNEGO/Negotiate) тем же доменным билетом, что IMAP/SMTP - без app-пароля
 * Wed Sep 09 2026 redmail <redmail@example.com> - 0.0.1-56
 - SMTP: письма с кириллицей больше не уходят как сырой 8bit без BODY=8BITMIME (причина 500 Message rejected на строгих серверах именно из redmail)
 * Wed Sep 09 2026 redmail <redmail@example.com> - 0.0.1-55
