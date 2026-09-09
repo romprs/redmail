@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        55%{?dist}
+Release:        56%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Wed Sep 09 2026 redmail <redmail@example.com> - 0.0.1-56
+- SMTP: письма с кириллицей больше не уходят как сырой 8bit без BODY=8BITMIME (причина 500 Message rejected на строгих серверах именно из redmail)
 * Wed Sep 09 2026 redmail <redmail@example.com> - 0.0.1-55
 - Пересылка письма больше не теряет картинки (передаётся HTML + встроенные изображения)
 - IMAP: восстановление сессии после долгого простоя (illegal in state NONAUTH)
