@@ -4,8 +4,33 @@ import smtplib
 import sys
 from unittest.mock import MagicMock, patch
 
-from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, send_message
+from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, build_email_message, send_message
 from redmail.smtp_client import test_connection as smtp_test_connection
+
+
+def test_cyrillic_body_uses_7bit_safe_encoding_not_raw_8bit() -> None:
+    # Жалоба: "ошибка отправки приходит именно если отправить из redmail,
+    # а при отправке из VK всё уходит без ошибок" — email.policy.default
+    # (cte_type="8bit") кодирует нелатинский текст как Content-Transfer-
+    # Encoding: 8bit, а smtplib.send_message() решает, слать ли ESMTP
+    # BODY=8BITMIME, только по non-ASCII в АДРЕСАХ конверта, не по телу
+    # письма — с обычными латинскими адресами 8-битное тело уходит без
+    # BODY=8BITMIME, что строгие корпоративные шлюзы вправе отклонить уже
+    # после приёма ("500 Message rejected" после END OF DATA). Тело должно
+    # быть закодировано 7-битно чисто (quoted-printable/base64) независимо
+    # от того, кириллица там или нет.
+    message = OutgoingMessage(
+        sender="ivan@example.com",
+        to=["boss@example.com"],
+        subject="Тема",
+        body="Текст письма с кириллицей",
+        html_body="<p>Текст письма с кириллицей</p>",
+    )
+    email_message = build_email_message(message)
+    for part in email_message.walk():
+        cte = part.get("Content-Transfer-Encoding")
+        if cte is not None:
+            assert cte.lower() != "8bit", f"part {part.get_content_type()} uses raw 8bit encoding"
 
 
 def test_send_message_starttls_flow() -> None:

@@ -3,8 +3,29 @@ from __future__ import annotations
 import smtplib
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from email import policy
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+
+# Жалоба: "ошибка отправки приходит именно если отправить из redmail, а
+# при отправке из VK всё уходит без ошибок" — реальная причина не в
+# запятой в поле "Кому" (тот путь уже фильтрует пустые адреса, см.
+# _parse_recipient_list в main_window.py), а в том, что политика по
+# умолчанию для EmailMessage — email.policy.default с cte_type="8bit":
+# для любого текста с кириллицей (почти каждое письмо здесь) это даёт
+# Content-Transfer-Encoding: 8bit. Но smtplib.SMTP.send_message() решает,
+# слать ли ESMTP-параметр BODY=8BITMIME, ТОЛЬКО по тому, содержат ли
+# non-ASCII символы САМИ АДРЕСА конверта (envelope from/to) — адреса это
+# обычные email на латинице, поэтому BODY=8BITMIME не запрашивается,
+# и письмо с 8-битным телом уходит без него: формальное нарушение RFC
+# 6152, которое строгие корпоративные шлюзы контентной фильтрации вполне
+# резонно отклоняют уже после приёма (SMTP error ... after end of data:
+# 500 Message rejected) — то самое поведение, "уходит, но потом
+# отбойник". cte_type="7bit" заставляет content manager всегда кодировать
+# нелатинский текст через quoted-printable/base64 (7-битно чистые,
+# универсально совместимые кодировки) вместо сырых 8-битных байт —
+# независимо от того, что там на стороне сервера с 8BITMIME.
+_OUTGOING_POLICY = policy.default.clone(cte_type="7bit")
 
 
 @dataclass
@@ -62,7 +83,7 @@ def build_email_message(message: OutgoingMessage) -> EmailMessage:
     "Отправленные"/"Черновики" через IMAP APPEND (сервер не всегда сам
     сохраняет копию исходящих — жалоба: "не отображается отправка почты,
     не появляется в папке отправленные")."""
-    email_message = EmailMessage()
+    email_message = EmailMessage(policy=_OUTGOING_POLICY)
     email_message["From"] = message.sender
     email_message["To"] = ", ".join(message.to)
     if message.cc:
