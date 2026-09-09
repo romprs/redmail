@@ -66,6 +66,13 @@ class CalDavAccount:
     url: str
     username: str
     password: str
+    # "password" — Basic (логин + app-пароль); "kerberos" — SSO по доменному
+    # билету через SPNEGO/Negotiate, как у IMAP/SMTP (Account.auth_type).
+    # Уточнение от пользователя: веб-приложение VK авторизует через keytab,
+    # то есть HTTP-фронт (тот же, что отдаёт CalDAV) принимает Negotiate —
+    # тогда app-пароль (который VK для сторонних клиентов требует и порой
+    # капризно: "Application password is REQUIRED") не нужен вовсе.
+    auth_type: str = "password"
 
 
 class CalDavSyncError(Exception):
@@ -103,10 +110,11 @@ def _auth_scheme_hint(url: str) -> str:
         return ""
     if any(s.lower() == "negotiate" for s in schemes):
         return (
-            f" Сервер предлагает: {', '.join(schemes)} — включая Negotiate (Kerberos/SPNEGO), "
-            "но CalDAV в этом приложении пока умеет только обычный логин и пароль, не SSO."
+            f" Сервер предлагает: {', '.join(schemes)} — включая Negotiate (Kerberos/SPNEGO): "
+            "переключите способ входа учётной записи на Kerberos (SSO) — CalDAV тогда пойдёт "
+            "по доменному билету, без app-пароля."
         )
-    return f" Сервер предлагает только: {', '.join(schemes)} — SSO (Negotiate) для CalDAV здесь недоступен."
+    return f" Сервер предлагает только: {', '.join(schemes)} — SSO (Negotiate) на этом сервере недоступен."
 
 
 @dataclass
@@ -163,23 +171,48 @@ class CalDavSession:
 
     def __init__(self, account: CalDavAccount):
         self.account = account
+        # Без явного таймаута зависший/недоступный сервер (закрытая
+        # корпоративная сеть, где угодно может быть неверно настроенный
+        # прокси/файрвол) мог держать HTTP-запрос сколько угодно — а весь
+        # on_caldav_sync() до сих пор шёл синхронно в основном потоке
+        # интерфейса: жалоба "после настройки CalDAV сломалась отправка,
+        # просмотр, переход между папками и получение почты" — на деле не
+        # сломалась, а всё это время буквально ждала одного зависшего
+        # сетевого запроса. См. MainWindow.on_caldav_sync — сама
+        # синхронизация теперь выполняется в фоновом потоке, но таймаут
+        # всё равно нужен: без него поток просто завис бы бесконечно вместо
+        # того, чтобы сообщить об ошибке.
+        client_kwargs: dict = {"timeout": 30, "headers": {"User-Agent": _CALDAV_USER_AGENT}}
         try:
-            self._client = caldav.DAVClient(
-                # Без явного таймаута зависший/недоступный сервер (закрытая
-                # корпоративная сеть, где угодно может быть неверно
-                # настроенный прокси/файрвол) мог держать HTTP-запрос
-                # сколько угодно — а весь on_caldav_sync() до сих пор шёл
-                # синхронно в основном потоке интерфейса: жалоба "после
-                # настройки CalDAV сломалась отправка, просмотр, переход
-                # между папками и получение почты" — на деле не сломалась,
-                # а всё это время буквально ждала одного зависшего сетевого
-                # запроса. См. MainWindow.on_caldav_sync — сама синхронизация
-                # теперь выполняется в фоновом потоке, но таймаут всё равно
-                # нужен: без него поток просто завис бы бесконечно вместо
-                # того, чтобы сообщить об ошибке.
-                account.url, username=account.username, password=account.password, timeout=30,
-                headers={"User-Agent": _CALDAV_USER_AGENT},
-            )
+            if account.auth_type == "kerberos":
+                # Импорт внутри — см. gssapi_sasl.py: requests_gssapi тянет
+                # системные библиотеки Kerberos, которых нет там, где SSO не
+                # используется (и на машине для тестов); обычный пароль от
+                # этого ломаться не должен.
+                import requests_gssapi
+
+                # mutual_authentication=OPTIONAL, а не REQUIRED по умолчанию:
+                # за корпоративным reverse-proxy/балансировщиком ответ сервера
+                # часто приходит без встречного GSSAPI-токена, и строгая
+                # взаимная проверка роняла бы уже успешно прошедший вход.
+                client_kwargs["auth"] = requests_gssapi.HTTPSPNEGOAuth(
+                    mutual_authentication=requests_gssapi.OPTIONAL
+                )
+            else:
+                client_kwargs["username"] = account.username
+                client_kwargs["password"] = account.password
+            self._client = caldav.DAVClient(account.url, **client_kwargs)
+            if account.auth_type == "kerberos":
+                # caldav при наличии niquests берёт его вместо requests, а
+                # HTTPSPNEGOAuth написан под настоящий requests (хук на 401 с
+                # повторной отправкой через r.connection/r.request.copy()) —
+                # подменяем сессию клиента на обычный requests.Session, с
+                # которым эта связка документирована и отлажена.
+                try:
+                    self._client.session.close()
+                except Exception:
+                    pass
+                self._client.session = requests.Session()
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось создать CalDAV-соединение: {exc}") from exc
         self._calendar = None

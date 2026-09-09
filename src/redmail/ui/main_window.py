@@ -2546,12 +2546,13 @@ class _EditCalendarUrlDialog(QDialog):
     переподключить на другой (например, другой расшаренный) календарь, не
     придётся вручную набирать точный URL."""
 
-    def __init__(self, parent, current_url: str, my_email: str, my_password: str):
+    def __init__(self, parent, current_url: str, my_email: str, my_password: str, my_auth_type: str = "password"):
         super().__init__(parent)
         self.setWindowTitle("Подключение CalDAV")
         self.resize(560, 160)
         self._my_email = my_email
         self._my_password = my_password
+        self._my_auth_type = my_auth_type
         self._test_workers: list[QThread] = []
 
         self.url_edit = QLineEdit(current_url, self)
@@ -2579,7 +2580,9 @@ class _EditCalendarUrlDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
             return
-        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        account = caldav_sync.CalDavAccount(
+            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
+        )
         self.status_label.setText("Ищу календари на сервере…")
 
         def discover() -> list[caldav_sync.CalDavCalendarInfo]:
@@ -2628,11 +2631,20 @@ class AddCalendarDialog(QDialog):
     отдельная OAuth2-интеграция с Google Calendar API, которой здесь пока
     нет и которую нет смысла изображать частично работающей."""
 
-    def __init__(self, parent=None, *, my_email: str = "", my_password: str = "", used_colors: set[str] | None = None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        my_email: str = "",
+        my_password: str = "",
+        my_auth_type: str = "password",
+        used_colors: set[str] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Новый календарь")
         self._my_email = my_email
         self._my_password = my_password
+        self._my_auth_type = my_auth_type
         self._test_workers: list[QThread] = []
 
         self.name_edit = QLineEdit(self)
@@ -2712,7 +2724,9 @@ class AddCalendarDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для проверки.")
             return
-        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        account = caldav_sync.CalDavAccount(
+            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
+        )
         self.caldav_test_button.setEnabled(False)
         self.caldav_test_status.setText("Проверка подключения…")
 
@@ -2784,7 +2798,9 @@ class AddCalendarDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
             return
-        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        account = caldav_sync.CalDavAccount(
+            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
+        )
         self.caldav_discover_button.setEnabled(False)
         self.caldav_test_status.setText("Ищу календари на сервере…")
 
@@ -6373,6 +6389,9 @@ class MainWindow(QMainWindow):
 
         username = self.account.username
         password = getattr(self.account, "password", "")
+        # Тот же способ входа, что у почты: при Kerberos (SSO) CalDAV идёт
+        # по доменному билету через SPNEGO, app-пароль не нужен.
+        auth_type = getattr(self.account, "auth_type", "password")
         calendar_path = self.calendar_path
         window_start = datetime.now(timezone.utc) - timedelta(days=30)
         window_end = datetime.now(timezone.utc) + timedelta(days=180)
@@ -6388,7 +6407,9 @@ class MainWindow(QMainWindow):
             total_pulled = 0
             local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
             for cal in caldav_calendars:
-                account = caldav_sync.CalDavAccount(url=cal.caldav_url, username=username, password=password)
+                account = caldav_sync.CalDavAccount(
+                    url=cal.caldav_url, username=username, password=password, auth_type=auth_type
+                )
                 session = caldav_sync.CalDavSession(account)
                 try:
                     # Сначала отправляем локальные изменения (свои встречи
@@ -6583,6 +6604,7 @@ class MainWindow(QMainWindow):
             self,
             my_email=self.account.username if self.account else "",
             my_password=getattr(self.account, "password", "") if self.account else "",
+            my_auth_type=getattr(self.account, "auth_type", "password") if self.account else "password",
             used_colors=used_colors,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -6632,7 +6654,13 @@ class MainWindow(QMainWindow):
         # сервере...", что и в "Новый календарь" — если нужно ПЕРЕподключить
         # календарь на другой (например, другой расшаренный), не придётся
         # вручную набирать точный URL.
-        dialog = _EditCalendarUrlDialog(self, current_url, self.account.username, getattr(self.account, "password", ""))
+        dialog = _EditCalendarUrlDialog(
+            self,
+            current_url,
+            self.account.username,
+            getattr(self.account, "password", ""),
+            getattr(self.account, "auth_type", "password"),
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         url = dialog.url()

@@ -46,6 +46,37 @@ def test_session_creates_client_with_account_credentials() -> None:
     )
 
 
+def test_session_kerberos_uses_spnego_auth_and_plain_requests_session(monkeypatch) -> None:
+    # SSO: веб-приложение VK авторизует по Kerberos (keytab на сервере,
+    # SPNEGO для клиентов) — CalDAV должен идти по доменному билету, без
+    # логина/пароля. requests_gssapi тянет системные библиотеки Kerberos,
+    # которых на машине для тестов нет — подменяем модуль целиком.
+    import sys
+
+    import requests
+
+    fake_gssapi = MagicMock()
+    fake_gssapi.OPTIONAL = 2
+    fake_auth = MagicMock()
+    fake_gssapi.HTTPSPNEGOAuth.return_value = fake_auth
+    monkeypatch.setitem(sys.modules, "requests_gssapi", fake_gssapi)
+
+    fake_client = MagicMock()
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client) as client_cls:
+        session = CalDavSession(
+            CalDavAccount(url="https://calendar.corp.local/", username="ivan@corp.local", password="", auth_type="kerberos")
+        )
+
+    fake_gssapi.HTTPSPNEGOAuth.assert_called_once_with(mutual_authentication=2)
+    client_cls.assert_called_once_with(
+        "https://calendar.corp.local/", timeout=30, headers={"User-Agent": "redmail-caldav-client/1.0"}, auth=fake_auth
+    )
+    assert "password" not in client_cls.call_args.kwargs
+    # caldav при наличии niquests берёт его; HTTPSPNEGOAuth написан под
+    # настоящий requests — сессия должна быть подменена на requests.Session.
+    assert isinstance(session._client.session, requests.Session)
+
+
 def test_fetch_events_parses_server_objects_into_events() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
