@@ -262,6 +262,31 @@ def test_reconnects_and_retries_after_imaplib_abort() -> None:
     fresh_client.login.assert_called_once_with("ivan", "secret")
 
 
+def test_reconnects_and_retries_after_stale_session_illegal_state() -> None:
+    # Жалоба: "после долгого простоя выдаёт... лечится перезапуском" —
+    # сервер молча разлогинил сессию (не разорвав сам TCP-сокет), и
+    # следующая же команда падает не сетевой ошибкой, а обычным
+    # imaplib.IMAP4.error с текстом "illegal in state NONAUTH" — раньше
+    # это ошибочно считалось "настоящей" протокольной ошибкой (как
+    # test_protocol_error_is_not_treated_as_dead_connection ниже) и
+    # показывалось как есть без единой попытки переподключиться.
+    import imaplib
+
+    dead_client = MagicMock()
+    dead_client.select_folder.side_effect = imaplib.IMAP4.error(
+        "command SELECT illegal in state NONAUTH, only allowed in states AUTH, SELECTED"
+    )
+    fresh_client = _client(exists=7)
+    clients = [dead_client, fresh_client]
+
+    with patch("redmail.imap_client.IMAPClient", side_effect=lambda *a, **k: clients.pop(0)):
+        session = ImapSession(_account())
+        count = session.folder_message_count("INBOX")
+
+    assert count == 7
+    fresh_client.login.assert_called_once_with("ivan", "secret")
+
+
 def test_protocol_error_is_not_treated_as_dead_connection() -> None:
     # Настоящая протокольная ошибка (сервер понял команду и отверг) не
     # лечится переподключением — не должна его вызывать вообще.

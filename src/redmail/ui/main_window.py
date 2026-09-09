@@ -2539,6 +2539,83 @@ class _CalendarPickerDialog(QDialog):
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
 
+class _EditCalendarUrlDialog(QDialog):
+    """Смена адреса CalDAV-календаря — жалоба: узкое QInputDialog.getText
+    показывало длинный URL с UUID обрезанным (виден только хвост). Тот же
+    поиск календарей на сервере, что в AddCalendarDialog — если нужно
+    переподключить на другой (например, другой расшаренный) календарь, не
+    придётся вручную набирать точный URL."""
+
+    def __init__(self, parent, current_url: str, my_email: str, my_password: str):
+        super().__init__(parent)
+        self.setWindowTitle("Подключение CalDAV")
+        self.resize(560, 160)
+        self._my_email = my_email
+        self._my_password = my_password
+        self._test_workers: list[QThread] = []
+
+        self.url_edit = QLineEdit(current_url, self)
+        discover_button = QPushButton("Найти календари на сервере…", self)
+        discover_button.clicked.connect(self._on_discover)
+        self.status_label = QLabel("", self)
+        self.status_label.setWordWrap(True)
+
+        form = QFormLayout()
+        form.addRow("Адрес сервера", self.url_edit)
+        form.addRow(discover_button)
+        form.addRow(self.status_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addStretch(1)
+        layout.addWidget(buttons)
+
+    def _on_discover(self) -> None:
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
+            return
+        account = caldav_sync.CalDavAccount(url=url, username=self._my_email, password=self._my_password)
+        self.status_label.setText("Ищу календари на сервере…")
+
+        def discover() -> list[caldav_sync.CalDavCalendarInfo]:
+            session = caldav_sync.CalDavSession(account)
+            try:
+                return session.list_calendars_detailed()
+            finally:
+                session.close()
+
+        worker = _CallableWorker(discover, parent=self)
+
+        def on_success(calendars: object) -> None:
+            self._test_workers.remove(worker)
+            if not calendars:
+                self.status_label.setText("На сервере не найдено ни одного календаря.")
+                return
+            picker = _CalendarPickerDialog(self, calendars)
+            if picker.exec() == QDialog.DialogCode.Accepted:
+                chosen = picker.selected()
+                if chosen is not None:
+                    self.url_edit.setText(chosen.url)
+                    self.status_label.setText(f"Выбран календарь: {chosen.name}")
+
+        def on_failure(error_text: str) -> None:
+            self.status_label.setText(f"Ошибка поиска: {error_text}")
+            self._test_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._test_workers.append(worker)
+        worker.start()
+
+    def url(self) -> str:
+        return self.url_edit.text().strip()
+
+
 class AddCalendarDialog(QDialog):
     """Новый календарь — локальный или подключённый к внешнему CalDAV-серверу.
 
@@ -2639,36 +2716,56 @@ class AddCalendarDialog(QDialog):
         self.caldav_test_button.setEnabled(False)
         self.caldav_test_status.setText("Проверка подключения…")
 
-        def connect_and_check() -> tuple[int, str | None]:
+        def connect_and_check() -> tuple[int | None, str | None, str | None]:
             # Проверяем чтение и запись ОТДЕЛЬНО и обе по-настоящему (запись —
             # реальным одноразовым PUT+DELETE тестового события), а не только
             # чтение — иначе получается ровно та путаница, из-за которой всё
             # началось: "проверка подключения проходит, а синхронизация нет",
             # потому что раньше проверялось только чтение (PROPFIND).
+            #
+            # list_calendar_names() — это ДИСКАВЕРИ всего аккаунта
+            # (current-user-principal/calendar-home-set), а не проверка
+            # КОНКРЕТНОГО календаря по указанному URL (её теперь делает
+            # test_write_access(), напрямую по account.url — см. правку
+            # _primary_calendar). Некоторые серверы отвечают 500 на такой
+            # дискавери-запрос, если он сделан НЕ от корня/принципала
+            # аккаунта, а от URL глубоко вложенного конкретного календаря
+            # (реальный случай на VK Mail/on-premise) — раньше эта ошибка
+            # обрывала всю проверку ДО того, как успевал выполниться более
+            # важный прямой тест чтения/записи именно нужного календаря.
+            # Список календарей — необязательная диагностика, её сбой не
+            # должен маскировать результат прямой проверки.
             session = caldav_sync.CalDavSession(account)
             try:
-                calendar_count = len(session.list_calendar_names())
+                try:
+                    calendar_count = len(session.list_calendar_names())
+                    discovery_error = None
+                except caldav_sync.CalDavSyncError as exc:
+                    calendar_count = None
+                    discovery_error = str(exc)
                 write_error: str | None = None
                 try:
                     session.test_write_access()
                 except caldav_sync.CalDavSyncError as exc:
                     write_error = str(exc)
-                return calendar_count, write_error
+                return calendar_count, discovery_error, write_error
             finally:
                 session.close()
 
         worker = _CallableWorker(connect_and_check, parent=self)
 
         def on_success(result: object) -> None:
-            calendar_count, write_error = result
-            if write_error is None:
-                self.caldav_test_status.setText(
-                    f"Подключение успешно, календарей найдено: {calendar_count}. Чтение и запись — OK."
-                )
+            calendar_count, discovery_error, write_error = result
+            lines = []
+            if discovery_error is None:
+                lines.append(f"Список календарей на сервере: OK (найдено {calendar_count}).")
             else:
-                self.caldav_test_status.setText(
-                    f"Чтение — OK (календарей: {calendar_count}). Запись — ОШИБКА: {write_error}"
-                )
+                lines.append(f"Список календарей на сервере получить не удалось: {discovery_error}")
+            if write_error is None:
+                lines.append("Чтение и запись именно этого календаря — OK.")
+            else:
+                lines.append(f"Чтение/запись этого календаря — ОШИБКА: {write_error}")
+            self.caldav_test_status.setText(" ".join(lines))
             self.caldav_test_button.setEnabled(True)
             self._test_workers.remove(worker)
 
@@ -3290,6 +3387,16 @@ class ContactDialog(QDialog):
         )
 
 
+def _exception_text(exc: BaseException) -> str:
+    """Текст ошибки для показа пользователю. Некоторые исключения imaplib
+    несут "сырой" ответ сервера как bytes прямо в args (жалоба: окно с
+    ошибкой показывало буквально b'[AUTHENTICATIONFAILED] ...' — обычный
+    str() на исключении с bytes-аргументом возвращает repr этих байт, а не
+    читаемый текст) — декодируем перед показом."""
+    parts = [arg.decode("utf-8", errors="replace") if isinstance(arg, bytes) else str(arg) for arg in exc.args]
+    return "; ".join(parts) if parts else str(exc)
+
+
 class _CallableWorker(QThread):
     """Выполняет одну функцию в отдельном потоке и сообщает результат через
     сигналы — без этого любая сетевая операция (SMTP-отправка, разбор
@@ -3314,7 +3421,7 @@ class _CallableWorker(QThread):
         try:
             result = self._fn(*self._args, **self._kwargs)
         except Exception as exc:  # передаём текст в основной поток — сам exc через границу потоков не тащим
-            self.failed.emit(str(exc))
+            self.failed.emit(_exception_text(exc))
         else:
             self.succeeded.emit(result)
 
@@ -6519,9 +6626,17 @@ class MainWindow(QMainWindow):
             self._delete_calendar(calendar_id, item.text())
 
     def _edit_calendar_connection(self, calendar_id: str, current_url: str) -> None:
-        url, ok = QInputDialog.getText(self, "Подключение CalDAV", "Адрес сервера:", text=current_url)
-        url = url.strip()
-        if not ok or not url or url == current_url:
+        # Жалоба: узкое поле QInputDialog.getText показывало длинный URL с
+        # UUID обрезанным (виден только хвост) — не поместить длинный адрес
+        # для чтения/правки. Заодно та же кнопка "Найти календари на
+        # сервере...", что и в "Новый календарь" — если нужно ПЕРЕподключить
+        # календарь на другой (например, другой расшаренный), не придётся
+        # вручную набирать точный URL.
+        dialog = _EditCalendarUrlDialog(self, current_url, self.account.username, getattr(self.account, "password", ""))
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        url = dialog.url()
+        if not url or url == current_url:
             return
         try:
             calendar_store.set_calendar_caldav_url(self.calendar_path, calendar_id, url)
@@ -7179,19 +7294,41 @@ class MainWindow(QMainWindow):
             )
             return
         subject = summary.subject if summary.subject.lower().startswith("fwd:") else f"Fwd: {summary.subject}"
-        forward_header = (
-            f"---------- Пересланное сообщение ----------\n"
-            f"От: {summary.sender} <{summary.sender_email}>\n"
-            f"Дата: {summary.date}\n"
-            f"Тема: {summary.subject}\n"
-        )
-        body = f"\n\n{forward_header}\n{content.text}"
+        # Жалоба: "при пересылке письма пропадает картинка" — раньше
+        # пересылка ВСЕГДА брала только content.text (простой текст) и
+        # никогда не передавала ни HTML, ни content.inline_images дальше
+        # в ComposeDialog. Для писем, у которых текстовая альтернатива —
+        # это не читаемый текст, а плейсхолдеры вида "[cid:image001.png@...]"
+        # (так Outlook формирует plain-text alternative для писем с
+        # картинками), пересылка получалась буквально с "хвостами" cid
+        # вместо картинок — и результат ещё и мог не пройти проверку
+        # содержимого на стороне корпоративного сервера (см. жалобу про
+        # 500 Message rejected). Если у письма есть HTML — пересылаем его
+        # как есть, вместе со встроенными картинками; иначе как раньше.
+        if content.html:
+            forward_header_html = (
+                "<br><br>---------- Пересланное сообщение ----------<br>"
+                f"От: {html.escape(summary.sender)} &lt;{html.escape(summary.sender_email)}&gt;<br>"
+                f"Дата: {html.escape(summary.date)}<br>"
+                f"Тема: {html.escape(summary.subject)}<br><br>"
+            )
+            body_kwargs = {
+                "body_html": forward_header_html + content.html,
+                "inline_images": content.inline_images,
+            }
+        else:
+            forward_header = (
+                f"---------- Пересланное сообщение ----------\n"
+                f"От: {summary.sender} <{summary.sender_email}>\n"
+                f"Дата: {summary.date}\n"
+                f"Тема: {summary.subject}\n"
+            )
+            body_kwargs = {"body": f"\n\n{forward_header}\n{content.text}"}
 
         dialog = ComposeDialog(
             self,
             title="Переслать",
             subject=subject,
-            body=body,
             contacts=self._load_contacts(),
             attachments=[
                 OutgoingAttachment(
@@ -7201,6 +7338,7 @@ class MainWindow(QMainWindow):
             ],
             signatures=self.signatures,
             default_signature_id=self.default_signature_id,
+            **body_kwargs,
         )
         self._exec_compose(dialog)
 

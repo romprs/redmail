@@ -34,6 +34,20 @@ _COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
 UNKNOWN_MARKER = object()
 
 
+def _is_stale_session_error(exc: Exception) -> bool:
+    """command SELECT/... illegal in state NONAUTH — сервер молча разлогинил
+    сессию после долгого простоя (жалоба: "после долгого простоя выдаёт...
+    лечится перезапуском"), но САМ TCP-сокет при этом мог и не порваться,
+    поэтому это НЕ OSError/EOFError/IMAP4.abort, а обычный
+    imaplib.IMAP4.error (=IMAPClientError) — команда сервером понята, но
+    отвергнута. В общем случае такие ошибки переподключением не лечатся
+    (см. _reconnecting), но именно "illegal in state NONAUTH" означает
+    ровно "мы больше не аутентифицированы" — это тот редкий протокольный
+    случай, который реконнект+повторный логин действительно чинит."""
+    text = str(exc)
+    return "illegal in state" in text and "NONAUTH" in text
+
+
 def _reconnecting(method):
     """После простоя реальный IMAP-сервер молча рвёт TCP-соединение (никто
     не обязан держать сессию вечно — RFC 3501 не гарантирует этого), и
@@ -52,7 +66,8 @@ def _reconnecting(method):
     ошибка показывалась как есть с первого же раза, без единой попытки
     восстановить соединение). Настоящие протокольные ошибки
     (IMAPClientError на команду, которую сервер понял, но отверг) НЕ
-    перехватываются — переподключение их не лечит, показываем как есть."""
+    перехватываются — переподключение их не лечит, показываем как есть,
+    КРОМЕ "illegal in state NONAUTH" — см. _is_stale_session_error."""
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
@@ -63,6 +78,14 @@ def _reconnecting(method):
                 self._reconnect()
             except Exception:
                 raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
+            return method(self, *args, **kwargs)
+        except imaplib.IMAP4.error as exc:
+            if not _is_stale_session_error(exc):
+                raise
+            try:
+                self._reconnect()
+            except Exception:
+                raise exc from None
             return method(self, *args, **kwargs)
 
     return wrapper

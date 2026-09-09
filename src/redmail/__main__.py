@@ -84,12 +84,22 @@ def main() -> int:
 
     splash = QSplashScreen(build_splash_pixmap())
     splash.show()
+    # Жалоба: "информационное окно выводится не сразу и иногда не успевает
+    # отрисоваться вообще" — processEvents() сам по себе лишь разбирает уже
+    # накопившуюся очередь событий, а не гарантирует, что отложенное окно
+    # успело быть замаплено/отрисовано оконным менеджером именно к этому
+    # моменту (особенно на X11 без композитора). repaint() — синхронная
+    # немедленная перерисовка виджета, без ожидания цикла событий, поэтому
+    # заставка гарантированно на экране ДО того, как MainWindow() ниже
+    # надолго заблокирует поток своей инициализацией.
+    splash.repaint()
     app.processEvents()
 
     def report(message: str) -> None:
         splash.showMessage(
             message, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignBottom, QColor(_SPLASH_FG)
         )
+        splash.repaint()
         app.processEvents()
 
     report("Применение темы оформления…")
