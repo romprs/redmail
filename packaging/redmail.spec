@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        57%{?dist}
+Release:        58%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,14 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-58
+- CalDAV: HTTP/1.1-сессия (requests) вместо niquests/HTTP/2 - обрыв PUT события; поиск календарей обходит все calendar-home-set и вложенные коллекции (расшаренные)
+- Адресная книга: множественный выбор галочками
+- IMAP: переподключение при [UNAVAILABLE] после сбоя/простоя сервера
+- Ответить всем - в тулбаре и в окне письма
+- SSO: keytab и principal как источник билета Kerberos (IMAP/SMTP/CalDAV)
+- Заставка показывается сразу (импорт интерфейса отложен, версия дорисовывается после)
+- Маркеры не пропадают: \Flagged без keyword = маркер, цвет из локального кэша
 * Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-57
 - CalDAV: вход по Kerberos (SPNEGO/Negotiate) тем же доменным билетом, что IMAP/SMTP - без app-пароля
 * Wed Sep 09 2026 redmail <redmail@example.com> - 0.0.1-56
