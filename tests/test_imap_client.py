@@ -1105,3 +1105,49 @@ def test_close_logs_out() -> None:
         session.close()
 
     fake_client.logout.assert_called_once()
+
+
+def test_session_serializes_commands_from_several_threads() -> None:
+    # Жалоба: "подвисает при переходе от письма к письму на загрузке
+    # письма". Тело письма грузится в фоновом потоке, а отметка
+    # "прочитано"/следующий fetch уходили в тот же сокет из другого потока
+    # параллельно — imaplib к этому не готов, ответы перемешивались и
+    # поток ждал вечно. Сессия обязана выполнять команды строго по одной.
+    import threading
+    import time
+
+    fake_client = _client(exists=1)
+    active = 0
+    max_active = 0
+    guard = threading.Lock()
+
+    def slow_fetch(*_args, **_kwargs):
+        nonlocal active, max_active
+        with guard:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.02)
+        with guard:
+            active -= 1
+        return {}
+
+    fake_client.fetch.side_effect = slow_fetch
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+
+    threads = [threading.Thread(target=session.fetch_folder_summaries, args=("INBOX",)) for _ in range(4)]
+    threads += [threading.Thread(target=session.set_read, args=("INBOX", 1, True)) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert max_active == 1
+
+
+def test_session_opens_socket_with_timeout_so_stuck_read_cannot_hang_forever() -> None:
+    # Без таймаута на сокете зависшее чтение блокирует поток навсегда; с
+    # ним это OSError, которую _reconnecting лечит переподключением.
+    fake_client = _client()
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client) as ctor:
+        ImapSession(_account())
+    assert ctor.call_args.kwargs.get("timeout"), "IMAPClient должен создаваться с timeout"

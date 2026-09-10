@@ -5341,9 +5341,7 @@ class MainWindow(QMainWindow):
             "Outlook: почта по IMAP/SMTP, локальные архивы писем, календарь "
             "с приглашениями по электронной почте (iTIP), адресная книга.</p>"
             f"<p>Версия: {app_version}</p>"
-            "<p>Автор: Пономарев Роман Сергеевич</p>"
-            "<p><i>Программа разработана с использованием искусственного "
-            "интеллекта.</i></p>",
+            "<p>Автор: Пономарев Роман Сергеевич</p>",
         )
 
     def on_settings(self) -> None:
@@ -6614,11 +6612,27 @@ class MainWindow(QMainWindow):
     def _render_body(self, content: MessageContent) -> None:
         _populate_body_browser(self.reading_pane, content)
 
+    def _run_in_background(self, fn, *args) -> None:
+        """Запускает необязательную сетевую операцию (STORE флага и т.п.)
+        в фоне и молча забывает о результате: она не должна ни блокировать
+        интерфейс, ни мешать загрузке следующего письма — IMAP-сессия
+        выполняет команды строго по очереди (см. ImapSession), и вызов из
+        основного потока ждал бы, пока фоновая загрузка тела не закончится
+        (жалоба: "подвисает при переходе от письма к письму")."""
+        worker = _CallableWorker(fn, *args, parent=self)
+
+        def _done(*_args) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        worker.succeeded.connect(_done)
+        worker.failed.connect(_done)
+        self._background_workers.append(worker)
+        worker.start()
+
     def _set_message_read(self, row: int, summary: MessageSummary, read: bool) -> None:
-        try:
-            self.active_source.set_read(self.current_folder, summary.uid, read)
-        except Exception:
-            pass  # необязательная операция — письмо и так уже открыто/помечено локально
+        # Отметка на сервере — в фоне; локально письмо уже показано/отмечено.
+        self._run_in_background(self.active_source.set_read, self.current_folder, summary.uid, read)
         summary.is_read = read
         for col in (COL_SENDER, COL_SUBJECT):
             item = self.table.item(row, col)
@@ -6632,10 +6646,7 @@ class MainWindow(QMainWindow):
         ответ, и сразу же обновляет строку в таблице, если это письмо всё
         ещё в текущей открытой папке (жалоба: "если мы ответили на письмо,
         это никак не отражается, нужен какой-то признак")."""
-        try:
-            source.set_answered(folder, uid)
-        except Exception:
-            pass  # необязательная отметка — письмо уже реально отправлено
+        self._run_in_background(source.set_answered, folder, uid)  # необязательная отметка — письмо уже реально отправлено
         if self.current_folder != folder or self.active_source is not source:
             return
         for row, summary in enumerate(self.current_summaries):

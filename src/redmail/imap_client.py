@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import imaplib
+import threading
 from dataclasses import dataclass, field
 from email import message_from_bytes
 from email.header import decode_header
@@ -42,6 +43,11 @@ def join_markers(colors) -> str | None:
         if color and color not in ordered:
             ordered.append(color)
     return ",".join(ordered) or None
+
+# Таймаут одной операции на сокете IMAP (секунды). Не ограничивает
+# длительность загрузки большого письма целиком — только паузу между
+# порциями данных от сервера.
+SOCKET_TIMEOUT = 120
 
 # Сентинел по умолчанию для set_marker(previous_color=...) — отличает "вызывающий
 # код не знает текущий маркер" (безопасный медленный путь: снять все
@@ -94,22 +100,30 @@ def _reconnecting(method):
 
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
-        try:
-            return method(self, *args, **kwargs)
-        except (OSError, EOFError, imaplib.IMAP4.abort) as exc:
+        # Одно соединение — одна команда за раз. Тело письма грузится в
+        # фоновом потоке, а отметка "прочитано"/маркер/следующий fetch
+        # могли уйти в тот же сокет из другого потока параллельно; imaplib
+        # к этому не готов — ответы перемешиваются, и один из потоков ждёт
+        # своего ответа вечно (жалоба: "подвисает при переходе от письма к
+        # письму на загрузке письма"). RLock — потому что декорированные
+        # методы вызывают друг друга.
+        with self._lock:
             try:
-                self._reconnect()
-            except Exception:
-                raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
-            return method(self, *args, **kwargs)
-        except imaplib.IMAP4.error as exc:
-            if not _is_recoverable_by_reconnect(exc):
-                raise
-            try:
-                self._reconnect()
-            except Exception:
-                raise exc from None
-            return method(self, *args, **kwargs)
+                return method(self, *args, **kwargs)
+            except (OSError, EOFError, imaplib.IMAP4.abort) as exc:
+                try:
+                    self._reconnect()
+                except Exception:
+                    raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
+                return method(self, *args, **kwargs)
+            except imaplib.IMAP4.error as exc:
+                if not _is_recoverable_by_reconnect(exc):
+                    raise
+                try:
+                    self._reconnect()
+                except Exception:
+                    raise exc from None
+                return method(self, *args, **kwargs)
 
     return wrapper
 
@@ -202,7 +216,8 @@ class ImapSession:
 
     def __init__(self, account: Account):
         self.account = account
-        self._client = IMAPClient(account.host, port=account.port, ssl=account.use_ssl)
+        self._lock = threading.RLock()
+        self._client = self._new_client()
         self._login()
         self._selected_folder: str | None = None
         self._selected_exists = 0
@@ -226,14 +241,22 @@ class ImapSession:
         else:
             self._client.login(self.account.username, self.account.password)
 
+    def _new_client(self) -> IMAPClient:
+        # Таймаут на сокете обязателен: без него любое зависшее чтение
+        # (сервер молча перестал отвечать, рассинхрон ответов) блокирует
+        # поток навсегда — с таймаутом это OSError, которую _reconnecting
+        # лечит переподключением и повтором.
+        return IMAPClient(self.account.host, port=self.account.port, ssl=self.account.use_ssl, timeout=SOCKET_TIMEOUT)
+
     def close(self) -> None:
-        try:
-            self._client.logout()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._client.logout()
+            except Exception:
+                pass
 
     def _reconnect(self) -> None:
-        self._client = IMAPClient(self.account.host, port=self.account.port, ssl=self.account.use_ssl)
+        self._client = self._new_client()
         self._login()
         if self._selected_folder is not None:
             # Кое-что из вызывающего кода (fetch_summaries) не делает
