@@ -26,6 +26,23 @@ MARKER_COLORS: dict[str, bytes] = {
 }
 _COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
 
+
+def split_markers(value: str | None) -> list[str]:
+    """Несколько маркеров на письме (пожелание: "на письмо можно поставить
+    несколько маркеров") хранятся в том же поле marker_color через запятую
+    ("red,blue") — так не меняются схема кэша/архива и все места, где это
+    поле просто прокидывается дальше; разбирают его только те, кому нужны
+    отдельные цвета (иконка, фильтр, меню, IMAP-флаги)."""
+    return [color for color in (value or "").split(",") if color]
+
+
+def join_markers(colors) -> str | None:
+    ordered: list[str] = []
+    for color in colors:
+        if color and color not in ordered:
+            ordered.append(color)
+    return ",".join(ordered) or None
+
 # Сентинел по умолчанию для set_marker(previous_color=...) — отличает "вызывающий
 # код не знает текущий маркер" (безопасный медленный путь: снять все
 # возможные keyword'ы) от "previous_color=None" (точно знает, что маркера не
@@ -409,20 +426,22 @@ class ImapSession:
             return  # уже в нужном состоянии — нечего менять, даже SELECT не нужен
         self._select(folder)
         all_keywords = list(MARKER_COLORS.values())
+        # `color`/`previous_color` — один цвет или несколько через запятую
+        # (см. split_markers): на письме может быть несколько маркеров.
+        new_keywords = [MARKER_COLORS[c] for c in split_markers(color) if c in MARKER_COLORS]
         if previous_color is UNKNOWN_MARKER:
             to_remove = list(all_keywords)
         elif previous_color is None:
             to_remove = []  # маркера не было — снимать нечего, кроме самого нового keyword'а ниже не нужно
         else:
-            to_remove = [MARKER_COLORS[previous_color]]
+            to_remove = [MARKER_COLORS[c] for c in split_markers(previous_color) if c in MARKER_COLORS]
 
-        if color is None:
+        if not new_keywords:
             self._remove_flags_best_effort(uid, [b"\\Flagged", *to_remove])
             return
-        keyword = MARKER_COLORS[color]
-        self._remove_flags_best_effort(uid, [k for k in to_remove if k != keyword])
+        self._remove_flags_best_effort(uid, [k for k in to_remove if k not in new_keywords])
         try:
-            self._client.add_flags([uid], [b"\\Flagged", keyword])
+            self._client.add_flags([uid], [b"\\Flagged", *new_keywords])
         except IMAPClientError:
             self._client.add_flags([uid], [b"\\Flagged"])
 
@@ -662,7 +681,7 @@ def _to_summary(data: dict) -> MessageSummary:
     sender_display, sender_email = _format_address(envelope.from_)
     message_id = envelope.message_id
     flags = data.get(b"FLAGS", ())
-    marker_color = next((_COLOR_BY_KEYWORD[f] for f in flags if f in _COLOR_BY_KEYWORD), None)
+    marker_color = join_markers(_COLOR_BY_KEYWORD[f] for f in flags if f in _COLOR_BY_KEYWORD)
     if marker_color is None and b"\\Flagged" in flags:
         # Жалоба: "не сохраняется проставленный маркер, через какое-то
         # время пропадает" — сервер (VK Mail) не хранит произвольные

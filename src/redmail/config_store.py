@@ -85,6 +85,23 @@ def save_theme(theme: str) -> None:
     _save_settings_dict(data)
 
 
+_MAIL_VIEW_MODES = ("table", "cards")
+
+
+def load_mail_view_mode() -> str:
+    """Режим списка писем: "table" — колонки (как раньше), "cards" — плитки
+    с аватаром/двумя строками (по дизайн-референсу; договорённость —
+    два режима с переключателем)."""
+    value = _load_settings_dict().get("mail_view_mode", "table")
+    return value if value in _MAIL_VIEW_MODES else "table"
+
+
+def save_mail_view_mode(mode: str) -> None:
+    data = _load_settings_dict()
+    data["mail_view_mode"] = mode if mode in _MAIL_VIEW_MODES else "table"
+    _save_settings_dict(data)
+
+
 @dataclass
 class Signature:
     id: str

@@ -21,6 +21,7 @@ from PySide6.QtCore import (
     QByteArray,
     QDate,
     QDateTime,
+    QEvent,
     QIODevice,
     QObject,
     QPointF,
@@ -42,6 +43,7 @@ from PySide6.QtGui import (
     QCursor,
     QDesktopServices,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QPainter,
@@ -93,6 +95,7 @@ from PySide6.QtWidgets import (
     QStatusBar,
     QStyle,
     QStyledItemDelegate,
+    QStyleOptionButton,
     QStyleOptionViewItem,
     QToolTip,
     QTableWidget,
@@ -127,6 +130,7 @@ from redmail.config_store import (
     load_default_signature_id,
     load_ews_accounts,
     load_font_scale,
+    load_mail_view_mode,
     load_mail_columns_state,
     load_mail_date_column_pinned,
     load_mail_rules,
@@ -143,6 +147,7 @@ from redmail.config_store import (
     save_default_signature_id,
     save_ews_accounts,
     save_font_scale,
+    save_mail_view_mode,
     save_mail_columns_state,
     save_mail_date_column_pinned,
     save_mail_rules,
@@ -155,7 +160,16 @@ from redmail.config_store import (
     save_window_geometry,
 )
 from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
-from redmail.imap_client import Account, Attachment, FolderInfo, ImapSession, MessageContent, MessageSummary
+from redmail.imap_client import (
+    Account,
+    Attachment,
+    FolderInfo,
+    ImapSession,
+    MessageContent,
+    MessageSummary,
+    join_markers,
+    split_markers,
+)
 from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail.paths import app_dir
 from redmail.smtp_client import (
@@ -987,6 +1001,177 @@ def _attendee_avatar_letter(name: str, email: str) -> str:
     return source[0] if source else "?"
 
 
+def _message_initials(name: str) -> str:
+    """Инициалы для аватара плитки: первые буквы двух первых слов имени
+    ("Иванов Пётр" → "ИП"), для голого email — первая буква."""
+    words = [w for w in re.split(r"[\s,<>\"']+", name or "") if w and w[0].isalnum()]
+    if not words:
+        return "?"
+    if len(words) == 1 or "@" in words[0]:
+        return words[0][0].upper()
+    return (words[0][0] + words[1][0]).upper()
+
+
+def _markers_icon(value: str | None) -> QIcon:
+    """Иконка маркеров в таблице: один цвет — кружок как раньше; несколько
+    (пожелание: "на письмо можно поставить несколько маркеров") — до
+    четырёх кружков поменьше сеткой 2×2 в том же квадрате, чтобы не
+    ломать фиксированный размер иконки колонки."""
+    colors = split_markers(value)
+    if not colors:
+        return QIcon()
+    if len(colors) == 1:
+        return _marker_icon(colors[0])
+    size = _MARKER_ICON_SIZE
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setPen(Qt.PenStyle.NoPen)
+    dot = size // 2 - 1
+    for index, color in enumerate(colors[:4]):
+        x = (index % 2) * (size // 2) + 1
+        y = (index // 2) * (size // 2) + 1
+        painter.setBrush(QColor(_MARKER_HEX[color]))
+        painter.drawEllipse(x, y, dot, dot)
+    painter.end()
+    return QIcon(pixmap)
+
+
+class _MessageCardDelegate(QStyledItemDelegate):
+    """Плитка письма (второй режим списка, по дизайн-референсу): галочка,
+    кружок-аватар с инициалами, отправитель + дата, тема + признаки
+    (важность, вложение, отвечено, маркеры). Рисует прямо из
+    MessageSummary — данные не дублируются, после смены флагов достаточно
+    перерисовать список."""
+
+    CHECK = 16
+    AVATAR = 36
+    PAD = 8
+
+    def __init__(self, summaries_by_uid, parent=None) -> None:
+        super().__init__(parent)
+        self._summaries_by_uid = summaries_by_uid
+        self.sent_mode = False
+
+    def _summary(self, index) -> MessageSummary | None:
+        return self._summaries_by_uid().get(index.data(Qt.ItemDataRole.UserRole))
+
+    def _check_rect(self, rect: QRect) -> QRect:
+        return QRect(rect.left() + self.PAD, rect.center().y() - self.CHECK // 2, self.CHECK, self.CHECK)
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt override
+        line_h = QFontMetrics(option.font).height()
+        return QSize(option.rect.width(), max(self.AVATAR + 2 * self.PAD, 2 * line_h + 2 * self.PAD + 4))
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        summary = self._summary(index)
+        if summary is None:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        palette = option.palette
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.fillRect(rect, palette.highlight())
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, palette.alternateBase())
+        text_color = palette.highlightedText().color() if selected else palette.text().color()
+        muted = palette.highlightedText().color() if selected else palette.placeholderText().color()
+
+        check_rect = self._check_rect(rect)
+        check_option = QStyleOptionButton()
+        check_option.rect = check_rect
+        check_option.palette = palette
+        checked = index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked
+        check_option.state = QStyle.StateFlag.State_Enabled | (
+            QStyle.StateFlag.State_On if checked else QStyle.StateFlag.State_Off
+        )
+        QApplication.style().drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorCheckBox, check_option, painter)
+
+        name = (summary.to if self.sent_mode else summary.sender) or summary.sender_email or "(без имени)"
+        key = (summary.to if self.sent_mode else (summary.sender_email or summary.sender)) or "?"
+        avatar_x = check_rect.right() + self.PAD + 2
+        avatar_y = rect.center().y() - self.AVATAR // 2
+        painter.drawPixmap(avatar_x, avatar_y, _avatar_pixmap(_message_initials(name), _avatar_color(key), self.AVATAR))
+        if not summary.is_read:
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(palette.highlightedText() if selected else palette.highlight())
+            painter.drawEllipse(avatar_x + self.AVATAR - 9, avatar_y - 1, 10, 10)
+
+        normal = QFont(option.font)
+        bold = QFont(option.font)
+        bold.setBold(True)
+        line_h = QFontMetrics(bold).height()
+        x = avatar_x + self.AVATAR + self.PAD + 2
+        right = rect.right() - self.PAD
+        top = rect.top() + (rect.height() - 2 * line_h - 4) // 2
+
+        painter.setFont(normal)
+        date_w = painter.fontMetrics().horizontalAdvance(summary.date)
+        painter.setPen(muted)
+        painter.drawText(QRect(right - date_w, top, date_w, line_h), Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, summary.date)
+        painter.setPen(text_color)
+        painter.setFont(normal if summary.is_read else bold)
+        sender_rect = QRect(x, top, max(10, right - date_w - self.PAD - x), line_h)
+        painter.drawText(
+            sender_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, sender_rect.width()),
+        )
+
+        y2 = top + line_h + 4
+        indicator_x = right
+        dot = 10
+        for color in reversed(split_markers(summary.marker_color)):
+            if color not in _MARKER_HEX:
+                continue
+            indicator_x -= dot + 3
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(_MARKER_HEX[color]))
+            painter.drawEllipse(indicator_x, y2 + (line_h - dot) // 2, dot, dot)
+        marks = []
+        if summary.importance == "high":
+            marks.append("!")
+        if summary.has_attachments:
+            marks.append(_ATTACHMENT_MARK)
+        if summary.is_answered:
+            marks.append(_REPLIED_MARK)
+        painter.setFont(normal)
+        if marks:
+            text = " ".join(marks)
+            w = painter.fontMetrics().horizontalAdvance(text)
+            indicator_x -= w + 6
+            painter.setPen(muted)
+            painter.drawText(QRect(indicator_x, y2, w, line_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        painter.setPen(text_color)
+        painter.setFont(normal if summary.is_read else bold)
+        subject_rect = QRect(x, y2, max(10, indicator_x - self.PAD - x), line_h)
+        painter.drawText(
+            subject_rect,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(summary.subject or "(без темы)", Qt.TextElideMode.ElideRight, subject_rect.width()),
+        )
+
+        painter.setPen(QPen(palette.mid().color()))
+        painter.drawLine(rect.left() + self.PAD, rect.bottom(), rect.right() - self.PAD, rect.bottom())
+        painter.restore()
+
+    def editorEvent(self, event, model, option, index) -> bool:  # noqa: N802 - Qt override
+        # Клик по галочке — переключить отметку письма (для массовых
+        # действий), а не выбрать плитку.
+        if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+            hit = self._check_rect(option.rect).adjusted(-4, -4, 4, 4)
+            if hit.contains(event.position().toPoint()):
+                current = index.data(Qt.ItemDataRole.CheckStateRole)
+                new_state = Qt.CheckState.Unchecked if current == Qt.CheckState.Checked else Qt.CheckState.Checked
+                model.setData(index, new_state, Qt.ItemDataRole.CheckStateRole)
+                return True
+        return super().editorEvent(event, model, option, index)
+
+
 def _icon_color() -> str:
     """Жалоба: 'на тёмном фоне значки поярче нужно' — фиксированный
     тёмно-серый (#5f6368) был рассчитан на светлую тему и еле виден на
@@ -1073,6 +1258,9 @@ _MATERIAL_ICON_PATHS: dict[str, str] = {
     "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
     "forward": "m644-288-43-43 193-193-193-193 43-43 236 236-236 236ZM81-200v-156q0-85 56.5-141.5T279-554h305L421-717l43-43 236 236-236 236-43-43 163-163H279q-60 0-99 39t-39 99v156H81Z",
     "reply_all": "M316-288 80-524l236-236 43 43-193 193 193 193-43 43Zm503 88v-156q0-60-39-99t-99-39H376l163 163-43 43-236-236 236-236 43 43-163 163h305q85 0 141.5 56.5T879-356v156h-60Z",
+    "filter_list": "M400-240v-60h160v60H400ZM240-450v-60h480v60H240ZM120-660v-60h720v60H120Z",
+    "view_agenda": "M180-510q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0 450q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0-600v210-210Zm0 390v210-210Z",
+    "view_list": "M350-220h470v-137H350v137ZM140-603h150v-137H140v137Zm0 187h150v-127H140v127Zm0 196h150v-137H140v137Zm210-196h470v-127H350v127Zm0-187h470v-137H350v137ZM140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h680q24 0 42 18t18 42v520q0 24-18 42t-42 18H140Z",
     "delete": "M261-120q-24.75 0-42.37-17.63Q201-155.25 201-180v-570h-41v-60h188v-30h264v30h188v60h-41v570q0 24-18 42t-42 18H261Zm438-630H261v570h438v-570ZM367-266h60v-399h-60v399Zm166 0h60v-399h-60v399ZM261-750v570-570Z",
     "refresh": "M480-160q-133 0-226.5-93.5T160-480q0-133 93.5-226.5T480-800q85 0 149 34.5T740-671v-129h60v254H546v-60h168q-38-60-97-97t-137-37q-109 0-184.5 75.5T220-480q0 109 75.5 184.5T480-220q83 0 152-47.5T728-393h62q-29 105-115 169t-195 64Z",
     "archive": "m480-270 156-156-40-40-86 86v-201h-60v201l-86-86-40 40 156 156ZM180-674v494h600v-494H180Zm0 554q-24.75 0-42.37-17.63Q120-155.25 120-180v-529q0-9.88 3-19.06 3-9.18 9-16.94l52-71q8-11 20.94-17.5Q217.88-840 232-840h495q14.12 0 27.06 6.5T775-816l53 71q6 7.76 9 16.94 3 9.18 3 19.06v529q0 24.75-17.62 42.37Q804.75-120 780-120H180Zm17-614h565l-36.41-46H233l-36 46Zm283 307Z",
@@ -1102,6 +1290,9 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "reply": "reply",
     "forward": "forward",
     "reply_all": "reply_all",
+    "filter": "filter_list",
+    "view_table": "view_list",
+    "view_cards": "view_agenda",
     "delete": "delete",
     "refresh": "refresh",
     "open_archive": "archive",
@@ -3611,6 +3802,10 @@ class MainWindow(QMainWindow):
         self._background_workers: list[QThread] = []
         self.filter_column = COL_SUBJECT
         self.marker_filter: str | None = None
+        # Фильтры списка писем (пожелание: "нужна фильтрация по важности,
+        # наличию вложений, маркеру") — маркер выше, остальные два тут.
+        self.filter_important = False
+        self.filter_attachments = False
         self._temp_attachment_dirs: list[Path] = []
         self._base_font_point_size = QApplication.instance().font().pointSizeF() or 10.0
 
@@ -3754,12 +3949,57 @@ class MainWindow(QMainWindow):
             if button is not None:
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
+        # Справа в той же панели — фильтр списка и переключатель режима
+        # отображения (таблица / плитки).
+        spacer = QWidget(self)
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        mail_actions_toolbar.addWidget(spacer)
+        self.filter_button = QToolButton(self)
+        self.filter_button.setText("Фильтр")
+        self.filter_button.setIcon(_toolbar_icon("filter"))
+        self.filter_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.filter_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.filter_button.setMenu(self._build_filter_menu())
+        mail_actions_toolbar.addWidget(self.filter_button)
+        mail_actions_toolbar.addSeparator()
+        view_group = QActionGroup(self)
+        view_group.setExclusive(True)
+        self.view_table_action = QAction(_toolbar_icon("view_table"), "Таблица", self)
+        self.view_table_action.setCheckable(True)
+        self.view_table_action.setToolTip("Список писем таблицей")
+        self.view_cards_action = QAction(_toolbar_icon("view_cards"), "Плитки", self)
+        self.view_cards_action.setCheckable(True)
+        self.view_cards_action.setToolTip("Список писем плитками")
+        for action in (self.view_table_action, self.view_cards_action):
+            view_group.addAction(action)
+            mail_actions_toolbar.addAction(action)
+        self.view_table_action.triggered.connect(lambda: self._set_mail_view_mode("table"))
+        self.view_cards_action.triggered.connect(lambda: self._set_mail_view_mode("cards"))
+
+        # Плитки — второй режим списка (см. _populate_cards и далее).
+        self.card_list = QListWidget(self)
+        self.card_delegate = _MessageCardDelegate(lambda: self.summaries_by_uid, self.card_list)
+        self.card_list.setItemDelegate(self.card_delegate)
+        self.card_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.card_list.setMouseTracking(True)
+        self.card_list.setUniformItemSizes(True)
+        self.card_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.card_list.customContextMenuRequested.connect(self._on_card_context_menu)
+        self.card_list.currentItemChanged.connect(self._on_card_current_changed)
+        self.card_list.itemChanged.connect(self._on_card_item_changed)
+        self.card_list.itemDoubleClicked.connect(self._on_card_double_clicked)
+        self._card_items_by_uid: dict[int, QListWidgetItem] = {}
+        self._syncing_card_selection = False
+        self.mail_view_mode = load_mail_view_mode()
+
         table_container = QWidget(self)
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.addWidget(mail_actions_toolbar)
         table_layout.addWidget(self.filter_edit)
         table_layout.addWidget(self.table)
+        table_layout.addWidget(self.card_list)
+        self._set_mail_view_mode(self.mail_view_mode)
 
         self.attachments_list = QListWidget(self)
         self.attachments_list.setMaximumHeight(110)
@@ -5608,11 +5848,30 @@ class MainWindow(QMainWindow):
             if needle:
                 value = self.table.item(row, self.filter_column).text().lower()
                 visible = needle in value
-            if visible and self.marker_filter is not None:
-                summary = self._summary_for_row(row)
-                marker = summary.marker_color if summary else None
-                visible = marker is not None if self.marker_filter == _ANY_MARKER_FILTER else marker == self.marker_filter
+            summary = self._summary_for_row(row)
+            if visible and summary is not None:
+                visible = self._summary_passes_filters(summary)
             self.table.setRowHidden(row, not visible)
+            if summary is not None:
+                card = self._card_items_by_uid.get(summary.uid)
+                if card is not None:
+                    card.setHidden(not visible)
+
+    def _summary_passes_filters(self, summary: MessageSummary) -> bool:
+        """Фильтры "Важные" / "С вложениями" / маркер (пожелание: "нужна
+        фильтрация по важности, наличию вложений, маркеру"). Маркеров на
+        письме может быть несколько — фильтр по цвету означает "среди них
+        есть этот цвет"."""
+        if self.filter_important and summary.importance != "high":
+            return False
+        if self.filter_attachments and not summary.has_attachments:
+            return False
+        if self.marker_filter is not None:
+            markers = split_markers(summary.marker_color)
+            if self.marker_filter == _ANY_MARKER_FILTER:
+                return bool(markers)
+            return self.marker_filter in markers
+        return True
 
     def _render_folder(self, summaries: list[MessageSummary]) -> None:
         previously_selected_uid = self.selected_summary.uid if self.selected_summary else None
@@ -5663,7 +5922,7 @@ class MainWindow(QMainWindow):
 
             flag_item = self._readonly_item("")
             if summary.marker_color:
-                flag_item.setIcon(_marker_icon(summary.marker_color))
+                flag_item.setIcon(_markers_icon(summary.marker_color))
             self.table.setItem(row, COL_FLAG, flag_item)
 
             self.table.setItem(row, COL_IMPORTANCE, self._readonly_item(_importance_mark(summary.importance)))
@@ -5682,6 +5941,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_SUBJECT, subject_item)
             self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
         self.table.setSortingEnabled(True)
+        self._populate_cards(summaries, is_sent_folder)
 
         self.statusBar().showMessage(f"{self.current_folder}: писем {len(summaries)}", 5000)
         self.on_filter_changed(self.filter_edit.text())
@@ -5703,6 +5963,155 @@ class MainWindow(QMainWindow):
         uid = self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
         return self.summaries_by_uid.get(uid)
 
+    def _row_for_uid(self, uid: int) -> int | None:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, COL_CHECK)
+            if item is not None and item.data(Qt.ItemDataRole.UserRole) == uid:
+                return row
+        return None
+
+    # ---- Плитки (второй режим списка писем) -------------------------------
+    # Договорённость: два режима отображения — таблица (как раньше) и
+    # плитки по дизайн-референсу (аватар с инициалами, две строки, дата и
+    # признаки справа). Таблица остаётся источником правды (чекбоксы для
+    # массовых действий, сортировка, восстановление выделения по uid) — и в
+    # режиме плиток она просто скрыта; плитки показывают те же summaries и
+    # транслируют выбор/галочки/двойной клик/контекстное меню в таблицу по
+    # uid, так что вся остальная логика (чтение письма, удаление, маркеры)
+    # не дублируется.
+
+    def _populate_cards(self, summaries: list[MessageSummary], is_sent_folder: bool) -> None:
+        self.card_delegate.sent_mode = is_sent_folder
+        self.card_list.blockSignals(True)
+        self.card_list.clear()
+        self._card_items_by_uid = {}
+        for summary in summaries:
+            item = QListWidgetItem()
+            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setData(Qt.ItemDataRole.UserRole, summary.uid)
+            self.card_list.addItem(item)
+            self._card_items_by_uid[summary.uid] = item
+        self.card_list.blockSignals(False)
+
+    def _refresh_cards(self) -> None:
+        self.card_list.viewport().update()
+
+    def _on_card_current_changed(self, current: QListWidgetItem | None, _previous: QListWidgetItem | None) -> None:
+        if current is None or self._syncing_card_selection:
+            return
+        row = self._row_for_uid(current.data(Qt.ItemDataRole.UserRole))
+        if row is None:
+            return
+        self._syncing_card_selection = True
+        try:
+            self.table.selectRow(row)  # дальше — обычный on_message_selected
+        finally:
+            self._syncing_card_selection = False
+
+    def _sync_card_selection(self, uid: int) -> None:
+        item = self._card_items_by_uid.get(uid)
+        if item is None or self._syncing_card_selection:
+            return
+        self._syncing_card_selection = True
+        try:
+            self.card_list.setCurrentItem(item)
+        finally:
+            self._syncing_card_selection = False
+
+    def _on_card_item_changed(self, item: QListWidgetItem) -> None:
+        # Галочка на плитке = галочка в таблице (источник правды для
+        # _checked_uids — удаление/архив отмеченных).
+        row = self._row_for_uid(item.data(Qt.ItemDataRole.UserRole))
+        if row is None:
+            return
+        check_item = self.table.item(row, COL_CHECK)
+        if check_item is not None and check_item.checkState() != item.checkState():
+            check_item.setCheckState(item.checkState())
+
+    def _on_card_double_clicked(self, item: QListWidgetItem) -> None:
+        row = self._row_for_uid(item.data(Qt.ItemDataRole.UserRole))
+        if row is None:
+            return
+        table_item = self.table.item(row, COL_SUBJECT)
+        if table_item is not None:
+            self.on_table_item_double_clicked(table_item)
+
+    def _on_card_context_menu(self, pos) -> None:
+        item = self.card_list.itemAt(pos)
+        if item is None:
+            return
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        row = self._row_for_uid(uid)
+        summary = self.summaries_by_uid.get(uid)
+        if row is None or summary is None:
+            return
+        self._show_message_context_menu(summary, row, self.card_list.mapToGlobal(pos), with_marker=True)
+
+    def _set_mail_view_mode(self, mode: str) -> None:
+        self.mail_view_mode = mode
+        is_cards = mode == "cards"
+        self.table.setVisible(not is_cards)
+        self.card_list.setVisible(is_cards)
+        self.view_table_action.setChecked(not is_cards)
+        self.view_cards_action.setChecked(is_cards)
+        try:
+            save_mail_view_mode(mode)
+        except Exception:
+            pass  # режим не запомнится между запусками — не критично
+        if is_cards and self.selected_summary is not None:
+            self._sync_card_selection(self.selected_summary.uid)
+
+    # ---- Фильтр списка (важные / вложения / маркер) ------------------------
+
+    def _build_filter_menu(self) -> QMenu:
+        menu = QMenu(self)
+        self.filter_important_action = menu.addAction("Только важные")
+        self.filter_important_action.setCheckable(True)
+        self.filter_important_action.toggled.connect(self._on_simple_filter_toggled)
+        self.filter_attachments_action = menu.addAction("Только с вложениями")
+        self.filter_attachments_action.setCheckable(True)
+        self.filter_attachments_action.toggled.connect(self._on_simple_filter_toggled)
+        menu.addSeparator()
+        marker_group = QActionGroup(self)
+        marker_group.setExclusive(True)
+        self._marker_filter_actions: dict[QAction, str | None] = {}
+        for value, label in ((None, "Маркер: любые письма"), (_ANY_MARKER_FILTER, "С любым маркером")):
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            marker_group.addAction(action)
+            self._marker_filter_actions[action] = value
+        for color, label in _MARKER_LABELS.items():
+            action = menu.addAction(_marker_icon(color), label)
+            action.setCheckable(True)
+            marker_group.addAction(action)
+            self._marker_filter_actions[action] = color
+        marker_group.triggered.connect(self._on_marker_filter_action)
+        menu.aboutToShow.connect(self._sync_filter_menu)
+        return menu
+
+    def _sync_filter_menu(self) -> None:
+        self.filter_important_action.setChecked(self.filter_important)
+        self.filter_attachments_action.setChecked(self.filter_attachments)
+        for action, value in self._marker_filter_actions.items():
+            action.setChecked(value == self.marker_filter)
+
+    def _on_simple_filter_toggled(self, _checked: bool) -> None:
+        self.filter_important = self.filter_important_action.isChecked()
+        self.filter_attachments = self.filter_attachments_action.isChecked()
+        self._update_filter_button_indicator()
+        self.on_filter_changed(self.filter_edit.text())
+
+    def _on_marker_filter_action(self, action: QAction) -> None:
+        self.marker_filter = self._marker_filter_actions.get(action)
+        self._update_marker_filter_indicator()
+        self._update_filter_button_indicator()
+        self.on_filter_changed(self.filter_edit.text())
+
+    def _update_filter_button_indicator(self) -> None:
+        active = self.filter_important or self.filter_attachments or self.marker_filter is not None
+        self.filter_button.setText("Фильтр •" if active else "Фильтр")
+
     def on_mail_table_context_menu(self, pos) -> None:
         item = self.table.itemAt(pos)
         if item is None:
@@ -5710,10 +6119,16 @@ class MainWindow(QMainWindow):
         summary = self._summary_for_row(item.row())
         if summary is None:
             return
+        self._show_message_context_menu(summary, item.row(), self.table.mapToGlobal(pos), with_marker=False)
+
+    def _show_message_context_menu(self, summary: MessageSummary, row: int, global_pos, *, with_marker: bool) -> None:
+        # Общее меню для таблицы и плиток; в плитках нет колонки маркера,
+        # поэтому там маркер — пунктом меню.
         menu = QMenu(self)
         toggle_read_action = menu.addAction(
             "Отметить как непрочитанное" if summary.is_read else "Отметить как прочитанное"
         )
+        marker_action = menu.addAction("Маркер…") if with_marker else None
         restore_action = None
         in_trash = (
             self.active_source is self.mailbox
@@ -5724,10 +6139,13 @@ class MainWindow(QMainWindow):
             restore_action = menu.addAction("Восстановить из корзины")
         menu.addSeparator()
         add_contact_action = menu.addAction("Добавить отправителя в контакты…")
-        chosen = menu.exec(self.table.mapToGlobal(pos))
+        chosen = menu.exec(global_pos)
 
         if chosen is toggle_read_action:
-            self._set_message_read(item.row(), summary, not summary.is_read)
+            self._set_message_read(row, summary, not summary.is_read)
+            return
+        if marker_action is not None and chosen is marker_action:
+            self._open_marker_menu(summary, row)
             return
         if restore_action is not None and chosen is restore_action:
             self.on_restore_from_trash()
@@ -5763,7 +6181,7 @@ class MainWindow(QMainWindow):
         summary = self._summary_for_row(item.row())
         if summary is None:
             return
-        self._open_marker_menu(item, summary)
+        self._open_marker_menu(summary, item.row())
 
     def on_table_item_double_clicked(self, item: QTableWidgetItem) -> None:
         if not self.active_source or not self.current_folder:
@@ -5810,30 +6228,44 @@ class MainWindow(QMainWindow):
 
         self._open_message_window(summary, content)
 
-    def _open_marker_menu(self, item: QTableWidgetItem, summary: MessageSummary) -> None:
+    def _open_marker_menu(self, summary: MessageSummary, row: int) -> None:
+        # Пожелание: "на письмо можно поставить несколько маркеров" — пункты
+        # меню с галочками, клик переключает один цвет, остальные остаются.
         menu = QMenu(self)
         none_action = menu.addAction("Без маркера")
         menu.addSeparator()
+        current = split_markers(summary.marker_color)
         action_colors: dict[QAction, str] = {}
         for color, label in _MARKER_LABELS.items():
             action = menu.addAction(_marker_icon(color), label)
+            action.setCheckable(True)
+            action.setChecked(color in current)
             action_colors[action] = color
 
         chosen = menu.exec(QCursor.pos())
         if chosen is None:
             return
-        new_color = None if chosen is none_action else action_colors[chosen]
+        if chosen is none_action:
+            new_value = None
+        else:
+            toggled = action_colors[chosen]
+            colors = [c for c in current if c != toggled] if toggled in current else [*current, toggled]
+            new_value = join_markers(colors)
 
         try:
             self.active_source.set_marker(
-                self.current_folder, summary.uid, new_color, previous_color=summary.marker_color
+                self.current_folder, summary.uid, new_value, previous_color=summary.marker_color
             )
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось изменить маркер", str(exc))
             return
 
-        summary.marker_color = new_color
-        item.setIcon(_marker_icon(new_color) if new_color else QIcon())
+        summary.marker_color = new_value
+        flag_item = self.table.item(row, COL_FLAG)
+        if flag_item is not None:
+            flag_item.setIcon(_markers_icon(new_value))
+        self._refresh_cards()
+        self.on_filter_changed(self.filter_edit.text())
 
     def _checked_uids(self) -> list[int]:
         checked = [
@@ -5952,6 +6384,7 @@ class MainWindow(QMainWindow):
         if summary is None:
             return
         self.selected_summary = summary
+        self._sync_card_selection(summary.uid)
         self.current_invite = None
         self.invite_bar.hide()
 
@@ -6192,6 +6625,7 @@ class MainWindow(QMainWindow):
             font = item.font()
             font.setBold(not read)
             item.setFont(font)
+        self._refresh_cards()
 
     def _mark_summary_answered(self, source: object, folder: str, uid: int) -> None:
         """Ставит \\Answered на письмо, на которое только что отправлен
@@ -6210,6 +6644,7 @@ class MainWindow(QMainWindow):
                 item = self.table.item(row, COL_SUBJECT)
                 if item is not None:
                     item.setText(_subject_display_text(summary))
+                self._refresh_cards()
                 break
 
     def _update_invite_bar(self, content: MessageContent) -> None:
