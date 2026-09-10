@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        59%{?dist}
+Release:        60%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-60
+- IMAP: команды по очереди (блокировка сессии) и таймаут сокета - зависание на «Загрузка…» при переходе между письмами
+- Отметки «прочитано»/«отвечено» уходят на сервер в фоне, не блокируя интерфейс
 * Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-59
 - Два режима списка писем: таблица и плитки (аватар, две строки), переключатель на панели, режим запоминается
 - Фильтр списка: только важные, только с вложениями, по маркеру (любой/цвет)
