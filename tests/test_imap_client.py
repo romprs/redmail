@@ -68,7 +68,9 @@ def test_session_with_kerberos_auth_type_uses_gssapi_sasl_not_password(monkeypat
         ImapSession(account)
 
     fake_client.login.assert_not_called()
-    fake_gssapi_sasl.imap_sasl_login.assert_called_once_with(fake_client, "imap.corp.local", "ivan")
+    fake_gssapi_sasl.imap_sasl_login.assert_called_once_with(
+        fake_client, "imap.corp.local", "ivan", keytab_path="", principal=""
+    )
 
 
 def test_fetch_folder_summaries_always_reselects_for_fresh_exists() -> None:

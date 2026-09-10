@@ -630,10 +630,13 @@ class MessageWindow(QWidget):
         # может быть вовсе не тем, что сейчас выделено в основном списке.
         reply_button = QPushButton("Ответить", self)
         reply_button.clicked.connect(self._on_reply)
+        reply_all_button = QPushButton("Ответить всем", self)
+        reply_all_button.clicked.connect(self._on_reply_all)
         forward_button = QPushButton("Переслать", self)
         forward_button.clicked.connect(self._on_forward)
         button_row = QHBoxLayout()
         button_row.addWidget(reply_button)
+        button_row.addWidget(reply_all_button)
         button_row.addWidget(forward_button)
         button_row.addStretch(1)
 
@@ -649,6 +652,11 @@ class MessageWindow(QWidget):
         main_window = self.parent()
         if main_window is not None:
             main_window._start_reply(self._summary, self._content.text)
+
+    def _on_reply_all(self) -> None:
+        main_window = self.parent()
+        if main_window is not None:
+            main_window._start_reply(self._summary, self._content.text, content=self._content, reply_all=True)
 
     def _on_forward(self) -> None:
         main_window = self.parent()
@@ -845,8 +853,17 @@ class ContactPickerDialog(QDialog):
 
         self.list_widget = QListWidget(self)
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        # Жалоба: "нельзя выбрать сразу несколько" — множественный выбор
+        # был, но только через Ctrl/Shift, о чём никто не догадывался.
+        # Галочки очевидны и, в отличие от выделения, переживают фильтрацию
+        # списка (выделение скрытых строк Qt сбрасывает, отмеченные
+        # галочки — нет).
         for candidate in _contact_candidates(contacts):
-            self.list_widget.addItem(candidate)
+            item = QListWidgetItem(candidate)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.list_widget.addItem(item)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -866,7 +883,14 @@ class ContactPickerDialog(QDialog):
             item.setHidden(bool(needle) and needle not in item.text().lower())
 
     def selected_candidates(self) -> list[str]:
-        return [item.text() for item in self.list_widget.selectedItems()]
+        # Галочки + текущее выделение: одиночный клик по строке (без
+        # галочки) по-прежнему считается выбором, как и раньше.
+        picked: list[str] = []
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.checkState() == Qt.CheckState.Checked or item.isSelected():
+                picked.append(item.text())
+        return picked
 
 
 def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_store.Contact]) -> None:
@@ -1048,6 +1072,7 @@ _MATERIAL_ICON_PATHS: dict[str, str] = {
     "edit": "M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z",
     "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
     "forward": "m644-288-43-43 193-193-193-193 43-43 236 236-236 236ZM81-200v-156q0-85 56.5-141.5T279-554h305L421-717l43-43 236 236-236 236-43-43 163-163H279q-60 0-99 39t-39 99v156H81Z",
+    "reply_all": "M316-288 80-524l236-236 43 43-193 193 193 193-43 43Zm503 88v-156q0-60-39-99t-99-39H376l163 163-43 43-236-236 236-236 43 43-163 163h305q85 0 141.5 56.5T879-356v156h-60Z",
     "delete": "M261-120q-24.75 0-42.37-17.63Q201-155.25 201-180v-570h-41v-60h188v-30h264v30h188v60h-41v570q0 24-18 42t-42 18H261Zm438-630H261v570h438v-570ZM367-266h60v-399h-60v399Zm166 0h60v-399h-60v399ZM261-750v570-570Z",
     "refresh": "M480-160q-133 0-226.5-93.5T160-480q0-133 93.5-226.5T480-800q85 0 149 34.5T740-671v-129h60v254H546v-60h168q-38-60-97-97t-137-37q-109 0-184.5 75.5T220-480q0 109 75.5 184.5T480-220q83 0 152-47.5T728-393h62q-29 105-115 169t-195 64Z",
     "archive": "m480-270 156-156-40-40-86 86v-201h-60v201l-86-86-40 40 156 156ZM180-674v494h600v-494H180Zm0 554q-24.75 0-42.37-17.63Q120-155.25 120-180v-529q0-9.88 3-19.06 3-9.18 9-16.94l52-71q8-11 20.94-17.5Q217.88-840 232-840h495q14.12 0 27.06 6.5T775-816l53 71q6 7.76 9 16.94 3 9.18 3 19.06v529q0 24.75-17.62 42.37Q804.75-120 780-120H180Zm17-614h565l-36.41-46H233l-36 46Zm283 307Z",
@@ -1076,6 +1101,7 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "compose": "edit",
     "reply": "reply",
     "forward": "forward",
+    "reply_all": "reply_all",
     "delete": "delete",
     "refresh": "refresh",
     "open_archive": "archive",
@@ -1214,6 +1240,21 @@ class SettingsDialog(QDialog):
         )
         self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
 
+        # Keytab — необязательный источник Kerberos-билета для SSO: без него
+        # берётся билет, уже полученный ОС при входе в домен (SSSD); с ним
+        # билет получается прямо из файла ключа для указанного principal —
+        # для машин вне домена или служебных учёток (пожелание: "адаптируй
+        # подключение под использование keytab").
+        self.keytab_edit = QLineEdit(getattr(account, "keytab_path", "") if account else "")
+        self.keytab_edit.setPlaceholderText("Необязательно: /etc/redmail/user.keytab")
+        self.keytab_browse_button = QPushButton("Обзор…")
+        self.keytab_browse_button.clicked.connect(self._on_browse_keytab)
+        keytab_row = QHBoxLayout()
+        keytab_row.addWidget(self.keytab_edit, 1)
+        keytab_row.addWidget(self.keytab_browse_button)
+        self.principal_edit = QLineEdit(getattr(account, "principal", "") if account else "")
+        self.principal_edit.setPlaceholderText("Необязательно: user@REALM.RU (по умолчанию — из билета/keytab)")
+
         self.imap_test_button = QPushButton("Проверить подключение")
         self.imap_test_button.clicked.connect(self._on_test_imap)
         self.imap_test_status = QLabel("")
@@ -1226,6 +1267,8 @@ class SettingsDialog(QDialog):
         imap_form.addRow("Способ входа", self.auth_combo)
         imap_form.addRow("Логин", self.user_edit)
         imap_form.addRow("Пароль", self.password_edit)
+        imap_form.addRow("Keytab (SSO)", keytab_row)
+        imap_form.addRow("Principal (SSO)", self.principal_edit)
         imap_form.addRow(self.ssl_check)
         imap_form.addRow(self.imap_test_button)
         imap_form.addRow(self.imap_test_status)
@@ -1335,7 +1378,16 @@ class SettingsDialog(QDialog):
         self._update_password_enabled()
 
     def _update_password_enabled(self) -> None:
-        self.password_edit.setEnabled(self.auth_combo.currentData() != "kerberos")
+        is_kerberos = self.auth_combo.currentData() == "kerberos"
+        self.password_edit.setEnabled(not is_kerberos)
+        self.keytab_edit.setEnabled(is_kerberos)
+        self.keytab_browse_button.setEnabled(is_kerberos)
+        self.principal_edit.setEnabled(is_kerberos)
+
+    def _on_browse_keytab(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Файл keytab", filter="Keytab (*.keytab);;Все файлы (*)")
+        if path:
+            self.keytab_edit.setText(path)
 
     def _on_test_imap(self) -> None:
         account = self.account()
@@ -1431,6 +1483,8 @@ class SettingsDialog(QDialog):
             port=self.port_edit.value(),
             use_ssl=self.ssl_check.isChecked(),
             auth_type=auth_type,
+            keytab_path=self.keytab_edit.text().strip() if auth_type == "kerberos" else "",
+            principal=self.principal_edit.text().strip() if auth_type == "kerberos" else "",
         )
 
     def smtp_account(self) -> SmtpAccount:
@@ -1442,6 +1496,8 @@ class SettingsDialog(QDialog):
             port=self.smtp_port_edit.value(),
             use_ssl=self.smtp_ssl_check.isChecked(),
             auth_type=auth_type,
+            keytab_path=self.keytab_edit.text().strip() if auth_type == "kerberos" else "",
+            principal=self.principal_edit.text().strip() if auth_type == "kerberos" else "",
         )
 
     def poll_interval_minutes(self) -> int:
@@ -3656,6 +3712,10 @@ class MainWindow(QMainWindow):
         self.reply_action = QAction(_toolbar_icon("reply"), "Ответить", self)
         self.reply_action.triggered.connect(self.on_reply)
 
+        self.reply_all_action = QAction(_toolbar_icon("reply_all"), "Ответить всем", self)
+        self.reply_all_action.setToolTip("Ответить всем — отправителю и всем получателям письма")
+        self.reply_all_action.triggered.connect(self.on_reply_all)
+
         self.forward_action = QAction(_toolbar_icon("forward"), "Переслать", self)
         self.forward_action.triggered.connect(self.on_forward)
 
@@ -3669,14 +3729,27 @@ class MainWindow(QMainWindow):
 
         mail_actions_toolbar = QToolBar("Письмо", self)
         mail_actions_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        for action in (compose_action, self.reply_action, self.forward_action, self.delete_action, self.archive_selected_action):
+        for action in (
+            compose_action,
+            self.reply_action,
+            self.reply_all_action,
+            self.forward_action,
+            self.delete_action,
+            self.archive_selected_action,
+        ):
             mail_actions_toolbar.addAction(action)
         # Написать/Ответить/Переслать/Удалить — с подписью рядом с иконкой
         # (по референсу пользователя), а не только иконка. Остальные
         # действия в этой панели (В архив и то, что добавляется ниже —
         # Обновить/В архив.../Импорт...) остаются только иконкой — тем же
         # способом экономии места, что и раньше.
-        for labelled_action in (compose_action, self.reply_action, self.forward_action, self.delete_action):
+        for labelled_action in (
+            compose_action,
+            self.reply_action,
+            self.reply_all_action,
+            self.forward_action,
+            self.delete_action,
+        ):
             button = mail_actions_toolbar.widgetForAction(labelled_action)
             if button is not None:
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -6268,6 +6341,7 @@ class MainWindow(QMainWindow):
         is_mail_page = self.pages.currentIndex() == 0
         for action in (
             self.reply_action,
+            self.reply_all_action,
             self.forward_action,
             self.delete_action,
             self.archive_selected_action,
@@ -7265,7 +7339,20 @@ class MainWindow(QMainWindow):
             return
         self._start_reply(self.selected_summary, self.current_body)
 
-    def _start_reply(self, summary: MessageSummary, body_text: str) -> None:
+    def on_reply_all(self) -> None:
+        if not self.selected_summary:
+            QMessageBox.warning(self, "Нет письма", "Выберите письмо, на которое хотите ответить.")
+            return
+        self._start_reply(self.selected_summary, self.current_body, content=self.current_content, reply_all=True)
+
+    def _start_reply(
+        self,
+        summary: MessageSummary,
+        body_text: str,
+        *,
+        content: MessageContent | None = None,
+        reply_all: bool = False,
+    ) -> None:
         # Вынесено из on_reply() отдельно — тем же путём пользуется кнопка
         # "Ответить" в окне отдельно открытого письма (MessageWindow),
         # где нет self.selected_summary/self.current_body (жалоба: "при
@@ -7282,10 +7369,25 @@ class MainWindow(QMainWindow):
         quoted = "\n".join(f"> {line}" for line in body_text.splitlines())
         body = f"\n\n{quote_header}\n{quoted}"
 
+        # Жалоба: "нельзя ответить всем участникам переписки, только
+        # первому" — "Ответить всем": отправитель + все из "Кому" в поле
+        # "Кому", все из "Копия" — в "Копия"; себя и дубли убираем.
+        to_list = [summary.sender_email] if summary.sender_email else []
+        cc_list: list[str] = []
+        if reply_all and content is not None:
+            skip = {addr.lower() for addr in (summary.sender_email, self.account.username if self.account else "") if addr}
+
+            def others(value: str) -> list[str]:
+                return [addr for _name, addr in getaddresses([value or ""]) if addr and addr.lower() not in skip]
+
+            to_list += others(content.to)
+            cc_list = [addr for addr in others(content.cc) if addr.lower() not in {a.lower() for a in to_list}]
+
         dialog = ComposeDialog(
             self,
-            title="Ответить",
-            to=summary.sender_email,
+            title="Ответить всем" if reply_all else "Ответить",
+            to=", ".join(dict.fromkeys(to_list)),
+            cc=", ".join(dict.fromkeys(cc_list)),
             subject=subject,
             body=body,
             contacts=self._load_contacts(),

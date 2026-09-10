@@ -38,6 +38,9 @@ class SmtpAccount:
     # "password" — обычный AUTH LOGIN/PLAIN; "kerberos" — SSO для сервера в
     # домене, см. Account.auth_type в imap_client.py и gssapi_sasl.py.
     auth_type: str = "password"
+    # См. Account.keytab_path/principal — тот же необязательный keytab.
+    keytab_path: str = ""
+    principal: str = ""
 
 
 @dataclass
@@ -146,7 +149,13 @@ def _connect_and_authenticate(account: SmtpAccount) -> smtplib.SMTP:
         # где нет системных библиотек Kerberos.
         from redmail import gssapi_sasl
 
-        gssapi_sasl.smtp_sasl_login(client, account.host, account.username)
+        gssapi_sasl.smtp_sasl_login(
+            client,
+            account.host,
+            account.username,
+            keytab_path=account.keytab_path,
+            principal=account.principal,
+        )
     else:
         client.login(account.username, account.password)
     return client

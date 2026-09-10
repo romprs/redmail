@@ -55,11 +55,19 @@ def test_session_kerberos_uses_spnego_auth_and_plain_requests_session(monkeypatc
 
     import requests
 
+    import redmail
+
     fake_gssapi = MagicMock()
     fake_gssapi.OPTIONAL = 2
     fake_auth = MagicMock()
     fake_gssapi.HTTPSPNEGOAuth.return_value = fake_auth
     monkeypatch.setitem(sys.modules, "requests_gssapi", fake_gssapi)
+    # redmail.gssapi_sasl сам импортирует gssapi на уровне модуля —
+    # подменяем целиком (см. test_smtp_client.py), keytab не задан → None.
+    fake_gssapi_sasl = MagicMock()
+    fake_gssapi_sasl.acquire_credentials.return_value = None
+    monkeypatch.setattr(redmail, "gssapi_sasl", fake_gssapi_sasl, raising=False)
+    monkeypatch.setitem(sys.modules, "redmail.gssapi_sasl", fake_gssapi_sasl)
 
     fake_client = MagicMock()
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client) as client_cls:
@@ -67,7 +75,8 @@ def test_session_kerberos_uses_spnego_auth_and_plain_requests_session(monkeypatc
             CalDavAccount(url="https://calendar.corp.local/", username="ivan@corp.local", password="", auth_type="kerberos")
         )
 
-    fake_gssapi.HTTPSPNEGOAuth.assert_called_once_with(mutual_authentication=2)
+    fake_gssapi_sasl.acquire_credentials.assert_called_once_with("", "")
+    fake_gssapi.HTTPSPNEGOAuth.assert_called_once_with(mutual_authentication=2, creds=None)
     client_cls.assert_called_once_with(
         "https://calendar.corp.local/", timeout=30, headers={"User-Agent": "redmail-caldav-client/1.0"}, auth=fake_auth
     )

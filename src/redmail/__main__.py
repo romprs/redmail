@@ -10,7 +10,6 @@ from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from redmail import config_store
 from redmail.ui import theme
-from redmail.ui.main_window import MainWindow
 
 _SPLASH_SIZE = (420, 240)
 _SPLASH_BG = "#1a73e8"
@@ -43,7 +42,7 @@ def app_version() -> str:
         return "?"
 
 
-def build_splash_pixmap() -> QPixmap:
+def build_splash_pixmap(version: str) -> QPixmap:
     """Заставка при запуске (жалоба: "открывай сразу информационное окно
     до открытия основного окна... название, автора и ход загрузки") —
     название/версия/автор совпадают с тем, что уже показывает "О
@@ -66,7 +65,7 @@ def build_splash_pixmap() -> QPixmap:
     painter.setFont(text_font)
     lines = (
         "Почтовый клиент для RED OS",
-        f"Версия {app_version()}",
+        f"Версия {version}",
         "Автор: Пономарев Роман Сергеевич",
     )
     for i, line in enumerate(lines):
@@ -82,16 +81,21 @@ def build_splash_pixmap() -> QPixmap:
 def main() -> int:
     app = QApplication(sys.argv)
 
-    splash = QSplashScreen(build_splash_pixmap())
+    # Жалоба (и после первой правки с repaint()): "информационное окно
+    # выводится не сразу, долго висит, потом появляется, и практически
+    # мгновенно открывается окно приложения" — то есть задержка была ДО
+    # показа заставки, а не после. Две причины: (1) `from
+    # redmail.ui.main_window import MainWindow` стоял на уровне модуля и
+    # тянул за собой PySide6.QtWebEngine* — инициализация Chromium занимает
+    # секунды ещё до входа в main(); теперь импорт отложен и сам является
+    # шагом "Загрузка интерфейса…" уже при видимой заставке; (2)
+    # app_version() запускает `rpm -q` (до 2 с на медленной VM) — тоже до
+    # показа. Заставка показывается сразу с версией "…", версия
+    # дорисовывается следом. repaint() — синхронная перерисовка: одного
+    # processEvents() недостаточно, чтобы окно гарантированно оказалось
+    # на экране до долгой блокировки потока (особенно X11 без композитора).
+    splash = QSplashScreen(build_splash_pixmap("…"))
     splash.show()
-    # Жалоба: "информационное окно выводится не сразу и иногда не успевает
-    # отрисоваться вообще" — processEvents() сам по себе лишь разбирает уже
-    # накопившуюся очередь событий, а не гарантирует, что отложенное окно
-    # успело быть замаплено/отрисовано оконным менеджером именно к этому
-    # моменту (особенно на X11 без композитора). repaint() — синхронная
-    # немедленная перерисовка виджета, без ожидания цикла событий, поэтому
-    # заставка гарантированно на экране ДО того, как MainWindow() ниже
-    # надолго заблокирует поток своей инициализацией.
     splash.repaint()
     app.processEvents()
 
@@ -102,10 +106,13 @@ def main() -> int:
         splash.repaint()
         app.processEvents()
 
+    splash.setPixmap(build_splash_pixmap(app_version()))
     report("Применение темы оформления…")
     theme.apply_theme(app, config_store.load_theme())
 
     report("Загрузка интерфейса…")
+    from redmail.ui.main_window import MainWindow
+
     window = MainWindow()
 
     report("Готово")

@@ -41,6 +41,22 @@ class CachedMailbox:
             if cached:
                 return cached[:limit]
         summaries = self.session.fetch_summaries(limit)
+        # Жалоба: "не сохраняется проставленный маркер, через какое-то время
+        # пропадает" — сервер (VK Mail) не хранит наши цветные keyword-флаги,
+        # только стандартный \Flagged. Сервер — источник правды о том, ЕСТЬ
+        # ли маркер (\Flagged: снят в другом клиенте — снят и здесь), а
+        # КАКОГО он цвета — помнит локальный кэш (set_marker пишет туда при
+        # каждой смене). Без этого шага save_folder_summaries затирал бы
+        # цвет из кэша серверным "красный по умолчанию" при каждом
+        # обновлении (см. imap_client._to_summary).
+        cached_colors = {
+            s.uid: s.marker_color
+            for s in cache_store.get_folder_summaries(self._account_key, folder)
+            if s.marker_color
+        }
+        for summary in summaries:
+            if summary.marker_color is not None and summary.uid in cached_colors:
+                summary.marker_color = cached_colors[summary.uid]
         cache_store.save_folder_summaries(self._account_key, folder, total, summaries)
         return summaries
 

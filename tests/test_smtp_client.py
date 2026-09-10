@@ -82,7 +82,9 @@ def test_send_message_kerberos_auth_uses_gssapi_sasl_not_password(monkeypatch) -
         send_message(account, message)
 
     fake_client.login.assert_not_called()
-    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(fake_client, "smtp.corp.local", "ivan")
+    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(
+        fake_client, "smtp.corp.local", "ivan", keytab_path="", principal=""
+    )
     fake_client.send_message.assert_called_once()
 
 
@@ -116,7 +118,9 @@ def test_test_connection_kerberos_uses_gssapi_sasl(monkeypatch) -> None:
         smtp_test_connection(account)
 
     fake_client.login.assert_not_called()
-    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(fake_client, "smtp.corp.local", "ivan")
+    fake_gssapi_sasl.smtp_sasl_login.assert_called_once_with(
+        fake_client, "smtp.corp.local", "ivan", keytab_path="", principal=""
+    )
     fake_client.send_message.assert_not_called()
 
 

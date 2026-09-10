@@ -73,6 +73,10 @@ class CalDavAccount:
     # тогда app-пароль (который VK для сторонних клиентов требует и порой
     # капризно: "Application password is REQUIRED") не нужен вовсе.
     auth_type: str = "password"
+    # См. imap_client.Account.keytab_path/principal — тот же необязательный
+    # keytab как источник билета для SSO.
+    keytab_path: str = ""
+    principal: str = ""
 
 
 class CalDavSyncError(Exception):
@@ -136,6 +140,16 @@ class CalDavCalendarInfo:
     read_only: bool
 
 
+_CALDAV_CALENDAR_TAG = "{urn:ietf:params:xml:ns:caldav}calendar"
+_CALDAV_HOME_SET_PROP = "{urn:ietf:params:xml:ns:caldav}calendar-home-set"
+_CALENDAR_DISCOVERY_PROPS = [
+    "{DAV:}resourcetype",
+    "{DAV:}displayname",
+    "{DAV:}owner",
+    "{DAV:}current-user-privilege-set",
+]
+
+
 def _href_path(href: str) -> str:
     """Путь без схемы/хоста и завершающего слэша — owner может прийти и
     абсолютным URL, и просто путём, сравнивать нужно только путь."""
@@ -191,28 +205,38 @@ class CalDavSession:
                 # этого ломаться не должен.
                 import requests_gssapi
 
+                from redmail import gssapi_sasl
+
                 # mutual_authentication=OPTIONAL, а не REQUIRED по умолчанию:
                 # за корпоративным reverse-proxy/балансировщиком ответ сервера
                 # часто приходит без встречного GSSAPI-токена, и строгая
                 # взаимная проверка роняла бы уже успешно прошедший вход.
+                # creds=None — билет из системного кэша; с keytab — из него.
                 client_kwargs["auth"] = requests_gssapi.HTTPSPNEGOAuth(
-                    mutual_authentication=requests_gssapi.OPTIONAL
+                    mutual_authentication=requests_gssapi.OPTIONAL,
+                    creds=gssapi_sasl.acquire_credentials(account.keytab_path, account.principal),
                 )
             else:
                 client_kwargs["username"] = account.username
                 client_kwargs["password"] = account.password
             self._client = caldav.DAVClient(account.url, **client_kwargs)
-            if account.auth_type == "kerberos":
-                # caldav при наличии niquests берёт его вместо requests, а
-                # HTTPSPNEGOAuth написан под настоящий requests (хук на 401 с
-                # повторной отправкой через r.connection/r.request.copy()) —
-                # подменяем сессию клиента на обычный requests.Session, с
-                # которым эта связка документирована и отлажена.
-                try:
-                    self._client.session.close()
-                except Exception:
-                    pass
-                self._client.session = requests.Session()
+            # Всегда обычный requests.Session вместо того, что выбрал caldav:
+            # при наличии niquests он берёт его, а niquests по умолчанию
+            # договаривается об HTTP/2 через ALPN. Жалоба (и после смены
+            # User-Agent, и после прямого URL календаря): чтение работает,
+            # а PUT события рвётся "Remote end closed connection without
+            # response" — при этом Evolution (libsoup, HTTP/1.1) на том же
+            # сервере события создаёт. Обрыв запроса с телом без единого
+            # байта ответа при рабочих запросах без тела — характерный
+            # симптом прокси/балансировщика с неполной поддержкой HTTP/2
+            # для методов с телом; обычный requests ходит по HTTP/1.1, как
+            # Evolution. Заодно с ним документирована и отлажена связка с
+            # HTTPSPNEGOAuth (хук на 401 через r.connection/r.request.copy()).
+            try:
+                self._client.session.close()
+            except Exception:
+                pass
+            self._client.session = requests.Session()
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось создать CalDAV-соединение: {exc}") from exc
         self._calendar = None
@@ -243,24 +267,24 @@ class CalDavSession:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
 
     def list_calendars_detailed(self) -> list[CalDavCalendarInfo]:
-        """Все календари в calendar-home-set, включая те, что расшарены нам
-        коллегами (не только собственные) — owner коллекции указывает на
-        ЧУЖОЙ принципал, если это так. См. CalDavCalendarInfo — задача
-        "настроить получение расшаренных календарей для VK Mail"."""
+        """Все календари, включая расшаренные нам коллегами (не только
+        собственные) — owner коллекции указывает на ЧУЖОЙ принципал, если
+        это так. См. CalDavCalendarInfo — задача "настроить получение
+        расшаренных календарей для VK Mail".
+
+        Жалоба после первой версии: "поиск находит основной, но не находит
+        расшаренный другого пользователя", при том что Evolution на том же
+        сервере его видит. Два отличия от простого PROPFIND Depth:1 по
+        одному calendar-home-set, которые Evolution (e-webdav-discover)
+        делает, а первая версия — нет: (1) calendar-home-set у принципала
+        может содержать НЕСКОЛЬКО href (свои календари в одном доме, чужие
+        расшаренные — в другом), caldav-библиотека берёт только первый;
+        (2) внутри дома могут лежать обычные под-коллекции (например,
+        shared/), в которых уже лежат календари — Depth:1 их не видит,
+        Evolution в такие коллекции спускается."""
         try:
             principal = self._client.principal()
-            home_url = str(principal.calendar_home_set.url)
-            response = _with_connection_retry(
-                self._client.propfind,
-                home_url,
-                [
-                    "{DAV:}resourcetype",
-                    "{DAV:}displayname",
-                    "{DAV:}owner",
-                    "{DAV:}current-user-privilege-set",
-                ],
-                1,
-            )
+            home_urls = self._calendar_home_urls(principal)
         except AuthorizationError as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
@@ -268,26 +292,71 @@ class CalDavSession:
 
         my_principal_path = _href_path(str(principal.url))
         infos: list[CalDavCalendarInfo] = []
+        seen: set[str] = set()
+        for home_url in home_urls:
+            self._collect_calendars(home_url, my_principal_path, infos, seen, depth_left=2)
+        return infos
+
+    def _calendar_home_urls(self, principal) -> list[str]:
+        """Все href из calendar-home-set принципала (не только первый)."""
+        urls: list[str] = []
+        try:
+            response = _with_connection_retry(
+                self._client.propfind, str(principal.url), [_CALDAV_HOME_SET_PROP], 0
+            )
+            for result in response.results:
+                value = result.properties.get(_CALDAV_HOME_SET_PROP)
+                hrefs = value if isinstance(value, list) else [value]
+                for href in hrefs:
+                    if isinstance(href, str) and href:
+                        urls.append(str(self._client.url.join(href)))
+        except Exception:
+            pass  # ниже — обычный путь библиотеки, как раньше
+        if not urls:
+            urls.append(str(principal.calendar_home_set.url))
+        return urls
+
+    def _collect_calendars(
+        self, url: str, my_principal_path: str, infos: list[CalDavCalendarInfo], seen: set[str], depth_left: int
+    ) -> None:
+        try:
+            response = _with_connection_retry(self._client.propfind, url, _CALENDAR_DISCOVERY_PROPS, 1)
+        except AuthorizationError as exc:
+            raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
+        except Exception as exc:
+            if depth_left == 2:
+                raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
+            return  # вложенная коллекция не отвечает — не роняем весь список
+        own_path = _href_path(url)
         for result in response.results:
             if result.status not in (200, 207):
                 continue
             resourcetype = result.properties.get("{DAV:}resourcetype") or []
-            tags = resourcetype if isinstance(resourcetype, list) else [resourcetype]
-            if not any("calendar" in str(tag).lower() for tag in tags):
-                continue  # сам calendar-home-set, адресная книга и т.п. — не календарь
-            name = result.properties.get("{DAV:}displayname") or result.href
-            owner_raw = result.properties.get("{DAV:}owner")
-            owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
-            is_shared = owner is not None and _href_path(owner) != my_principal_path
-            read_only = not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set"))
-            infos.append(CalDavCalendarInfo(
-                url=str(self._client.url.join(result.href)),
-                name=name,
-                owner=owner,
-                is_shared=is_shared,
-                read_only=read_only,
-            ))
-        return infos
+            tags = [str(t) for t in (resourcetype if isinstance(resourcetype, list) else [resourcetype])]
+            full_url = str(self._client.url.join(result.href))
+            path = _href_path(full_url)
+            if path == own_path:
+                continue  # сама обходимая коллекция
+            # Точное имя тега, не подстрока "calendar": у расшаренных
+            # коллекций в resourcetype бывает {http://calendarserver.org/ns/}shared
+            # — "calendarserver" содержит "calendar", ложное срабатывание.
+            is_calendar = _CALDAV_CALENDAR_TAG in tags
+            is_collection = any(t.endswith("}collection") for t in tags)
+            if is_calendar:
+                if path in seen:
+                    continue
+                seen.add(path)
+                owner_raw = result.properties.get("{DAV:}owner")
+                owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
+                infos.append(CalDavCalendarInfo(
+                    url=full_url,
+                    name=result.properties.get("{DAV:}displayname") or result.href,
+                    owner=owner,
+                    is_shared=owner is not None and _href_path(owner) != my_principal_path,
+                    read_only=not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set")),
+                ))
+            elif is_collection and depth_left > 1:
+                self._collect_calendars(full_url, my_principal_path, infos, seen, depth_left - 1)
 
     def fetch_events(self, start: datetime, end: datetime, my_email: str) -> list[Event]:
         """События сервера в окне [start, end). Разбор VEVENT переиспользует

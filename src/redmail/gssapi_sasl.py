@@ -13,6 +13,24 @@ class GssapiSaslError(Exception):
     "перелогина" по паролю здесь быть не может."""
 
 
+def acquire_credentials(keytab_path: str = "", principal: str = ""):
+    """Kerberos-учётные данные инициатора. Без keytab — None: библиотека
+    сама возьмёт билет из системного кэша (SSSD выдала при входе в домен).
+    С keytab — билет получается прямо из файла ключа (расширение MIT krb5
+    "client_keytab" в cred store: kinit -kt под капотом, без внешних
+    команд), в отдельный in-memory кэш, чтобы не трогать системный.
+    Пожелание: "адаптируй подключение под использование keytab" — для
+    машин вне домена и служебных учётных записей."""
+    if not keytab_path:
+        return None
+    try:
+        store = {"client_keytab": keytab_path, "ccache": "MEMORY:redmail"}
+        name = gssapi.Name(principal, gssapi.NameType.kerberos_principal) if principal else None
+        return gssapi.Credentials(name=name, usage="initiate", store=store)
+    except gssapi.exceptions.GSSError as exc:
+        raise GssapiSaslError(f"Не удалось получить билет Kerberos из keytab {keytab_path}: {exc}") from exc
+
+
 class GssapiSaslContext:
     """Клиентская сторона SASL-механизма GSSAPI (RFC 4752) поверх
     Kerberos-билета, уже полученного ОС при входе пользователя в домен
@@ -24,10 +42,12 @@ class GssapiSaslContext:
     принудительно кодирует ответ authobject() как ASCII-строку, что
     несовместимо с бинарными GSS-токенами)."""
 
-    def __init__(self, service: str, host: str, authzid: str = "") -> None:
+    def __init__(self, service: str, host: str, authzid: str = "", creds=None) -> None:
         try:
             target = gssapi.Name(f"{service}@{host}", gssapi.NameType.hostbased_service)
-            self._ctx = gssapi.SecurityContext(name=target, usage="initiate")
+            # creds=None — билет из системного кэша; иначе — из keytab, см.
+            # acquire_credentials.
+            self._ctx = gssapi.SecurityContext(name=target, usage="initiate", creds=creds)
         except gssapi.exceptions.GSSError as exc:
             raise GssapiSaslError(str(exc)) from exc
         self._authzid = authzid
@@ -57,7 +77,7 @@ class GssapiSaslContext:
             raise GssapiSaslError(str(exc)) from exc
 
 
-def imap_sasl_login(client, host: str, username: str) -> None:
+def imap_sasl_login(client, host: str, username: str, *, keytab_path: str = "", principal: str = "") -> None:
     """Аутентифицирует уже открытую IMAPClient-сессию по Kerberos-билету
     вместо пароля."""
     capabilities = client.capabilities()
@@ -79,7 +99,9 @@ def imap_sasl_login(client, host: str, username: str) -> None:
             f"Поддерживаемые способы входа: {supported or 'не объявлены'}. "
             "SSO по этому протоколу здесь не сработает независимо от билета Kerberos."
         )
-    context = GssapiSaslContext(service="imap", host=host, authzid=username)
+    context = GssapiSaslContext(
+        service="imap", host=host, authzid=username, creds=acquire_credentials(keytab_path, principal)
+    )
     try:
         client.sasl_login("GSSAPI", context.step)
     except GssapiSaslError:
@@ -99,7 +121,9 @@ def imap_sasl_login(client, host: str, username: str) -> None:
         ) from exc
 
 
-def smtp_sasl_login(client: smtplib.SMTP, host: str, username: str) -> None:
+def smtp_sasl_login(
+    client: smtplib.SMTP, host: str, username: str, *, keytab_path: str = "", principal: str = ""
+) -> None:
     """Аутентифицирует уже открытую SMTP-сессию по Kerberos-билету вместо
     пароля.
 
@@ -126,7 +150,9 @@ def smtp_sasl_login(client: smtplib.SMTP, host: str, username: str) -> None:
             f"Поддерживаемые способы входа: {', '.join(supported_auth) or 'не объявлены'}. "
             "SSO по этому протоколу здесь не сработает независимо от билета Kerberos."
         )
-    context = GssapiSaslContext(service="smtp", host=host, authzid=username)
+    context = GssapiSaslContext(
+        service="smtp", host=host, authzid=username, creds=acquire_credentials(keytab_path, principal)
+    )
     code, resp = client.docmd("AUTH", "GSSAPI")
     if code not in (235, 334, 503):
         # Сервер заявляет GSSAPI в EHLO (иначе сработала бы проверка выше),

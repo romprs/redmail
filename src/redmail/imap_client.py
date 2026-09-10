@@ -34,18 +34,24 @@ _COLOR_BY_KEYWORD = {v: k for k, v in MARKER_COLORS.items()}
 UNKNOWN_MARKER = object()
 
 
-def _is_stale_session_error(exc: Exception) -> bool:
-    """command SELECT/... illegal in state NONAUTH — сервер молча разлогинил
-    сессию после долгого простоя (жалоба: "после долгого простоя выдаёт...
-    лечится перезапуском"), но САМ TCP-сокет при этом мог и не порваться,
-    поэтому это НЕ OSError/EOFError/IMAP4.abort, а обычный
-    imaplib.IMAP4.error (=IMAPClientError) — команда сервером понята, но
-    отвергнута. В общем случае такие ошибки переподключением не лечатся
-    (см. _reconnecting), но именно "illegal in state NONAUTH" означает
-    ровно "мы больше не аутентифицированы" — это тот редкий протокольный
-    случай, который реконнект+повторный логин действительно чинит."""
+def _is_recoverable_by_reconnect(exc: Exception) -> bool:
+    """Протокольные ошибки (imaplib.IMAP4.error = IMAPClientError: команда
+    сервером понята, но отвергнута), которые всё же лечатся
+    переподключением — в отличие от остальных, см. _reconnecting:
+
+    * "command SELECT/... illegal in state NONAUTH" — сервер молча
+      разлогинил сессию после долгого простоя (жалоба: "после долгого
+      простоя выдаёт... лечится перезапуском"), но САМ TCP-сокет при этом
+      мог и не порваться, поэтому это не OSError/EOFError/IMAP4.abort;
+    * "[UNAVAILABLE] Failed to open mailbox" / "Service temporarily
+      unavailable" (RFC 5530: временный отказ подсистемы сервера — жалоба:
+      "после сбоя сервера или принудительного простоя не восстанавливается
+      подключение, обновление даёт ошибку") — сессия после такого сбоя
+      сервера обычно уже невалидна, свежее соединение проходит."""
     text = str(exc)
-    return "illegal in state" in text and "NONAUTH" in text
+    if "illegal in state" in text and "NONAUTH" in text:
+        return True
+    return "[UNAVAILABLE]" in text.upper()
 
 
 def _reconnecting(method):
@@ -80,7 +86,7 @@ def _reconnecting(method):
                 raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
             return method(self, *args, **kwargs)
         except imaplib.IMAP4.error as exc:
-            if not _is_stale_session_error(exc):
+            if not _is_recoverable_by_reconnect(exc):
                 raise
             try:
                 self._reconnect()
@@ -103,6 +109,11 @@ class Account:
     # выдала при входе пользователя в домен (RED OS + SSSD), пароль в
     # приложении не хранится и не используется (см. gssapi_sasl.py).
     auth_type: str = "password"
+    # Необязательный keytab как источник билета для SSO (вместо билета из
+    # системного кэша) и principal, для которого он выписан — см.
+    # gssapi_sasl.acquire_credentials.
+    keytab_path: str = ""
+    principal: str = ""
 
 
 @dataclass
@@ -188,7 +199,13 @@ class ImapSession:
             # из-за отсутствия зависимости, нужной только для SSO.
             from redmail import gssapi_sasl
 
-            gssapi_sasl.imap_sasl_login(self._client, self.account.host, self.account.username)
+            gssapi_sasl.imap_sasl_login(
+                self._client,
+                self.account.host,
+                self.account.username,
+                keytab_path=self.account.keytab_path,
+                principal=self.account.principal,
+            )
         else:
             self._client.login(self.account.username, self.account.password)
 
@@ -646,6 +663,16 @@ def _to_summary(data: dict) -> MessageSummary:
     message_id = envelope.message_id
     flags = data.get(b"FLAGS", ())
     marker_color = next((_COLOR_BY_KEYWORD[f] for f in flags if f in _COLOR_BY_KEYWORD), None)
+    if marker_color is None and b"\\Flagged" in flags:
+        # Жалоба: "не сохраняется проставленный маркер, через какое-то
+        # время пропадает" — сервер (VK Mail) не хранит произвольные
+        # keyword-флаги ($RedMailRed и т.п.: их нет в PERMANENTFLAGS),
+        # принимает их только на время сессии и молча теряет, а стандартный
+        # \Flagged хранит. Раньше без keyword'а маркер считался снятым —
+        # теперь \Flagged без цвета = маркер по умолчанию; конкретный цвет
+        # при этом восстанавливается из локального кэша (см.
+        # CachedMailbox.refresh_folder).
+        marker_color = "red"
     return MessageSummary(
         uid=data[b"UID"],
         subject=_decode_subject(envelope.subject),

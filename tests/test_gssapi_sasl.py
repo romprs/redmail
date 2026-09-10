@@ -18,9 +18,10 @@ class _FakeSecurityContext:
     unwrap()/wrap() работают как identity + префикс — этого достаточно,
     чтобы проверить логику GssapiSaslContext, не поднимая настоящий KDC."""
 
-    def __init__(self, name, usage) -> None:
+    def __init__(self, name, usage, creds=None) -> None:
         self.name = name
         self.usage = usage
+        self.creds = creds
         self.complete = False
         self._steps = 0
 
@@ -38,12 +39,25 @@ class _FakeSecurityContext:
         return types.SimpleNamespace(message=b"wrapped:" + message)
 
 
+class _FakeCredentials:
+    """Имитирует gssapi.Credentials: запоминает cred store (keytab), чтобы
+    проверить, что билет запрашивается именно из указанного keytab."""
+
+    def __init__(self, name=None, usage="both", store=None) -> None:
+        self.name = name
+        self.usage = usage
+        self.store = store
+
+
 @pytest.fixture
 def fake_gssapi_sasl(monkeypatch):
     fake_gssapi = types.ModuleType("gssapi")
     fake_gssapi.Name = lambda name, name_type: name
-    fake_gssapi.NameType = types.SimpleNamespace(hostbased_service="hostbased_service")
+    fake_gssapi.NameType = types.SimpleNamespace(
+        hostbased_service="hostbased_service", kerberos_principal="kerberos_principal"
+    )
     fake_gssapi.SecurityContext = _FakeSecurityContext
+    fake_gssapi.Credentials = _FakeCredentials
     fake_gssapi.exceptions = types.SimpleNamespace(GSSError=_FakeGSSError)
     monkeypatch.setitem(sys.modules, "gssapi", fake_gssapi)
     sys.modules.pop("redmail.gssapi_sasl", None)
@@ -64,6 +78,26 @@ def fake_gssapi_sasl(monkeypatch):
     if "gssapi_sasl" in vars(_redmail_pkg):
         delattr(_redmail_pkg, "gssapi_sasl")
     sys.modules.pop("redmail.gssapi_sasl", None)
+
+
+def test_acquire_credentials_without_keytab_uses_system_ticket(fake_gssapi_sasl) -> None:
+    # Без keytab — None: библиотека берёт билет из системного кэша (SSSD).
+    assert fake_gssapi_sasl.acquire_credentials("", "") is None
+
+
+def test_acquire_credentials_from_keytab_uses_client_keytab_store(fake_gssapi_sasl) -> None:
+    # Пожелание: "адаптируй подключение под использование keytab" — билет
+    # берётся из файла ключа для указанного principal через расширение
+    # cred store "client_keytab" (kinit -kt под капотом), в отдельный
+    # in-memory кэш, чтобы не трогать системный.
+    creds = fake_gssapi_sasl.acquire_credentials("/etc/redmail/user.keytab", "ivan@CORP.LOCAL")
+    assert creds.usage == "initiate"
+    assert creds.name == "ivan@CORP.LOCAL"
+    assert creds.store["client_keytab"] == "/etc/redmail/user.keytab"
+    assert creds.store["ccache"].startswith("MEMORY:")
+
+    ctx = fake_gssapi_sasl.GssapiSaslContext(service="imap", host="mail.corp.local", authzid="ivan", creds=creds)
+    assert ctx._ctx.creds is creds
 
 
 def test_context_negotiates_then_wraps_security_layer_response(fake_gssapi_sasl) -> None:
