@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import urllib.error
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -265,22 +266,13 @@ def test_list_calendar_names() -> None:
 
 
 def _propfind_response(xml: str):
-    """DAVResponse настоящей caldav-библиотеки, собранный из сырого XML
-    (как реально пришёл бы multistatus от сервера) — используем её
-    собственный parse_propfind(), а не свой мини-парсер: current-user-
-    privilege-set caldav не разбирает в удобный список (вложенные
-    <privilege><write/></privilege> не подходят под общий разбор
-    свойств) и приходит "сырым" lxml-элементом — это стоит проверять на
-    поведении настоящей библиотеки, а не на предположении о нём."""
-    from caldav.response import DAVResponse
+    """Ответ PROPFIND как его отдаёт caldav любой версии: объект с сырым
+    lxml-деревом multistatus (tree) и статусом. Разбор свойств — наш
+    собственный (_parse_multistatus), поэтому от внутренностей библиотеки
+    (в 3.x был parse_propfind/results, в 2.x их нет) тест не зависит."""
     import lxml.etree as etree
 
-    response = object.__new__(DAVResponse)
-    response.tree = etree.XML(xml.encode("utf-8"))
-    response.status = 207
-    response.huge_tree = False
-    response.results = response.parse_propfind()
-    return response
+    return SimpleNamespace(tree=etree.XML(xml.encode("utf-8")), status=207)
 
 
 _SHARED_CALENDARS_XML = '''<?xml version="1.0" encoding="utf-8"?>

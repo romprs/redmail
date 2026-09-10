@@ -150,6 +150,84 @@ _CALENDAR_DISCOVERY_PROPS = [
 ]
 
 
+@dataclass
+class _PropfindResult:
+    """Один <response> из multistatus-ответа на PROPFIND: href, статус и
+    свойства (tag → значение: текст, список тегов для resourcetype, список
+    href для ссылочных свойств, сам элемент для сложных вроде
+    current-user-privilege-set)."""
+
+    href: str
+    status: int
+    properties: dict[str, object]
+
+
+def _propfind_body(props: list[str]) -> str:
+    """Тело PROPFIND-запроса под нужные свойства. Библиотека caldav в
+    разных версиях по-разному принимает список свойств и по-разному
+    отдаёт разобранный ответ (в 3.x — results, в 2.x — только дерево);
+    свой XML на входе и свой разбор дерева на выходе (_parse_multistatus)
+    не зависят от этих различий — нужен только сырой lxml-tree ответа."""
+    from lxml import etree
+
+    root = etree.Element("{DAV:}propfind", nsmap={"d": "DAV:", "c": "urn:ietf:params:xml:ns:caldav"})
+    prop = etree.SubElement(root, "{DAV:}prop")
+    for name in props:
+        etree.SubElement(prop, name)
+    return etree.tostring(root, xml_declaration=True, encoding="utf-8").decode("utf-8")
+
+
+def _status_code(text: str | None) -> int:
+    for part in (text or "").split():
+        if part.isdigit():
+            return int(part)
+    return 200
+
+
+def _prop_value(element) -> object:
+    children = [child for child in element if isinstance(child.tag, str)]
+    if not children:
+        return (element.text or "").strip()
+    if element.tag == "{DAV:}resourcetype":
+        return [child.tag for child in children]
+    if all(child.tag == "{DAV:}href" for child in children):
+        return [(child.text or "").strip() for child in children]
+    return element
+
+
+def _parse_multistatus(tree) -> list[_PropfindResult]:
+    """Разбор <multistatus> ответа PROPFIND (RFC 4918): по одному
+    результату на <response>, в properties — только свойства из
+    propstat со статусом 2xx."""
+    results: list[_PropfindResult] = []
+    if tree is None:
+        return results
+    for response in tree.iter("{DAV:}response"):
+        href_el = response.find("{DAV:}href")
+        href = (href_el.text or "").strip() if href_el is not None else ""
+        properties: dict[str, object] = {}
+        statuses: list[int] = []
+        for propstat in response.findall("{DAV:}propstat"):
+            status_el = propstat.find("{DAV:}status")
+            code = _status_code(status_el.text if status_el is not None else None)
+            statuses.append(code)
+            if code // 100 != 2:
+                continue
+            prop = propstat.find("{DAV:}prop")
+            if prop is None:
+                continue
+            for element in prop:
+                if isinstance(element.tag, str):
+                    properties[element.tag] = _prop_value(element)
+        if statuses:
+            status = 200 if any(code // 100 == 2 for code in statuses) else statuses[0]
+        else:
+            direct = response.find("{DAV:}status")
+            status = _status_code(direct.text) if direct is not None else 200
+        results.append(_PropfindResult(href=href, status=status, properties=properties))
+    return results
+
+
 def _href_path(href: str) -> str:
     """Путь без схемы/хоста и завершающего слэша — owner может прийти и
     абсолютным URL, и просто путём, сравнивать нужно только путь."""
@@ -302,9 +380,9 @@ class CalDavSession:
         urls: list[str] = []
         try:
             response = _with_connection_retry(
-                self._client.propfind, str(principal.url), [_CALDAV_HOME_SET_PROP], 0
+                self._client.propfind, str(principal.url), _propfind_body([_CALDAV_HOME_SET_PROP]), 0
             )
-            for result in response.results:
+            for result in _parse_multistatus(response.tree):
                 value = result.properties.get(_CALDAV_HOME_SET_PROP)
                 hrefs = value if isinstance(value, list) else [value]
                 for href in hrefs:
@@ -320,7 +398,9 @@ class CalDavSession:
         self, url: str, my_principal_path: str, infos: list[CalDavCalendarInfo], seen: set[str], depth_left: int
     ) -> None:
         try:
-            response = _with_connection_retry(self._client.propfind, url, _CALENDAR_DISCOVERY_PROPS, 1)
+            response = _with_connection_retry(
+                self._client.propfind, url, _propfind_body(_CALENDAR_DISCOVERY_PROPS), 1
+            )
         except AuthorizationError as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
@@ -328,7 +408,7 @@ class CalDavSession:
                 raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
             return  # вложенная коллекция не отвечает — не роняем весь список
         own_path = _href_path(url)
-        for result in response.results:
+        for result in _parse_multistatus(response.tree):
             if result.status not in (200, 207):
                 continue
             resourcetype = result.properties.get("{DAV:}resourcetype") or []
@@ -347,6 +427,8 @@ class CalDavSession:
                     continue
                 seen.add(path)
                 owner_raw = result.properties.get("{DAV:}owner")
+                if isinstance(owner_raw, list):
+                    owner_raw = owner_raw[0] if owner_raw else None
                 owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
                 infos.append(CalDavCalendarInfo(
                     url=full_url,

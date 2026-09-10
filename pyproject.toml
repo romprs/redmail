@@ -10,7 +10,13 @@ dependencies = [
     "icalendar",
     "python-dateutil",
     "vobject",
-    "caldav",
+    # caldav >= 2.2 (и все 3.x) тянет icalendar-searcher под AGPL-3.0 и
+    # niquests (HTTP/2, с которым PUT на корпоративном прокси рвался) -
+    # для проприетарного продукта AGPL-компонент недопустим (реестр
+    # российского ПО, лицензионная чистота), поэтому держимся на 2.0.x:
+    # requests/HTTP/1.1, только BSD/LGPL/Apache-зависимости.
+    "caldav>=2.0,<2.1",
+    "requests",
     "libpff-python",
     "exchangelib",
     "requests-gssapi",
