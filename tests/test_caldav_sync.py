@@ -126,7 +126,7 @@ def test_fetch_events_skips_broken_object_without_failing_whole_sync() -> None:
 def test_push_event_creates_new_when_not_found_on_server() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.event_by_uid.side_effect = NotFoundError("nope")
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
          patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
@@ -143,7 +143,7 @@ def test_push_event_updates_existing_when_found_on_server() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
     existing_obj = MagicMock()
-    fake_calendar.get_event_by_uid.return_value = existing_obj
+    fake_calendar.event_by_uid.return_value = existing_obj
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
          patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
@@ -163,7 +163,7 @@ def test_push_event_retries_once_on_connection_error() -> None:
     # соединении — стандартное лечение для устаревшего keep-alive.
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.event_by_uid.side_effect = NotFoundError("nope")
     fake_calendar.save_event.side_effect = [
         requests.exceptions.ConnectionError("Remote end closed connection without response"),
         None,
@@ -180,7 +180,7 @@ def test_push_event_retries_once_on_connection_error() -> None:
 def test_push_event_raises_clear_error_when_connection_fails_twice() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.event_by_uid.side_effect = NotFoundError("nope")
     fake_calendar.save_event.side_effect = requests.exceptions.ConnectionError("still closed")
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
@@ -196,7 +196,7 @@ def test_write_access_saves_and_deletes_test_event() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
     cleanup_obj = MagicMock()
-    fake_calendar.get_event_by_uid.return_value = cleanup_obj
+    fake_calendar.event_by_uid.return_value = cleanup_obj
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
          patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
@@ -228,7 +228,7 @@ def test_delete_event_deletes_when_found() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
     existing_obj = MagicMock()
-    fake_calendar.get_event_by_uid.return_value = existing_obj
+    fake_calendar.event_by_uid.return_value = existing_obj
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
          patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):
@@ -241,7 +241,7 @@ def test_delete_event_deletes_when_found() -> None:
 def test_delete_event_is_noop_when_not_found() -> None:
     fake_client = MagicMock()
     fake_calendar = MagicMock()
-    fake_calendar.get_event_by_uid.side_effect = NotFoundError("nope")
+    fake_calendar.event_by_uid.side_effect = NotFoundError("nope")
 
     with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client), \
          patch("redmail.caldav_sync.caldav.Calendar", return_value=fake_calendar):

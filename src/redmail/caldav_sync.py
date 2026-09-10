@@ -467,7 +467,7 @@ class CalDavSession:
         calendar = self._primary_calendar()
         ics_text = itip.build_caldav_ics(event, organizer_email, organizer_name).decode("utf-8")
         try:
-            existing = _with_connection_retry(calendar.get_event_by_uid, event.uid)
+            existing = _with_connection_retry(calendar.event_by_uid, event.uid)
         except NotFoundError:
             existing = None
         except Exception as exc:
@@ -511,7 +511,7 @@ class CalDavSession:
         except Exception as exc:
             raise CalDavSyncError(f"Запись на сервер не удалась: {exc}") from exc
         try:
-            existing = _with_connection_retry(calendar.get_event_by_uid, test_uid)
+            existing = _with_connection_retry(calendar.event_by_uid, test_uid)
             _with_connection_retry(existing.delete)
         except Exception:
             pass  # уборка тестового события — не критично, если не получилось
@@ -519,7 +519,7 @@ class CalDavSession:
     def delete_event(self, uid: str) -> None:
         calendar = self._primary_calendar()
         try:
-            existing = _with_connection_retry(calendar.get_event_by_uid, uid)
+            existing = _with_connection_retry(calendar.event_by_uid, uid)
         except NotFoundError:
             return  # уже нет на сервере — нечего удалять, не ошибка
         except Exception as exc:
