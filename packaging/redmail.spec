@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        60%{?dist}
+Release:        61%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-61
+- CalDAV: библиотека caldav 2.0.x (без AGPL-компонента icalendar-searcher и niquests); обнаружение календарей своим разбором PROPFIND по RFC 4918, проверено e2e на Radicale
+- Убрано упоминание ИИ из окна «О программе»
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-60
 - IMAP: команды по очереди (блокировка сессии) и таймаут сокета - зависание на «Загрузка…» при переходе между письмами
 - Отметки «прочитано»/«отвечено» уходят на сервер в фоне, не блокируя интерфейс
