@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        58%{?dist}
+Release:        59%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,10 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-59
+- Два режима списка писем: таблица и плитки (аватар, две строки), переключатель на панели, режим запоминается
+- Фильтр списка: только важные, только с вложениями, по маркеру (любой/цвет)
+- На письмо можно ставить несколько маркеров (меню с галочками, иконка-сетка в таблице)
 * Thu Sep 10 2026 redmail <redmail@example.com> - 0.0.1-58
 - CalDAV: HTTP/1.1-сессия (requests) вместо niquests/HTTP/2 - обрыв PUT события; поиск календарей обходит все calendar-home-set и вложенные коллекции (расшаренные)
 - Адресная книга: множественный выбор галочками
