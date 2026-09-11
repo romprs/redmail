@@ -39,6 +39,42 @@ python -m venv .venv
 .venv/Scripts/python -m redmail
 ```
 
+## Локальный канал управления (IPC)
+
+Запущенное окно слушает локальный сокет `redmail-ipc`
+(`src/redmail/ipc_server.py`) — через него внешняя программа (прежде всего
+будущий голосовой ассистент) просит открыть письмо/встречу с готовыми полями.
+Только локальный сокет, никакого TCP; доступ — тому же пользователю ОС.
+
+Протокол построчный JSON: одна строка `{"action": ..., "args": {...}}` —
+одна строка ответа `{"ok": true, ...}` либо `{"ok": false, "error": "..."}`.
+Команды: `ping`, `focus`, `compose_email`, `create_event`, `update_event`,
+`find_events`, `cancel_event`, `apply_mail_rules`, `list_mail_rules`.
+
+`update_event`/`cancel_event` требуют `uid` встречи — голосовая сторона его
+не знает, у неё есть только тема (и, возможно, дата). `find_events` (`subject`
+— подстрока темы, необязательно; `date` — `YYYY-MM-DD`, если не задана, берётся
+сегодняшняя) возвращает список подходящих встреч с `uid`, по которому уже
+можно вызвать `update_event`/`cancel_event`.
+
+Всё, что отправляет что-либо наружу (письмо, приглашение, отмена встречи),
+только ОТКРЫВАЕТ обычный диалог с заполненными полями — «Отправить»/
+«Сохранить»/«Да» нажимает человек. Без подтверждения выполняются лишь
+`focus`, `find_events`, `list_mail_rules` и `apply_mail_rules` (перекладывание
+писем между папками того же ящика).
+
+Проверить руками (или из голосового помощника audioreferent):
+
+```bash
+python3 scripts/ipc_client_test.py ping
+python3 scripts/ipc_client_test.py compose_email --to ivan@example.com --subject Тест
+python3 scripts/ipc_client_test.py create_event --subject Планёрка \
+    --start 2026-09-10T15:00 --duration 30 --participants a@e.com,b@e.com
+```
+
+Фактический адрес сокета работающее приложение пишет в
+`<каталог настроек>/ipc-endpoint.json`, скрипт читает его оттуда.
+
 ## Тесты
 
 ```bash
