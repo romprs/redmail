@@ -47,6 +47,7 @@ class FolderSyncResult:
 class SyncStats:
     folders: list[FolderSyncResult] = field(default_factory=list)
     bodies_downloaded: int = 0
+    bodies_pending: int = 0  # сколько тел ещё не скачано после этого прохода
 
     @property
     def added(self) -> int:

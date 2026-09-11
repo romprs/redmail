@@ -188,7 +188,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import autoarchive, profile, secret_store
+from redmail import autoarchive, profile, secret_store, sync_engine
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -3937,23 +3937,35 @@ class _SyncWorker(QThread):
     finished_ok = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, mailbox: CachedMailbox, folders: list[str], stop: threading.Event, *, bodies_limit: int | None = None, parent=None):
+    # Тела качаются раундами по BODIES_ROUND писем: между раундами окно
+    # успевает проверить размер базы и запустить автоархив (жалоба: "почему
+    # файл не разделился на архивы по 500 МБ? он уже 2,1 ГБ" — раньше
+    # проверка шла только после ПОЛНОЙ докачки всех тел, а это часы).
+    BODIES_ROUND = 200
+
+    def __init__(self, mailbox: CachedMailbox, folders: list[str], stop: threading.Event, *, bodies_limit: int | None = None, headers: bool = True, parent=None):
         super().__init__(parent)
         self._mailbox = mailbox
         self._folders = folders
         self._stop = stop
         self._bodies_limit = bodies_limit
+        self._headers = headers
 
     def run(self) -> None:  # noqa: N802 - Qt override
         try:
             def report(text: str, _done: int, _total: int) -> None:
                 self.progress.emit(text)
 
-            stats = self._mailbox.sync_all(self._folders, progress=report, stop=self._stop)
+            if self._headers:
+                stats = self._mailbox.sync_all(self._folders, progress=report, stop=self._stop)
+            else:
+                stats = sync_engine.SyncStats()
             bodies = 0
             if not self._stop.is_set():
-                bodies = self._mailbox.download_bodies(progress=report, stop=self._stop, limit=self._bodies_limit)
+                limit = self.BODIES_ROUND if self._bodies_limit is None else min(self._bodies_limit, self.BODIES_ROUND)
+                bodies = self._mailbox.download_bodies(progress=report, stop=self._stop, limit=limit)
             stats.bodies_downloaded = bodies
+            stats.bodies_pending = self._mailbox.pending_bodies()
         except Exception as exc:
             self.failed.emit(_exception_text(exc))
         else:
@@ -6313,7 +6325,7 @@ class MainWindow(QMainWindow):
         старым. Идёт в фоне порциями, индикатор — в строке состояния."""
         if self._sync_worker is not None:
             return
-        self._sync_queue = [key for key in self.mailboxes if self.mailbox_protocols.get(key) in ("imap", "ews")]
+        self._sync_queue = [(key, True) for key in self.mailboxes if self.mailbox_protocols.get(key) in ("imap", "ews")]
         self._sync_stop.clear()
         self._sync_next(bodies_limit)
 
@@ -6322,13 +6334,13 @@ class MainWindow(QMainWindow):
             self._sync_worker = None
             self._set_busy(None)
             return
-        key = self._sync_queue.pop(0)
+        key, headers = self._sync_queue.pop(0)
         mailbox = self.mailboxes.get(key)
         folders = self.mailbox_folders.get(key, [])
         if mailbox is None or not folders:
             self._sync_next(bodies_limit)
             return
-        worker = _SyncWorker(mailbox, folders, self._sync_stop, bodies_limit=bodies_limit, parent=self)
+        worker = _SyncWorker(mailbox, folders, self._sync_stop, bodies_limit=bodies_limit, headers=headers, parent=self)
         self._sync_worker = worker
 
         def on_progress(text: str) -> None:
@@ -6347,7 +6359,16 @@ class MainWindow(QMainWindow):
                     self._render_folder(mailbox.folder_summaries(self.current_folder))
                 except Exception:
                     pass
-            self._maybe_autoarchive(key, lambda: self._sync_next(bodies_limit))
+            def continue_sync() -> None:
+                # Полный режим: пока есть нескачанные тела — ещё раунд по
+                # этому же ящику (без повторного обхода заголовков), после
+                # каждого раунда — проверка автоархива. В периодическом
+                # режиме (bodies_limit задан) — один раунд за тик.
+                if bodies_limit is None and stats.bodies_pending > 0 and not self._sync_stop.is_set():
+                    self._sync_queue.append((key, False))
+                self._sync_next(bodies_limit)
+
+            self._maybe_autoarchive(key, continue_sync)
 
         def on_failed(error_text: str) -> None:
             finish()

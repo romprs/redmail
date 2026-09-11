@@ -68,6 +68,9 @@ class CachedMailbox:
         with self._sync_lock:
             return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
 
+    def pending_bodies(self) -> int:
+        return cache_store.count_messages_without_body(self._account_key, self.body_max_bytes)
+
     def download_bodies(self, *, progress=None, stop: threading.Event | None = None, limit: int | None = None) -> int:
         with self._sync_lock:
             return sync_engine.download_bodies(
