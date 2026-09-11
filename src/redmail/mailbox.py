@@ -44,12 +44,15 @@ class CachedMailbox:
         return self._account_key
 
     def folder_summaries(self, folder: str, limit: int | None = None) -> list[MessageSummary]:
-        if not cache_store.is_folder_synced(self._account_key, folder):
-            cached = cache_store.get_folder_summaries(self._account_key, folder, limit)
-            if cached:
-                return cached
-            return self.refresh_folder(folder, limit)
+        # Только база, никогда сеть: вызывается из потока интерфейса, а
+        # синхронизация может в этот момент держать замок ящика — ждать её
+        # здесь значило бы заморозить окно. Не синхронизированную папку
+        # интерфейс дозапрашивает через refresh_folder в фоне (см.
+        # is_folder_synced).
         return cache_store.get_folder_summaries(self._account_key, folder, limit)
+
+    def is_folder_synced(self, folder: str) -> bool:
+        return cache_store.is_folder_synced(self._account_key, folder)
 
     def folder_message_total(self, folder: str) -> int:
         return cache_store.count_folder_summaries(self._account_key, folder)

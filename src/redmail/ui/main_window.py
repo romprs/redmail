@@ -5904,6 +5904,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
         self._render_folder(summaries)
+        is_synced = getattr(source, "is_folder_synced", None)
+        if is_synced is not None and not is_synced(folder_name):
+            # Папка ещё не синхронизирована (первое открытие) — дозапросить
+            # с сервера в фоне, окно при этом не ждёт.
+            self._refresh_folder_async(silent=True)
 
     def on_folder_tree_context_menu(self, pos) -> None:
         item = self.folder_tree.itemAt(pos)

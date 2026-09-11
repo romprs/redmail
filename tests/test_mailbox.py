@@ -69,10 +69,13 @@ def test_first_open_syncs_folder_then_reads_only_from_local_copy(tmp_path: Path)
     session = FakeSession({1: _summary(1), 2: _summary(2)})
     ctx, mailbox = _mailbox(tmp_path, session)
     with ctx:
-        first = mailbox.folder_summaries("INBOX")
+        assert mailbox.folder_summaries("INBOX") == []  # база пуста, в сеть из потока интерфейса не ходим
+        assert not mailbox.is_folder_synced("INBOX")
+        first = mailbox.refresh_folder("INBOX")
         session.calls.clear()
         mailbox.folder_summaries("INBOX")
         mailbox.folder_summaries("INBOX")
+        assert mailbox.is_folder_synced("INBOX")
 
     assert [s.uid for s in first] == [2, 1]  # новые сверху
     assert session.calls == []  # после синхронизации папка читается только из базы
@@ -174,8 +177,8 @@ def test_different_accounts_do_not_share_cache(tmp_path: Path) -> None:
     session_b = FakeSession({7: _summary(7)})
     account_b = Account(host="imap.example.com", username="petr", password="secret")
     with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
-        a = CachedMailbox(session_a, _account()).folder_summaries("INBOX")
-        b = CachedMailbox(session_b, account_b).folder_summaries("INBOX")
+        a = CachedMailbox(session_a, _account()).refresh_folder("INBOX")
+        b = CachedMailbox(session_b, account_b).refresh_folder("INBOX")
     assert [s.uid for s in a] == [1] and [s.uid for s in b] == [7]
 
 
