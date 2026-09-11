@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        69%{?dist}
+Release:        70%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-70
+- Автоархив проверяется после каждых 200 скачанных писем, а не только после полной докачки ящика
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-69
 - Канал управления для голосового помощника: пошаговое заполнение открытой формы встречи (event_form_*), поиск контактов по фамилии на слух (find_contacts)
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-68
