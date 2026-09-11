@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        72%{?dist}
+Release:        73%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-73
+- Автоархив: раунды по 300 писем с ужатием базы после каждого, один архиватор за раз; пока база больше порога, фоновая докачка тел приостановлена
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-72
 - Автоархив: письма с заголовками в неизвестной кодировке (unknown-8bit) переносятся, а не пропускаются
 - Полная копия: папка Gmail «Вся почта» (зеркало всех писем) не синхронизируется и не удваивает базу
