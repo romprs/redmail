@@ -3,6 +3,8 @@ from __future__ import annotations
 import threading
 from pathlib import Path
 
+from pathlib import Path as _Path
+
 from redmail import archive_store, cache_store, sync_engine
 from redmail.applog import get_logger
 from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageSummary
@@ -76,6 +78,10 @@ class CachedMailbox:
         cached = cache_store.get_message_content(self._account_key, folder, uid)
         if cached is not None:
             return cached
+        ref = cache_store.get_archive_ref(self._account_key, folder, uid)
+        if ref is not None:
+            # Единый индекс: письмо перенесено автоархивом — тело из файла архива.
+            return archive_store.get_message_content(_Path(ref[0]), ref[1])
         content = self.session.fetch_message_content(folder, uid)
         cache_store.save_message_content(self._account_key, folder, uid, content)
         return content
@@ -90,32 +96,78 @@ class CachedMailbox:
         сервере, а не то, что сейчас в локальном кэше сводок."""
         return self.session.search_uids(folder, before=before)
 
+    def _archived(self, folder: str, uid: int) -> tuple[str, int] | None:
+        return cache_store.get_archive_ref(self._account_key, folder, uid)
+
     def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
-        self.session.set_marker(folder, uid, color, previous_color=previous_color)
+        ref = self._archived(folder, uid)
+        if ref is not None:
+            archive_store.set_marker(_Path(ref[0]), ref[1], color)  # на сервере письма уже нет
+        else:
+            self.session.set_marker(folder, uid, color, previous_color=previous_color)
         cache_store.set_marker(self._account_key, folder, uid, color)
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:
-        self.session.set_read(folder, uid, read)
+        if self._archived(folder, uid) is None:
+            self.session.set_read(folder, uid, read)
         cache_store.set_read(self._account_key, folder, uid, read)
 
     def set_answered(self, folder: str, uid: int) -> None:
-        self.session.set_answered(folder, uid)
+        if self._archived(folder, uid) is None:
+            self.session.set_answered(folder, uid)
         cache_store.set_answered(self._account_key, folder, uid)
+
+    def delete_on_server(self, folder: str, uids: list[int]) -> None:
+        """Только сервер, без локальной базы — для автоархива, который
+        оставляет строку в индексе."""
+        self.session.delete_messages(folder, uids)
 
     def move_to_trash(self, folder: str, uids: list[int], trash_folder: str) -> None:
         self.move_to_folder(folder, uids, trash_folder)
 
+    def _split_archived(self, folder: str, uids: list[int]) -> tuple[list[int], list[tuple[int, str, int]]]:
+        live: list[int] = []
+        archived: list[tuple[int, str, int]] = []
+        for uid in uids:
+            ref = self._archived(folder, uid)
+            if ref is None:
+                live.append(uid)
+            else:
+                archived.append((uid, ref[0], ref[1]))
+        return live, archived
+
     def move_to_folder(self, folder: str, uids: list[int], target_folder: str) -> None:
         """Общий переезд писем в любую папку (не только корзину) — так же
-        используется при ручном применении правил сортировки почты."""
-        self.session.move_messages(folder, uids, target_folder)
-        cache_store.delete_messages(self._account_key, folder, uids)
+        используется при ручном применении правил сортировки почты.
+        Архивные письма (их уже нет на сервере) при «переезде в корзину»
+        удаляются из архива и индекса."""
+        live, archived = self._split_archived(folder, uids)
+        if live:
+            self.session.move_messages(folder, live, target_folder)
+            cache_store.delete_messages(self._account_key, folder, live)
+        if archived:
+            self._delete_archived(folder, archived)
+
+    def _delete_archived(self, folder: str, archived: list[tuple[int, str, int]]) -> None:
+        by_file: dict[str, list[int]] = {}
+        for _uid, path, archive_uid in archived:
+            by_file.setdefault(path, []).append(archive_uid)
+        for path, ids in by_file.items():
+            try:
+                archive_store.delete_messages(_Path(path), ids)
+            except Exception as exc:
+                _log.warning("Архив %s: не удалось удалить письма %s: %s", path, ids, exc)
+        cache_store.delete_messages(self._account_key, folder, [uid for uid, _p, _a in archived])
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         # Удаление локально = удаление на сервере (договорённость по
         # хранилищу): сначала сервер, затем локальная копия.
-        self.session.delete_messages(folder, uids)
-        cache_store.delete_messages(self._account_key, folder, uids)
+        live, archived = self._split_archived(folder, uids)
+        if live:
+            self.session.delete_messages(folder, live)
+            cache_store.delete_messages(self._account_key, folder, live)
+        if archived:
+            self._delete_archived(folder, archived)
 
     def close(self) -> None:
         self.session.close()

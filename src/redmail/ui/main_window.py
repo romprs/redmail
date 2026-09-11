@@ -132,6 +132,8 @@ from redmail.config_store import (
     load_caldav_url,
     load_default_signature_id,
     load_ews_accounts,
+    load_auto_archive_confirmed,
+    load_auto_archive_enabled,
     load_auto_archive_size_mb,
     load_body_max_size_mb,
     load_font_scale,
@@ -152,6 +154,8 @@ from redmail.config_store import (
     save_caldav_url,
     save_default_signature_id,
     save_ews_accounts,
+    save_auto_archive_confirmed,
+    save_auto_archive_enabled,
     save_auto_archive_size_mb,
     save_body_max_size_mb,
     save_font_scale,
@@ -182,7 +186,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import profile, secret_store
+from redmail import autoarchive, profile, secret_store
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -1440,6 +1444,7 @@ class SettingsDialog(QDialog):
         body_max_size_mb: int = 25,
         auto_archive_size_mb: int = 500,
         storage_stats: dict | None = None,
+        auto_archive_enabled: bool = True,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -1598,6 +1603,8 @@ class SettingsDialog(QDialog):
         self.body_max_size_edit.setRange(1, 2000)
         self.body_max_size_edit.setSuffix(" МБ")
         self.body_max_size_edit.setValue(int(body_max_size_mb))
+        self.auto_archive_check = QCheckBox("Автоархив по размеру базы: самые старые письма — в файл архива, с сервера удаляются", self)
+        self.auto_archive_check.setChecked(bool(auto_archive_enabled))
         self.auto_archive_size_edit = QSpinBox(self)
         self.auto_archive_size_edit.setRange(50, 100000)
         self.auto_archive_size_edit.setSuffix(" МБ")
@@ -1613,6 +1620,7 @@ class SettingsDialog(QDialog):
         storage_form = QFormLayout()
         storage_form.addRow("Каталог профиля", profile_dir_row)
         storage_form.addRow("Не скачивать фоном письма больше", self.body_max_size_edit)
+        storage_form.addRow(self.auto_archive_check)
         storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
         storage_form.addRow(storage_stats_label)
         storage_form.addRow(storage_hint)
@@ -1698,6 +1706,9 @@ class SettingsDialog(QDialog):
 
     def auto_archive_size_mb(self) -> int:
         return self.auto_archive_size_edit.value()
+
+    def auto_archive_enabled(self) -> bool:
+        return self.auto_archive_check.isChecked()
 
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
@@ -5653,6 +5664,7 @@ class MainWindow(QMainWindow):
             body_max_size_mb=load_body_max_size_mb(),
             auto_archive_size_mb=load_auto_archive_size_mb(),
             storage_stats=self._storage_stats(),
+            auto_archive_enabled=load_auto_archive_enabled(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -5671,6 +5683,7 @@ class MainWindow(QMainWindow):
             save_theme(self.theme)
             save_body_max_size_mb(dialog.body_max_size_mb())
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
+            save_auto_archive_enabled(dialog.auto_archive_enabled())
             for mailbox in self.mailboxes.values():
                 if isinstance(mailbox, CachedMailbox):
                     mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024
@@ -6212,7 +6225,7 @@ class MainWindow(QMainWindow):
                     self._render_folder(mailbox.folder_summaries(self.current_folder))
                 except Exception:
                     pass
-            self._sync_next(bodies_limit)
+            self._maybe_autoarchive(key, lambda: self._sync_next(bodies_limit))
 
         def on_failed(error_text: str) -> None:
             finish()
@@ -6224,6 +6237,76 @@ class MainWindow(QMainWindow):
         worker.failed.connect(on_failed)
         self._background_workers.append(worker)
         self._set_busy(f"{key}: синхронизация…")
+        worker.start()
+
+    def _maybe_autoarchive(self, key: str, then: Callable[[], None]) -> None:
+        """Автоархив по размеру базы (договорённость: порог 500 МБ, самые
+        старые письма — в файл архива, затем удаление с сервера). Первый
+        запуск для учётной записи — с подтверждением: операция необратима
+        на сервере."""
+        mailbox = self.mailboxes.get(key)
+        if mailbox is None or not isinstance(mailbox, CachedMailbox) or not load_auto_archive_enabled():
+            then()
+            return
+        threshold = load_auto_archive_size_mb() * 1024 * 1024
+        skip = {name for name in (self.mailbox_trash_folders.get(key), self.mailbox_drafts_folders.get(key)) if name}
+        try:
+            plan = autoarchive.make_plan(mailbox.account_key, threshold, skip_folders=skip)
+        except Exception as exc:
+            _log.error("Автоархив %s: не удалось составить план: %s", key, exc)
+            then()
+            return
+        if not plan.candidates:
+            then()
+            return
+        confirmed = load_auto_archive_confirmed()
+        if key not in confirmed:
+            answer = QMessageBox.question(
+                self,
+                "Автоархив",
+                f"База почты {plan.db_bytes / (1024 * 1024):.0f} МБ превысила порог "
+                f"{plan.threshold_bytes / (1024 * 1024):.0f} МБ.\n\n"
+                f"Перенести {plan.count} самых старых писем ({plan.total_bytes / (1024 * 1024):.0f} МБ, "
+                f"{plan.oldest_date[:10]} — {plan.newest_date[:10]}) в файл архива в каталоге\n{self.archive_storage_dir}\n"
+                "и удалить их с сервера? Письма останутся в списке и будут читаться из архива.\n\n"
+                "Больше этот вопрос для этой учётной записи задаваться не будет; отключить автоархив можно в Параметрах.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                _log.info("Автоархив %s: пользователь отказался (%d писем)", key, plan.count)
+                then()
+                return
+            save_auto_archive_confirmed([*confirmed, key])
+        worker = _CallableWorker(
+            autoarchive.run, mailbox, plan, Path(self.archive_storage_dir), stop=self._sync_stop, parent=self
+        )
+
+        def done(_result: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            self._set_busy(None)
+            if self.active_source is mailbox and self.current_folder:
+                try:
+                    self._render_folder(mailbox.folder_summaries(self.current_folder))
+                except Exception:
+                    pass
+            then()
+
+        def on_success(result: object) -> None:
+            self.statusBar().showMessage(
+                f"Автоархив: перенесено {result.archived} писем, освобождено {result.bytes_freed / (1024 * 1024):.0f} МБ", 8000
+            )
+            done()
+
+        def on_failure(error_text: str) -> None:
+            _log.error("Автоархив %s: %s", key, error_text)
+            done()
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        self._set_busy(f"{key}: автоархив {plan.count} писем…")
         worker.start()
 
     def _on_periodic_refresh(self) -> None:

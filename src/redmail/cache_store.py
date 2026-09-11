@@ -93,6 +93,9 @@ _MIGRATIONS = (
     "ALTER TABLE folders ADD COLUMN uidvalidity INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE folders ADD COLUMN headers_complete INTEGER NOT NULL DEFAULT 0",
     "CREATE INDEX IF NOT EXISTS idx_messages_body_state ON messages (account, body_state, uid)",
+    # автоархив: письмо перенесено в файл архива, тело читается оттуда
+    "ALTER TABLE messages ADD COLUMN archive_path TEXT",
+    "ALTER TABLE messages ADD COLUMN archive_uid INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_attachments_msg ON attachments (account, folder, uid)",
     "CREATE INDEX IF NOT EXISTS idx_inline_msg ON inline_images (account, folder, uid)",
 )
@@ -249,7 +252,8 @@ def count_folder_summaries(account_key: str, folder: str) -> int:
 def get_folder_uids(account_key: str, folder: str) -> set[int]:
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid FROM messages WHERE account = ? AND folder = ? AND position >= 0", (account_key, folder)
+            "SELECT uid FROM messages WHERE account = ? AND folder = ? AND position >= 0 AND archive_path IS NULL",
+            (account_key, folder),
         ).fetchall()
     return {r[0] for r in rows}
 
@@ -257,7 +261,8 @@ def get_folder_uids(account_key: str, folder: str) -> set[int]:
 def get_folder_flags(account_key: str, folder: str) -> dict[int, tuple[bool, bool, str | None]]:
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid, is_read, is_answered, marker_color FROM messages WHERE account = ? AND folder = ? AND position >= 0",
+            "SELECT uid, is_read, is_answered, marker_color FROM messages WHERE account = ? AND folder = ? "
+            "AND position >= 0 AND archive_path IS NULL",
             (account_key, folder),
         ).fetchall()
     return {uid: (bool(r), bool(a), m) for uid, r, a, m in rows}
@@ -491,6 +496,63 @@ def defer_large_messages(account_key: str, max_bytes: int) -> int:
         )
         conn.commit()
         return cur.rowcount
+
+
+# ---- Автоархив (единый индекс: архивные письма остаются в списке) -------------
+
+
+def oldest_messages(account_key: str, *, limit: int | None = None) -> list[tuple[str, int, int, str]]:
+    """(папка, uid, размер, дата) не архивированных писем от старых к новым —
+    кандидаты автоархива."""
+    sql = (
+        "SELECT folder, uid, size, date FROM messages WHERE account = ? AND position >= 0 AND archive_path IS NULL "
+        "ORDER BY date ASC, uid ASC"
+    )
+    params: tuple = (account_key,)
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (*params, limit)
+    with closing(_connect()) as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return [(f, u, int(s or 0), d or "") for f, u, s, d in rows]
+
+
+def mark_archived(account_key: str, folder: str, uid: int, archive_path: str, archive_uid: int) -> None:
+    """Письмо перенесено в архив: тело и вложения из основной базы убираются,
+    строка остаётся с указателем на файл архива."""
+    with closing(_connect()) as conn:
+        conn.execute(
+            "UPDATE messages SET archive_path = ?, archive_uid = ?, body = NULL, html = NULL, body_state = 'archived' "
+            "WHERE account = ? AND folder = ? AND uid = ?",
+            (archive_path, archive_uid, account_key, folder, uid),
+        )
+        for table in ("attachments", "inline_images"):
+            conn.execute(f"DELETE FROM {table} WHERE account = ? AND folder = ? AND uid = ?", (account_key, folder, uid))
+        conn.commit()
+
+
+def get_archive_ref(account_key: str, folder: str, uid: int) -> tuple[str, int] | None:
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT archive_path, archive_uid FROM messages WHERE account = ? AND folder = ? AND uid = ? "
+            "AND archive_path IS NOT NULL",
+            (account_key, folder, uid),
+        ).fetchone()
+    return (row[0], int(row[1])) if row else None
+
+
+def count_archived(account_key: str) -> int:
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM messages WHERE account = ? AND archive_path IS NOT NULL", (account_key,)
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def vacuum() -> None:
+    """Вернуть место после автоархива — SQLite сам файл не ужимает."""
+    with closing(_connect()) as conn:
+        conn.execute("VACUUM")
 
 
 def storage_stats(account_key: str | None = None) -> dict:

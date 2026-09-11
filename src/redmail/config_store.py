@@ -124,6 +124,27 @@ def save_body_max_size_mb(value: int) -> None:
     _save_settings_dict(data)
 
 
+def load_auto_archive_enabled() -> bool:
+    return bool(_load_settings_dict().get("auto_archive_enabled", True))
+
+
+def save_auto_archive_enabled(enabled: bool) -> None:
+    data = _load_settings_dict()
+    data["auto_archive_enabled"] = bool(enabled)
+    _save_settings_dict(data)
+
+
+def load_auto_archive_confirmed() -> list[str]:
+    value = _load_settings_dict().get("auto_archive_confirmed", [])
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def save_auto_archive_confirmed(keys: list[str]) -> None:
+    data = _load_settings_dict()
+    data["auto_archive_confirmed"] = list(keys)
+    _save_settings_dict(data)
+
+
 def load_auto_archive_size_mb() -> int:
     try:
         value = int(_load_settings_dict().get("auto_archive_size_mb", DEFAULT_AUTO_ARCHIVE_SIZE_MB))
