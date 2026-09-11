@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
 from redmail import applog
+from redmail import profile
 from redmail import config_store
 from redmail.ui import theme
 
@@ -118,6 +119,8 @@ def main() -> int:
     report("Загрузка интерфейса…")
     from redmail.ui.main_window import MainWindow
 
+    profile_path = profile.ensure_profile()
+    applog.get_logger("app").info("Профиль: %s", profile_path)
     window = MainWindow()
 
     report("Готово")

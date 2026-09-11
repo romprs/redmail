@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+from email.message import EmailMessage
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-
-from email.message import EmailMessage
 
 from redmail import archive_store
 from redmail.imap_client import UNKNOWN_MARKER, Account, MessageContent, MessageSummary
@@ -14,209 +13,184 @@ def _account() -> Account:
     return Account(host="imap.example.com", username="ivan", password="secret")
 
 
-def _summary(uid: int) -> MessageSummary:
-    return MessageSummary(
+def _summary(uid: int, **kwargs) -> MessageSummary:
+    base = dict(
         uid=uid, subject="S", sender="Ivan", sender_email="ivan@example.com", date="2026-08-18 10:00",
-        message_id="<1@example.com>",
+        message_id=f"<{uid}@example.com>",
     )
+    base.update(kwargs)
+    return MessageSummary(**base)
 
 
-def test_folder_summaries_hits_network_once_when_cache_empty(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 1
-    session.fetch_summaries.return_value = [_summary(1)]
+class FakeSession:
+    """Сервер с полным списком писем — тем набором методов, который нужен
+    полной синхронизации (sync_engine): STATUS, список UID, сводки по UID,
+    флаги по UID."""
 
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        summaries = mailbox.folder_summaries("INBOX")
+    def __init__(self, messages: dict[int, MessageSummary], uidvalidity: int = 1) -> None:
+        self.messages = dict(messages)
+        self.uidvalidity = uidvalidity
+        self.calls: list[tuple] = []
+        self.fetch_message_content = MagicMock(return_value=MessageContent(text="hello"))
+        self.fetch_message_raw = MagicMock(return_value=b"raw bytes")
+        self.set_marker = MagicMock()
+        self.set_read = MagicMock()
+        self.set_answered = MagicMock()
+        self.move_messages = MagicMock()
+        self.delete_messages = MagicMock()
+        self.close = MagicMock()
+        self.append_message = MagicMock()
 
-    assert [s.uid for s in summaries] == [1]
-    session.folder_message_count.assert_called_once()
-    session.fetch_summaries.assert_called_once()
+    def folder_status(self, folder):
+        self.calls.append(("status", folder))
+        return self.uidvalidity, len(self.messages)
+
+    def search_uids(self, folder, *, before=None):
+        self.calls.append(("search", folder, before))
+        return sorted(self.messages)
+
+    def fetch_summaries_by_uids(self, folder, uids):
+        self.calls.append(("summaries", folder, tuple(uids)))
+        return [self.messages[u] for u in uids if u in self.messages]
+
+    def fetch_flags(self, folder, uids):
+        self.calls.append(("flags", folder, tuple(uids)))
+        return {
+            u: (self.messages[u].is_read, self.messages[u].is_answered, self.messages[u].marker_color)
+            for u in uids if u in self.messages
+        }
 
 
-def test_folder_summaries_never_hits_network_once_cached(tmp_path: Path) -> None:
-    # Ключевое требование: переключение между уже открытыми папками не должно
-    # спрашивать сервер вообще — ни SELECT, ни FETCH.
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 1
-    session.fetch_summaries.return_value = [_summary(1)]
+def _mailbox(tmp_path: Path, session: FakeSession):
+    return patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"), CachedMailbox(session, _account())
 
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")  # первый раз — сеть
+
+def test_first_open_syncs_folder_then_reads_only_from_local_copy(tmp_path: Path) -> None:
+    session = FakeSession({1: _summary(1), 2: _summary(2)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        first = mailbox.folder_summaries("INBOX")
+        session.calls.clear()
         mailbox.folder_summaries("INBOX")
         mailbox.folder_summaries("INBOX")
 
-    session.folder_message_count.assert_called_once()
-    session.fetch_summaries.assert_called_once()
+    assert [s.uid for s in first] == [2, 1]  # новые сверху
+    assert session.calls == []  # после синхронизации папка читается только из базы
 
 
-def test_refresh_folder_skips_fetch_when_exists_unchanged(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 5
-    session.fetch_summaries.return_value = [_summary(1)]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
+def test_refresh_adds_new_deletes_missing_and_updates_flags(tmp_path: Path) -> None:
+    # Зеркало сервера: новое письмо появляется, удалённое на сервере
+    # исчезает локально, смена флага в другом клиенте подхватывается.
+    session = FakeSession({1: _summary(1), 2: _summary(2, is_read=False)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
         mailbox.refresh_folder("INBOX")
-        mailbox.refresh_folder("INBOX")
-
-    # EXISTS не поменялся (5 оба раза) — второй refresh не должен снова
-    # ходить в сеть за сводками, только за EXISTS (folder_message_count).
-    assert session.fetch_summaries.call_count == 1
-    assert session.folder_message_count.call_count == 2
-
-
-def test_refresh_folder_refetches_when_exists_changes(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.side_effect = [5, 6]
-    session.fetch_summaries.side_effect = [[_summary(1)], [_summary(1), _summary(2)]]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.refresh_folder("INBOX")
+        del session.messages[1]
+        session.messages[3] = _summary(3)
+        session.messages[2] = _summary(2, is_read=True, marker_color="red")
         second = mailbox.refresh_folder("INBOX")
 
-    assert session.fetch_summaries.call_count == 2
-    assert len(second) == 2
+    assert [s.uid for s in second] == [3, 2]
+    by_uid = {s.uid: s for s in second}
+    assert by_uid[2].is_read is True and by_uid[2].marker_color == "red"
+
+
+def test_local_marker_color_survives_server_that_only_keeps_flagged(tmp_path: Path) -> None:
+    # VK хранит только \Flagged: цвет помнит локальная база.
+    session = FakeSession({1: _summary(1, marker_color="red")})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        mailbox.refresh_folder("INBOX")
+        mailbox.set_marker("INBOX", 1, "green")
+        session.messages[1] = _summary(1, marker_color="red")  # сервер по-прежнему говорит лишь «флаг есть»
+        after = mailbox.refresh_folder("INBOX")
+        session.messages[1] = _summary(1, marker_color=None)  # флаг сняли в другом клиенте
+        cleared = mailbox.refresh_folder("INBOX")
+
+    session.set_marker.assert_called_once_with("INBOX", 1, "green", previous_color=UNKNOWN_MARKER)
+    assert after[0].marker_color == "green"
+    assert cleared[0].marker_color is None
+
+
+def test_uidvalidity_change_rebuilds_local_copy(tmp_path: Path) -> None:
+    session = FakeSession({5: _summary(5)}, uidvalidity=100)
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        mailbox.refresh_folder("INBOX")
+        session.uidvalidity = 200
+        session.messages = {1: _summary(1, subject="new")}
+        after = mailbox.refresh_folder("INBOX")
+    assert [(s.uid, s.subject) for s in after] == [(1, "new")]
 
 
 def test_message_content_cached_after_first_fetch(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.fetch_message_content.return_value = MessageContent(text="hello")
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
+    session = FakeSession({1: _summary(1)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
         first = mailbox.message_content("INBOX", 1)
         second = mailbox.message_content("INBOX", 1)
-
     assert session.fetch_message_content.call_count == 1
     assert first.text == second.text == "hello"
 
 
-def test_set_marker_updates_session_and_cache(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 1
-    session.fetch_summaries.return_value = [_summary(1)]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")
-        mailbox.set_marker("INBOX", 1, "green")
-        cached = mailbox.folder_summaries("INBOX")
-
-    session.set_marker.assert_called_once_with("INBOX", 1, "green", previous_color=UNKNOWN_MARKER)
-    assert cached[0].marker_color == "green"
+def test_download_bodies_fetches_newest_first_and_defers_large(tmp_path: Path) -> None:
+    session = FakeSession({1: _summary(1, size=100), 2: _summary(2, size=50 * 1024 * 1024), 3: _summary(3, size=200)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        mailbox.refresh_folder("INBOX")
+        downloaded = mailbox.download_bodies()
+        remaining = mailbox.download_bodies()
+    assert downloaded == 2 and remaining == 0
+    fetched = [call.args for call in session.fetch_message_content.call_args_list]
+    assert fetched == [("INBOX", 3), ("INBOX", 1)]  # большое письмо 2 отложено, порядок — от новых к старым
 
 
-def test_set_read_updates_session_and_cache(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 1
-    session.fetch_summaries.return_value = [_summary(1)]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")
+def test_set_read_and_delete_update_session_and_local_copy(tmp_path: Path) -> None:
+    session = FakeSession({1: _summary(1), 2: _summary(2)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        mailbox.refresh_folder("INBOX")
         mailbox.set_read("INBOX", 1, True)
+        mailbox.delete_messages("INBOX", [2])
         cached = mailbox.folder_summaries("INBOX")
-
     session.set_read.assert_called_once_with("INBOX", 1, True)
-    assert cached[0].is_read is True
-
-
-def test_delete_messages_updates_session_and_cache(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 2
-    session.fetch_summaries.return_value = [_summary(1), _summary(2)]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")
-        mailbox.delete_messages("INBOX", [1])
-        cached = mailbox.folder_summaries("INBOX")
-
-    session.delete_messages.assert_called_once_with("INBOX", [1])
-    assert [s.uid for s in cached] == [2]
+    session.delete_messages.assert_called_once_with("INBOX", [2])
+    assert [(s.uid, s.is_read) for s in cached] == [(1, True)]
 
 
 def test_move_to_trash_updates_session_and_cache(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.folder_message_count.return_value = 2
-    session.fetch_summaries.return_value = [_summary(1), _summary(2)]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        mailbox.folder_summaries("INBOX")
+    session = FakeSession({1: _summary(1), 2: _summary(2)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        mailbox.refresh_folder("INBOX")
         mailbox.move_to_trash("INBOX", [1], "Trash")
         cached = mailbox.folder_summaries("INBOX")
-
     session.move_messages.assert_called_once_with("INBOX", [1], "Trash")
     assert [s.uid for s in cached] == [2]
 
 
 def test_different_accounts_do_not_share_cache(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session_a = MagicMock()
-    session_a.folder_message_count.return_value = 1
-    session_a.fetch_summaries.return_value = [_summary(1)]
-
-    session_b = MagicMock()
-    session_b.folder_message_count.return_value = 1
-    session_b.fetch_summaries.return_value = [_summary(1)]
-
-    account_a = Account(host="imap.example.com", username="ivan", password="secret")
+    session_a = FakeSession({1: _summary(1)})
+    session_b = FakeSession({7: _summary(7)})
     account_b = Account(host="imap.example.com", username="petr", password="secret")
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        CachedMailbox(session_a, account_a).folder_summaries("INBOX")
-        CachedMailbox(session_b, account_b).folder_summaries("INBOX")
-
-    # У обоих аккаунтов должен был быть реальный запрос сводок — не подхватили чужой кэш.
-    assert session_a.fetch_summaries.call_count == 1
-    assert session_b.fetch_summaries.call_count == 1
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        a = CachedMailbox(session_a, _account()).folder_summaries("INBOX")
+        b = CachedMailbox(session_b, account_b).folder_summaries("INBOX")
+    assert [s.uid for s in a] == [1] and [s.uid for s in b] == [7]
 
 
-def test_message_raw_delegates_to_session_uncached(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.fetch_message_raw.return_value = b"raw bytes"
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        first = mailbox.message_raw("INBOX", 1)
-        second = mailbox.message_raw("INBOX", 1)
-
-    assert first == second == b"raw bytes"
+def test_message_raw_and_search_uids_delegate_uncached(tmp_path: Path) -> None:
+    session = FakeSession({1: _summary(1)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx:
+        assert mailbox.message_raw("INBOX", 1) == mailbox.message_raw("INBOX", 1) == b"raw bytes"
+        assert mailbox.search_uids("INBOX", before=None) == [1]
     assert session.fetch_message_raw.call_count == 2
 
 
-def test_search_uids_delegates_to_session_uncached(tmp_path: Path) -> None:
-    db_path = tmp_path / "cache.sqlite3"
-    session = MagicMock()
-    session.search_uids.return_value = [3, 7]
-
-    with patch("redmail.cache_store._db_path", return_value=db_path):
-        mailbox = CachedMailbox(session, _account())
-        uids = mailbox.search_uids("INBOX", before=None)
-
-    assert uids == [3, 7]
-    session.search_uids.assert_called_once_with("INBOX", before=None)
-
-
 def test_close_delegates_to_session() -> None:
-    session = MagicMock()
-    mailbox = CachedMailbox(session, _account())
-    mailbox.close()
+    session = FakeSession({})
+    CachedMailbox(session, _account()).close()
     session.close.assert_called_once()
 
 
@@ -237,10 +211,7 @@ def test_archive_source_same_protocol_as_cached_mailbox(tmp_path: Path) -> None:
     summaries = source.folder_summaries("F")
     assert len(summaries) == 1
     assert summaries[0].subject == "A"
-
-    # refresh_folder — тот же результат, архив не ходит в сеть
     assert source.refresh_folder("F")[0].subject == "A"
-
     content = source.message_content("F", summaries[0].uid)
     assert content.text.strip() == "тело"
 
@@ -253,14 +224,10 @@ def test_archive_source_set_marker_and_delete(tmp_path: Path) -> None:
     source = ArchiveSource(archive_path)
     source.set_marker("F", msg_id, "green")
     assert source.folder_summaries("F")[0].marker_color == "green"
-
     source.delete_messages("F", [msg_id])
     assert source.folder_summaries("F") == []
 
 
-def test_archive_source_close_is_noop(tmp_path: Path) -> None:
-    ArchiveSource(tmp_path / "test.rmarchive").close()  # не должно падать
-
-
-def test_archive_source_set_read_is_noop(tmp_path: Path) -> None:
-    ArchiveSource(tmp_path / "test.rmarchive").set_read("F", 1, False)  # не должно падать
+def test_archive_source_close_and_set_read_are_noops(tmp_path: Path) -> None:
+    ArchiveSource(tmp_path / "test.rmarchive").close()
+    ArchiveSource(tmp_path / "test.rmarchive").set_read("F", 1, False)

@@ -183,6 +183,9 @@ class MessageSummary:
     # проставлялся (жалоба: "если мы ответили на письмо, это никак не
     # отражается, нужен какой-то признак").
     is_answered: bool = False
+    # RFC822.SIZE — по нему фоновая синхронизация решает, качать ли тело
+    # сразу или отложить до открытия (порог «вложения > 25 МБ по запросу»).
+    size: int = 0
 
 
 @dataclass
@@ -400,6 +403,61 @@ class ImapSession:
     def fetch_folder_summaries(self, folder: str = "INBOX", limit: int = 50) -> list[MessageSummary]:
         self.folder_message_count(folder)
         return self.fetch_summaries(limit)
+
+    @_reconnecting
+    def folder_status(self, folder: str) -> tuple[int, int]:
+        """(UIDVALIDITY, число писем) через STATUS — без SELECT и без
+        сканирования; UIDVALIDITY нужен полной синхронизации: если сервер
+        перевыдал UID, локальную копию папки надо перестроить."""
+        status = self._client.folder_status(folder, ["UIDVALIDITY", "MESSAGES"])
+        validity = 0
+        messages = 0
+        for key, value in status.items():
+            name = key.decode("ascii", errors="replace") if isinstance(key, bytes) else str(key)
+            if name.upper() == "UIDVALIDITY":
+                validity = int(value)
+            elif name.upper() == "MESSAGES":
+                messages = int(value)
+        return validity, messages
+
+    @_reconnecting
+    def fetch_summaries_by_uids(self, folder: str, uids: list[int]) -> list[MessageSummary]:
+        """Сводки конкретных писем по UID (полная синхронизация качает
+        заголовки порциями, от новых к старым). RFC822.SIZE — чтобы решить,
+        качать ли тело сразу."""
+        if not uids:
+            return []
+        self._select(folder)
+        response = self._client.fetch(
+            list(uids), ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "RFC822.SIZE", _HEADER_FIELDS]
+        )
+        summaries = []
+        for _key, data in sorted(response.items(), key=lambda item: item[0], reverse=True):
+            if b"ENVELOPE" not in data:
+                continue
+            summaries.append(_to_summary(data))
+        return summaries
+
+    @_reconnecting
+    def fetch_flags(self, folder: str, uids: list[int]) -> dict[int, tuple[bool, bool, str | None]]:
+        """uid → (прочитано, отвечено, маркер) для уже известных писем —
+        дешёвый способ подхватить чужие изменения флагов (другой клиент,
+        веб-интерфейс) без повторной загрузки заголовков."""
+        if not uids:
+            return {}
+        self._select(folder)
+        response = self._client.fetch(list(uids), ["FLAGS"])
+        result: dict[int, tuple[bool, bool, str | None]] = {}
+        for _key, data in response.items():
+            uid = data.get(b"UID")
+            if uid is None:
+                continue
+            flags = data.get(b"FLAGS", ())
+            marker = join_markers(_COLOR_BY_KEYWORD[f] for f in flags if f in _COLOR_BY_KEYWORD)
+            if marker is None and b"\\Flagged" in flags:
+                marker = "red"
+            result[int(uid)] = (b"\\Seen" in flags, b"\\Answered" in flags, marker)
+        return result
 
     @_reconnecting
     def search_uids(self, folder: str, *, before=None) -> list[int]:
@@ -746,6 +804,7 @@ def _to_summary(data: dict) -> MessageSummary:
         is_read=b"\\Seen" in flags,
         to=_format_address_list(getattr(envelope, "to", None)),
         is_answered=b"\\Answered" in flags,
+        size=int(data.get(b"RFC822.SIZE", 0) or 0),
     )
 
 

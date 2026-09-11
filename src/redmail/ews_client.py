@@ -122,6 +122,7 @@ class EwsSession:
         # тип идентификатора письма. crc32 — детерминированный, не зависит
         # от PYTHONHASHSEED (в отличие от встроенного hash()).
         self._id_map: dict[int, tuple[str, str]] = {}
+        self._listing: dict[str, dict[int, object]] = {}
 
     def close(self) -> None:
         pass  # exchangelib сам управляет пулом HTTP-соединений, отдельно закрывать нечего
@@ -216,7 +217,40 @@ class EwsSession:
         items = folder_obj.all()
         if before is not None:
             items = items.filter(datetime_received__lt=before)
-        return [self._register(item) for item in items]
+        listing: dict[int, object] = {}
+        for item in items:
+            listing[self._register(item)] = item
+        if before is None:
+            # Полная синхронизация (sync_engine) сразу после search_uids
+            # запрашивает сводки и флаги порциями — отдаём их из этого же
+            # списка, а не перечитываем папку с сервера на каждую порцию.
+            self._listing[folder] = listing
+        return list(listing)
+
+    def folder_status(self, folder: str) -> tuple[int, int]:
+        """(UIDVALIDITY, число писем): у EWS нет UIDVALIDITY — наши uid
+        детерминированы (crc32 от id письма), возвращаем 0."""
+        return 0, self._folder(folder).total_count
+
+    def _listed(self, folder: str) -> dict[int, object]:
+        if folder not in self._listing:
+            self.search_uids(folder)
+        return self._listing[folder]
+
+    def fetch_summaries_by_uids(self, folder: str, uids: list[int]) -> list[MessageSummary]:
+        listing = self._listed(folder)
+        return [self._to_summary(listing[uid]) for uid in uids if uid in listing]
+
+    def fetch_flags(self, folder: str, uids: list[int]) -> dict[int, tuple[bool, bool, str | None]]:
+        listing = self._listed(folder)
+        result: dict[int, tuple[bool, bool, str | None]] = {}
+        for uid in uids:
+            item = listing.get(uid)
+            if item is None:
+                continue
+            summary = self._to_summary(item)
+            result[uid] = (summary.is_read, summary.is_answered, summary.marker_color)
+        return result
 
     def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
         return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))

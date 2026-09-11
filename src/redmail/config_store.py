@@ -87,6 +87,54 @@ def save_theme(theme: str) -> None:
 
 _MAIL_VIEW_MODES = ("table", "cards")
 
+# ---- Хранилище (профиль, аналог OST/PST) --------------------------------------
+DEFAULT_BODY_MAX_SIZE_MB = 25
+DEFAULT_AUTO_ARCHIVE_SIZE_MB = 500
+
+
+def load_profile_dir() -> Path:
+    from redmail import profile
+
+    return profile.load_profile_dir()
+
+
+def save_profile_dir(directory: Path | None) -> None:
+    """Пустое значение — вернуться к каталогу по умолчанию."""
+    data = _load_settings_dict()
+    data["profile_dir"] = str(directory) if directory else ""
+    _save_settings_dict(data)
+
+
+def load_body_max_size_mb() -> int:
+    """Письма больше этого размера не скачиваются фоном — только при
+    открытии (договорённость: вложения > 25 МБ по запросу; порог
+    настраивается в обе стороны)."""
+    try:
+        value = int(_load_settings_dict().get("body_max_size_mb", DEFAULT_BODY_MAX_SIZE_MB))
+    except (TypeError, ValueError):
+        value = DEFAULT_BODY_MAX_SIZE_MB
+    return max(1, value)
+
+
+def save_body_max_size_mb(value: int) -> None:
+    data = _load_settings_dict()
+    data["body_max_size_mb"] = max(1, int(value))
+    _save_settings_dict(data)
+
+
+def load_auto_archive_size_mb() -> int:
+    try:
+        value = int(_load_settings_dict().get("auto_archive_size_mb", DEFAULT_AUTO_ARCHIVE_SIZE_MB))
+    except (TypeError, ValueError):
+        value = DEFAULT_AUTO_ARCHIVE_SIZE_MB
+    return max(50, value)
+
+
+def save_auto_archive_size_mb(value: int) -> None:
+    data = _load_settings_dict()
+    data["auto_archive_size_mb"] = max(50, int(value))
+    _save_settings_dict(data)
+
 
 def load_mail_view_mode() -> str:
     """Режим списка писем: "table" — колонки (как раньше), "cards" — плитки

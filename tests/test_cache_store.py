@@ -207,8 +207,31 @@ def test_schema_version_bump_wipes_stale_cache(tmp_path: Path) -> None:
         assert cache_store.get_folder_exists("acc", "INBOX") == 1
 
     with patch("redmail.cache_store._db_path", return_value=db_path), \
-         patch("redmail.cache_store._SCHEMA_VERSION", cache_store._SCHEMA_VERSION + 1):
+         patch("redmail.cache_store._SCHEMA_VERSION", cache_store._SCHEMA_VERSION + 1), \
+         patch("redmail.cache_store._MIN_COMPATIBLE_VERSION", cache_store._SCHEMA_VERSION + 1):
         # "Новая версия приложения" видит несовпадающий schema_version и должна
         # очистить всё, что было закэшировано старой версией.
         assert cache_store.get_folder_exists("acc", "INBOX") is None
         assert cache_store.get_folder_summaries("acc", "INBOX") == []
+
+
+def test_compatible_schema_bump_keeps_data_and_marks_bodies(tmp_path: Path) -> None:
+    # Переход 6 → 7 (полная локальная копия): данные — в т.ч. цвета маркеров,
+    # которых сервер VK не хранит, — не стираются; у уже скачанных тел
+    # проставляется body_state='full'.
+    import sqlite3
+    from contextlib import closing
+
+    from redmail.imap_client import MessageContent
+
+    db_path = tmp_path / "cache.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        cache_store.save_folder_summaries("acc", "INBOX", 1, [_summary(1, "A", marker_color="green")])
+        cache_store.save_message_content("acc", "INBOX", 1, MessageContent(text="body"))
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute("UPDATE meta SET value = '6' WHERE key = 'schema_version'")
+            conn.execute("UPDATE messages SET body_state = 'none'")
+            conn.commit()
+        cached = cache_store.get_folder_summaries("acc", "INBOX")
+        assert [s.marker_color for s in cached] == ["green"]
+        assert cache_store.count_messages_without_body("acc", 10**9) == 0  # тело уже есть — докачивать нечего

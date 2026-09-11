@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
-from redmail import archive_store, cache_store
+from redmail import archive_store, cache_store, sync_engine
 from redmail.applog import get_logger
 from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageSummary
 
@@ -10,59 +11,54 @@ _log = get_logger("mailbox")
 
 
 class CachedMailbox:
-    """Читает через ImapSession, но сперва проверяет локальный кэш.
+    """Ящик поверх локальной копии (аналог OST): интерфейс читает только
+    из базы, сервер опрашивается синхронизацией.
 
-    folder_summaries() — чистое чтение из кэша, без обращения к серверу,
-    КРОМЕ самого первого раза, когда для папки ещё нет вообще ничего
-    закэшированного (переключение между уже открытыми папками сети не
-    трогает — не нужно спрашивать сервер на каждый клик).
+    folder_summaries() — чистое чтение из базы, сети не касается.
+    refresh_folder() — синхронизация заголовков папки с сервером
+    (sync_engine.sync_folder_headers): новые письма добавляются, удалённые
+    на сервере удаляются локально, флаги обновляются; тела при этом не
+    скачиваются. Первое открытие ещё не синхронизированной папки тоже
+    идёт через refresh_folder.
 
-    refresh_folder() — явная проверка сервера: при первом открытии папки,
-    по периодическому таймеру и по кнопке «Обновить» в UI. SELECT (дёшево,
-    без сканирования) выполняется всегда, чтобы узнать текущее число писем;
-    если оно не изменилось — обходимся без похода за самими письмами.
+    message_content() — тело из базы; если его ещё нет (фон не успел или
+    письмо большое и отложено) — скачивается сейчас и сохраняется.
 
-    Текст письма и вложения кэшируются один раз навсегда: после доставки
-    письмо не меняется, повторно скачивать нечего.
+    sync_all()/download_bodies() — полная фоновая синхронизация (все папки,
+    затем тела от новых к старым), см. sync_engine.
     """
 
-    def __init__(self, session: ImapSession, account: Account):
+    def __init__(self, session: ImapSession, account: Account, *, body_max_bytes: int = sync_engine.DEFAULT_BODY_MAX_BYTES):
         self.session = session
         self._account_key = f"{account.host}:{account.username}"
+        self.body_max_bytes = body_max_bytes
 
-    def folder_summaries(self, folder: str, limit: int = 50) -> list[MessageSummary]:
-        cached = cache_store.get_folder_summaries(self._account_key, folder)
-        if cached:
-            return cached[:limit]
-        return self.refresh_folder(folder, limit)
+    @property
+    def account_key(self) -> str:
+        return self._account_key
 
-    def refresh_folder(self, folder: str, limit: int = 50) -> list[MessageSummary]:
-        total = self.session.folder_message_count(folder)
-        cached_total = cache_store.get_folder_exists(self._account_key, folder)
-        if cached_total == total:
-            cached = cache_store.get_folder_summaries(self._account_key, folder)
+    def folder_summaries(self, folder: str, limit: int | None = None) -> list[MessageSummary]:
+        if not cache_store.is_folder_synced(self._account_key, folder):
+            cached = cache_store.get_folder_summaries(self._account_key, folder, limit)
             if cached:
-                return cached[:limit]
-        summaries = self.session.fetch_summaries(limit)
-        _log.info("Папка %s: на сервере %d, загружено сводок %d", folder, total, len(summaries))
-        # Жалоба: "не сохраняется проставленный маркер, через какое-то время
-        # пропадает" — сервер (VK Mail) не хранит наши цветные keyword-флаги,
-        # только стандартный \Flagged. Сервер — источник правды о том, ЕСТЬ
-        # ли маркер (\Flagged: снят в другом клиенте — снят и здесь), а
-        # КАКОГО он цвета — помнит локальный кэш (set_marker пишет туда при
-        # каждой смене). Без этого шага save_folder_summaries затирал бы
-        # цвет из кэша серверным "красный по умолчанию" при каждом
-        # обновлении (см. imap_client._to_summary).
-        cached_colors = {
-            s.uid: s.marker_color
-            for s in cache_store.get_folder_summaries(self._account_key, folder)
-            if s.marker_color
-        }
-        for summary in summaries:
-            if summary.marker_color is not None and summary.uid in cached_colors:
-                summary.marker_color = cached_colors[summary.uid]
-        cache_store.save_folder_summaries(self._account_key, folder, total, summaries)
-        return summaries
+                return cached
+            return self.refresh_folder(folder, limit)
+        return cache_store.get_folder_summaries(self._account_key, folder, limit)
+
+    def folder_message_total(self, folder: str) -> int:
+        return cache_store.count_folder_summaries(self._account_key, folder)
+
+    def refresh_folder(self, folder: str, limit: int | None = None, *, progress=None, stop: threading.Event | None = None) -> list[MessageSummary]:
+        sync_engine.sync_folder_headers(self.session, self._account_key, folder, progress=progress, stop=stop)
+        return cache_store.get_folder_summaries(self._account_key, folder, limit)
+
+    def sync_all(self, folders: list[str], *, progress=None, stop: threading.Event | None = None) -> sync_engine.SyncStats:
+        return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
+
+    def download_bodies(self, *, progress=None, stop: threading.Event | None = None, limit: int | None = None) -> int:
+        return sync_engine.download_bodies(
+            self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit
+        )
 
     def message_content(self, folder: str, uid: int) -> MessageContent:
         cached = cache_store.get_message_content(self._account_key, folder, uid)
@@ -104,6 +100,8 @@ class CachedMailbox:
         cache_store.delete_messages(self._account_key, folder, uids)
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
+        # Удаление локально = удаление на сервере (договорённость по
+        # хранилищу): сначала сервер, затем локальная копия.
         self.session.delete_messages(folder, uids)
         cache_store.delete_messages(self._account_key, folder, uids)
 
@@ -111,10 +109,8 @@ class CachedMailbox:
         self.session.close()
 
     def append_message(self, folder: str, raw: bytes, *, flags: tuple = ()) -> None:
-        # Кэш сам заметит новое письмо при следующем открытии папки — там
-        # refresh_folder() уже сравнивает EXISTS с закэшированным числом
-        # писем и перечитывает при расхождении, отдельная инвалидация не
-        # нужна.
+        # Новое письмо подхватит следующая синхронизация папки (появится
+        # новый UID на сервере).
         self.session.append_message(folder, raw, flags=flags)
 
 
@@ -126,10 +122,14 @@ class ArchiveSource:
     def __init__(self, path: Path):
         self.path = path
 
-    def folder_summaries(self, folder: str, limit: int = 50) -> list[MessageSummary]:
-        return archive_store.list_messages(self.path, folder)[:limit]
+    def folder_summaries(self, folder: str, limit: int | None = None) -> list[MessageSummary]:
+        messages = archive_store.list_messages(self.path, folder)
+        return messages[:limit] if limit is not None else messages
 
-    def refresh_folder(self, folder: str, limit: int = 50) -> list[MessageSummary]:
+    def folder_message_total(self, folder: str) -> int:
+        return len(archive_store.list_messages(self.path, folder))
+
+    def refresh_folder(self, folder: str, limit: int | None = None, **_kwargs) -> list[MessageSummary]:
         # Архив не меняется извне сам по себе — «обновить» просто перечитывает файл.
         return self.folder_summaries(folder, limit)
 

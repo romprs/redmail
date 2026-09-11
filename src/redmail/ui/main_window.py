@@ -10,6 +10,7 @@ import mimetypes
 import re
 import shutil
 import tempfile
+import threading
 import zlib
 from datetime import date, datetime, time, timedelta, timezone
 from email.utils import getaddresses
@@ -131,7 +132,10 @@ from redmail.config_store import (
     load_caldav_url,
     load_default_signature_id,
     load_ews_accounts,
+    load_auto_archive_size_mb,
+    load_body_max_size_mb,
     load_font_scale,
+    load_profile_dir,
     load_mail_view_mode,
     load_mail_columns_state,
     load_mail_date_column_pinned,
@@ -148,7 +152,10 @@ from redmail.config_store import (
     save_caldav_url,
     save_default_signature_id,
     save_ews_accounts,
+    save_auto_archive_size_mb,
+    save_body_max_size_mb,
     save_font_scale,
+    save_profile_dir,
     save_mail_view_mode,
     save_mail_columns_state,
     save_mail_date_column_pinned,
@@ -175,6 +182,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
+from redmail import profile
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -263,6 +271,11 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
         painter.restore()
 
 _FLAG_MARK = "⚑"
+# Сколько последних писем папки показывать в таблице (полная локальная
+# копия может быть на десятки тысяч писем; QTableWidget на таком объёме
+# заметно тормозит).
+MAX_LIST_ROWS = 3000
+
 _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно скрепка
 _REPLIED_MARK = "↩"  # ↩ — письмо, на которое уже отправлен ответ (флаг \Answered)
 
@@ -1423,6 +1436,10 @@ class SettingsDialog(QDialog):
         pane_orientation: str = "vertical",
         archive_storage_dir: Path | None = None,
         theme: str = "light",
+        profile_dir: Path | None = None,
+        body_max_size_mb: int = 25,
+        auto_archive_size_mb: int = 500,
+        storage_stats: dict | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -1567,6 +1584,41 @@ class SettingsDialog(QDialog):
         layout.addWidget(smtp_group)
         layout.addWidget(general_group)
         layout.addWidget(archive_dir_group)
+
+        # Хранилище (переход на хранение «как в Outlook»): каталог профиля с
+        # базами почты/календаря/контактов, порог размера письма для фоновой
+        # загрузки, порог автоархива по размеру базы.
+        self.profile_dir_edit = QLineEdit(str(profile_dir or profile.default_profile_dir()))
+        profile_dir_browse = QPushButton("Обзор…", self)
+        profile_dir_browse.clicked.connect(self._on_browse_profile_dir)
+        profile_dir_row = QHBoxLayout()
+        profile_dir_row.addWidget(self.profile_dir_edit)
+        profile_dir_row.addWidget(profile_dir_browse)
+        self.body_max_size_edit = QSpinBox(self)
+        self.body_max_size_edit.setRange(1, 2000)
+        self.body_max_size_edit.setSuffix(" МБ")
+        self.body_max_size_edit.setValue(int(body_max_size_mb))
+        self.auto_archive_size_edit = QSpinBox(self)
+        self.auto_archive_size_edit.setRange(50, 100000)
+        self.auto_archive_size_edit.setSuffix(" МБ")
+        self.auto_archive_size_edit.setValue(int(auto_archive_size_mb))
+        stats = storage_stats or {}
+        stats_text = (
+            f"База почты: {stats.get('db_bytes', 0) / (1024 * 1024):.1f} МБ, писем {stats.get('messages', 0)}, "
+            f"с телом {stats.get('with_body', 0)}"
+        ) if stats else "База почты ещё не создана"
+        storage_stats_label = QLabel(stats_text, self)
+        storage_hint = QLabel("Смена каталога профиля вступает в силу после перезапуска программы.", self)
+        storage_hint.setWordWrap(True)
+        storage_form = QFormLayout()
+        storage_form.addRow("Каталог профиля", profile_dir_row)
+        storage_form.addRow("Не скачивать фоном письма больше", self.body_max_size_edit)
+        storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
+        storage_form.addRow(storage_stats_label)
+        storage_form.addRow(storage_hint)
+        storage_group = QGroupBox("Хранилище")
+        storage_group.setLayout(storage_form)
+        layout.addWidget(storage_group)
         layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
 
@@ -1631,6 +1683,21 @@ class SettingsDialog(QDialog):
         worker.failed.connect(on_failure)
         self._smtp_test_worker = worker
         worker.start()
+
+    def _on_browse_profile_dir(self) -> None:
+        chosen = QFileDialog.getExistingDirectory(self, "Каталог профиля", self.profile_dir_edit.text())
+        if chosen:
+            self.profile_dir_edit.setText(chosen)
+
+    def profile_dir(self) -> Path:
+        text = self.profile_dir_edit.text().strip()
+        return Path(text) if text else profile.default_profile_dir()
+
+    def body_max_size_mb(self) -> int:
+        return self.body_max_size_edit.value()
+
+    def auto_archive_size_mb(self) -> int:
+        return self.auto_archive_size_edit.value()
 
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
@@ -3733,6 +3800,38 @@ class _CallableWorker(QThread):
             self.succeeded.emit(result)
 
 
+class _SyncWorker(QThread):
+    """Полная синхронизация одного ящика в фоне (см. sync_engine):
+    заголовки всех папок, затем тела писем от новых к старым. Прогресс —
+    сигналом в GUI-поток; остановка — threading.Event (закрытие окна)."""
+
+    progress = Signal(str)
+    finished_ok = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, mailbox: CachedMailbox, folders: list[str], stop: threading.Event, *, bodies_limit: int | None = None, parent=None):
+        super().__init__(parent)
+        self._mailbox = mailbox
+        self._folders = folders
+        self._stop = stop
+        self._bodies_limit = bodies_limit
+
+    def run(self) -> None:  # noqa: N802 - Qt override
+        try:
+            def report(text: str, _done: int, _total: int) -> None:
+                self.progress.emit(text)
+
+            stats = self._mailbox.sync_all(self._folders, progress=report, stop=self._stop)
+            bodies = 0
+            if not self._stop.is_set():
+                bodies = self._mailbox.download_bodies(progress=report, stop=self._stop, limit=self._bodies_limit)
+            stats.bodies_downloaded = bodies
+        except Exception as exc:
+            self.failed.emit(_exception_text(exc))
+        else:
+            self.finished_ok.emit(stats)
+
+
 class _FolderTreeWidget(QTreeWidget):
     """Дерево папок (живые ящики + архивы) с перетаскиванием мышью — по
     просьбе пользователя ("нужно сделать возможность перетаскивать папки
@@ -3858,7 +3957,7 @@ class MainWindow(QMainWindow):
 
         # Один локальный календарь на пользователя (не на учётную запись —
         # как и почтовый кэш, это просто локальное состояние приложения).
-        self.calendar_path = app_dir() / "calendar.rmcal"
+        self.calendar_path = profile.calendar_db_path()
         # Разовая миграция: раньше был единственный общий адрес CalDAV на
         # весь аккаунт (настраивался в Параметрах) — источник CalDAV теперь
         # настраивается per-календарь (см. AddCalendarDialog), пожелание
@@ -3882,7 +3981,7 @@ class MainWindow(QMainWindow):
                 save_caldav_url("")
             except Exception:
                 pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
-        self.contacts_path = app_dir() / "contacts.rmcontacts"
+        self.contacts_path = profile.contacts_db_path()
         self.current_invite: itip.IncomingInvite | None = None
         self.selected_contact: contact_store.Contact | None = None
         self._contacts_by_row: list[contact_store.Contact] = []
@@ -4502,6 +4601,11 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.busy_label)
         self.statusBar().addPermanentWidget(self.busy_bar)
         self._refresh_in_progress = False
+        self._sync_worker: _SyncWorker | None = None
+        self._sync_queue: list[str] = []
+        self._sync_stop = threading.Event()
+        self._periodic_ticks = 0
+        self.mailbox_folders: dict[str, list[str]] = {}
 
         initial_font_scale = load_font_scale()
         self.font_scale_label = QLabel(f"{round(initial_font_scale * 100)}%", self)
@@ -4732,6 +4836,7 @@ class MainWindow(QMainWindow):
                 if restored:
                     self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
                     self._refresh_folder_async(silent=True)
+                    QTimer.singleShot(1500, self._start_full_sync)
                 return
             protocol, account, smtp_account = queue.pop(0)
             name = account.email if protocol == "ews" else account.username
@@ -4807,7 +4912,10 @@ class MainWindow(QMainWindow):
         if old_mailbox is not None:
             old_mailbox.close()
 
-        self.mailboxes[key] = CachedMailbox(session, account)
+        self.mailboxes[key] = CachedMailbox(
+            session, account, body_max_bytes=load_body_max_size_mb() * 1024 * 1024
+        )
+        self.mailbox_folders[key] = [info.name for info in folders]
         self.mailbox_accounts[key] = account
         self.mailbox_smtp_accounts[key] = smtp_account
         self.mailbox_protocols[key] = protocol
@@ -5465,6 +5573,14 @@ class MainWindow(QMainWindow):
             "<p>Автор: Пономарев Роман Сергеевич</p>",
         )
 
+    def _storage_stats(self) -> dict:
+        try:
+            from redmail import cache_store
+
+            return cache_store.storage_stats()
+        except Exception:
+            return {}
+
     def on_show_log(self) -> None:
         """Справка → «Журнал подключений…» (пожелание: "писать лог
         подключений и синхронизаций, чтобы отладить подключения") —
@@ -5514,9 +5630,14 @@ class MainWindow(QMainWindow):
             pane_orientation=self.pane_orientation,
             archive_storage_dir=self.archive_storage_dir,
             theme=self.theme,
+            profile_dir=load_profile_dir(),
+            body_max_size_mb=load_body_max_size_mb(),
+            auto_archive_size_mb=load_auto_archive_size_mb(),
+            storage_stats=self._storage_stats(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        old_profile_dir = load_profile_dir()
 
         self.poll_interval_minutes = dialog.poll_interval_minutes()
         self.pane_orientation = dialog.pane_orientation()
@@ -5529,6 +5650,20 @@ class MainWindow(QMainWindow):
             save_pane_orientation(self.pane_orientation)
             save_archive_storage_dir(self.archive_storage_dir)
             save_theme(self.theme)
+            save_body_max_size_mb(dialog.body_max_size_mb())
+            save_auto_archive_size_mb(dialog.auto_archive_size_mb())
+            for mailbox in self.mailboxes.values():
+                if isinstance(mailbox, CachedMailbox):
+                    mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024
+            new_profile_dir = dialog.profile_dir()
+            if new_profile_dir != old_profile_dir:
+                save_profile_dir(None if new_profile_dir == profile.default_profile_dir() else new_profile_dir)
+                QMessageBox.information(
+                    self, "Каталог профиля",
+                    f"Новый каталог профиля: {new_profile_dir}\n\nБазы почты, календаря и контактов будут "
+                    "созданы там при следующем запуске; чтобы перенести данные, скопируйте файлы "
+                    "mail.sqlite3, calendar.rmcal и contacts.rmcontacts из старого каталога.",
+                )
         except Exception as exc:
             QMessageBox.warning(self, "Не удалось сохранить параметры", str(exc))
         self._restart_poll_timer()
@@ -6013,6 +6148,60 @@ class MainWindow(QMainWindow):
         self._background_workers.append(worker)
         worker.start()
 
+    def _start_full_sync(self, bodies_limit: int | None = None) -> None:
+        """Полная синхронизация всех подключённых ящиков по очереди (аналог
+        офлайн-копии OST): заголовки всех папок, затем тела от новых к
+        старым. Идёт в фоне порциями, индикатор — в строке состояния."""
+        if self._sync_worker is not None:
+            return
+        self._sync_queue = [key for key in self.mailboxes if self.mailbox_protocols.get(key) in ("imap", "ews")]
+        self._sync_stop.clear()
+        self._sync_next(bodies_limit)
+
+    def _sync_next(self, bodies_limit: int | None = None) -> None:
+        if not self._sync_queue or self._sync_stop.is_set():
+            self._sync_worker = None
+            self._set_busy(None)
+            return
+        key = self._sync_queue.pop(0)
+        mailbox = self.mailboxes.get(key)
+        folders = self.mailbox_folders.get(key, [])
+        if mailbox is None or not folders:
+            self._sync_next(bodies_limit)
+            return
+        worker = _SyncWorker(mailbox, folders, self._sync_stop, bodies_limit=bodies_limit, parent=self)
+        self._sync_worker = worker
+
+        def on_progress(text: str) -> None:
+            self._set_busy(f"{key}: {text}")
+
+        def finish() -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            self._sync_worker = None
+
+        def on_done(stats: object) -> None:
+            finish()
+            _log.info("Полная синхронизация %s: новых %d, удалено %d, тел скачано %d", key, stats.added, stats.deleted, stats.bodies_downloaded)
+            if self.active_source is mailbox and self.current_folder:
+                try:
+                    self._render_folder(mailbox.folder_summaries(self.current_folder))
+                except Exception:
+                    pass
+            self._sync_next(bodies_limit)
+
+        def on_failed(error_text: str) -> None:
+            finish()
+            _log.error("Полная синхронизация %s не удалась: %s", key, error_text)
+            self._sync_next(bodies_limit)
+
+        worker.progress.connect(on_progress)
+        worker.finished_ok.connect(on_done)
+        worker.failed.connect(on_failed)
+        self._background_workers.append(worker)
+        self._set_busy(f"{key}: синхронизация…")
+        worker.start()
+
     def _on_periodic_refresh(self) -> None:
         # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
         # чтобы не перебивать пользователя, если тот занят (например, пишет письмо).
@@ -6020,6 +6209,13 @@ class MainWindow(QMainWindow):
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
         self._refresh_folder_async(silent=True)
+        # Раз в несколько опросов — полный проход по всем папкам и докачка
+        # тел новых писем (порциями, чтобы не мешать работе).
+        self._periodic_ticks += 1
+        if self._periodic_ticks % 6 == 0:
+            QTimer.singleShot(2000, lambda: self._start_full_sync(bodies_limit=None))
+        else:
+            QTimer.singleShot(2000, lambda: self._start_full_sync(bodies_limit=100))
 
     def _clear_reading_pane(self) -> None:
         _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content=""))
@@ -6069,6 +6265,12 @@ class MainWindow(QMainWindow):
     def _render_folder(self, summaries: list[MessageSummary]) -> None:
         previously_selected_uid = self.selected_summary.uid if self.selected_summary else None
 
+        if len(summaries) > MAX_LIST_ROWS:
+            # Полная локальная копия может содержать десятки тысяч писем —
+            # таблица показывает последние MAX_LIST_ROWS (список отсортирован
+            # новые сверху), остальные доступны через поиск/архив.
+            self.statusBar().showMessage(f"Показаны последние {MAX_LIST_ROWS} из {len(summaries)} писем", 6000)
+            summaries = summaries[:MAX_LIST_ROWS]
         self.current_summaries = summaries
         self.summaries_by_uid = {s.uid: s for s in summaries}
 
@@ -8579,6 +8781,10 @@ class MainWindow(QMainWindow):
         return [asdict(rule) for rule in self.mail_rules]
 
     def closeEvent(self, event) -> None:
+        self._sync_stop.set()
+        for worker in list(self._background_workers):
+            if isinstance(worker, _SyncWorker):
+                worker.wait(3000)
         try:
             self.ipc_server.stop()
         except Exception:
