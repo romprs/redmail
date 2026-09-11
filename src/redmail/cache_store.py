@@ -467,23 +467,34 @@ def set_body_state(account_key: str, folder: str, uid: int, state: str) -> None:
         conn.commit()
 
 
-def messages_without_body(account_key: str, max_bytes: int, *, limit: int = 50) -> list[tuple[str, int, int]]:
+def _skip_clause(skip_folders: tuple[str, ...]) -> tuple[str, tuple]:
+    if not skip_folders:
+        return "", ()
+    placeholders = ",".join("?" * len(skip_folders))
+    return f" AND folder NOT IN ({placeholders})", tuple(skip_folders)
+
+
+def messages_without_body(
+    account_key: str, max_bytes: int, *, limit: int = 50, skip_folders: tuple[str, ...] = ()
+) -> list[tuple[str, int, int]]:
     """(папка, uid, размер) писем без тела, от новых к старым, не больше
     max_bytes (большие — по запросу, см. defer_large_messages)."""
+    clause, params = _skip_clause(skip_folders)
     with closing(_connect()) as conn:
         rows = conn.execute(
             "SELECT folder, uid, size FROM messages WHERE account = ? AND body_state = 'none' AND position >= 0 "
-            "AND size <= ? ORDER BY uid DESC LIMIT ?",
-            (account_key, max_bytes, limit),
+            f"AND size <= ?{clause} ORDER BY uid DESC LIMIT ?",
+            (account_key, max_bytes, *params, limit),
         ).fetchall()
     return [(f, u, s) for f, u, s in rows]
 
 
-def count_messages_without_body(account_key: str, max_bytes: int) -> int:
+def count_messages_without_body(account_key: str, max_bytes: int, *, skip_folders: tuple[str, ...] = ()) -> int:
+    clause, params = _skip_clause(skip_folders)
     with closing(_connect()) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE account = ? AND body_state = 'none' AND position >= 0 AND size <= ?",
-            (account_key, max_bytes),
+            f"SELECT COUNT(*) FROM messages WHERE account = ? AND body_state = 'none' AND position >= 0 AND size <= ?{clause}",
+            (account_key, max_bytes, *params),
         ).fetchone()
     return int(row[0]) if row else 0
 

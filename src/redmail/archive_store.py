@@ -9,7 +9,7 @@ from email.message import EmailMessage, Message
 from email.utils import formatdate, parseaddr
 from pathlib import Path
 
-from redmail.imap_client import MessageContent, MessageSummary, extract_content, parse_importance
+from redmail.imap_client import decode_bytes_safely, MessageContent, MessageSummary, extract_content, parse_importance
 
 # Свой формат: один файл SQLite на архив. Не PST — по назначению аналог
 # (папка с письмами, которую можно отключить от сервера и открыть локально),
@@ -192,7 +192,7 @@ def _decode_mime_words(value: str | None) -> str:
         # письмо или весь импорт целиком.
         return value
     return "".join(
-        chunk.decode(encoding or "utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
+        decode_bytes_safely(chunk, encoding) if isinstance(chunk, bytes) else chunk
         for chunk, encoding in parts
     )
 

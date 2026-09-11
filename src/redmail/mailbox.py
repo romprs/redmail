@@ -68,13 +68,17 @@ class CachedMailbox:
         with self._sync_lock:
             return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
 
+    # Папки, тела которых фоном не качаются (зеркало всех писем у Gmail).
+    skip_body_folders: tuple[str, ...] = ()
+
     def pending_bodies(self) -> int:
-        return cache_store.count_messages_without_body(self._account_key, self.body_max_bytes)
+        return cache_store.count_messages_without_body(self._account_key, self.body_max_bytes, skip_folders=self.skip_body_folders)
 
     def download_bodies(self, *, progress=None, stop: threading.Event | None = None, limit: int | None = None) -> int:
         with self._sync_lock:
             return sync_engine.download_bodies(
-                self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit
+                self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit,
+                skip_folders=self.skip_body_folders,
             )
 
     def message_content(self, folder: str, uid: int) -> MessageContent:

@@ -182,6 +182,7 @@ def download_bodies(
     progress: ProgressCallback | None = None,
     stop: threading.Event | None = None,
     limit: int | None = None,
+    skip_folders: tuple[str, ...] = (),
 ) -> int:
     """Докачивает тела писем, которых ещё нет локально, от новых к старым.
     Письма больше max_bytes помечаются как отложенные (скачаются при
@@ -190,9 +191,9 @@ def download_bodies(
     # Большие письма сразу помечаются отложенными — независимо от того,
     # дойдёт ли этот проход до конца (limit/stop).
     cache_store.defer_large_messages(account_key, max_bytes)
-    total_pending = cache_store.count_messages_without_body(account_key, max_bytes)
+    total_pending = cache_store.count_messages_without_body(account_key, max_bytes, skip_folders=skip_folders)
     while not _stopped(stop):
-        pending = cache_store.messages_without_body(account_key, max_bytes, limit=batch)
+        pending = cache_store.messages_without_body(account_key, max_bytes, limit=batch, skip_folders=skip_folders)
         if not pending:
             break
         for folder, uid, size in pending:

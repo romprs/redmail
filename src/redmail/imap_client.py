@@ -764,14 +764,7 @@ def _decode_header_text(value: str | None) -> str:
         # (TypeError: Header не итерируется).
         parts: list[str] = []
         for chunk, charset in decode_header(value):
-            if isinstance(chunk, bytes):
-                encoding = charset if charset and charset.lower() != "unknown-8bit" else "utf-8"
-                try:
-                    parts.append(chunk.decode(encoding))
-                except (LookupError, UnicodeDecodeError):
-                    parts.append(chunk.decode("utf-8", errors="replace"))
-            else:
-                parts.append(chunk)
+            parts.append(decode_bytes_safely(chunk, charset) if isinstance(chunk, bytes) else chunk)
         value = "".join(parts)
     if not value or "=?" not in value:
         return value or ""
@@ -906,10 +899,24 @@ def _decode_rfc2047(raw: bytes) -> str:
     out: list[str] = []
     for chunk, encoding in parts:
         if isinstance(chunk, bytes):
-            out.append(chunk.decode(encoding or "utf-8", errors="replace"))
+            out.append(decode_bytes_safely(chunk, encoding))
         else:
             out.append(chunk.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
     return "".join(out)
+
+
+def decode_bytes_safely(chunk: bytes, encoding: str | None) -> str:
+    """Байты заголовка → текст: неизвестная/служебная кодировка (например,
+    'unknown-8bit', которую подставляет email.header для сырых 8-битных
+    заголовков; реальная находка на автоархиве Gmail: "unknown encoding:
+    unknown-8bit") читается как UTF-8, а не роняет разбор письма."""
+    name = (encoding or "utf-8").strip().lower()
+    if name in ("", "unknown-8bit", "x-unknown", "unknown", "default", "8bit", "binary"):
+        name = "utf-8"
+    try:
+        return chunk.decode(name, errors="replace")
+    except LookupError:
+        return chunk.decode("utf-8", errors="replace")
 
 
 def _format_address_list(addresses) -> str:

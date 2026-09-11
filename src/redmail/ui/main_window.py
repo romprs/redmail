@@ -5077,7 +5077,10 @@ class MainWindow(QMainWindow):
         self.mailboxes[key] = CachedMailbox(
             session, account, body_max_bytes=load_body_max_size_mb() * 1024 * 1024
         )
-        self.mailbox_folders[key] = [info.name for info in folders]
+        # «Вся почта»/All Mail у Gmail — зеркало всех остальных папок: в полную
+        # локальную копию не входит, иначе база удваивается (на .80: 3.3 ГБ).
+        self.mailbox_folders[key] = [info.name for info in folders if _folder_role(info.name) != "all"]
+        self.mailboxes[key].skip_body_folders = tuple(info.name for info in folders if _folder_role(info.name) == "all")
         self.mailbox_accounts[key] = account
         self.mailbox_smtp_accounts[key] = smtp_account
         self.mailbox_protocols[key] = protocol

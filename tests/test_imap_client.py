@@ -1173,3 +1173,13 @@ def test_decode_subject_reads_raw_utf8_and_mixed_encoded_words() -> None:
     assert _decode_subject("Тест 3000".encode("utf-8")) == "Тест 3000"
     assert _decode_subject(b"Re: =?utf-8?B?0J/RgNC40LLQtdGC?= world") == "Re: Привет world"
     assert _decode_subject("Сырой =?utf-8?B?0J/RgNC40LLQtdGC?=".encode("utf-8")) == "Сырой Привет"
+
+
+def test_unknown_8bit_charset_does_not_break_header_decoding() -> None:
+    # Реальная находка на автоархиве Gmail: "unknown encoding: unknown-8bit"
+    # ронял перенос письма в архив.
+    from redmail.imap_client import decode_bytes_safely
+
+    assert decode_bytes_safely("Тест".encode("utf-8"), "unknown-8bit") == "Тест"
+    assert decode_bytes_safely("Тест".encode("utf-8"), "no-such-charset") == "Тест"
+    assert decode_bytes_safely("Тест".encode("cp1251"), "windows-1251") == "Тест"
