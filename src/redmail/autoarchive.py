@@ -33,6 +33,9 @@ _log = get_logger("autoarchive")
 # каждом новом письме.
 TARGET_RATIO = 0.8
 BATCH = 50
+# Писем за один раунд: после раунда база ужимается и снова проверяется
+# порог, а фоновая синхронизация получает свою очередь к серверу.
+ROUND = 300
 _SKIP_HINTS = ("trash", "корзин", "spam", "junk", "спам", "draft", "черновик")
 
 ProgressCallback = Callable[[str, int, int], None]
@@ -93,7 +96,7 @@ def make_plan(account_key: str, threshold_bytes: int, *, skip_folders: set[str] 
             continue
         plan.candidates.append((folder, uid, size, date))
         freed += max(size, 1)
-        if freed >= plan.to_free_bytes:
+        if freed >= plan.to_free_bytes or len(plan.candidates) >= ROUND:
             break
     return plan
 

@@ -3961,7 +3961,7 @@ class _SyncWorker(QThread):
             else:
                 stats = sync_engine.SyncStats()
             bodies = 0
-            if not self._stop.is_set():
+            if not self._stop.is_set() and self._bodies_limit != 0:
                 limit = self.BODIES_ROUND if self._bodies_limit is None else min(self._bodies_limit, self.BODIES_ROUND)
                 bodies = self._mailbox.download_bodies(progress=report, stop=self._stop, limit=limit)
             stats.bodies_downloaded = bodies
@@ -4742,6 +4742,8 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.busy_bar)
         self._refresh_in_progress = False
         self._sync_worker: _SyncWorker | None = None
+        self._autoarchive_active = False
+        self._autoarchive_exhausted: set[str] = set()
         self._sync_queue: list[str] = []
         self._sync_stop = threading.Event()
         self._periodic_ticks = 0
@@ -6326,7 +6328,7 @@ class MainWindow(QMainWindow):
         """Полная синхронизация всех подключённых ящиков по очереди (аналог
         офлайн-копии OST): заголовки всех папок, затем тела от новых к
         старым. Идёт в фоне порциями, индикатор — в строке состояния."""
-        if self._sync_worker is not None:
+        if self._sync_worker is not None or self._autoarchive_active:
             return
         self._sync_queue = [(key, True) for key in self.mailboxes if self.mailbox_protocols.get(key) in ("imap", "ews")]
         self._sync_stop.clear()
@@ -6343,7 +6345,18 @@ class MainWindow(QMainWindow):
         if mailbox is None or not folders:
             self._sync_next(bodies_limit)
             return
-        worker = _SyncWorker(mailbox, folders, self._sync_stop, bodies_limit=bodies_limit, headers=headers, parent=self)
+        # Пока база больше порога автоархива, тела фоном не качаем: иначе
+        # архиватор и докачка соревнуются за одно IMAP-соединение, а база
+        # растёт быстрее, чем освобождается (жалоба: "база не уменьшается").
+        effective_limit = bodies_limit
+        if load_auto_archive_enabled() and isinstance(mailbox, CachedMailbox):
+            try:
+                db_bytes = self._storage_stats().get("db_bytes", 0)
+            except Exception:
+                db_bytes = 0
+            if db_bytes > load_auto_archive_size_mb() * 1024 * 1024:
+                effective_limit = 0
+        worker = _SyncWorker(mailbox, folders, self._sync_stop, bodies_limit=effective_limit, headers=headers, parent=self)
         self._sync_worker = worker
 
         def on_progress(text: str) -> None:
@@ -6369,6 +6382,10 @@ class MainWindow(QMainWindow):
                 # режиме (bodies_limit задан) — один раунд за тик.
                 if bodies_limit is None and stats.bodies_pending > 0 and not self._sync_stop.is_set():
                     self._sync_queue.append((key, False))
+                elif self._autoarchive_pending(key) and not self._sync_stop.is_set():
+                    # база всё ещё больше порога — следующий раунд автоархива
+                    # (ставится через тот же цикл, тела при этом не качаются)
+                    self._sync_queue.append((key, False))
                 self._sync_next(bodies_limit)
 
             self._maybe_autoarchive(key, continue_sync)
@@ -6385,6 +6402,17 @@ class MainWindow(QMainWindow):
         self._set_busy(f"{key}: синхронизация…")
         worker.start()
 
+    def _autoarchive_pending(self, key: str) -> bool:
+        mailbox = self.mailboxes.get(key)
+        if mailbox is None or not isinstance(mailbox, CachedMailbox) or not load_auto_archive_enabled():
+            return False
+        if key in self._autoarchive_exhausted:
+            return False  # прошлый план был пуст (нечего архивировать) — не крутиться вхолостую
+        try:
+            return self._storage_stats().get("db_bytes", 0) > load_auto_archive_size_mb() * 1024 * 1024
+        except Exception:
+            return False
+
     def _maybe_autoarchive(self, key: str, then: Callable[[], None]) -> None:
         """Автоархив по размеру базы (договорённость: порог 500 МБ, самые
         старые письма — в файл архива, затем удаление с сервера). Первый
@@ -6393,6 +6421,9 @@ class MainWindow(QMainWindow):
         mailbox = self.mailboxes.get(key)
         if mailbox is None or not isinstance(mailbox, CachedMailbox) or not load_auto_archive_enabled():
             then()
+            return
+        if self._autoarchive_active:
+            then()  # один архиватор за раз — иначе два потока переносят одни и те же письма
             return
         threshold = load_auto_archive_size_mb() * 1024 * 1024
         skip = {name for name in (self.mailbox_trash_folders.get(key), self.mailbox_drafts_folders.get(key)) if name}
@@ -6403,8 +6434,11 @@ class MainWindow(QMainWindow):
             then()
             return
         if not plan.candidates:
+            if plan.to_free_bytes > 0:
+                self._autoarchive_exhausted.add(key)
             then()
             return
+        self._autoarchive_exhausted.discard(key)
         confirmed = load_auto_archive_confirmed()
         delete_on_server = load_auto_archive_delete_on_server()
         if delete_on_server and key not in confirmed:
@@ -6436,6 +6470,7 @@ class MainWindow(QMainWindow):
         )
 
         def done(_result: object = None) -> None:
+            self._autoarchive_active = False
             if worker in self._background_workers:
                 self._background_workers.remove(worker)
             self._set_busy(None)
@@ -6459,7 +6494,8 @@ class MainWindow(QMainWindow):
         worker.succeeded.connect(on_success)
         worker.failed.connect(on_failure)
         self._background_workers.append(worker)
-        self._set_busy(f"{key}: автоархив {plan.count} писем…")
+        self._autoarchive_active = True
+        self._set_busy(f"{key}: автоархив, раунд {plan.count} писем ({plan.db_bytes / (1024 * 1024):.0f} МБ → цель {plan.threshold_bytes * 0.8 / (1024 * 1024):.0f} МБ)…")
         worker.start()
 
     def _on_periodic_refresh(self) -> None:

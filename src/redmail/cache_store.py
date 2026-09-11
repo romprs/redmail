@@ -113,7 +113,10 @@ def _db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
+    # timeout: VACUUM/ужатие после автоархива держат базу минуты — другие
+    # потоки (синхронизация, окно) должны ждать, а не падать с
+    # "database is locked" через 5 секунд по умолчанию.
+    conn = sqlite3.connect(path, timeout=600)
     conn.executescript(_SCHEMA)
     for migration in _MIGRATIONS:
         try:
@@ -561,9 +564,19 @@ def count_archived(account_key: str) -> int:
 
 
 def vacuum() -> None:
-    """Вернуть место после автоархива — SQLite сам файл не ужимает."""
+    """Вернуть место после автоархива — SQLite сам файл не ужимает.
+
+    Первый раз — полный VACUUM (на базе в несколько ГБ это минуты, зато
+    заодно включается auto_vacuum=INCREMENTAL), дальше — быстрое
+    инкрементальное ужатие после каждого раунда автоархива, чтобы размер
+    файла уменьшался по ходу, а не только в самом конце."""
     with closing(_connect()) as conn:
-        conn.execute("VACUUM")
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if int(mode or 0) != 2:
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            conn.execute("VACUUM")
+        else:
+            conn.execute("PRAGMA incremental_vacuum")
 
 
 def storage_stats(account_key: str | None = None) -> dict:
