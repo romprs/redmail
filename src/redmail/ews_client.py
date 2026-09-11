@@ -9,6 +9,7 @@ from exchangelib import Account as ExchangeAccount
 from exchangelib import Configuration, Credentials, FileAttachment, Folder, Mailbox
 from exchangelib.items import Message as EwsMessage
 
+from redmail.applog import get_logger
 from redmail.imap_client import (
     UNKNOWN_MARKER,
     FolderInfo,
@@ -17,6 +18,8 @@ from redmail.imap_client import (
     extract_content,
 )
 from redmail.smtp_client import OutgoingMessage
+
+_log = get_logger("ews")
 
 _AUTH_TYPE_MAP = {"basic": BASIC, "ntlm": NTLM, "kerberos": GSSAPI}
 _IMPORTANCE_MAP = {"High": "high", "Normal": "normal", "Low": "low"}
@@ -103,7 +106,9 @@ class EwsSession:
                 access_type=DELEGATE,
             )
         except Exception as exc:
+            _log.error("EWS %s: подключение не удалось (%s, %s): %s", account.server or "autodiscover", account.email, account.auth_type, exc)
             raise EwsConnectionError(str(exc)) from exc
+        _log.info("EWS %s: подключение выполнено (%s, %s)", account.server or "autodiscover", account.email, account.auth_type)
 
         self._folders_by_path: dict[str, Folder] = {}
         self._selected_folder: str | None = None

@@ -11,6 +11,10 @@ from email.message import Message
 from imapclient import IMAPClient
 from imapclient.exceptions import IMAPClientError
 
+from redmail.applog import get_logger
+
+_log = get_logger("imap")
+
 _HEADER_FIELDS = "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"
 
 # Флаг \Flagged ставим всегда вместе с цветом — так другие IMAP-клиенты
@@ -111,17 +115,22 @@ def _reconnecting(method):
             try:
                 return method(self, *args, **kwargs)
             except (OSError, EOFError, imaplib.IMAP4.abort) as exc:
+                _log.warning("IMAP %s: %s — обрыв соединения (%s), переподключение", self.account.host, method.__name__, exc)
                 try:
                     self._reconnect()
-                except Exception:
+                except Exception as reconnect_exc:
+                    _log.error("IMAP %s: переподключение не удалось: %s", self.account.host, reconnect_exc)
                     raise exc from None  # переподключиться тоже не вышло — исходная ошибка нагляднее
                 return method(self, *args, **kwargs)
             except imaplib.IMAP4.error as exc:
                 if not _is_recoverable_by_reconnect(exc):
+                    _log.error("IMAP %s: %s — ошибка протокола: %s", self.account.host, method.__name__, exc)
                     raise
+                _log.warning("IMAP %s: %s — сессия недействительна (%s), переподключение", self.account.host, method.__name__, exc)
                 try:
                     self._reconnect()
-                except Exception:
+                except Exception as reconnect_exc:
+                    _log.error("IMAP %s: переподключение не удалось: %s", self.account.host, reconnect_exc)
                     raise exc from None
                 return method(self, *args, **kwargs)
 
@@ -218,7 +227,11 @@ class ImapSession:
         self.account = account
         self._lock = threading.RLock()
         self._client = self._new_client()
-        self._login()
+        try:
+            self._login()
+        except Exception as exc:
+            _log.error("IMAP %s:%s: вход не удался (%s, %s): %s", account.host, account.port, account.username, account.auth_type, exc)
+            raise
         self._selected_folder: str | None = None
         self._selected_exists = 0
         self._raw_folders: list[tuple] = []
@@ -240,6 +253,7 @@ class ImapSession:
             )
         else:
             self._client.login(self.account.username, self.account.password)
+        _log.info("IMAP %s:%s: вход выполнен (%s, %s)", self.account.host, self.account.port, self.account.username, self.account.auth_type)
 
     def _new_client(self) -> IMAPClient:
         # Таймаут на сокете обязателен: без него любое зависшее чтение
@@ -257,7 +271,11 @@ class ImapSession:
 
     def _reconnect(self) -> None:
         self._client = self._new_client()
-        self._login()
+        try:
+            self._login()
+        except Exception as exc:
+            _log.error("IMAP %s: повторный вход не удался: %s", self.account.host, exc)
+            raise
         if self._selected_folder is not None:
             # Кое-что из вызывающего кода (fetch_summaries) не делает
             # собственный SELECT — полагается, что папка уже выбрана

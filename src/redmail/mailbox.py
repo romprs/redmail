@@ -3,7 +3,10 @@ from __future__ import annotations
 from pathlib import Path
 
 from redmail import archive_store, cache_store
+from redmail.applog import get_logger
 from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageSummary
+
+_log = get_logger("mailbox")
 
 
 class CachedMailbox:
@@ -41,6 +44,7 @@ class CachedMailbox:
             if cached:
                 return cached[:limit]
         summaries = self.session.fetch_summaries(limit)
+        _log.info("Папка %s: на сервере %d, загружено сводок %d", folder, total, len(summaries))
         # Жалоба: "не сохраняется проставленный маркер, через какое-то время
         # пропадает" — сервер (VK Mail) не хранит наши цветные keyword-флаги,
         # только стандартный \Flagged. Сервер — источник правды о том, ЕСТЬ

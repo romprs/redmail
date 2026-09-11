@@ -343,8 +343,6 @@ def _account_dict(account: Account, smtp: SmtpAccount | None) -> dict:
         "imap_use_ssl": account.use_ssl,
         "username": account.username,
         "auth_type": account.auth_type,
-        "keytab_path": account.keytab_path,
-        "principal": account.principal,
         "smtp_host": smtp.host if smtp else "",
         "smtp_port": smtp.port if smtp else 587,
         "smtp_use_ssl": smtp.use_ssl if smtp else False,
@@ -353,8 +351,6 @@ def _account_dict(account: Account, smtp: SmtpAccount | None) -> dict:
 
 def _account_from_dict(data: dict, username: str, password: str) -> tuple[Account, SmtpAccount | None]:
     auth_type = data.get("auth_type", "password")
-    keytab_path = data.get("keytab_path", "") or ""
-    principal = data.get("principal", "") or ""
     account = Account(
         host=data["imap_host"],
         username=username,
@@ -362,8 +358,6 @@ def _account_from_dict(data: dict, username: str, password: str) -> tuple[Accoun
         port=data["imap_port"],
         use_ssl=data["imap_use_ssl"],
         auth_type=auth_type,
-        keytab_path=keytab_path,
-        principal=principal,
     )
     smtp = (
         SmtpAccount(
@@ -373,8 +367,6 @@ def _account_from_dict(data: dict, username: str, password: str) -> tuple[Accoun
             port=data["smtp_port"],
             use_ssl=data["smtp_use_ssl"],
             auth_type=auth_type,
-            keytab_path=keytab_path,
-            principal=principal,
         )
         if data.get("smtp_host")
         else None

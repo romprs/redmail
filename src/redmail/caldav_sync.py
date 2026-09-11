@@ -12,6 +12,9 @@ import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
 
 from redmail import itip
+from redmail.applog import get_logger
+
+_log = get_logger("caldav")
 from redmail.calendar_store import Event
 
 # Некоторые корпоративные прокси/WAF перед CalDAV-сервером отличают
@@ -316,8 +319,10 @@ class CalDavSession:
                 pass
             self._client.session = requests.Session()
         except Exception as exc:
+            _log.error("CalDAV %s: не удалось создать соединение (%s): %s", account.url, account.auth_type, exc)
             raise CalDavSyncError(f"Не удалось создать CalDAV-соединение: {exc}") from exc
         self._calendar = None
+        _log.info("CalDAV %s: соединение создано (%s, %s)", account.url, account.username, account.auth_type)
 
     def _primary_calendar(self):
         if self._calendar is None:
@@ -373,6 +378,8 @@ class CalDavSession:
         seen: set[str] = set()
         for home_url in home_urls:
             self._collect_calendars(home_url, my_principal_path, infos, seen, depth_left=2)
+        _log.info("CalDAV %s: домов календарей %d, найдено календарей %d (расшаренных %d)",
+                  self.account.url, len(home_urls), len(infos), sum(1 for i in infos if i.is_shared))
         return infos
 
     def _calendar_home_urls(self, principal) -> list[str]:
@@ -449,6 +456,7 @@ class CalDavSession:
         try:
             results = _with_connection_retry(calendar.date_search, start, end)
         except Exception as exc:
+            _log.error("CalDAV %s: получение событий не удалось: %s", self.account.url, exc)
             raise CalDavSyncError(f"Не удалось получить события с сервера: {exc}") from exc
 
         events: list[Event] = []
@@ -459,6 +467,8 @@ class CalDavSession:
                 events.extend(itip.parse_ics_events(raw_bytes, my_email))
             except Exception:
                 continue  # одно повреждённое/непонятное событие не должно валить всю синхронизацию
+        _log.info("CalDAV %s: получено объектов %d, событий %d (окно %s — %s)",
+                  self.account.url, len(results), len(events), start.date(), end.date())
         return events
 
     def push_event(self, event: Event, organizer_email: str, organizer_name: str) -> None:
@@ -477,9 +487,12 @@ class CalDavSession:
             if existing is not None:
                 existing.data = ics_text
                 _with_connection_retry(existing.save)
+                _log.info("CalDAV %s: событие обновлено uid=%s", self.account.url, event.uid)
             else:
                 _with_connection_retry(calendar.save_event, ics_text)
+                _log.info("CalDAV %s: событие создано uid=%s", self.account.url, event.uid)
         except Exception as exc:
+            _log.error("CalDAV %s: сохранение события uid=%s не удалось: %s", self.account.url, event.uid, exc)
             raise CalDavSyncError(f"Не удалось сохранить событие на сервере: {exc}") from exc
 
     def test_write_access(self) -> None:
@@ -509,7 +522,9 @@ class CalDavSession:
         try:
             _with_connection_retry(calendar.save_event, ics_text)
         except Exception as exc:
+            _log.error("CalDAV %s: проверка записи не удалась: %s", self.account.url, exc)
             raise CalDavSyncError(f"Запись на сервер не удалась: {exc}") from exc
+        _log.info("CalDAV %s: проверка записи прошла", self.account.url)
         try:
             existing = _with_connection_retry(calendar.event_by_uid, test_uid)
             _with_connection_retry(existing.delete)
@@ -526,7 +541,9 @@ class CalDavSession:
             raise CalDavSyncError(f"Не удалось найти событие на сервере: {exc}") from exc
         try:
             _with_connection_retry(existing.delete)
+            _log.info("CalDAV %s: событие удалено uid=%s", self.account.url, uid)
         except Exception as exc:
+            _log.error("CalDAV %s: удаление события uid=%s не удалось: %s", self.account.url, uid, exc)
             raise CalDavSyncError(f"Не удалось удалить событие на сервере: {exc}") from exc
 
     def close(self) -> None:

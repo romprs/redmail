@@ -120,6 +120,7 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
+from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
     MailRule,
     Signature,
@@ -1431,20 +1432,6 @@ class SettingsDialog(QDialog):
         )
         self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
 
-        # Keytab — необязательный источник Kerberos-билета для SSO: без него
-        # берётся билет, уже полученный ОС при входе в домен (SSSD); с ним
-        # билет получается прямо из файла ключа для указанного principal —
-        # для машин вне домена или служебных учёток (пожелание: "адаптируй
-        # подключение под использование keytab").
-        self.keytab_edit = QLineEdit(getattr(account, "keytab_path", "") if account else "")
-        self.keytab_edit.setPlaceholderText("Необязательно: /etc/redmail/user.keytab")
-        self.keytab_browse_button = QPushButton("Обзор…")
-        self.keytab_browse_button.clicked.connect(self._on_browse_keytab)
-        keytab_row = QHBoxLayout()
-        keytab_row.addWidget(self.keytab_edit, 1)
-        keytab_row.addWidget(self.keytab_browse_button)
-        self.principal_edit = QLineEdit(getattr(account, "principal", "") if account else "")
-        self.principal_edit.setPlaceholderText("Необязательно: user@REALM.RU (по умолчанию — из билета/keytab)")
 
         self.imap_test_button = QPushButton("Проверить подключение")
         self.imap_test_button.clicked.connect(self._on_test_imap)
@@ -1458,8 +1445,6 @@ class SettingsDialog(QDialog):
         imap_form.addRow("Способ входа", self.auth_combo)
         imap_form.addRow("Логин", self.user_edit)
         imap_form.addRow("Пароль", self.password_edit)
-        imap_form.addRow("Keytab (SSO)", keytab_row)
-        imap_form.addRow("Principal (SSO)", self.principal_edit)
         imap_form.addRow(self.ssl_check)
         imap_form.addRow(self.imap_test_button)
         imap_form.addRow(self.imap_test_status)
@@ -1571,14 +1556,6 @@ class SettingsDialog(QDialog):
     def _update_password_enabled(self) -> None:
         is_kerberos = self.auth_combo.currentData() == "kerberos"
         self.password_edit.setEnabled(not is_kerberos)
-        self.keytab_edit.setEnabled(is_kerberos)
-        self.keytab_browse_button.setEnabled(is_kerberos)
-        self.principal_edit.setEnabled(is_kerberos)
-
-    def _on_browse_keytab(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Файл keytab", filter="Keytab (*.keytab);;Все файлы (*)")
-        if path:
-            self.keytab_edit.setText(path)
 
     def _on_test_imap(self) -> None:
         account = self.account()
@@ -1674,8 +1651,6 @@ class SettingsDialog(QDialog):
             port=self.port_edit.value(),
             use_ssl=self.ssl_check.isChecked(),
             auth_type=auth_type,
-            keytab_path=self.keytab_edit.text().strip() if auth_type == "kerberos" else "",
-            principal=self.principal_edit.text().strip() if auth_type == "kerberos" else "",
         )
 
     def smtp_account(self) -> SmtpAccount:
@@ -1687,8 +1662,6 @@ class SettingsDialog(QDialog):
             port=self.smtp_port_edit.value(),
             use_ssl=self.smtp_ssl_check.isChecked(),
             auth_type=auth_type,
-            keytab_path=self.keytab_edit.text().strip() if auth_type == "kerberos" else "",
-            principal=self.principal_edit.text().strip() if auth_type == "kerberos" else "",
         )
 
     def poll_interval_minutes(self) -> int:
@@ -3723,6 +3696,9 @@ class _FolderTreeWidget(QTreeWidget):
             self.folderDropped.emit(source_item, target_item)
 
 
+_log = get_logger("ui")
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -4379,6 +4355,10 @@ class MainWindow(QMainWindow):
         about_action = QAction("О программе…", self)
         about_action.triggered.connect(self.on_about)
         help_menu.addAction(about_action)
+        log_action = QAction("Журнал подключений…", self)
+        log_action.setToolTip("Журнал входов, переподключений, отправок и синхронизаций")
+        log_action.triggered.connect(self.on_show_log)
+        help_menu.addAction(log_action)
         help_button.setMenu(help_menu)
         toolbar.addWidget(help_button)
 
@@ -5343,6 +5323,46 @@ class MainWindow(QMainWindow):
             f"<p>Версия: {app_version}</p>"
             "<p>Автор: Пономарев Роман Сергеевич</p>",
         )
+
+    def on_show_log(self) -> None:
+        """Справка → «Журнал подключений…» (пожелание: "писать лог
+        подключений и синхронизаций, чтобы отладить подключения") —
+        хвост файла журнала прямо в окне, чтобы можно было скопировать
+        текст в обращение, плюс кнопка открыть каталог с файлами."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Журнал подключений")
+        dialog.resize(900, 600)
+        layout = QVBoxLayout(dialog)
+        path_label = QLabel(f"Файл: {log_path()}")
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(path_label)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.StyleHint.TypeWriter)
+        text.setFont(mono)
+        layout.addWidget(text, 1)
+
+        def reload() -> None:
+            content = tail_text()
+            text.setPlainText(content or "Журнал пока пуст.")
+            text.verticalScrollBar().setValue(text.verticalScrollBar().maximum())
+
+        buttons = QHBoxLayout()
+        refresh_button = QPushButton("Обновить")
+        refresh_button.clicked.connect(reload)
+        open_dir_button = QPushButton("Открыть папку")
+        open_dir_button.clicked.connect(lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(log_dir()))))
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(dialog.accept)
+        buttons.addWidget(refresh_button)
+        buttons.addWidget(open_dir_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        reload()
+        dialog.exec()
 
     def on_settings(self) -> None:
         dialog = SettingsDialog(
@@ -6925,6 +6945,7 @@ class MainWindow(QMainWindow):
             # не проставлялся, событие с сервера всегда попадало в default).
             total_pushed = 0
             total_pulled = 0
+            _log.info("CalDAV: синхронизация, календарей %d", len(caldav_calendars))
             local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
             for cal in caldav_calendars:
                 account = caldav_sync.CalDavAccount(
@@ -6967,11 +6988,13 @@ class MainWindow(QMainWindow):
 
         def on_success(result: object) -> None:
             pushed, pulled = result
+            _log.info("CalDAV: синхронизация завершена, отправлено %d, получено %d", pushed, pulled)
             self.refresh_calendar_view()
             self.statusBar().showMessage(f"CalDAV: отправлено {pushed}, получено {pulled}", 7000)
             self._background_workers.remove(worker)
 
         def on_failure(error_text: str) -> None:
+            _log.error("CalDAV: синхронизация не удалась: %s", error_text)
             QMessageBox.critical(self, "Ошибка CalDAV", error_text)
             self._background_workers.remove(worker)
 

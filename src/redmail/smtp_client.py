@@ -5,7 +5,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from email import policy
 from email.message import EmailMessage
-from email.utils import formatdate, make_msgid
+from email.utils import formatdate, getaddresses, make_msgid
+
+from redmail.applog import get_logger
+
+_log = get_logger("smtp")
 
 # Жалоба: "ошибка отправки приходит именно если отправить из redmail, а
 # при отправке из VK всё уходит без ошибок" — реальная причина не в
@@ -134,7 +138,8 @@ def _with_retry(operation: Callable[[], None]) -> None:
     уже применён для IMAP в imap_client.py._reconnecting."""
     try:
         operation()
-    except (OSError, EOFError):
+    except (OSError, EOFError) as exc:
+        _log.warning("SMTP: обрыв соединения (%s), повтор на новом соединении", exc)
         operation()
 
 
@@ -158,6 +163,7 @@ def _connect_and_authenticate(account: SmtpAccount) -> smtplib.SMTP:
         )
     else:
         client.login(account.username, account.password)
+    _log.info("SMTP %s:%s: вход выполнен (%s, %s)", account.host, account.port, account.username, account.auth_type)
     return client
 
 
@@ -181,4 +187,10 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
         with _connect_and_authenticate(account) as client:
             client.send_message(email_message)
 
-    _with_retry(attempt)
+    recipients = getaddresses(email_message.get_all("To", []) + email_message.get_all("Cc", []) + email_message.get_all("Bcc", []))
+    try:
+        _with_retry(attempt)
+    except Exception as exc:
+        _log.error("SMTP %s: отправка не удалась (получателей %d, тема %r): %s", account.host, len(recipients), message.subject, exc)
+        raise
+    _log.info("SMTP %s: письмо отправлено (получателей %d, тема %r)", account.host, len(recipients), message.subject)

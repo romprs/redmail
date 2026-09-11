@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
+from redmail import applog
 from redmail import config_store
 from redmail.ui import theme
 
@@ -79,6 +80,8 @@ def build_splash_pixmap(version: str) -> QPixmap:
 
 
 def main() -> int:
+    log_file = applog.setup_logging()
+    applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
     app = QApplication(sys.argv)
 
     # Жалоба (и после первой правки с repaint()): "информационное окно
@@ -106,7 +109,9 @@ def main() -> int:
         splash.repaint()
         app.processEvents()
 
-    splash.setPixmap(build_splash_pixmap(app_version()))
+    version = app_version()
+    applog.get_logger("app").info("Версия %s", version)
+    splash.setPixmap(build_splash_pixmap(version))
     report("Применение темы оформления…")
     theme.apply_theme(app, config_store.load_theme())
 
