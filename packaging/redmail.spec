@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        61%{?dist}
+Release:        62%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-62
+- Журнал подключений и синхронизаций (~/.config/redmail/logs/redmail.log, ротация); Справка → «Журнал подключений…»
+- Поля keytab/principal убраны из настроек
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-61
 - CalDAV: библиотека caldav 2.0.x (без AGPL-компонента icalendar-searcher и niquests); обнаружение календарей своим разбором PROPFIND по RFC 4918, проверено e2e на Radicale
 - Убрано упоминание ИИ из окна «О программе»
