@@ -432,9 +432,12 @@ class ImapSession:
             list(uids), ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "RFC822.SIZE", _HEADER_FIELDS]
         )
         summaries = []
-        for _key, data in sorted(response.items(), key=lambda item: item[0], reverse=True):
+        for key, data in sorted(response.items(), key=lambda item: item[0], reverse=True):
             if b"ENVELOPE" not in data:
                 continue
+            # В UID-режиме imapclient ключом ответа и есть UID, а поле UID в
+            # данных может отсутствовать (реальный Dovecot) — подставляем.
+            data.setdefault(b"UID", key)
             summaries.append(_to_summary(data))
         return summaries
 
@@ -448,8 +451,8 @@ class ImapSession:
         self._select(folder)
         response = self._client.fetch(list(uids), ["FLAGS"])
         result: dict[int, tuple[bool, bool, str | None]] = {}
-        for _key, data in response.items():
-            uid = data.get(b"UID")
+        for key, data in response.items():
+            uid = data.get(b"UID", key)
             if uid is None:
                 continue
             flags = data.get(b"FLAGS", ())
