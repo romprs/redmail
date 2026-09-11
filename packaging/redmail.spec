@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        67%{?dist}
+Release:        68%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-68
+- Автоархив по размеру базы: старые письма переносятся в файлы архива и удаляются с сервера после проверки; архивные письма остаются в списке, тело читается из архива; первый запуск с подтверждением
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-67
 - Исправлено зависание окна при заполнении списка писем на полной локальной копии
 - Хранилище паролей: повторные попытки, запасной файл в профиле по согласию пользователя, адрес D-Bus по умолчанию
