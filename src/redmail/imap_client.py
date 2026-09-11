@@ -894,11 +894,22 @@ def _decode_subject(raw: bytes | None) -> str:
 def _decode_rfc2047(raw: bytes) -> str:
     # Имена отправителей и темы писем сервер отдаёт как есть — они бывают
     # в кодированных словах RFC 2047 (=?utf-8?B?...?=), а не только сырым UTF-8.
-    parts = decode_header(raw.decode("ascii", errors="replace"))
-    return "".join(
-        chunk.decode(encoding or "utf-8", errors="replace") if isinstance(chunk, bytes) else chunk
-        for chunk, encoding in parts
-    )
+    if b"=?" not in raw:
+        # Нет encoded-word — это либо чистый ASCII, либо сырой UTF-8
+        # (RFC 6532; реальная находка на Dovecot: тема превращалась в
+        # знаки замены, потому что байты читались как ASCII).
+        return raw.decode("utf-8", errors="replace")
+    # latin-1 — обратимое 1:1 отображение байтов в символы: незакодированные
+    # куски decode_header вернёт как те же байты (raw-unicode-escape для
+    # символов < 256), и их можно прочитать как UTF-8.
+    parts = decode_header(raw.decode("latin-1"))
+    out: list[str] = []
+    for chunk, encoding in parts:
+        if isinstance(chunk, bytes):
+            out.append(chunk.decode(encoding or "utf-8", errors="replace"))
+        else:
+            out.append(chunk.encode("latin-1", errors="replace").decode("utf-8", errors="replace"))
+    return "".join(out)
 
 
 def _format_address_list(addresses) -> str:

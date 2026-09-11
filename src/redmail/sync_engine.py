@@ -183,6 +183,9 @@ def download_bodies(
     Письма больше max_bytes помечаются как отложенные (скачаются при
     открытии). Возвращает число скачанных."""
     downloaded = 0
+    # Большие письма сразу помечаются отложенными — независимо от того,
+    # дойдёт ли этот проход до конца (limit/stop).
+    cache_store.defer_large_messages(account_key, max_bytes)
     total_pending = cache_store.count_messages_without_body(account_key, max_bytes)
     while not _stopped(stop):
         pending = cache_store.messages_without_body(account_key, max_bytes, limit=batch)
@@ -203,7 +206,6 @@ def download_bodies(
                 _report(progress, f"Загрузка писем: {downloaded}/{total_pending}", downloaded, total_pending)
                 return downloaded
         _report(progress, f"Загрузка писем: {downloaded}/{total_pending}", downloaded, total_pending)
-    cache_store.defer_large_messages(account_key, max_bytes)
     if downloaded:
         _log.info("Скачано тел писем: %d", downloaded)
     return downloaded

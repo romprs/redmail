@@ -1165,3 +1165,11 @@ def test_extract_content_handles_raw_utf8_headers() -> None:
     raw = ("From: a@b.ru" + crlf + "Subject: Тест сырой заголовок" + crlf + crlf + "body").encode("utf-8")
     content = extract_content(message_from_bytes(raw))
     assert content.subject == "Тест сырой заголовок"
+
+
+def test_decode_subject_reads_raw_utf8_and_mixed_encoded_words() -> None:
+    from redmail.imap_client import _decode_subject
+
+    assert _decode_subject("Тест 3000".encode("utf-8")) == "Тест 3000"
+    assert _decode_subject(b"Re: =?utf-8?B?0J/RgNC40LLQtdGC?= world") == "Re: Привет world"
+    assert _decode_subject("Сырой =?utf-8?B?0J/RgNC40LLQtdGC?=".encode("utf-8")) == "Сырой Привет"
