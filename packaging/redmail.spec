@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        62%{?dist}
+Release:        63%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-63
+- Локальный канал управления (unix-сокет redmail-ipc, JSON) для голосового помощника audioreferent: открыть почту, новое письмо/встреча с заполненными полями, перенос/отмена встречи, правила сортировки; отправка только после подтверждения человеком
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-62
 - Журнал подключений и синхронизаций (~/.config/redmail/logs/redmail.log, ротация); Справка → «Журнал подключений…»
 - Поля keytab/principal убраны из настроек
