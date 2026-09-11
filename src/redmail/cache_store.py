@@ -555,6 +555,15 @@ def get_archive_ref(account_key: str, folder: str, uid: int) -> tuple[str, int] 
     return (row[0], int(row[1])) if row else None
 
 
+def relocate_archive_path(old_path: str, new_path: str) -> int:
+    """Файл архива переехал (например, из старого каталога в профиль) —
+    переписать указатели в индексе."""
+    with closing(_connect()) as conn:
+        cur = conn.execute("UPDATE messages SET archive_path = ? WHERE archive_path = ?", (new_path, old_path))
+        conn.commit()
+        return cur.rowcount
+
+
 def count_archived(account_key: str) -> int:
     with closing(_connect()) as conn:
         row = conn.execute(

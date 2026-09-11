@@ -6425,6 +6425,11 @@ class MainWindow(QMainWindow):
         if self._autoarchive_active:
             then()  # один архиватор за раз — иначе два потока переносят одни и те же письма
             return
+        try:
+            # Файлы первых сборок лежали в «Каталоге для новых архивов» — забрать в профиль.
+            autoarchive.relocate_archives(Path(self.archive_storage_dir), profile.archives_dir())
+        except Exception as exc:
+            _log.warning("Автоархив: перенос файлов в профиль не удался: %s", exc)
         threshold = load_auto_archive_size_mb() * 1024 * 1024
         skip = {name for name in (self.mailbox_trash_folders.get(key), self.mailbox_drafts_folders.get(key)) if name}
         try:
@@ -6452,7 +6457,7 @@ class MainWindow(QMainWindow):
                 f"База почты {plan.db_bytes / (1024 * 1024):.0f} МБ превысила порог "
                 f"{plan.threshold_bytes / (1024 * 1024):.0f} МБ.\n\n"
                 f"Перенести {plan.count} самых старых писем ({plan.total_bytes / (1024 * 1024):.0f} МБ, "
-                f"{plan.oldest_date[:10]} — {plan.newest_date[:10]}) в файл архива в каталоге\n{self.archive_storage_dir}\n"
+                f"{plan.oldest_date[:10]} — {plan.newest_date[:10]}) в файл архива в каталоге\n{profile.archives_dir()}\n"
                 "и удалить их с сервера? Письма останутся в списке и будут читаться из архива.\n\n"
                 "Больше этот вопрос для этой учётной записи задаваться не будет; отключить автоархив можно в Параметрах."
             )
@@ -6465,7 +6470,7 @@ class MainWindow(QMainWindow):
                 return
             save_auto_archive_confirmed([*confirmed, key])
         worker = _CallableWorker(
-            autoarchive.run, mailbox, plan, Path(self.archive_storage_dir),
+            autoarchive.run, mailbox, plan, profile.archives_dir(),
             stop=self._sync_stop, delete_on_server=delete_on_server, parent=self,
         )
 

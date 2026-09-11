@@ -263,7 +263,11 @@ def save_caldav_url(url: str) -> None:
 
 
 def default_archive_storage_dir() -> Path:
-    return Path.home() / "Архивы RedMail"
+    """Каталог архивов по умолчанию — в профиле рядом с базами (договорённость
+    по хранилищу); явно заданный в настройках каталог сохраняется."""
+    from redmail import profile
+
+    return profile.archives_dir()
 
 
 def load_archive_storage_dir() -> Path:

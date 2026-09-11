@@ -157,3 +157,22 @@ def test_default_mode_keeps_messages_on_server(tmp_path: Path) -> None:
         assert 1 in server.messages["INBOX"]
         assert mailbox.message_content("INBOX", 1).subject == "Old 1"
         assert [s.uid for s in mailbox.refresh_folder("INBOX")] == [3, 2, 1]
+
+
+def test_relocate_archives_moves_files_into_profile_and_fixes_index(tmp_path: Path) -> None:
+    # Договорённость: архивы живут в профиле; файлы из старого каталога
+    # переезжают, указатели в индексе обновляются, тела читаются дальше.
+    server, mailbox = _setup(tmp_path)
+    old_dir = tmp_path / "old_archives"
+    new_dir = tmp_path / "profile" / "archives"
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        mailbox.refresh_folder("INBOX")
+        plan = autoarchive.make_plan(mailbox.account_key, 1)
+        plan.candidates = plan.candidates[:1]
+        plan.threshold_bytes = 10**9
+        result = autoarchive.run(mailbox, plan, old_dir)
+        assert Path(result.files[0]).parent == old_dir
+        moved = autoarchive.relocate_archives(old_dir, new_dir)
+        assert moved == 1 and not list(old_dir.glob("*.rmarchive")) and list(new_dir.glob("autoarchive-*.rmarchive"))
+        assert mailbox.message_content("INBOX", 1).subject == "Old 1"
+        assert autoarchive.relocate_archives(old_dir, new_dir) == 0  # повторно — нечего

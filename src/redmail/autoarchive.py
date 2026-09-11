@@ -117,6 +117,42 @@ def _archive_file(archive_dir: Path, account_key: str, threshold_bytes: int) -> 
         index += 1
 
 
+def relocate_archives(old_dir: Path, new_dir: Path) -> int:
+    """Переносит файлы автоархива из старого каталога в каталог профиля
+    (договорённость: архивы живут в профиле рядом с базами; первые сборки
+    писали их в «Каталог для новых архивов») и обновляет указатели в
+    индексе. Возвращает число перенесённых файлов."""
+    try:
+        old_dir = Path(old_dir)
+        new_dir = Path(new_dir)
+        if not old_dir.exists() or old_dir.resolve() == new_dir.resolve():
+            return 0
+    except OSError:
+        return 0
+    moved = 0
+    for path in sorted(old_dir.glob("autoarchive-*.rmarchive")):
+        target = new_dir / path.name
+        if target.exists():
+            continue
+        try:
+            new_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(path, target) if path.stat().st_dev == new_dir.stat().st_dev else _move_across(path, target)
+        except OSError as exc:
+            _log.error("Автоархив: не удалось перенести %s в %s: %s", path, target, exc)
+            continue
+        rows = cache_store.relocate_archive_path(str(path), str(target))
+        _log.info("Автоархив: %s перенесён в %s (обновлено ссылок: %d)", path, target, rows)
+        moved += 1
+    return moved
+
+
+def _move_across(src: Path, dst: Path) -> None:
+    import shutil
+
+    shutil.copy2(src, dst)
+    src.unlink()
+
+
 def run(
     mailbox,
     plan: ArchivePlan,
