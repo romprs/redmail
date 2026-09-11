@@ -3611,6 +3611,93 @@ class EventDialog(QDialog):
         self.end_edit.setDisplayFormat(fmt)
 
 
+def _apply_event_form_changes(dialog: EventDialog, changes: dict) -> None:
+    """Применить поля, пришедшие по каналу управления (ipc_server:
+    event_form_open/event_form_set), к открытому EventDialog — прямо в
+    виджеты, чтобы человек видел каждое изменение в окне. При смене даты или
+    времени начала длительность сохраняется (конец переносится вслед)."""
+    duration_seconds = dialog.start_edit.dateTime().secsTo(dialog.end_edit.dateTime())
+    if "summary" in changes:
+        dialog.summary_edit.setText(changes["summary"])
+
+    start = dialog.start_edit.dateTime()
+    moved = False
+    if "start" in changes:
+        local = changes["start"].astimezone()
+        start = QDateTime(QDate(local.year, local.month, local.day), QTime(local.hour, local.minute))
+        moved = True
+    if "date" in changes:
+        day = changes["date"]
+        start = QDateTime(QDate(day.year, day.month, day.day), start.time())
+        moved = True
+    if "time" in changes:
+        hour, minute = changes["time"]
+        start = QDateTime(start.date(), QTime(hour, minute))
+        moved = True
+    if moved:
+        dialog.start_edit.setDateTime(start)
+        dialog.end_edit.setDateTime(start.addSecs(duration_seconds))
+    if "duration_minutes" in changes:
+        dialog.end_edit.setDateTime(dialog.start_edit.dateTime().addSecs(changes["duration_minutes"] * 60))
+
+    if "recurrence" in changes:
+        rule = changes["recurrence"]
+        index = 0 if rule is None else dialog.recurrence_combo.findData(rule)
+        if index < 0:
+            raise ValueError(f"Неизвестное повторение: {rule!r}")
+        dialog.recurrence_combo.setCurrentIndex(index)
+
+    if "participants" in changes:
+        dialog.attendees_edit.setText(", ".join(changes["participants"]))
+    if "add_participants" in changes:
+        current = dialog.attendee_emails()
+        merged = current + [email for email in changes["add_participants"] if email not in current]
+        dialog.attendees_edit.setText(", ".join(merged))
+
+    if "location" in changes:
+        dialog.location_edit.setText(changes["location"])
+    if "description" in changes:
+        dialog.description_edit.setPlainText(changes["description"])
+    if "all_day" in changes:
+        dialog.all_day_check.setChecked(bool(changes["all_day"]))
+
+
+def _event_form_state(dialog: EventDialog, existing: calendar_store.Event | None) -> dict:
+    """Текущее содержимое формы — ответ каждой команды event_form_*."""
+    start = dialog.start_edit.dateTime()
+    end = dialog.end_edit.dateTime()
+    return {
+        "uid": existing.uid if existing else None,
+        "summary": dialog.summary(),
+        "start": start.toString(Qt.DateFormat.ISODate),  # местное время, как в окне
+        "end": end.toString(Qt.DateFormat.ISODate),
+        "duration_minutes": max(0, start.secsTo(end) // 60),
+        "recurrence": dialog.recurrence_rule(),
+        "participants": dialog.attendee_emails(),
+        "location": dialog.location(),
+        "description": dialog.description(),
+        "all_day": dialog.all_day(),
+    }
+
+
+def _validate_event_form(dialog: EventDialog, existing: calendar_store.Event | None) -> None:
+    """Те же проверки, что делает MainWindow._save_event_from_dialog, но
+    ошибкой клиенту канала вместо QMessageBox: форма остаётся открытой, и
+    человек исправляет поле голосом или мышью, а не заполняет всё заново."""
+    start, end = dialog.start_utc(), dialog.end_utc()
+    if not dialog.all_day() and end <= start:
+        raise ValueError("Окончание должно быть позже начала.")
+    start_unchanged = existing is not None and start.replace(second=0, microsecond=0) == existing.dtstart.replace(
+        second=0, microsecond=0
+    )
+    if not start_unchanged:
+        past_cutoff = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0).astimezone(
+            timezone.utc
+        )
+        if start < past_cutoff:
+            raise ValueError("Нельзя запланировать встречу на прошедшую дату/время.")
+
+
 class EventDetailsDialog(QDialog):
     """Просмотр встречи, которую организовал не я — со ссылками кликабельными
     и вложениями открываемыми/сохраняемыми, как в письме, плюс участники
@@ -4672,6 +4759,9 @@ class MainWindow(QMainWindow):
         # занято живым соседним экземпляром или ОС не дала его создать,
         # приложение обязано работать дальше как обычно, поэтому здесь и
         # проверка результата, и защита от исключения.
+        # Открытая через канал пошаговая форма встречи (диалог, исходное
+        # событие) — см. ipc_event_form_open; None, пока формы нет.
+        self._ipc_event_form: tuple[EventDialog, calendar_store.Event | None] | None = None
         self.ipc_server = IpcServer(self, parent=self)
         try:
             self.ipc_server.start()
@@ -8901,6 +8991,95 @@ class MainWindow(QMainWindow):
             }
             for event in events
         ]
+
+    # -- Пошаговая форма встречи (event_form_* в ipc_server.py) ----------
+    #
+    # Голосовое заполнение «на открытом окне»: ipc_event_form_open показывает
+    # обычный EventDialog и держит на него ссылку, пока он открыт;
+    # ipc_event_form_set меняет поля прямо в виджетах (человек видит каждое
+    # изменение), ipc_event_form_save/cancel нажимают «Сохранить»/«Отмена».
+    # Сохранение — тем же _save_event_from_dialog, что и у кнопки, со всеми
+    # его проверками и рассылкой приглашений.
+    #
+    # Обработчики канала выполняются и внутри вложенного цикла exec()
+    # открытого диалога (сигналы сокета обрабатываются там же), поэтому
+    # трогать его виджеты отсюда безопасно — это тот же GUI-поток.
+
+    def _ipc_exec_event_form(self, dialog: EventDialog, existing: calendar_store.Event | None) -> None:
+        self._ipc_event_form = (dialog, existing)
+        try:
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        finally:
+            self._ipc_event_form = None
+        if accepted:
+            self._save_event_from_dialog(dialog, existing=existing)
+
+    def _ipc_open_event_form(self) -> tuple[EventDialog, calendar_store.Event | None]:
+        if self._ipc_event_form is None:
+            raise RuntimeError("Форма встречи не открыта.")
+        return self._ipc_event_form
+
+    def ipc_event_form_open(self, *, uid: str | None = None, **changes) -> dict:
+        if not self.account:
+            raise RuntimeError("Нет учётной записи: сначала подключитесь к почте в настройках.")
+        if self._ipc_event_form is not None:
+            # Форма уже открыта — вторую не плодим, поля применяем к ней.
+            self.ipc_focus()
+            return self.ipc_event_form_set(**changes) if changes else self.ipc_event_form_state()
+        existing: calendar_store.Event | None = None
+        if uid:
+            existing = calendar_store.get_event(self.calendar_path, uid)
+            if existing is None:
+                raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+            if not existing.is_organizer:
+                raise PermissionError("Изменить можно только встречу, которую организовали вы сами.")
+            draft, title = existing, "Изменить встречу"
+        else:
+            # Ближайший полный час — как у пустого EventDialog по кнопке.
+            start = datetime.now().astimezone().replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+            draft = calendar_store.Event(
+                uid=calendar_store.new_uid(),
+                summary="",
+                dtstart=start.astimezone(timezone.utc),
+                dtend=(start + timedelta(hours=1)).astimezone(timezone.utc),
+                organizer_email=self.account.username,
+                organizer_name=self.account.username,
+                is_organizer=True,
+                my_participation="accepted",
+                calendar_id=self._ipc_default_calendar_id(),
+            )
+            title = "Новая встреча"
+        dialog = self._ipc_event_dialog(draft, title=title)
+        if changes:
+            _apply_event_form_changes(dialog, changes)
+        self.ipc_focus()
+        self._ipc_later(lambda: self._ipc_exec_event_form(dialog, existing))
+        return _event_form_state(dialog, existing)
+
+    def ipc_event_form_set(self, **changes) -> dict:
+        dialog, existing = self._ipc_open_event_form()
+        _apply_event_form_changes(dialog, changes)
+        return _event_form_state(dialog, existing)
+
+    def ipc_event_form_state(self) -> dict:
+        dialog, existing = self._ipc_open_event_form()
+        return _event_form_state(dialog, existing)
+
+    def ipc_event_form_save(self) -> dict:
+        dialog, existing = self._ipc_open_event_form()
+        _validate_event_form(dialog, existing)
+        state = _event_form_state(dialog, existing)
+        # accept() завершит exec() в _ipc_exec_event_form уже после того,
+        # как ответ ушёл клиенту, — и там сработает обычное сохранение.
+        dialog.accept()
+        return state
+
+    def ipc_event_form_cancel(self) -> None:
+        dialog, _existing = self._ipc_open_event_form()
+        dialog.reject()
+
+    def ipc_contacts(self) -> list[contact_store.Contact]:
+        return self._load_contacts()
 
     def ipc_cancel_event(self, uid: str) -> None:
         event = calendar_store.get_event(self.calendar_path, uid)

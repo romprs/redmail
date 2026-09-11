@@ -57,6 +57,31 @@ class FakeController:
         self.calls.append(("find_events", {"subject": subject, "on_date": on_date}))
         return self._found_events
 
+    # -- пошаговая форма встречи: запоминаем поля, отдаём «состояние» --
+    def ipc_event_form_open(self, *, uid=None, **changes):
+        self.calls.append(("event_form_open", dict(changes, uid=uid)))
+        self.form = dict(changes)
+        return dict(self.form)
+
+    def ipc_event_form_set(self, **changes):
+        self.calls.append(("event_form_set", dict(changes)))
+        self.form.update(changes)
+        return dict(self.form)
+
+    def ipc_event_form_state(self):
+        self.calls.append(("event_form_state", {}))
+        return dict(getattr(self, "form", {}))
+
+    def ipc_event_form_save(self):
+        self.calls.append(("event_form_save", {}))
+        return dict(getattr(self, "form", {}))
+
+    def ipc_event_form_cancel(self):
+        self.calls.append(("event_form_cancel", {}))
+
+    def ipc_contacts(self):
+        return getattr(self, "contacts", [])
+
     def ipc_cancel_event(self, uid):
         self.calls.append(("cancel_event", {"uid": uid}))
 
@@ -272,6 +297,190 @@ def test_find_events_empty_subject_becomes_none() -> None:
     controller = FakeController()
     handle_request(controller, {"action": "find_events", "args": {"date": "2026-09-10"}})
     assert controller.calls[0][1]["subject"] is None
+
+
+# ---------------------------------------------------------------------------
+# Пошаговая форма встречи
+# ---------------------------------------------------------------------------
+
+
+def test_event_form_open_parses_fields() -> None:
+    controller = FakeController()
+    response = handle_request(
+        controller,
+        {
+            "action": "event_form_open",
+            "args": {
+                "subject": "Планёрка",
+                "date": "2026-09-15",
+                "time": "08:30",
+                "duration_minutes": 120,
+                "recurrence": "weekly",
+                "participants": ["a@example.com"],
+                "location": "каб. 121",
+            },
+        },
+    )
+    assert response["ok"] is True and response["opened"] == "event_form"
+    action, kwargs = controller.calls[0]
+    assert action == "event_form_open"
+    assert kwargs == {
+        "uid": None,
+        "summary": "Планёрка",
+        "date": date(2026, 9, 15),
+        "time": (8, 30),
+        "duration_minutes": 120,
+        "recurrence": "FREQ=WEEKLY",
+        "participants": ["a@example.com"],
+        "location": "каб. 121",
+    }
+
+
+def test_event_form_open_by_uid_without_fields() -> None:
+    controller = FakeController()
+    handle_request(controller, {"action": "event_form_open", "args": {"uid": "uid-1"}})
+    assert controller.calls[0] == ("event_form_open", {"uid": "uid-1"})
+
+
+def test_event_form_set_requires_at_least_one_field() -> None:
+    response = handle_request(FakeController(), {"action": "event_form_set", "args": {}})
+    assert response["ok"] is False and "нечего менять" in response["error"]
+
+
+def test_event_form_set_recurrence_aliases_and_raw_rule() -> None:
+    controller = FakeController()
+    for given, expected in (("none", None), ("daily", "FREQ=DAILY"), ("FREQ=MONTHLY", "FREQ=MONTHLY"), ("", None)):
+        handle_request(controller, {"action": "event_form_set", "args": {"recurrence": given}})
+        assert controller.calls[-1][1] == {"recurrence": expected}, given
+    bad = handle_request(controller, {"action": "event_form_set", "args": {"recurrence": "каждую пятницу"}})
+    assert bad["ok"] is False and "recurrence" in bad["error"]
+
+
+def test_event_form_set_rejects_bad_time() -> None:
+    response = handle_request(FakeController(), {"action": "event_form_set", "args": {"time": "25:00"}})
+    assert response["ok"] is False and "HH:MM" in response["error"]
+
+
+def test_event_form_state_save_cancel() -> None:
+    controller = FakeController()
+    handle_request(controller, {"action": "event_form_open", "args": {"subject": "X"}})
+    assert handle_request(controller, {"action": "event_form_state"}) == {"ok": True, "form": {"summary": "X"}}
+    assert handle_request(controller, {"action": "event_form_save"}) == {
+        "ok": True,
+        "saving": True,
+        "form": {"summary": "X"},
+    }
+    assert handle_request(controller, {"action": "event_form_cancel"}) == {"ok": True, "cancelled": True}
+
+
+def _contact(name: str, *emails: str):
+    from redmail.contact_store import Contact
+
+    return Contact(display_name=name, emails=list(emails))
+
+
+CONTACTS = [
+    _contact("Шилкин Иван Петрович", "shilkin@example.com"),
+    _contact("Пономарёв Роман", "ponomarev@example.com"),
+    _contact("Будько Анна", "budko@example.com"),
+    _contact("Шапошникова Мария", "m.shaposhnikova@example.com"),
+    _contact("Точилин Сергей", "tochilin@example.com"),
+    _contact("Ли Дмитрий", "li@example.com"),
+    _contact("Без адреса"),
+]
+
+
+@pytest.mark.parametrize(
+    "spoken, expected",
+    [
+        ("Шилкина", "shilkin@example.com"),  # родительный падеж
+        ("шилкин", "shilkin@example.com"),
+        ("Пономарева", "ponomarev@example.com"),  # е вместо ё и падеж
+        ("Будько", "budko@example.com"),  # несклоняемая
+        ("Шапошникову", "m.shaposhnikova@example.com"),  # женская, винительный
+        ("Точилина", "tochilin@example.com"),
+        ("Ивана Шилкина", "shilkin@example.com"),  # два слова — оба должны совпасть
+    ],
+)
+def test_match_contacts_by_spoken_surname(spoken: str, expected: str) -> None:
+    matches = ipc_server.match_contacts(CONTACTS, spoken)
+    assert [c.emails[0] for c in matches] == [expected]
+
+
+def test_match_contacts_short_query_needs_exact_stem() -> None:
+    assert [c.emails[0] for c in ipc_server.match_contacts(CONTACTS, "Ли")] == ["li@example.com"]
+    assert ipc_server.match_contacts(CONTACTS, "Ш") == []
+    assert ipc_server.match_contacts(CONTACTS, "Сидоров") == []
+    assert ipc_server.match_contacts(CONTACTS, "Без адреса") == []  # без email участник бесполезен
+
+
+def test_find_contacts_handler() -> None:
+    controller = FakeController()
+    controller.contacts = CONTACTS
+    response = handle_request(controller, {"action": "find_contacts", "args": {"query": "Шилкина"}})
+    assert response == {
+        "ok": True,
+        "contacts": [{"name": "Шилкин Иван Петрович", "email": "shilkin@example.com", "emails": ["shilkin@example.com"]}],
+    }
+    assert handle_request(controller, {"action": "find_contacts", "args": {}})["ok"] is False
+
+
+def _fresh_event_dialog(qapp):
+    from redmail.ui.main_window import EventDialog
+
+    start = datetime(2026, 9, 10, 15, 0, tzinfo=timezone.utc)
+    draft = calendar_store.Event(uid="draft", summary="", dtstart=start, dtend=start + timedelta(hours=1))
+    return EventDialog(None, event=draft, my_email="me@example.com")
+
+
+def test_apply_event_form_changes_on_real_dialog(qapp) -> None:
+    from redmail.ui.main_window import _apply_event_form_changes, _event_form_state
+
+    dialog = _fresh_event_dialog(qapp)
+    _apply_event_form_changes(
+        dialog,
+        {
+            "summary": "Планёрка",
+            "date": date(2026, 9, 15),
+            "time": (8, 30),
+            "recurrence": "FREQ=WEEKLY",
+            "participants": ["a@example.com"],
+            "location": "каб. 121",
+            "description": "утренняя",
+        },
+    )
+    state = _event_form_state(dialog, None)
+    assert state["summary"] == "Планёрка"
+    assert state["start"] == "2026-09-15T08:30:00"
+    assert state["duration_minutes"] == 60  # длительность при смене даты/времени сохранилась
+    assert state["recurrence"] == "FREQ=WEEKLY"
+    assert state["participants"] == ["a@example.com"]
+    assert state["location"] == "каб. 121" and state["description"] == "утренняя"
+
+    _apply_event_form_changes(dialog, {"duration_minutes": 120, "add_participants": ["b@example.com", "a@example.com"]})
+    state = _event_form_state(dialog, None)
+    assert state["end"] == "2026-09-15T10:30:00"
+    assert state["participants"] == ["a@example.com", "b@example.com"]
+
+    _apply_event_form_changes(dialog, {"recurrence": None})
+    assert _event_form_state(dialog, None)["recurrence"] is None
+    with pytest.raises(ValueError):
+        _apply_event_form_changes(dialog, {"recurrence": "FREQ=HOURLY"})
+
+
+def test_validate_event_form_rejects_past_and_inverted(qapp) -> None:
+    from redmail.ui.main_window import _apply_event_form_changes, _validate_event_form
+
+    dialog = _fresh_event_dialog(qapp)
+    _apply_event_form_changes(dialog, {"date": date(2020, 1, 1)})
+    with pytest.raises(ValueError, match="прошедшую"):
+        _validate_event_form(dialog, None)
+
+    dialog = _fresh_event_dialog(qapp)
+    _apply_event_form_changes(dialog, {"date": date.today() + timedelta(days=30)})
+    dialog.end_edit.setDateTime(dialog.start_edit.dateTime().addSecs(-60))
+    with pytest.raises(ValueError, match="позже начала"):
+        _validate_event_form(dialog, None)
 
 
 def test_cancel_event() -> None:
