@@ -6404,24 +6404,25 @@ class MainWindow(QMainWindow):
             return
         confirmed = load_auto_archive_confirmed()
         delete_on_server = load_auto_archive_delete_on_server()
-        if key not in confirmed:
-            server_note = (
-                "и удалить их с сервера (включено в Параметрах)" if delete_on_server
-                else "(на сервере письма останутся: удаление с сервера выключено в Параметрах)"
-            )
-            answer = QMessageBox.question(
-                self,
-                "Автоархив",
+        if delete_on_server and key not in confirmed:
+            # Вопрос только когда включено удаление с сервера: это
+            # необратимо. В режиме по умолчанию (сервер не трогаем)
+            # спрашивать не о чем (пользователь: "зачем спрашивать?").
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Автоархив")
+            box.setText(
                 f"База почты {plan.db_bytes / (1024 * 1024):.0f} МБ превысила порог "
                 f"{plan.threshold_bytes / (1024 * 1024):.0f} МБ.\n\n"
                 f"Перенести {plan.count} самых старых писем ({plan.total_bytes / (1024 * 1024):.0f} МБ, "
                 f"{plan.oldest_date[:10]} — {plan.newest_date[:10]}) в файл архива в каталоге\n{self.archive_storage_dir}\n"
-                f"{server_note}? Письма останутся в списке и будут читаться из архива.\n\n"
-                "Больше этот вопрос для этой учётной записи задаваться не будет; отключить автоархив можно в Параметрах.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
+                "и удалить их с сервера? Письма останутся в списке и будут читаться из архива.\n\n"
+                "Больше этот вопрос для этой учётной записи задаваться не будет; отключить автоархив можно в Параметрах."
             )
-            if answer != QMessageBox.StandardButton.Yes:
+            yes = box.addButton("Да, перенести и удалить", QMessageBox.ButtonRole.YesRole)
+            box.addButton("Нет", QMessageBox.ButtonRole.NoRole)
+            box.exec()
+            if box.clickedButton() is not yes:
                 _log.info("Автоархив %s: пользователь отказался (%d писем)", key, plan.count)
                 then()
                 return
