@@ -32,6 +32,12 @@ class CachedMailbox:
         self.session = session
         self._account_key = f"{account.host}:{account.username}"
         self.body_max_bytes = body_max_bytes
+        # Одна синхронизация за раз на ящик: обновление по кнопке/таймеру и
+        # полный фоновый проход могли стартовать одновременно и оба качать
+        # одни и те же заголовки (в журнале на реальном ящике: две строки
+        # «новых 3096» подряд). Второй ждёт первого и находит папку уже
+        # синхронизированной.
+        self._sync_lock = threading.Lock()
 
     @property
     def account_key(self) -> str:
@@ -49,16 +55,19 @@ class CachedMailbox:
         return cache_store.count_folder_summaries(self._account_key, folder)
 
     def refresh_folder(self, folder: str, limit: int | None = None, *, progress=None, stop: threading.Event | None = None) -> list[MessageSummary]:
-        sync_engine.sync_folder_headers(self.session, self._account_key, folder, progress=progress, stop=stop)
+        with self._sync_lock:
+            sync_engine.sync_folder_headers(self.session, self._account_key, folder, progress=progress, stop=stop)
         return cache_store.get_folder_summaries(self._account_key, folder, limit)
 
     def sync_all(self, folders: list[str], *, progress=None, stop: threading.Event | None = None) -> sync_engine.SyncStats:
-        return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
+        with self._sync_lock:
+            return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
 
     def download_bodies(self, *, progress=None, stop: threading.Event | None = None, limit: int | None = None) -> int:
-        return sync_engine.download_bodies(
-            self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit
-        )
+        with self._sync_lock:
+            return sync_engine.download_bodies(
+                self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit
+            )
 
     def message_content(self, folder: str, uid: int) -> MessageContent:
         cached = cache_store.get_message_content(self._account_key, folder, uid)
