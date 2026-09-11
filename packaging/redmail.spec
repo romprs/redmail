@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        65%{?dist}
+Release:        66%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-66
+- Синхронизация: одна за раз на ящик; открытие несинхронизированной папки не блокирует окно
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-65
 - Хранилище, этап 1: профиль (каталог с базами почты/календаря/контактов, настраивается), полная локальная копия ящика: заголовки всех папок, тела фоном от новых к старым, письма больше 25 МБ по запросу, зеркалирование удалений и флагов с сервера
 - Настройки → «Хранилище»: каталог профиля, порог размера письма, порог автоархива, статистика базы
