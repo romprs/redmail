@@ -68,6 +68,16 @@ def _setup(tmp_path: Path):
         "Trash": {9: _summary(9, "2020-01-01 10:00", 1000)},
     })
     mailbox = CachedMailbox(server, Account(host="imap.x", username="ivan", password="p"))
+    original_refresh = mailbox.refresh_folder
+
+    def refresh_and_download(folder, *args, **kwargs):
+        # В тестах тела считаем скачанными: кандидаты автоархива — только
+        # письма с телами в базе.
+        result = original_refresh(folder, *args, **kwargs)
+        mailbox.download_bodies()
+        return result
+
+    mailbox.refresh_folder = refresh_and_download
     return server, mailbox
 
 
@@ -176,3 +186,12 @@ def test_relocate_archives_moves_files_into_profile_and_fixes_index(tmp_path: Pa
         assert moved == 1 and not list(old_dir.glob("*.rmarchive")) and list(new_dir.glob("autoarchive-*.rmarchive"))
         assert mailbox.message_content("INBOX", 1).subject == "Old 1"
         assert autoarchive.relocate_archives(old_dir, new_dir) == 0  # повторно — нечего
+
+
+def test_plan_ignores_messages_without_local_body(tmp_path: Path) -> None:
+    server, mailbox = _setup(tmp_path)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        mailbox.refresh_folder("INBOX")
+        cache_store.set_body_state(mailbox.account_key, "INBOX", 1, "none")  # у самого старого тела нет
+        plan = autoarchive.make_plan(mailbox.account_key, 1)
+    assert [u for _f, u, _s, _d in plan.candidates][:1] == [2]

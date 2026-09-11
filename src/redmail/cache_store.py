@@ -516,11 +516,14 @@ def defer_large_messages(account_key: str, max_bytes: int) -> int:
 
 
 def oldest_messages(account_key: str, *, limit: int | None = None) -> list[tuple[str, int, int, str]]:
-    """(папка, uid, размер, дата) не архивированных писем от старых к новым —
-    кандидаты автоархива."""
+    """(папка, uid, размер, дата) кандидатов автоархива от старых к новым —
+    только письма, тела которых реально лежат в базе (body_state='full'):
+    у писем с одними заголовками локально ~1 КБ, и их перенос ничего не
+    освобождает (реальная находка на .80: раунд из 300 самых старых писем
+    ужал базу на 40 МБ вместо 248)."""
     sql = (
         "SELECT folder, uid, size, date FROM messages WHERE account = ? AND position >= 0 AND archive_path IS NULL "
-        "ORDER BY date ASC, uid ASC"
+        "AND body_state = 'full' ORDER BY date ASC, uid ASC"
     )
     params: tuple = (account_key,)
     if limit is not None:
