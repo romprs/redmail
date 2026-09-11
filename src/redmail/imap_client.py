@@ -762,12 +762,17 @@ def _decode_header_text(value: str | None) -> str:
         # внутри — строка с surrogateescape. Восстанавливаем байты и
         # читаем как UTF-8; иначе падало на проверке "=?" in value
         # (TypeError: Header не итерируется).
-        text = str(value)
-        try:
-            text = text.encode("ascii", errors="surrogateescape").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
-        value = text
+        parts: list[str] = []
+        for chunk, charset in decode_header(value):
+            if isinstance(chunk, bytes):
+                encoding = charset if charset and charset.lower() != "unknown-8bit" else "utf-8"
+                try:
+                    parts.append(chunk.decode(encoding))
+                except (LookupError, UnicodeDecodeError):
+                    parts.append(chunk.decode("utf-8", errors="replace"))
+            else:
+                parts.append(chunk)
+        value = "".join(parts)
     if not value or "=?" not in value:
         return value or ""
     return _decode_rfc2047(value.encode("ascii", errors="replace"))
