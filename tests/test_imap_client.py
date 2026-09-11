@@ -1151,3 +1151,17 @@ def test_session_opens_socket_with_timeout_so_stuck_read_cannot_hang_forever() -
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client) as ctor:
         ImapSession(_account())
     assert ctor.call_args.kwargs.get("timeout"), "IMAPClient должен создаваться с timeout"
+
+
+def test_extract_content_handles_raw_utf8_headers() -> None:
+    # Реальная находка на Dovecot: письмо с не закодированной (RFC 6532)
+    # кириллицей в Subject — email.message отдаёт Header, а не str, и
+    # разбор падал с TypeError; тема должна читаться как есть.
+    from email import message_from_bytes
+
+    from redmail.imap_client import extract_content
+
+    crlf = chr(13) + chr(10)
+    raw = ("From: a@b.ru" + crlf + "Subject: Тест сырой заголовок" + crlf + crlf + "body").encode("utf-8")
+    content = extract_content(message_from_bytes(raw))
+    assert content.subject == "Тест сырой заголовок"

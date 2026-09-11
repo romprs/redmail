@@ -5,7 +5,7 @@ import imaplib
 import threading
 from dataclasses import dataclass, field
 from email import message_from_bytes
-from email.header import decode_header
+from email.header import Header, decode_header
 from email.message import Message
 
 from imapclient import IMAPClient
@@ -756,6 +756,18 @@ def _decode_header_text(value: str | None) -> str:
     From/To/Cc) — не все сервера сворачивают RFC 2047 encoded-word до
     ENVELOPE, который парсит imapclient (см. _decode_subject); здесь тот
     же случай, но для содержимого письма, разбираемого через email.message."""
+    if isinstance(value, Header):
+        # Заголовок с «сырыми» не-ASCII байтами (RFC 6532 / небрежные
+        # отправители): email.message отдаёт Header с charset unknown-8bit,
+        # внутри — строка с surrogateescape. Восстанавливаем байты и
+        # читаем как UTF-8; иначе падало на проверке "=?" in value
+        # (TypeError: Header не итерируется).
+        text = str(value)
+        try:
+            text = text.encode("ascii", errors="surrogateescape").decode("utf-8")
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            text = text.encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+        value = text
     if not value or "=?" not in value:
         return value or ""
     return _decode_rfc2047(value.encode("ascii", errors="replace"))
