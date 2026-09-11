@@ -25,6 +25,10 @@ QLocalServer.fullServerName() в <каталог настроек>/ipc-endpoint.
     python3 scripts/ipc_client_test.py update_event --uid <UID> --start 2026-09-10T16:00
     python3 scripts/ipc_client_test.py find_events --subject Планёрка --date 2026-09-10
     python3 scripts/ipc_client_test.py cancel_event --uid <UID>
+    python3 scripts/ipc_client_test.py event_form_open --subject Планёрка --date 2026-09-15 --time 08:30
+    python3 scripts/ipc_client_test.py find_contacts Шилкина
+    python3 scripts/ipc_client_test.py event_form_set --add-participants shilkin@example.com --recurrence weekly
+    python3 scripts/ipc_client_test.py event_form_save        # или event_form_cancel
     python3 scripts/ipc_client_test.py apply_mail_rules --folder INBOX
     python3 scripts/ipc_client_test.py list_mail_rules
     python3 scripts/ipc_client_test.py raw '{"action": "ping"}'
@@ -199,6 +203,21 @@ def build_request(ns: argparse.Namespace) -> dict:
             args["subject"] = ns.subject
         if ns.date:
             args["date"] = ns.date
+    elif action in ("event_form_open", "event_form_set"):
+        if action == "event_form_open" and ns.uid:
+            args["uid"] = ns.uid
+        for key in ("subject", "date", "time", "start", "recurrence", "location", "description"):
+            value = getattr(ns, key)
+            if value:
+                args[key] = value
+        if ns.duration:
+            args["duration_minutes"] = ns.duration
+        if ns.participants is not None:
+            args["participants"] = _split_list(ns.participants)
+        if ns.add_participants is not None:
+            args["add_participants"] = _split_list(ns.add_participants)
+    elif action == "find_contacts":
+        args["query"] = ns.query
     elif action == "cancel_event":
         args["uid"] = ns.uid
     elif action == "apply_mail_rules":
@@ -243,6 +262,30 @@ def main(argv: list[str] | None = None) -> int:
     find = sub.add_parser("find_events", help="найти встречи по теме и/или дню (без подтверждения)")
     find.add_argument("--subject", default="", help="подстрока темы")
     find.add_argument("--date", default="", help="YYYY-MM-DD; по умолчанию — сегодня")
+
+    for name, help_text in (
+        ("event_form_open", "открыть пошаговую форму встречи (новую или свою по --uid)"),
+        ("event_form_set", "изменить поля уже открытой формы"),
+    ):
+        form = sub.add_parser(name, help=help_text)
+        if name == "event_form_open":
+            form.add_argument("--uid", default="")
+        form.add_argument("--subject", default="")
+        form.add_argument("--date", default="", help="YYYY-MM-DD (время остаётся)")
+        form.add_argument("--time", default="", help="HH:MM (дата остаётся)")
+        form.add_argument("--start", default="", help="ISO 8601 — и дата, и время")
+        form.add_argument("--duration", type=int, default=0, help="длительность в минутах")
+        form.add_argument("--recurrence", default="", help="none/daily/weekly/monthly/yearly")
+        form.add_argument("--participants", default=None, help="адреса через запятую (заменить)")
+        form.add_argument("--add-participants", dest="add_participants", default=None, help="добавить адреса")
+        form.add_argument("--location", default="")
+        form.add_argument("--description", default="")
+    sub.add_parser("event_form_state", help="показать поля открытой формы")
+    sub.add_parser("event_form_save", help="нажать «Сохранить» в открытой форме")
+    sub.add_parser("event_form_cancel", help="нажать «Отмена» в открытой форме")
+
+    contacts = sub.add_parser("find_contacts", help="контакты по фамилии/имени, как на слух (с падежом)")
+    contacts.add_argument("query")
 
     cancel = sub.add_parser("cancel_event", help="запустить отмену встречи по UID (с подтверждением в окне)")
     cancel.add_argument("--uid", required=True)

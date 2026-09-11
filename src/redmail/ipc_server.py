@@ -35,6 +35,7 @@ QTimer.singleShot(0, ...) — он выполнится, когда мы уже 
 
 import json
 import os
+import re
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -266,6 +267,187 @@ def _handle_list_mail_rules(controller, _args) -> dict:
     return {"rules": controller.ipc_list_mail_rules()}
 
 
+# --------------------------------------------------------------------------
+# Пошаговая форма встречи — голосовое заполнение «на открытом окне»
+#
+# create_event/update_event открывают диалог с готовыми полями и на этом
+# заканчиваются. Голосовому помощнику нужен другой режим: открыть окно
+# встречи и дальше по одной фразе менять поля («Тема планёрка», «Дата
+# пятнадцатое сентября», «Участники Шилкин, Пономарёв»), пока человек
+# смотрит на окно, а в конце сказать «Сохранить» или «Отменить». Для этого:
+#
+#   event_form_open   — открыть форму (новую или по uid своей встречи),
+#                       поля из args применяются сразу;
+#   event_form_set    — изменить поля уже открытой формы;
+#   event_form_state  — что сейчас в полях;
+#   event_form_save   — нажать «Сохранить» (те же проверки и та же рассылка
+#                       приглашений, что у кнопки в окне);
+#   event_form_cancel — нажать «Отмена»;
+#   find_contacts     — контакты адресной книги по фамилии/имени, как их
+#                       слышно в речи (с падежным окончанием).
+#
+# Поля event_form_open/event_form_set: subject, date (YYYY-MM-DD, время
+# остаётся), time (HH:MM, дата остаётся), start (ISO — и дата, и время),
+# duration_minutes, recurrence (none/daily/weekly/monthly/yearly или
+# FREQ=…), participants (список адресов — заменить), add_participants
+# (добавить), location, description, all_day.
+# --------------------------------------------------------------------------
+
+_RECURRENCE_ALIASES: dict[str, str | None] = {
+    "none": None,
+    "no": None,
+    "daily": "FREQ=DAILY",
+    "weekly": "FREQ=WEEKLY",
+    "monthly": "FREQ=MONTHLY",
+    "yearly": "FREQ=YEARLY",
+}
+
+
+def _recurrence(value, field: str = "recurrence") -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{field} должен быть строкой: none/daily/weekly/monthly/yearly или FREQ=...")
+    text = value.strip()
+    if not text:
+        return None
+    if text.upper().startswith("FREQ="):
+        return text.upper()
+    key = text.lower()
+    if key not in _RECURRENCE_ALIASES:
+        raise ValueError(f"{field}: неизвестное повторение {value!r} (none/daily/weekly/monthly/yearly)")
+    return _RECURRENCE_ALIASES[key]
+
+
+def parse_iso_time(value, field: str = "time") -> tuple[int, int]:
+    """"HH:MM" → (часы, минуты)."""
+    text = _text(value, field)
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ValueError(f"{field}: ожидается время HH:MM, получено {value!r}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def _form_changes(args: dict) -> dict:
+    """Поля формы из args — только те, что реально переданы (как в
+    update_event: отсутствие ключа и пустая строка — разные вещи)."""
+    changes: dict = {}
+    if "subject" in args:
+        changes["summary"] = _text(args.get("subject"), "subject")
+    if "start" in args:
+        changes["start"] = parse_iso_datetime(args.get("start"), "start")
+    if "date" in args:
+        changes["date"] = parse_iso_date(args.get("date"), "date")
+    if "time" in args:
+        changes["time"] = parse_iso_time(args.get("time"), "time")
+    if "duration_minutes" in args:
+        changes["duration_minutes"] = _positive_int(args.get("duration_minutes"), "duration_minutes")
+    if "recurrence" in args:
+        changes["recurrence"] = _recurrence(args.get("recurrence"))
+    if "participants" in args:
+        changes["participants"] = _email_list(args.get("participants"), "participants")
+    if "add_participants" in args:
+        changes["add_participants"] = _email_list(args.get("add_participants"), "add_participants")
+    if "location" in args:
+        changes["location"] = _text(args.get("location"), "location")
+    if "description" in args:
+        changes["description"] = _text(args.get("description"), "description")
+    if "all_day" in args:
+        changes["all_day"] = bool(args.get("all_day"))
+    return changes
+
+
+def _handle_event_form_open(controller, args) -> dict:
+    uid = _text(args.get("uid"), "uid") or None
+    form = controller.ipc_event_form_open(uid=uid, **_form_changes(args))
+    return {"opened": "event_form", "form": form}
+
+
+def _handle_event_form_set(controller, args) -> dict:
+    changes = _form_changes(args)
+    if not changes:
+        raise ValueError("нечего менять: в args нет ни одного поля формы")
+    return {"form": controller.ipc_event_form_set(**changes)}
+
+
+def _handle_event_form_state(controller, _args) -> dict:
+    return {"form": controller.ipc_event_form_state()}
+
+
+def _handle_event_form_save(controller, _args) -> dict:
+    # "saving", а не "saved": форма только что нажала «Сохранить» — само
+    # сохранение и рассылка приглашений произойдут, когда диалог закроется
+    # (после того, как этот ответ уже ушёл клиенту).
+    return {"saving": True, "form": controller.ipc_event_form_save()}
+
+
+def _handle_event_form_cancel(controller, _args) -> dict:
+    controller.ipc_event_form_cancel()
+    return {"cancelled": True}
+
+
+# Сравнение фамилий "на слух": в речи фамилия почти всегда в косвенном
+# падеже («пригласить Шилкина, Пономарёва»), в адресной книге — в
+# именительном («Шилкин»). Сравниваем основы: без ё/е-различия и без
+# хвоста из гласных/й/ь (до трёх букв), а основы считаем совпавшими, если
+# равны или одна начинается с другой (не короче 4 букв — чтобы «Ли» не
+# совпадало со всеми).
+_STEM_TAIL = set("аеёийоуыьюя")
+
+
+def _stem(word: str) -> str:
+    stem = word.lower().replace("ё", "е")
+    stripped = 0
+    while len(stem) > 3 and stripped < 3 and stem[-1] in _STEM_TAIL:
+        stem = stem[:-1]
+        stripped += 1
+    return stem
+
+
+def _word_matches(query_word: str, name_word: str) -> bool:
+    q, w = _stem(query_word), _stem(name_word)
+    if not q or not w:
+        return False
+    if q == w:
+        return True
+    return min(len(q), len(w)) >= 4 and (q.startswith(w) or w.startswith(q))
+
+
+def _contact_words(contact) -> list[str]:
+    words = re.split(r"[\s,;()]+", contact.display_name or "")
+    for email in contact.emails:
+        words.extend(re.split(r"[._\-+]+", email.split("@", 1)[0]))
+    return [w for w in words if w]
+
+
+def match_contacts(contacts, query: str) -> list:
+    """Контакты (с адресом), у которых КАЖДОЕ слово запроса совпало с
+    каким-то словом имени или локальной части адреса — см. _stem."""
+    query_words = [w for w in re.split(r"[\s,;]+", query) if w]
+    if not query_words:
+        return []
+    result = []
+    for contact in contacts:
+        if not contact.emails:
+            continue
+        words = _contact_words(contact)
+        if all(any(_word_matches(qw, nw) for nw in words) for qw in query_words):
+            result.append(contact)
+    return result
+
+
+def _handle_find_contacts(controller, args) -> dict:
+    query = _text(args.get("query"), "query")
+    if not query:
+        raise ValueError("query обязателен: фамилия или имя")
+    matches = match_contacts(controller.ipc_contacts(), query)
+    return {
+        "contacts": [
+            {"name": c.display_name, "email": c.emails[0], "emails": list(c.emails)} for c in matches
+        ]
+    }
+
+
 _HANDLERS = {
     "ping": _handle_ping,
     "focus": _handle_focus,
@@ -274,6 +456,12 @@ _HANDLERS = {
     "update_event": _handle_update_event,
     "find_events": _handle_find_events,
     "cancel_event": _handle_cancel_event,
+    "event_form_open": _handle_event_form_open,
+    "event_form_set": _handle_event_form_set,
+    "event_form_state": _handle_event_form_state,
+    "event_form_save": _handle_event_form_save,
+    "event_form_cancel": _handle_event_form_cancel,
+    "find_contacts": _handle_find_contacts,
     "apply_mail_rules": _handle_apply_mail_rules,
     "list_mail_rules": _handle_list_mail_rules,
 }

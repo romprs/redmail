@@ -49,7 +49,20 @@ python -m venv .venv
 Протокол построчный JSON: одна строка `{"action": ..., "args": {...}}` —
 одна строка ответа `{"ok": true, ...}` либо `{"ok": false, "error": "..."}`.
 Команды: `ping`, `focus`, `compose_email`, `create_event`, `update_event`,
-`find_events`, `cancel_event`, `apply_mail_rules`, `list_mail_rules`.
+`find_events`, `cancel_event`, `event_form_open`, `event_form_set`,
+`event_form_state`, `event_form_save`, `event_form_cancel`, `find_contacts`,
+`apply_mail_rules`, `list_mail_rules`.
+
+Пошаговая форма встречи (`event_form_*`) — для голосового заполнения «на
+открытом окне»: `event_form_open` показывает обычное окно встречи (новой,
+либо своей по `uid`) и держит его открытым, `event_form_set` меняет поля
+прямо в нём по одному (`subject`, `date`, `time`, `start`,
+`duration_minutes`, `recurrence` = none/daily/weekly/monthly/yearly,
+`participants`/`add_participants`, `location`, `description`, `all_day`) —
+человек видит каждое изменение, `event_form_save`/`event_form_cancel`
+нажимают «Сохранить»/«Отмена». `find_contacts` ищет в адресной книге по
+фамилии/имени так, как их слышно в речи (с падежным окончанием: «Шилкина»
+→ Шилкин), возвращая адреса для `participants`.
 
 `update_event`/`cancel_event` требуют `uid` встречи — голосовая сторона его
 не знает, у неё есть только тема (и, возможно, дата). `find_events` (`subject`
