@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        70%{?dist}
+Release:        71%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-71
+- Автоархив без удаления с сервера работает молча в фоне; вопрос с русскими кнопками только при включённом удалении с сервера
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-70
 - Автоархив проверяется после каждых 200 скачанных писем, а не только после полной докачки ящика
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-69
