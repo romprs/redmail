@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        66%{?dist}
+Release:        67%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,10 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-67
+- Исправлено зависание окна при заполнении списка писем на полной локальной копии
+- Хранилище паролей: повторные попытки, запасной файл в профиле по согласию пользователя, адрес D-Bus по умолчанию
+- Фоновая загрузка тел писем не забирает процессор у интерфейса
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-66
 - Синхронизация: одна за раз на ящик; открытие несинхронизированной папки не блокирует окно
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-65
