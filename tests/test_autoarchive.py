@@ -95,7 +95,7 @@ def test_run_archives_verifies_then_deletes_on_server_and_keeps_index(tmp_path: 
         plan = autoarchive.make_plan(mailbox.account_key, 1)
         plan.candidates = plan.candidates[:2]  # uid 1 и 2
         plan.threshold_bytes = 10**9  # без ротации — оба письма в одном файле
-        result = autoarchive.run(mailbox, plan, archive_dir)
+        result = autoarchive.run(mailbox, plan, archive_dir, delete_on_server=True)
 
         assert result.archived == 2 and result.failed == 0
         assert server.deleted == [("INBOX", [1]), ("INBOX", [2])]
@@ -127,7 +127,7 @@ def test_run_skips_message_and_keeps_it_on_server_when_archive_write_fails(tmp_p
         plan = autoarchive.make_plan(mailbox.account_key, 1)
         plan.candidates = plan.candidates[:1]
         with patch("redmail.autoarchive.archive_store.append_raw_message", side_effect=OSError("disk full")):
-            result = autoarchive.run(mailbox, plan, tmp_path / "archives")
+            result = autoarchive.run(mailbox, plan, tmp_path / "archives", delete_on_server=True)
     assert result.archived == 0 and result.failed == 1
     assert server.deleted == []  # без проверенной записи в архив ничего не удаляется
 
@@ -141,3 +141,19 @@ def test_archive_files_rotate_by_size(tmp_path: Path) -> None:
         result = autoarchive.run(mailbox, plan, tmp_path / "archives")
     assert result.archived == 3
     assert len(result.files) == 3 and sorted(Path(f).name for f in result.files)[0].startswith("autoarchive-")
+
+
+def test_default_mode_keeps_messages_on_server(tmp_path: Path) -> None:
+    # По умолчанию автоархив только освобождает локальную базу: письмо в
+    # архиве и в индексе, на сервере остаётся.
+    server, mailbox = _setup(tmp_path)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        mailbox.refresh_folder("INBOX")
+        plan = autoarchive.make_plan(mailbox.account_key, 1)
+        plan.candidates = plan.candidates[:1]
+        plan.threshold_bytes = 10**9
+        result = autoarchive.run(mailbox, plan, tmp_path / "archives")
+        assert result.archived == 1 and server.deleted == []
+        assert 1 in server.messages["INBOX"]
+        assert mailbox.message_content("INBOX", 1).subject == "Old 1"
+        assert [s.uid for s in mailbox.refresh_folder("INBOX")] == [3, 2, 1]

@@ -134,6 +134,18 @@ def save_auto_archive_enabled(enabled: bool) -> None:
     _save_settings_dict(data)
 
 
+def load_auto_archive_delete_on_server() -> bool:
+    """Удалять ли письма с сервера после переноса в архив. По умолчанию
+    НЕТ: автоархив только освобождает локальную базу."""
+    return bool(_load_settings_dict().get("auto_archive_delete_on_server", False))
+
+
+def save_auto_archive_delete_on_server(enabled: bool) -> None:
+    data = _load_settings_dict()
+    data["auto_archive_delete_on_server"] = bool(enabled)
+    _save_settings_dict(data)
+
+
 def load_auto_archive_confirmed() -> list[str]:
     value = _load_settings_dict().get("auto_archive_confirmed", [])
     return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []

@@ -121,9 +121,13 @@ def run(
     *,
     progress: ProgressCallback | None = None,
     stop: threading.Event | None = None,
+    delete_on_server: bool = False,
 ) -> ArchiveResult:
     """Выполняет план: по одному письму — скачать целиком, записать в
-    архив, проверить, удалить на сервере, пометить в индексе."""
+    архив, проверить, пометить в индексе; удалить на сервере — только если
+    delete_on_server (отдельная галочка в настройках, по умолчанию
+    выключена: пользователь усомнился — «что значит удаляет?»). Без неё
+    автоархив лишь освобождает локальную базу, сервер не трогает."""
     result = ArchiveResult()
     if not plan.candidates:
         return result
@@ -150,7 +154,8 @@ def run(
             if len(stored) != len(raw):
                 archive_store.delete_messages(current, [archive_uid])
                 raise ValueError("письмо в архиве не совпадает с исходным")
-            mailbox.delete_on_server(folder, [uid])
+            if delete_on_server:
+                mailbox.delete_on_server(folder, [uid])
             cache_store.mark_archived(plan.account_key, folder, uid, str(current), archive_uid)
             result.archived += 1
             result.bytes_freed += size
@@ -171,7 +176,8 @@ def run(
         except Exception as exc:
             _log.warning("VACUUM после автоархива не удался: %s", exc)
         _log.info(
-            "Автоархив %s: перенесено %d писем (%.1f МБ), ошибок %d, файлы: %s",
-            plan.account_key, result.archived, result.bytes_freed / (1024 * 1024), result.failed, ", ".join(result.files),
+            "Автоархив %s: перенесено %d писем (%.1f МБ), с сервера %s, ошибок %d, файлы: %s",
+            plan.account_key, result.archived, result.bytes_freed / (1024 * 1024),
+            "удалены" if delete_on_server else "НЕ удалялись", result.failed, ", ".join(result.files),
         )
     return result

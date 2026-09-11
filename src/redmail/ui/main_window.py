@@ -133,6 +133,7 @@ from redmail.config_store import (
     load_default_signature_id,
     load_ews_accounts,
     load_auto_archive_confirmed,
+    load_auto_archive_delete_on_server,
     load_auto_archive_enabled,
     load_auto_archive_size_mb,
     load_body_max_size_mb,
@@ -155,6 +156,7 @@ from redmail.config_store import (
     save_default_signature_id,
     save_ews_accounts,
     save_auto_archive_confirmed,
+    save_auto_archive_delete_on_server,
     save_auto_archive_enabled,
     save_auto_archive_size_mb,
     save_body_max_size_mb,
@@ -1445,6 +1447,7 @@ class SettingsDialog(QDialog):
         auto_archive_size_mb: int = 500,
         storage_stats: dict | None = None,
         auto_archive_enabled: bool = True,
+        auto_archive_delete_on_server: bool = False,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -1603,8 +1606,10 @@ class SettingsDialog(QDialog):
         self.body_max_size_edit.setRange(1, 2000)
         self.body_max_size_edit.setSuffix(" МБ")
         self.body_max_size_edit.setValue(int(body_max_size_mb))
-        self.auto_archive_check = QCheckBox("Автоархив по размеру базы: самые старые письма — в файл архива, с сервера удаляются", self)
+        self.auto_archive_check = QCheckBox("Автоархив по размеру базы: самые старые письма — в файл архива", self)
         self.auto_archive_check.setChecked(bool(auto_archive_enabled))
+        self.auto_archive_delete_check = QCheckBox("Удалять письма с сервера после переноса в архив (необратимо)", self)
+        self.auto_archive_delete_check.setChecked(bool(auto_archive_delete_on_server))
         self.auto_archive_size_edit = QSpinBox(self)
         self.auto_archive_size_edit.setRange(50, 100000)
         self.auto_archive_size_edit.setSuffix(" МБ")
@@ -1622,6 +1627,7 @@ class SettingsDialog(QDialog):
         storage_form.addRow("Не скачивать фоном письма больше", self.body_max_size_edit)
         storage_form.addRow(self.auto_archive_check)
         storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
+        storage_form.addRow(self.auto_archive_delete_check)
         storage_form.addRow(storage_stats_label)
         storage_form.addRow(storage_hint)
         storage_group = QGroupBox("Хранилище")
@@ -1709,6 +1715,9 @@ class SettingsDialog(QDialog):
 
     def auto_archive_enabled(self) -> bool:
         return self.auto_archive_check.isChecked()
+
+    def auto_archive_delete_on_server(self) -> bool:
+        return self.auto_archive_delete_check.isChecked()
 
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
@@ -2129,6 +2138,27 @@ class ComposeDialog(QDialog):
 
     def save_as_draft_requested(self) -> bool:
         return self._save_as_draft
+
+    def apply_embedded_images(self, html_with_cids: str, images: dict[str, tuple[str, bytes]]) -> None:
+        """Картинки пересылаемого письма докачались в фоне: регистрируем
+        их как ресурсы документа и, если пользователь ещё ничего не менял,
+        подменяем разметку на вариант с cid:. Если текст уже правился —
+        разметку не трогаем (ушло бы с внешними ссылками, как раньше)."""
+        if self.body_edit.document().isModified():
+            return
+        for cid, (_content_type, payload) in images.items():
+            if cid in self._inline_images:
+                continue
+            self._inline_images[cid] = (_content_type, payload)
+            image = QImage.fromData(payload)
+            if not image.isNull():  # нерисуемый формат (svg и т.п.) всё равно уйдёт вложением
+                self.body_edit.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image)
+        cursor_position = self.body_edit.textCursor().position()
+        self.body_edit.setHtml(html_with_cids)
+        cursor = self.body_edit.textCursor()
+        cursor.setPosition(min(cursor_position, self.body_edit.document().characterCount() - 1))
+        self.body_edit.setTextCursor(cursor)
+        self.body_edit.document().setModified(False)
 
     def _clear_recipients(self) -> None:
         self.to_edit.clear()
@@ -5665,6 +5695,7 @@ class MainWindow(QMainWindow):
             auto_archive_size_mb=load_auto_archive_size_mb(),
             storage_stats=self._storage_stats(),
             auto_archive_enabled=load_auto_archive_enabled(),
+            auto_archive_delete_on_server=load_auto_archive_delete_on_server(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -5684,6 +5715,7 @@ class MainWindow(QMainWindow):
             save_body_max_size_mb(dialog.body_max_size_mb())
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
             save_auto_archive_enabled(dialog.auto_archive_enabled())
+            save_auto_archive_delete_on_server(dialog.auto_archive_delete_on_server())
             for mailbox in self.mailboxes.values():
                 if isinstance(mailbox, CachedMailbox):
                     mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024
@@ -6260,7 +6292,12 @@ class MainWindow(QMainWindow):
             then()
             return
         confirmed = load_auto_archive_confirmed()
+        delete_on_server = load_auto_archive_delete_on_server()
         if key not in confirmed:
+            server_note = (
+                "и удалить их с сервера (включено в Параметрах)" if delete_on_server
+                else "(на сервере письма останутся: удаление с сервера выключено в Параметрах)"
+            )
             answer = QMessageBox.question(
                 self,
                 "Автоархив",
@@ -6268,7 +6305,7 @@ class MainWindow(QMainWindow):
                 f"{plan.threshold_bytes / (1024 * 1024):.0f} МБ.\n\n"
                 f"Перенести {plan.count} самых старых писем ({plan.total_bytes / (1024 * 1024):.0f} МБ, "
                 f"{plan.oldest_date[:10]} — {plan.newest_date[:10]}) в файл архива в каталоге\n{self.archive_storage_dir}\n"
-                "и удалить их с сервера? Письма останутся в списке и будут читаться из архива.\n\n"
+                f"{server_note}? Письма останутся в списке и будут читаться из архива.\n\n"
                 "Больше этот вопрос для этой учётной записи задаваться не будет; отключить автоархив можно в Параметрах.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -6279,7 +6316,8 @@ class MainWindow(QMainWindow):
                 return
             save_auto_archive_confirmed([*confirmed, key])
         worker = _CallableWorker(
-            autoarchive.run, mailbox, plan, Path(self.archive_storage_dir), stop=self._sync_stop, parent=self
+            autoarchive.run, mailbox, plan, Path(self.archive_storage_dir),
+            stop=self._sync_stop, delete_on_server=delete_on_server, parent=self,
         )
 
         def done(_result: object = None) -> None:
@@ -6715,12 +6753,9 @@ class MainWindow(QMainWindow):
         summary = self._summary_for_row(item.row())
         if summary is None:
             return
-        try:
-            content = self.active_source.message_content(self.current_folder, summary.uid)
-        except Exception as exc:
-            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
-            return
+        self._with_message_content(summary, lambda content: self._open_loaded_message(summary, content))
 
+    def _open_loaded_message(self, summary: MessageSummary, content: MessageContent) -> None:
         # Двойной клик по письму в "Черновиках" — сразу продолжить его
         # редактирование, а не просто показать (жалоба: "из черновиков не
         # отправляет"); во всех остальных папках — открыть в отдельном
@@ -8416,12 +8451,41 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Нет письма", "Выберите письмо, которое хотите переслать.")
             return
         summary = self.selected_summary
-        try:
-            content = self.active_source.message_content(self.current_folder, summary.uid)
-        except Exception as exc:
-            QMessageBox.critical(self, "Не удалось загрузить письмо", str(exc))
+        self._with_message_content(summary, lambda content: self._start_forward(summary, content))
+
+    def _with_message_content(self, summary: MessageSummary, on_ready: Callable[[MessageContent], None]) -> None:
+        """Тело письма для действия (переслать, открыть в окне): если это
+        уже показанное письмо — берём готовое, без повторной загрузки;
+        иначе грузим в фоне с индикатором. Жалоба: "при попытке переслать
+        сначала всё подвисает" — загрузка шла в потоке интерфейса и ждала
+        очередь IMAP, занятую фоновой синхронизацией."""
+        if self.selected_summary is summary and self.current_content is not None:
+            on_ready(self.current_content)
             return
-        self._start_forward(summary, content)
+        source = self.active_source
+        folder = self.current_folder
+        if source is None or not folder:
+            return
+        self._set_busy("Загрузка письма…")
+        worker = _CallableWorker(source.message_content, folder, summary.uid, parent=self)
+
+        def finish() -> None:
+            self._set_busy(None)
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        def on_success(content: object) -> None:
+            finish()
+            on_ready(content)
+
+        def on_failure(error_text: str) -> None:
+            finish()
+            QMessageBox.critical(self, "Не удалось загрузить письмо", error_text)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _start_forward(self, summary: MessageSummary, content: MessageContent) -> None:
         # См. _start_reply — то же самое: общая часть для тулбара и для
@@ -8465,8 +8529,8 @@ class MainWindow(QMainWindow):
             )
             body_kwargs = {"body": f"\n\n{forward_header}\n{content.text}"}
 
-        def open_dialog(kwargs: dict) -> None:
-            dialog = ComposeDialog(
+        def build_dialog(kwargs: dict) -> ComposeDialog:
+            return ComposeDialog(
                 self,
                 title="Переслать",
                 subject=subject,
@@ -8481,48 +8545,36 @@ class MainWindow(QMainWindow):
                 default_signature_id=self.default_signature_id,
                 **kwargs,
             )
-            self._exec_compose(dialog)
 
-        if "body_html" not in body_kwargs or "http" not in body_kwargs["body_html"]:
-            open_dialog(body_kwargs)
-            return
+        dialog = build_dialog(body_kwargs)
+        if "body_html" in body_kwargs and "http" in body_kwargs["body_html"]:
+            # Внешние картинки (<img src="https://…">) скачиваются в фоне и
+            # подставляются в УЖЕ открытое окно (жалоба: "сначала окно о
+            # загрузке изображений и только потом окно пересылки — зачем
+            # так?"). Если сервер картинок недоступен — письмо уйдёт с
+            # внешними ссылками, как было.
+            worker = _CallableWorker(
+                remote_images.embed_remote_images, body_kwargs["body_html"], body_kwargs.get("inline_images"), parent=self
+            )
 
-        # Внешние картинки (<img src="https://…">) скачиваются и уходят
-        # внутри письма (см. remote_images) — в фоне, с окном ожидания и
-        # кнопкой «Пропустить»: если сервер картинок недоступен, письмо
-        # всё равно откроется, просто с внешними ссылками.
-        progress = QProgressDialog("Загрузка изображений письма…", "Пропустить", 0, 0, self)
-        progress.setWindowTitle("Переслать")
-        progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setMinimumDuration(400)
-        worker = _CallableWorker(
-            remote_images.embed_remote_images, body_kwargs["body_html"], body_kwargs.get("inline_images"), parent=self
-        )
-        state = {"opened": False}
+            def on_success(result: object) -> None:
+                if worker in self._background_workers:
+                    self._background_workers.remove(worker)
+                html_with_cids, images = result
+                try:
+                    dialog.apply_embedded_images(html_with_cids, images)
+                except RuntimeError:
+                    pass  # окно уже закрыто
 
-        def open_once(kwargs: dict) -> None:
-            if state["opened"]:
-                return
-            state["opened"] = True
-            progress.close()
-            open_dialog(kwargs)
+            def on_failure(_error_text: str) -> None:
+                if worker in self._background_workers:
+                    self._background_workers.remove(worker)
 
-        def on_success(result: object) -> None:
-            if worker in self._background_workers:
-                self._background_workers.remove(worker)
-            html_with_cids, images = result
-            open_once({**body_kwargs, "body_html": html_with_cids, "inline_images": images})
-
-        def on_failure(_error_text: str) -> None:
-            if worker in self._background_workers:
-                self._background_workers.remove(worker)
-            open_once(body_kwargs)
-
-        progress.canceled.connect(lambda: open_once(body_kwargs))
-        worker.succeeded.connect(on_success)
-        worker.failed.connect(on_failure)
-        self._background_workers.append(worker)
-        worker.start()
+            worker.succeeded.connect(on_success)
+            worker.failed.connect(on_failure)
+            self._background_workers.append(worker)
+            worker.start()
+        self._exec_compose(dialog)
 
     def _exec_compose(
         self,
