@@ -32,7 +32,7 @@ OUT = Path(__file__).resolve().parent / "out"
 PRODUCT_NAME = "RedMail"          # рабочее название; будет заменено на выбранное
 PACKAGE_NAME = "redmail"          # имя RPM-пакета и команды запуска
 VERSION = "0.0.1"
-RELEASE = "70"
+RELEASE = "74"
 AUTHOR = "Пономарев Роман Сергеевич"
 RIGHTSHOLDER = AUTHOR             # правообладатель — физическое лицо
 RIGHTSHOLDER_EMAIL = "romprs@gmail.com"
@@ -333,7 +333,7 @@ def doc_functional() -> Path:
         ["Локальная копия почты", "SQLite", "<профиль>/mail.sqlite3 (профиль по умолчанию ~/.config/" + PACKAGE_NAME + "/profile, настраивается)"],
         ["Календарь", "SQLite (.rmcal)", "<профиль>/calendar.rmcal"],
         ["Контакты", "SQLite (.rmcontacts)", "<профиль>/contacts.rmcontacts"],
-        ["Архивы писем", "SQLite (.rmarchive)", "настраиваемый каталог, по умолчанию ~/Архивы " + PRODUCT_NAME],
+        ["Архивы писем", "SQLite (.rmarchive)", "<профиль>/archives (файлы автоархива всегда там; каталог для ручных архивов настраивается)"],
     ], [4, 5, 7])
     h(doc, "5. Системные требования")
     table(doc, ["Компонент", "Требование"], [
