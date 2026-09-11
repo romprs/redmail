@@ -514,6 +514,28 @@ def _is_alive(name: str) -> bool:
     return connected
 
 
+def focus_running_instance(name: str | None = None) -> bool:
+    """Один экземпляр программы: если по имени сокета уже отвечает живой
+    redmail, попросить его поднять окно и вернуть True — тогда новый
+    процесс не стартует (жалоба: "смог открыть 2 окна почты — это
+    неправильно"). Ответа не ждём дольше PROBE_TIMEOUT_MS."""
+    name = name or server_name()
+    probe = QLocalSocket()
+    probe.connectToServer(name)
+    if not probe.waitForConnected(PROBE_TIMEOUT_MS):
+        probe.abort()
+        return False
+    probe.write(json.dumps({"action": "focus", "args": {}}).encode("utf-8") + b"\n")
+    probe.waitForBytesWritten(PROBE_TIMEOUT_MS)
+    probe.waitForReadyRead(PROBE_TIMEOUT_MS)
+    # Штатное отключение, а не abort(): abort может сбросить ещё не
+    # прочитанные сервером данные вместе с соединением.
+    probe.disconnectFromServer()
+    if probe.state() != QLocalSocket.LocalSocketState.UnconnectedState:
+        probe.waitForDisconnected(PROBE_TIMEOUT_MS)
+    return True
+
+
 class IpcServer(QObject):
     """QLocalServer + построчный JSON поверх него.
 

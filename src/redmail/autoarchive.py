@@ -211,9 +211,11 @@ def run(
                 pass
     if result.archived:
         try:
-            cache_store.vacuum()
+            freed_pages = cache_store.vacuum(stop)
+            if freed_pages:
+                _log.info("Автоархив: база ужата на %d страниц (~%.0f МБ)", freed_pages, freed_pages * 4096 / (1024 * 1024))
         except Exception as exc:
-            _log.warning("VACUUM после автоархива не удался: %s", exc)
+            _log.warning("Ужатие базы после автоархива не удалось: %s", exc)
         _log.info(
             "Автоархив %s: перенесено %d писем (%.1f МБ), с сервера %s, ошибок %d, файлы: %s",
             plan.account_key, result.archived, result.bytes_freed / (1024 * 1024),

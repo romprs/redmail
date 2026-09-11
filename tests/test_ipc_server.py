@@ -1182,3 +1182,34 @@ def test_ipc_list_mail_rules_returns_plain_dicts() -> None:
     ]
     # результат обязан быть сериализуем в JSON — он уходит в ответ клиенту
     json.dumps(MainWindow.ipc_list_mail_rules(stub))
+
+
+def test_focus_running_instance_talks_to_live_server_and_is_false_without_one(qapp, monkeypatch):
+    import threading
+    import time
+    from unittest.mock import MagicMock
+
+    from redmail import ipc_server
+
+    name = f"redmail-ipc-test-single-{os.getpid()}"
+    monkeypatch.setenv("REDMAIL_IPC_NAME", name)
+    assert ipc_server.focus_running_instance() is False  # никто не слушает
+
+    controller = MagicMock()
+    server = ipc_server.IpcServer(controller)
+    assert server.start()
+    try:
+        # Второй экземпляр — отдельный процесс; здесь его роль играет поток,
+        # а главный поток крутит цикл событий первого экземпляра.
+        outcome: list[bool] = []
+        client = threading.Thread(target=lambda: outcome.append(ipc_server.focus_running_instance()))
+        client.start()
+        deadline = time.time() + 5
+        while (client.is_alive() or not controller.ipc_focus.called) and time.time() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        client.join(1)
+        assert outcome == [True]
+        assert controller.ipc_focus.called
+    finally:
+        server.stop()

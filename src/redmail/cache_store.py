@@ -252,10 +252,14 @@ def count_folder_summaries(account_key: str, folder: str) -> int:
     return int(row[0]) if row else 0
 
 
-def get_folder_uids(account_key: str, folder: str) -> set[int]:
+def get_folder_uids(account_key: str, folder: str, *, include_archived: bool = False) -> set[int]:
+    """UID писем папки, известных локально. include_archived=True — вместе с
+    перенесёнными в архив (их заголовки уже есть, качать заново незачем);
+    False — только «живые» на сервере (для зеркала удалений)."""
+    clause = "" if include_archived else " AND archive_path IS NULL"
     with closing(_connect()) as conn:
         rows = conn.execute(
-            "SELECT uid FROM messages WHERE account = ? AND folder = ? AND position >= 0 AND archive_path IS NULL",
+            f"SELECT uid FROM messages WHERE account = ? AND folder = ? AND position >= 0{clause}",
             (account_key, folder),
         ).fetchall()
     return {r[0] for r in rows}
@@ -575,20 +579,51 @@ def count_archived(account_key: str) -> int:
     return int(row[0]) if row else 0
 
 
-def vacuum() -> None:
-    """Вернуть место после автоархива — SQLite сам файл не ужимает.
+VACUUM_STEP_PAGES = 20000  # ≈ 80 МБ за шаг: замок на базе — доли секунды, окно не замирает
 
-    Первый раз — полный VACUUM (на базе в несколько ГБ это минуты, зато
-    заодно включается auto_vacuum=INCREMENTAL), дальше — быстрое
-    инкрементальное ужатие после каждого раунда автоархива, чтобы размер
-    файла уменьшался по ходу, а не только в самом конце."""
+
+def needs_initial_vacuum(min_bytes: int = 200 * 1024 * 1024) -> bool:
+    """Базу нужно один раз перевести в режим auto_vacuum=INCREMENTAL полным
+    VACUUM (минуты на нескольких ГБ) — делается при старте программы под
+    заставкой, а не во время работы (окно замирало: жалоба "почему завис
+    почтовый клиент")."""
+    path = _db_path()
+    if not path.exists() or path.stat().st_size < min_bytes:
+        return False
     with closing(_connect()) as conn:
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
-        if int(mode or 0) != 2:
-            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
-            conn.execute("VACUUM")
-        else:
-            conn.execute("PRAGMA incremental_vacuum")
+    return int(mode or 0) != 2
+
+
+def initial_vacuum() -> None:
+    with closing(_connect()) as conn:
+        conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+        conn.execute("VACUUM")
+
+
+def vacuum(stop=None) -> int:
+    """Вернуть место после автоархива — SQLite сам файл не ужимает.
+    Только инкрементально, порциями по VACUUM_STEP_PAGES страниц: каждый
+    шаг держит базу доли секунды, между шагами окно и синхронизация
+    успевают поработать. Если база ещё не переведена в режим
+    auto_vacuum=INCREMENTAL — ничего не делает (переведёт старт программы).
+    Возвращает число освобождённых страниц."""
+    freed = 0
+    with closing(_connect()) as conn:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+    if int(mode or 0) != 2:
+        return 0
+    while stop is None or not stop.is_set():
+        with closing(_connect()) as conn:
+            before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            if not before:
+                break
+            conn.execute(f"PRAGMA incremental_vacuum({VACUUM_STEP_PAGES})")
+            after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        freed += max(0, int(before) - int(after))
+        if after >= before:
+            break
+    return freed
 
 
 def storage_stats(account_key: str | None = None) -> dict:

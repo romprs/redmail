@@ -133,8 +133,28 @@ def main() -> int:
     report("Загрузка интерфейса…")
     from redmail.ui.main_window import MainWindow
 
+    from redmail import ipc_server
+
+    if ipc_server.focus_running_instance():
+        # Уже запущен — поднять существующее окно и выйти, второго не открывать.
+        applog.get_logger("app").info("Уже запущен другой экземпляр — показываю его окно и выхожу")
+        splash.close()
+        return 0
+
     profile_path = profile.ensure_profile()
     applog.get_logger("app").info("Профиль: %s", profile_path)
+    try:
+        from redmail import cache_store
+
+        if cache_store.needs_initial_vacuum():
+            # Один раз: перевод базы в режим инкрементального ужатия. На базе
+            # в несколько ГБ это минуты — под заставкой, пока окна ещё нет.
+            report("Ужимаю базу почты (один раз, несколько минут)…")
+            applog.get_logger("app").info("Первичное ужатие базы почты (VACUUM)…")
+            cache_store.initial_vacuum()
+            applog.get_logger("app").info("Первичное ужатие базы почты завершено")
+    except Exception as exc:
+        applog.get_logger("app").error("Первичное ужатие базы не удалось: %s", exc)
     window = MainWindow()
 
     report("Готово")

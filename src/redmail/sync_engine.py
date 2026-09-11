@@ -99,7 +99,8 @@ def sync_folder_headers(
         result.reset = True
 
     server_uids = set(session.search_uids(folder))
-    local_uids = cache_store.get_folder_uids(account_key, folder)
+    local_uids = cache_store.get_folder_uids(account_key, folder)  # живые на сервере
+    known_uids = cache_store.get_folder_uids(account_key, folder, include_archived=True)
     result.total = len(server_uids)
 
     missing_on_server = sorted(local_uids - server_uids)
@@ -107,7 +108,10 @@ def sync_folder_headers(
         cache_store.delete_messages(account_key, folder, missing_on_server)
         result.deleted = len(missing_on_server)
 
-    new_uids = sorted(server_uids - local_uids, reverse=True)
+    # Новые — которых нет ни среди живых, ни среди архивных: архивные
+    # (без удаления с сервера они остаются на нём) иначе перекачивались бы
+    # каждый проход (в журнале на .80: «новых 1138» при каждой синхронизации).
+    new_uids = sorted(server_uids - known_uids, reverse=True)
     done = 0
     for part in _chunks(new_uids, chunk):
         if _stopped(stop):
