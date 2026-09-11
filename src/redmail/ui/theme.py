@@ -73,6 +73,59 @@ QToolButton:checked {{
 QMenu {{
     border: 1px solid {border};
 }}
+/* Мини-календарь слева от сетки (QCalendarWidget): жалоба "у меню убери
+   рамку" — кнопки месяца/года в его навигационной панели наследовали общую
+   рамку QToolButton и выглядели как обведённое меню; стрелки и кнопки
+   месяца/года здесь — без рамок, панель без фона-плашки. Выделенный день
+   — акцентом темы, иначе в тёмной теме выбор был почти неразличим
+   (жалоба: "выделение календаря работает криво"). */
+QCalendarWidget QWidget#qt_calendar_navigationbar {{
+    background-color: transparent;
+    border: none;
+}}
+QCalendarWidget QToolButton {{
+    border: none;
+    background-color: transparent;
+    padding: 2px 6px;
+    /* Явный цвет текста: навигационная панель QCalendarWidget по умолчанию
+       рисует подписи цветом HighlightedText поверх заливки Highlight; без
+       заливки в тёмной теме это тёмный текст на тёмном фоне. */
+    color: {text};
+}}
+QCalendarWidget QToolButton:hover {{
+    background-color: {alt_base};
+}}
+QCalendarWidget QToolButton::menu-indicator {{
+    image: none;
+}}
+QCalendarWidget QAbstractItemView:enabled {{
+    selection-background-color: {accent};
+    selection-color: {accent_text};
+    background-color: {base};
+    color: {text};
+    outline: none;
+}}
+/* Поля ввода: явная рамка и фон base (жалоба: "в тёмной теме всё
+   сливается" — поле «Кому»/«Тема» на фоне окна не отличалось от него). */
+QLineEdit {{
+    border: 1px solid {border};
+    border-radius: 4px;
+    padding: 4px 6px;
+    background-color: {base};
+    selection-background-color: {accent};
+    selection-color: {accent_text};
+}}
+QLineEdit:focus {{
+    border: 1px solid {accent};
+}}
+QLineEdit:disabled {{
+    color: {disabled_text};
+}}
+QTextEdit#composeBody, QPlainTextEdit#composeBody {{
+    border: 1px solid {border};
+    border-radius: 4px;
+    background-color: {base};
+}}
 QGroupBox {{
     border: 1px solid {border};
     border-radius: 4px;

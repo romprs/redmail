@@ -126,6 +126,17 @@ def save_contact(path: Path, contact: Contact) -> Contact:
     UID — повторный импорт того же файла обновляет, а не дублирует."""
     create_contacts_book(path)
     uid = contact.uid or new_uid()
+    # Адреса — всегда в нижнем регистре (пожелание: "при загрузке адресной
+    # книги или добавлении в неё надо менять регистр email на нижний — у
+    # некоторых серверов есть проблема с распознаванием"). Локальная
+    # часть адреса формально чувствительна к регистру, но на практике
+    # серверы её не различают, а вот "Ivan.Petrov@Corp.RU" из экспорта
+    # Outlook часть серверов отвергает.
+    emails = []
+    for email in contact.emails:
+        normalized = (email or "").strip().lower()
+        if normalized and normalized not in emails:
+            emails.append(normalized)
     with closing(_connect(path)) as conn:
         conn.execute(
             "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes) "
@@ -136,7 +147,7 @@ def save_contact(path: Path, contact: Contact) -> Contact:
             (
                 uid,
                 contact.display_name,
-                json.dumps(contact.emails, ensure_ascii=False),
+                json.dumps(emails, ensure_ascii=False),
                 contact.phone,
                 contact.organization,
                 contact.notes,

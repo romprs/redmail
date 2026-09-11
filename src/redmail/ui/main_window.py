@@ -83,6 +83,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QProgressDialog,
     QPushButton,
     QRadioButton,
@@ -161,6 +162,7 @@ from redmail.config_store import (
     save_window_geometry,
 )
 from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
+from redmail import ics_subscription, remote_images
 from redmail.imap_client import (
     Account,
     Attachment,
@@ -1849,9 +1851,13 @@ class ComposeDialog(QDialog):
 
         self.to_edit = QLineEdit(to)
         self.to_edit.setPlaceholderText("Через запятую, если получателей несколько")
+        # Поля «Кому»/«Тема» повыше (жалоба: "поле кому и тема расширь —
+        # в тёмной теме всё сливается"; рамка/фон — в theme.py).
+        self.to_edit.setMinimumHeight(30)
         if contacts:
             _install_recipient_completer(self.to_edit, contacts)
         self.subject_edit = QLineEdit(subject)
+        self.subject_edit.setMinimumHeight(30)
 
         # Раньше тело письма было простым QPlainTextEdit — жалоба: "нет
         # возможности вставить картинку... редактор не даёт установить
@@ -1862,6 +1868,7 @@ class ComposeDialog(QDialog):
         # содержать "<"/">" (например, адрес в угловых скобках), который
         # иначе разобрался бы как HTML-тег, а не как текст.
         self.body_edit = _ComposeBodyEdit(lambda image: self._insert_image(image, "image/png"))
+        self.body_edit.setObjectName("composeBody")
         self.body_edit.setAcceptRichText(True)
         self._inline_images: dict[str, tuple[str, bytes]] = dict(inline_images) if inline_images else {}
         if body_html:
@@ -1956,9 +1963,16 @@ class ComposeDialog(QDialog):
         cc_bcc_button = QPushButton("Копия/Скрытая копия", self)
         cc_bcc_button.setFlat(True)
         cc_bcc_button.clicked.connect(self._show_cc_bcc)
+        # Пожелание: "в карточку события и создание сообщения добавь
+        # кнопку очистки получателей" — сбрасывает все три поля адресатов.
+        clear_recipients_button = QPushButton("✕", self)
+        clear_recipients_button.setToolTip("Очистить получателей (Кому, Копия, Скрытая копия)")
+        clear_recipients_button.setFixedWidth(28)
+        clear_recipients_button.clicked.connect(self._clear_recipients)
         to_row = QHBoxLayout()
         to_row.addWidget(self.to_edit)
         to_row.addWidget(address_book_button)
+        to_row.addWidget(clear_recipients_button)
         to_row.addWidget(cc_bcc_button)
 
         self.cc_edit = QLineEdit(cc, self)
@@ -1971,6 +1985,9 @@ class ComposeDialog(QDialog):
             _install_recipient_completer(self.bcc_edit, contacts)
 
         form = QFormLayout()
+        # Пожелание: "немного разнеси поля тема и кому".
+        form.setVerticalSpacing(10)
+        form.setHorizontalSpacing(12)
         form.addRow("Кому", to_row)
         self._cc_row_label = "Копия"
         form.addRow("Копия", self.cc_edit)
@@ -2034,6 +2051,12 @@ class ComposeDialog(QDialog):
 
     def save_as_draft_requested(self) -> bool:
         return self._save_as_draft
+
+    def _clear_recipients(self) -> None:
+        self.to_edit.clear()
+        self.cc_edit.clear()
+        self.bcc_edit.clear()
+        self.to_edit.setFocus()
 
     def _show_cc_bcc(self) -> None:
         self._show_cc_bcc_fields(True)
@@ -2213,6 +2236,7 @@ class SignatureEditDialog(QDialog):
         self.name_edit.setPlaceholderText("Например, «Рабочая»")
 
         self.body_edit = _ComposeBodyEdit(lambda image: self._insert_image(image, "image/png"))
+        self.body_edit.setObjectName("composeBody")
         self.body_edit.setAcceptRichText(True)
         self._inline_images: dict[str, tuple[str, bytes]] = dict(signature.inline_images) if signature else {}
         if signature:
@@ -2901,10 +2925,26 @@ class AddCalendarDialog(QDialog):
         self.source_combo = QComboBox(self)
         self.source_combo.addItem("Локальный", calendar_store.SOURCE_LOCAL)
         self.source_combo.addItem("CalDAV (VK Mail, Exchange и др.)", calendar_store.SOURCE_CALDAV)
-        self.source_combo.addItem("Google — пока не поддерживается", "google")
-        google_item = self.source_combo.model().item(self.source_combo.count() - 1)
-        google_item.setEnabled(False)
+        self.source_combo.addItem("Google Календарь / подписка по ссылке (.ics)", calendar_store.SOURCE_ICS)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+
+        # Подписка на .ics: Google отдаёт весь календарь по «закрытому
+        # адресу в формате iCal» без входа (CalDAV у Google — только через
+        # OAuth-клиент Google Cloud, пароль приложения там не работает).
+        self.ics_url_edit = QLineEdit(self)
+        self.ics_url_edit.setPlaceholderText("https://calendar.google.com/calendar/ical/…/private-…/basic.ics")
+        ics_hint = QLabel(
+            "Google Календарь: Настройки календаря → «Интеграция календаря» → "
+            "«Закрытый адрес в формате iCal». Подписка односторонняя: события "
+            "читаются при синхронизации, изменения на сервер не отправляются.",
+            self,
+        )
+        ics_hint.setWordWrap(True)
+        self.ics_group = QGroupBox("Подписка по ссылке", self)
+        ics_form = QFormLayout()
+        ics_form.addRow("Адрес .ics", self.ics_url_edit)
+        ics_form.addRow(ics_hint)
+        self.ics_group.setLayout(ics_form)
 
         self.caldav_url_edit = QLineEdit(self)
         self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/")
@@ -2948,6 +2988,7 @@ class AddCalendarDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.caldav_group)
+        layout.addWidget(self.ics_group)
         layout.addStretch(1)
         layout.addWidget(buttons)
 
@@ -2955,6 +2996,7 @@ class AddCalendarDialog(QDialog):
 
     def _on_source_changed(self) -> None:
         self.caldav_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_CALDAV)
+        self.ics_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_ICS)
 
     def _on_test_connection(self) -> None:
         url = self.caldav_url_edit.text().strip()
@@ -3082,6 +3124,11 @@ class AddCalendarDialog(QDialog):
         if self.source_combo.currentData() == calendar_store.SOURCE_CALDAV and not self.caldav_url_edit.text().strip():
             QMessageBox.warning(self, "Укажите адрес", "Адрес CalDAV-сервера обязателен для этого источника.")
             return
+        if self.source_combo.currentData() == calendar_store.SOURCE_ICS:
+            url = ics_subscription.normalize_url(self.ics_url_edit.text())
+            if not url.lower().startswith(("http://", "https://")):
+                QMessageBox.warning(self, "Укажите адрес", "Адрес подписки должен начинаться с https:// или webcal://.")
+                return
         self.accept()
 
     def name(self) -> str:
@@ -3094,6 +3141,8 @@ class AddCalendarDialog(QDialog):
         return self.source_combo.currentData()
 
     def caldav_url(self) -> str:
+        if self.source_combo.currentData() == calendar_store.SOURCE_ICS:
+            return ics_subscription.normalize_url(self.ics_url_edit.text())
         return self.caldav_url_edit.text().strip()
 
 
@@ -3162,7 +3211,7 @@ class EventDialog(QDialog):
             _install_recipient_completer(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
         self.description_edit.setPlaceholderText("Добавьте описание")
-        self.description_edit.setFixedHeight(70)
+        self.description_edit.setFixedHeight(140)  # пожелание: "поле текст в карточке событий увеличь в 2 раза"
         # Жалоба "убери внутреннюю рамку" была про это поле — стандартная
         # рамка QPlainTextEdit вокруг текста описания, а не про карточку
         # события в недельной сетке (которую я по ошибке трогал раньше).
@@ -3256,10 +3305,15 @@ class EventDialog(QDialog):
         repeat_row.addWidget(self.recurrence_combo)
         repeat_row.addStretch(1)
 
+        clear_attendees_button = QPushButton("✕", self)
+        clear_attendees_button.setToolTip("Убрать всех участников")
+        clear_attendees_button.setFixedWidth(28)
+        clear_attendees_button.clicked.connect(self.attendees_edit.clear)
         attendees_row = QHBoxLayout()
         attendees_row.addWidget(_icon_label("people", self))
         attendees_row.addWidget(self.attendees_edit)
         attendees_row.addWidget(attendees_address_book_button)
+        attendees_row.addWidget(clear_attendees_button)
 
         location_row = QHBoxLayout()
         location_row.addWidget(_icon_label("location", self))
@@ -4120,8 +4174,7 @@ class MainWindow(QMainWindow):
         self._apply_pane_orientation()
 
         self.main_splitter = QSplitter(Qt.Orientation.Horizontal, self)
-        self.main_splitter.addWidget(self.folder_tree)
-        self.main_splitter.addWidget(self.right_splitter)
+        self.main_splitter.addWidget(self.right_splitter)  # панель папок вставляется первой ниже (folder_panel)
         self.main_splitter.setStretchFactor(0, 0)
         self.main_splitter.setStretchFactor(1, 1)
         self.main_splitter.setSizes([220, 980])
@@ -4396,21 +4449,36 @@ class MainWindow(QMainWindow):
         # ряду основного тулбара, перенесены к кнопкам над списком писем
         # (по просьбе пользователя — "разместить аналогично кнопкам над
         # списком писем"), в конец ряда через разделитель.
-        mail_actions_toolbar.addSeparator()
-
+        # Кнопки архивов — над деревом папок (пожелание: "кнопки, связанные
+        # с подключением архива, перенеси в раздел дерева папок"), см.
+        # folder_toolbar ниже: архив — это ещё один узел дерева, логично
+        # управлять им рядом с деревом, а не среди действий над письмами.
         open_archive_action = QAction(_toolbar_icon("open_archive"), "Открыть архив…", self)
         open_archive_action.triggered.connect(self.on_open_archive)
-        mail_actions_toolbar.addAction(open_archive_action)
 
         import_action = QAction(_toolbar_icon("import"), "Импортировать…", self)
         import_action.setToolTip("Импортировать — mbox/Maildir (Evolution) или .pst (Outlook) в архив")
         import_action.triggered.connect(self.on_import)
-        mail_actions_toolbar.addAction(import_action)
 
         self.archive_folder_action = QAction(_toolbar_icon("archive_folder"), "Архивировать папку…", self)
         self.archive_folder_action.setToolTip("Архивировать папку — выгрузить в архив всю папку целиком или всё старше выбранной даты")
         self.archive_folder_action.triggered.connect(self.on_archive_folder)
-        mail_actions_toolbar.addAction(self.archive_folder_action)
+
+        self.folder_toolbar = QToolBar("Архивы", self)
+        self.folder_toolbar.setIconSize(QSize(18, 18))
+        self.folder_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        for action in (open_archive_action, import_action, self.archive_folder_action):
+            self.folder_toolbar.addAction(action)
+        self.folder_panel = QWidget(self)
+        folder_panel_layout = QVBoxLayout(self.folder_panel)
+        folder_panel_layout.setContentsMargins(0, 0, 0, 0)
+        folder_panel_layout.setSpacing(2)
+        folder_panel_layout.addWidget(self.folder_toolbar)
+        folder_panel_layout.addWidget(self.folder_tree, 1)
+        self.main_splitter.insertWidget(0, self.folder_panel)
+        self.main_splitter.setStretchFactor(0, 0)
+        self.main_splitter.setStretchFactor(1, 1)
+        self.main_splitter.setSizes([220, 980])
 
         # Обновить — была в основном тулбаре наверху, перенесена вниз к
         # написать/ответить/переслать и поставлена первой (по просьбе
@@ -4421,6 +4489,19 @@ class MainWindow(QMainWindow):
         mail_actions_toolbar.insertAction(compose_action, refresh_action)
 
         self.setStatusBar(QStatusBar(self))
+        # Индикатор фоновой синхронизации (жалоба: "нет информирования для
+        # пользователя о прохождении синхронизации"): бегущая полоса и текст
+        # справа в строке состояния, пока идёт подключение/обновление папки.
+        self.busy_label = QLabel("", self)
+        self.busy_bar = QProgressBar(self)
+        self.busy_bar.setRange(0, 0)
+        self.busy_bar.setFixedWidth(90)
+        self.busy_bar.setTextVisible(False)
+        self.busy_label.hide()
+        self.busy_bar.hide()
+        self.statusBar().addPermanentWidget(self.busy_label)
+        self.statusBar().addPermanentWidget(self.busy_bar)
+        self._refresh_in_progress = False
 
         initial_font_scale = load_font_scale()
         self.font_scale_label = QLabel(f"{round(initial_font_scale * 100)}%", self)
@@ -4619,41 +4700,77 @@ class MainWindow(QMainWindow):
                 f"Хранилище паролей недоступно: {exc}\n\nПодключитесь заново вручную.",
             )
             return
-        restored = []
-        for account, smtp_account in saved_accounts:
-            try:
-                session = ImapSession(account)
-                folders = session.list_folders()
-            except Exception as exc:
-                QMessageBox.warning(
-                    self,
-                    "Не удалось войти с сохранёнными данными",
-                    f"{account.username}: {exc}\n\nПодключитесь заново вручную.",
-                )
-                continue
-            self._add_or_replace_account(account, smtp_account, session, folders)
-            restored.append(account.username)
-
         try:
             saved_ews_accounts = load_ews_accounts()
         except Exception:
             saved_ews_accounts = []  # то же хранилище секретов, что и выше — если оно уже пожаловалось, не дублируем
-        for ews_account in saved_ews_accounts:
-            try:
-                session = EwsSession(ews_account)
-                folders = session.list_folders()
-            except Exception as exc:
-                QMessageBox.warning(
-                    self,
-                    "Не удалось войти в Exchange с сохранёнными данными",
-                    f"{ews_account.email}: {exc}\n\nПодключитесь заново вручную.",
-                )
-                continue
-            self._add_or_replace_ews_account(ews_account, session, folders)
-            restored.append(ews_account.email)
 
-        if restored:
-            self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
+        # Жалоба: "при подключении ящика создаётся ощущение подвисания, нет
+        # информирования о прохождении синхронизации" — вход на сервер и
+        # список папок шли прямо в потоке интерфейса. Теперь по очереди в
+        # фоне, с немодальным окном хода: видно, что именно происходит, а
+        # окно программы живёт.
+        queue: list[tuple[str, object, object]] = [("imap", acc, smtp) for acc, smtp in saved_accounts]
+        queue += [("ews", acc, None) for acc in saved_ews_accounts]
+        if not queue:
+            return
+        progress = QProgressDialog("Подключение к почте…", None, 0, len(queue), self)
+        progress.setWindowTitle("Подключение")
+        progress.setWindowModality(Qt.WindowModality.NonModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+        progress.show()
+        restored: list[str] = []
+        done_count = 0
+
+        def next_account() -> None:
+            nonlocal done_count
+            if not queue:
+                progress.close()
+                if restored:
+                    self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
+                    self._refresh_folder_async(silent=True)
+                return
+            protocol, account, smtp_account = queue.pop(0)
+            name = account.email if protocol == "ews" else account.username
+            progress.setLabelText(f"{name}: вход на сервер и список папок…")
+
+            def connect():
+                session = EwsSession(account) if protocol == "ews" else ImapSession(account)
+                return session, session.list_folders()
+
+            worker = _CallableWorker(connect, parent=self)
+
+            def on_success(result: object) -> None:
+                nonlocal done_count
+                self._background_workers.remove(worker)
+                session, folders = result
+                if protocol == "ews":
+                    self._add_or_replace_ews_account(account, session, folders)
+                else:
+                    self._add_or_replace_account(account, smtp_account, session, folders)
+                restored.append(name)
+                done_count += 1
+                progress.setValue(done_count)
+                next_account()
+
+            def on_failure(error_text: str) -> None:
+                nonlocal done_count
+                self._background_workers.remove(worker)
+                done_count += 1
+                progress.setValue(done_count)
+                title = "Не удалось войти в Exchange с сохранёнными данными" if protocol == "ews" else "Не удалось войти с сохранёнными данными"
+                QMessageBox.warning(self, title, f"{name}: {error_text}\n\nПодключитесь заново вручную.")
+                next_account()
+
+            worker.succeeded.connect(on_success)
+            worker.failed.connect(on_failure)
+            self._background_workers.append(worker)
+            worker.start()
+
+        next_account()
 
     def _add_or_replace_account(
         self,
@@ -5847,16 +5964,54 @@ class MainWindow(QMainWindow):
                 self.current_folder = new_path
         self.statusBar().showMessage(f"Папка перемещена: {new_path}", 5000)
 
+    def _set_busy(self, text: str | None) -> None:
+        if text:
+            self.busy_label.setText(text)
+            self.busy_label.show()
+            self.busy_bar.show()
+        else:
+            self.busy_label.hide()
+            self.busy_bar.hide()
+
     def on_refresh(self) -> None:
-        if not self.active_source or not self.current_folder:
+        self._refresh_folder_async(silent=False)
+
+    def _refresh_folder_async(self, *, silent: bool) -> None:
+        """Обновление текущей папки с сервера в фоне (жалоба: "ощущение
+        подвисания… нет информирования о синхронизации") — раньше
+        refresh_folder шёл в потоке интерфейса и на медленной сети
+        замораживал окно. Пока идёт — индикатор в строке состояния; второй
+        запуск поверх первого не стартует."""
+        source = self.active_source
+        folder = self.current_folder
+        if not source or not folder or self._refresh_in_progress:
             return
-        try:
-            summaries = self.active_source.refresh_folder(self.current_folder)
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка обновления", str(exc))
-            return
-        self._render_folder(summaries)
-        self.statusBar().showMessage(f"Обновлено: {self.current_folder}", 3000)
+        self._refresh_in_progress = True
+        self._set_busy(f"Синхронизация: {folder}…")
+        worker = _CallableWorker(source.refresh_folder, folder, parent=self)
+
+        def finish() -> None:
+            self._refresh_in_progress = False
+            self._set_busy(None)
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        def on_success(summaries: object) -> None:
+            finish()
+            if source is not self.active_source or folder != self.current_folder:
+                return  # пользователь уже переключил папку — не подменяем список
+            self._render_folder(summaries)
+            self.statusBar().showMessage(f"Обновлено: {folder}", 3000)
+
+        def on_failure(error_text: str) -> None:
+            finish()
+            if not silent:
+                QMessageBox.critical(self, "Ошибка обновления", error_text)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _on_periodic_refresh(self) -> None:
         # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
@@ -5864,11 +6019,7 @@ class MainWindow(QMainWindow):
         # Архивы локальны и статичны — опрашивать их по таймеру незачем.
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
-        try:
-            summaries = self.mailbox.refresh_folder(self.current_folder)
-        except Exception:
-            return
-        self._render_folder(summaries)
+        self._refresh_folder_async(silent=True)
 
     def _clear_reading_pane(self) -> None:
         _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content=""))
@@ -6942,12 +7093,12 @@ class MainWindow(QMainWindow):
             return
         caldav_calendars = [
             cal for cal in calendar_store.list_calendars(self.calendar_path)
-            if cal.source_type == calendar_store.SOURCE_CALDAV
+            if cal.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_ICS)
         ]
         if not caldav_calendars:
             QMessageBox.information(
-                self, "CalDAV не настроен",
-                "Добавьте календарь с источником CalDAV через «+ Добавить календарь».",
+                self, "Синхронизация не настроена",
+                "Добавьте календарь с источником CalDAV или подписку по ссылке (.ics) через «+ Добавить календарь».",
             )
             return
 
@@ -6972,6 +7123,19 @@ class MainWindow(QMainWindow):
             _log.info("CalDAV: синхронизация, календарей %d", len(caldav_calendars))
             local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
             for cal in caldav_calendars:
+                if cal.source_type == calendar_store.SOURCE_ICS:
+                    # Подписка по ссылке (Google и др.): только чтение —
+                    # локальные правки на сервер не уходят.
+                    for event in ics_subscription.fetch_events(cal.caldav_url, username):
+                        if event.dtend < window_start or event.dtstart > window_end:
+                            continue
+                        event = replace(event, calendar_id=cal.id)
+                        existing_local = calendar_store.get_event(calendar_path, event.uid)
+                        if existing_local and not event.color and existing_local.color:
+                            event.color = existing_local.color
+                        calendar_store.save_event(calendar_path, event)
+                        total_pulled += 1
+                    continue
                 account = caldav_sync.CalDavAccount(
                     url=cal.caldav_url, username=username, password=password, auth_type=auth_type
                 )
@@ -7511,15 +7675,35 @@ class MainWindow(QMainWindow):
         if not path_str:
             return
 
-        try:
-            data = Path(path_str).read_bytes()
-            count = importer(self.contacts_path, data)
-        except Exception as exc:
-            QMessageBox.critical(self, "Ошибка импорта", str(exc))
-            return
+        # Жалоба: "загрузка идёт без видимого процесса — нужно окно с
+        # отображением хода загрузки": импорт большого файла — в фоне, с
+        # окном ожидания вместо замершего интерфейса.
+        progress = QProgressDialog(f"Импорт контактов из {Path(path_str).name}…", None, 0, 0, self)
+        progress.setWindowTitle("Импорт контактов")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(300)
 
-        self.refresh_contacts_view()
-        self.statusBar().showMessage(f"Импортировано контактов: {count}", 5000)
+        def run_import() -> int:
+            data = Path(path_str).read_bytes()
+            return importer(self.contacts_path, data)
+
+        worker = _CallableWorker(run_import, parent=self)
+
+        def on_success(count: object) -> None:
+            progress.close()
+            self._background_workers.remove(worker)
+            self.refresh_contacts_view()
+            self.statusBar().showMessage(f"Импортировано контактов: {count}", 5000)
+
+        def on_failure(error_text: str) -> None:
+            progress.close()
+            self._background_workers.remove(worker)
+            QMessageBox.critical(self, "Ошибка импорта", error_text)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _save_event_from_dialog(self, dialog: EventDialog, *, existing: calendar_store.Event | None) -> None:
         start = dialog.start_utc()
@@ -7948,22 +8132,64 @@ class MainWindow(QMainWindow):
             )
             body_kwargs = {"body": f"\n\n{forward_header}\n{content.text}"}
 
-        dialog = ComposeDialog(
-            self,
-            title="Переслать",
-            subject=subject,
-            contacts=self._load_contacts(),
-            attachments=[
-                OutgoingAttachment(
-                    filename=a.filename, content_type=a.content_type, payload=a.payload
-                )
-                for a in content.attachments
-            ],
-            signatures=self.signatures,
-            default_signature_id=self.default_signature_id,
-            **body_kwargs,
+        def open_dialog(kwargs: dict) -> None:
+            dialog = ComposeDialog(
+                self,
+                title="Переслать",
+                subject=subject,
+                contacts=self._load_contacts(),
+                attachments=[
+                    OutgoingAttachment(
+                        filename=a.filename, content_type=a.content_type, payload=a.payload
+                    )
+                    for a in content.attachments
+                ],
+                signatures=self.signatures,
+                default_signature_id=self.default_signature_id,
+                **kwargs,
+            )
+            self._exec_compose(dialog)
+
+        if "body_html" not in body_kwargs or "http" not in body_kwargs["body_html"]:
+            open_dialog(body_kwargs)
+            return
+
+        # Внешние картинки (<img src="https://…">) скачиваются и уходят
+        # внутри письма (см. remote_images) — в фоне, с окном ожидания и
+        # кнопкой «Пропустить»: если сервер картинок недоступен, письмо
+        # всё равно откроется, просто с внешними ссылками.
+        progress = QProgressDialog("Загрузка изображений письма…", "Пропустить", 0, 0, self)
+        progress.setWindowTitle("Переслать")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(400)
+        worker = _CallableWorker(
+            remote_images.embed_remote_images, body_kwargs["body_html"], body_kwargs.get("inline_images"), parent=self
         )
-        self._exec_compose(dialog)
+        state = {"opened": False}
+
+        def open_once(kwargs: dict) -> None:
+            if state["opened"]:
+                return
+            state["opened"] = True
+            progress.close()
+            open_dialog(kwargs)
+
+        def on_success(result: object) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            html_with_cids, images = result
+            open_once({**body_kwargs, "body_html": html_with_cids, "inline_images": images})
+
+        def on_failure(_error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            open_once(body_kwargs)
+
+        progress.canceled.connect(lambda: open_once(body_kwargs))
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _exec_compose(
         self,
