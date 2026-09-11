@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        73%{?dist}
+Release:        74%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -103,6 +103,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-74
+- Файлы автоархива хранятся в профиле (<профиль>/archives); уже созданные переезжают туда автоматически
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-73
 - Автоархив: раунды по 300 писем с ужатием базы после каждого, один архиватор за раз; пока база больше порога, фоновая докачка тел приостановлена
 * Fri Sep 11 2026 redmail <redmail@example.com> - 0.0.1-72
