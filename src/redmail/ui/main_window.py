@@ -182,7 +182,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import profile
+from redmail import profile, secret_store
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -4791,13 +4791,32 @@ class MainWindow(QMainWindow):
     def _restore_saved_account(self) -> None:
         try:
             saved_accounts = load_accounts()
+        except secret_store.SecretsUnavailable as exc:
+            # Системное хранилище (gnome-keyring/KWallet по D-Bus) недоступно
+            # и после повторов (жалоба: "периодически получаю: No recommended
+            # backend was available"). Предлагаем запасной файл в профиле —
+            # только по явному согласию, с честным описанием.
+            answer = QMessageBox.question(
+                self,
+                "Хранилище паролей недоступно",
+                f"Системное хранилище паролей не отвечает: {exc}\n\n"
+                "Хранить пароли в файле профиля? Файл доступен только вашему пользователю ОС, "
+                "но не зашифрован. Если отказаться, подключиться можно вручную через Параметры "
+                "(пароль потребуется вводить при каждом запуске, пока хранилище недоступно).",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            secret_store.set_fallback_enabled(True)
+            try:
+                saved_accounts = load_accounts()
+            except Exception as exc2:
+                QMessageBox.warning(self, "Не удалось получить сохранённые данные входа", str(exc2))
+                return
+            if not saved_accounts:
+                self.statusBar().showMessage("Паролей в файле профиля пока нет — подключитесь через Параметры", 8000)
         except Exception as exc:
-            # Отличаем от штатного "пароля в хранилище нет" (load_accounts
-            # сам пропускает такие записи без исключения) — сюда попадает
-            # поломка самого хранилища секретов (например, при запуске без
-            # сессионной шины D-Bus keyring выдаёт NoKeyringError). Раньше
-            # это тихо проглатывалось, и пользователю казалось, что все
-            # настройки исчезли без причины.
             QMessageBox.warning(
                 self,
                 "Не удалось получить сохранённые данные входа",
@@ -6304,6 +6323,41 @@ class MainWindow(QMainWindow):
         sender_header_item = self.table.horizontalHeaderItem(COL_SENDER)
         if sender_header_item is not None:
             sender_header_item.setText("Кому" if is_sent_folder else "От кого")
+        # Зависание на полной локальной копии (py-spy на .80: главный поток
+        # минутами сидел в setItem): у колонок галочки/маркера/важности/
+        # скрепки стоит ResizeToContents, и Qt пересчитывал ширину колонки
+        # по ВСЕМ строкам на каждую вставленную ячейку — квадратично от
+        # числа писем, а строк теперь до 3000. На время заполнения эти
+        # колонки делаются фиксированными, перерисовка и сигналы заголовка
+        # выключаются; пересчёт — один раз в конце.
+        header = self.table.horizontalHeader()
+        auto_columns = [
+            col for col in range(self.table.columnCount())
+            if header.sectionResizeMode(col) == QHeaderView.ResizeMode.ResizeToContents
+        ]
+        for col in auto_columns:
+            header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
+        header.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
+        try:
+            self._fill_message_rows(summaries, is_sent_folder)
+        finally:
+            self.table.setUpdatesEnabled(True)
+            header.blockSignals(False)
+            for col in auto_columns:
+                header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setSortingEnabled(True)
+        self._populate_cards(summaries, is_sent_folder)
+
+        self.statusBar().showMessage(f"{self.current_folder}: писем {len(summaries)}", 5000)
+        self.on_filter_changed(self.filter_edit.text())
+
+        if previously_selected_uid is not None:
+            row = self._row_for_uid(previously_selected_uid)
+            if row is not None:
+                self.table.selectRow(row)
+
+    def _fill_message_rows(self, summaries: list[MessageSummary], is_sent_folder: bool) -> None:
         for row, summary in enumerate(summaries):
             check_item = QTableWidgetItem()
             # ItemIsSelectable — без него Qt при selectRow()/выборе строки
@@ -6340,17 +6394,6 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_SENDER, sender_item)
             self.table.setItem(row, COL_SUBJECT, subject_item)
             self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
-        self.table.setSortingEnabled(True)
-        self._populate_cards(summaries, is_sent_folder)
-
-        self.statusBar().showMessage(f"{self.current_folder}: писем {len(summaries)}", 5000)
-        self.on_filter_changed(self.filter_edit.text())
-
-        if previously_selected_uid is not None:
-            for row in range(self.table.rowCount()):
-                if self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) == previously_selected_uid:
-                    self.table.selectRow(row)
-                    break
 
     @staticmethod
     def _readonly_item(text: str) -> QTableWidgetItem:

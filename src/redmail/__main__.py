@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
@@ -80,8 +81,21 @@ def build_splash_pixmap(version: str) -> QPixmap:
     return pixmap
 
 
+def _ensure_session_bus_address() -> None:
+    """Запуск не из сессии рабочего стола (ssh, автозапуск до экспорта
+    переменных) — без DBUS_SESSION_BUS_ADDRESS keyring не найдёт
+    Secret Service и решит, что хранилища паролей нет. Стандартный адрес
+    шины пользователя — $XDG_RUNTIME_DIR/bus; если файл есть, подставляем."""
+    if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        return
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}" if hasattr(os, "getuid") else ""
+    if runtime_dir and os.path.exists(os.path.join(runtime_dir, "bus")):
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + os.path.join(runtime_dir, "bus")
+
+
 def main() -> int:
     log_file = applog.setup_logging()
+    _ensure_session_bus_address()
     applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
     app = QApplication(sys.argv)
 

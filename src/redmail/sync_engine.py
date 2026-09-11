@@ -15,6 +15,7 @@ threading.Event.
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
@@ -26,6 +27,7 @@ _log = get_logger("sync")
 HEADER_CHUNK = 250
 FLAGS_CHUNK = 2000
 BODY_BATCH = 20
+BODY_PAUSE_SECONDS = 0.05
 DEFAULT_BODY_MAX_BYTES = 25 * 1024 * 1024
 
 ProgressCallback = Callable[[str, int, int], None]  # (текст, сделано, всего); всего=0 — неизвестно
@@ -112,6 +114,7 @@ def sync_folder_headers(
         summaries = session.fetch_summaries_by_uids(folder, part)
         cache_store.upsert_summaries(account_key, folder, summaries)
         done += len(part)
+        time.sleep(0.01)
         result.added += len(summaries)
         _report(progress, f"{folder}: заголовки {done}/{len(new_uids)}", done, len(new_uids))
 
@@ -202,6 +205,9 @@ def download_bodies(
                 continue
             cache_store.save_message_content(account_key, folder, uid, content)
             downloaded += 1
+            # Пауза между письмами: разбор MIME и запись больших вложений
+            # держат GIL, без передышки окно становилось вялым.
+            time.sleep(BODY_PAUSE_SECONDS)
             if limit is not None and downloaded >= limit:
                 _report(progress, f"Загрузка писем: {downloaded}/{total_pending}", downloaded, total_pending)
                 return downloaded

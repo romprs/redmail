@@ -5,7 +5,9 @@ import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-import keyring
+import keyring  # noqa: F401 - тесты подменяют keyring.get_password/set_password
+
+from redmail import secret_store
 
 from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
@@ -357,7 +359,7 @@ def save_account(account: Account, smtp: SmtpAccount | None) -> None:
     data = _account_dict(account, smtp)
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     if account.auth_type != "kerberos":
-        keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
+        secret_store.set_password(_KEYRING_SERVICE, account.username, account.password)
 
 
 def load_account() -> tuple[Account, SmtpAccount | None] | None:
@@ -373,7 +375,7 @@ def load_account() -> tuple[Account, SmtpAccount | None] | None:
     auth_type = data.get("auth_type", "password")
     password = ""
     if auth_type != "kerberos":
-        password = keyring.get_password(_KEYRING_SERVICE, username)
+        password = secret_store.get_password(_KEYRING_SERVICE, username)
         if password is None:
             # Файл настроек есть, а пароля в хранилище секретов нет
             # (например, его отозвали или это другая машина) — просим
@@ -450,7 +452,7 @@ def load_accounts() -> list[tuple[Account, SmtpAccount | None]]:
         auth_type = entry.get("auth_type", "password") if isinstance(entry, dict) else "password"
         password = ""
         if auth_type != "kerberos":
-            password = keyring.get_password(_KEYRING_SERVICE, username)
+            password = secret_store.get_password(_KEYRING_SERVICE, username)
             if password is None:
                 continue  # пароль недоступен (другая машина/отозван) — эту запись пропускаем, а не всё подряд
         try:
@@ -466,7 +468,7 @@ def save_accounts(accounts: list[tuple[Account, SmtpAccount | None]]) -> None:
     entries = []
     for account, smtp in accounts:
         if account.auth_type != "kerberos":
-            keyring.set_password(_KEYRING_SERVICE, account.username, account.password)
+            secret_store.set_password(_KEYRING_SERVICE, account.username, account.password)
         entries.append(_account_dict(account, smtp))
     path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -501,7 +503,7 @@ def load_ews_accounts() -> list[EwsAccount]:
         auth_type = entry.get("auth_type", "basic")
         password = ""
         if auth_type != "kerberos":
-            password = keyring.get_password(_EWS_KEYRING_SERVICE, email)
+            password = secret_store.get_password(_EWS_KEYRING_SERVICE, email)
             if password is None:
                 continue  # пароль недоступен (другая машина/отозван) — пропускаем эту запись
         try:
@@ -525,7 +527,7 @@ def save_ews_accounts(accounts: list[EwsAccount]) -> None:
     entries = []
     for account in accounts:
         if account.auth_type != "kerberos":
-            keyring.set_password(_EWS_KEYRING_SERVICE, account.email, account.password)
+            secret_store.set_password(_EWS_KEYRING_SERVICE, account.email, account.password)
         entries.append(
             {
                 "email": account.email,
