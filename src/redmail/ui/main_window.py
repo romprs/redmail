@@ -194,7 +194,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import autoarchive, profile, secret_store, sync_engine, voice_assistant
+from redmail import autoarchive, html_cleanup, profile, secret_store, sync_engine, voice_assistant
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -7386,7 +7386,7 @@ class MainWindow(QMainWindow):
                 bcc=content.bcc,
                 subject=content.subject or summary.subject,
                 body=content.text,
-                body_html=content.html or None,
+                body_html=html_cleanup.simplify_html_for_editor(content.html) or None,
                 inline_images=content.inline_images,
                 contacts=self._load_contacts(),
                 attachments=[
@@ -9140,10 +9140,22 @@ class MainWindow(QMainWindow):
                 f"Тема: {html.escape(summary.subject)}"
                 "</div><br>"
             )
-            body_kwargs = {
-                "body_html": forward_header_html + content.html,
-                "inline_images": content.inline_images,
-            }
+            # В редактор — упрощённая разметка: вложенные таблицы рассылок
+            # вешали окно на десятки минут (см. html_cleanup). Слишком
+            # тяжёлое письмо пересылается текстом.
+            simplified = html_cleanup.simplify_html_for_editor(content.html)
+            if len(simplified) <= html_cleanup.MAX_EDITOR_HTML_BYTES:
+                body_kwargs = {
+                    "body_html": forward_header_html + simplified,
+                    "inline_images": content.inline_images,
+                }
+            else:
+                _log.warning("Пересылка: HTML %d байт слишком велик для редактора — текстом", len(simplified))
+                body_kwargs = {
+                    "body": f"\n\n---------- Пересланное сообщение ----------\n"
+                    f"От: {summary.sender} <{summary.sender_email}>\nДата: {summary.date}\nТема: {summary.subject}\n\n"
+                    + html_to_text(content.html)
+                }
         else:
             forward_header = (
                 f"---------- Пересланное сообщение ----------\n"
