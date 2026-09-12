@@ -180,6 +180,9 @@ QScrollBar::add-page, QScrollBar::sub-page {{
 /* Кнопки разделов (Почта/Календарь/Контакты/Параметры/Справка) — без
    рамок, выделяется только активный раздел (пожелание: "убери рамку у
    кнопок меню"). */
+QToolBar#modeBar {{
+    padding: 6px 4px;  /* отступы сверху и снизу у панели разделов (пожелание пользователя) */
+}}
 QToolBar#modeBar QToolButton {{
     border: none;
     background-color: transparent;

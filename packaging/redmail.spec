@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        83%{?dist}
+Release:        84%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-84
+- Панель разделов (Почта/Календарь/Контакты/Параметры/Справка): отступы сверху и снизу
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-83
 - Пересылка HTML-рассылок больше не вешает окно: в редактор идёт упрощённая разметка без вложенных таблиц и стилей; слишком тяжёлое письмо пересылается текстом
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-82
