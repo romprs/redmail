@@ -436,6 +436,28 @@ def test_mail_rules_skips_corrupt_entries(tmp_path: Path) -> None:
     assert rules == [MailRule(field="subject", contains="y", target_folder="Z")]
 
 
+def test_maintenance_window_defaults_and_round_trip(tmp_path: Path) -> None:
+    from datetime import datetime
+
+    from redmail import config_store
+
+    with patch("redmail.config_store.app_dir", return_value=tmp_path):
+        assert config_store.load_maintenance_window() == (False, 22, 7)
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 15)) is True  # выключено — всегда можно
+        config_store.save_maintenance_window(True, 22, 7)
+        assert config_store.load_maintenance_window() == (True, 22, 7)
+        # Промежуток через полночь.
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 23)) is True
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 3)) is True
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 7)) is False
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 15)) is False
+        config_store.save_maintenance_window(True, 9, 18)
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 12)) is True
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 20)) is False
+        config_store.save_maintenance_window(True, 5, 5)
+        assert config_store.in_maintenance_window(datetime(2026, 9, 12, 20)) is True  # пустой промежуток = всегда
+
+
 def test_signatures_default_to_empty(tmp_path: Path) -> None:
     settings_file = tmp_path / "settings.json"
     with patch("redmail.config_store._settings_path", return_value=settings_file):

@@ -15,6 +15,7 @@ threading.Event.
 from __future__ import annotations
 
 import threading
+from contextlib import nullcontext
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -164,14 +165,19 @@ def sync_all_folders(
     *,
     progress: ProgressCallback | None = None,
     stop: threading.Event | None = None,
+    folder_lock=None,
 ) -> SyncStats:
+    """folder_lock(folder) — контекстный менеджер на папку: полный проход
+    держит замок только на текущую папку, а не на весь ящик, чтобы
+    обновление папки по клику не ждало прохода по всем папкам."""
     stats = SyncStats()
     for index, folder in enumerate(folders):
         if _stopped(stop):
             break
         _report(progress, f"Папка {folder} ({index + 1}/{len(folders)})", index, len(folders))
         try:
-            stats.folders.append(sync_folder_headers(session, account_key, folder, progress=progress, stop=stop))
+            with (folder_lock(folder) if folder_lock is not None else nullcontext()):
+                stats.folders.append(sync_folder_headers(session, account_key, folder, progress=progress, stop=stop))
         except Exception as exc:
             _log.error("Папка %s: синхронизация заголовков не удалась: %s", folder, exc)
     return stats

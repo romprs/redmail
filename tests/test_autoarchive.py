@@ -89,7 +89,12 @@ def test_plan_picks_oldest_non_trash_until_target_and_nothing_below_threshold(tm
         big = cache_store.storage_stats()["db_bytes"] * 10
         assert autoarchive.make_plan(mailbox.account_key, big).candidates == []  # база меньше порога — ничего
         plan = autoarchive.make_plan(mailbox.account_key, 1, skip_folders={"Trash"})
-    # порог 1 байт: освободить нужно почти всю базу, кандидаты — от старых к новым, корзина пропущена
+        db_bytes = cache_store.storage_stats()["db_bytes"]
+        # Раунд — не меньше порога (один файл архива) и не меньше, чем нужно
+        # для спуска ниже 0.8 × порога; при пороге 1 байт — почти вся база.
+        assert plan.to_free_bytes == db_bytes
+        half = autoarchive.make_plan(mailbox.account_key, db_bytes // 2, skip_folders={"Trash"})
+        assert half.to_free_bytes == max(db_bytes // 2, db_bytes - int((db_bytes // 2) * autoarchive.TARGET_RATIO))
     assert [(f, u) for f, u, _s, _d in plan.candidates][:2] == [("INBOX", 1), ("INBOX", 2)]
     assert all(f != "Trash" for f, *_rest in plan.candidates)
 

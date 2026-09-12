@@ -135,6 +135,8 @@ from redmail.config_store import (
     load_auto_archive_confirmed,
     load_auto_archive_delete_on_server,
     load_auto_archive_enabled,
+    load_maintenance_window,
+    in_maintenance_window,
     load_auto_archive_size_mb,
     load_body_max_size_mb,
     load_font_scale,
@@ -160,6 +162,7 @@ from redmail.config_store import (
     save_auto_archive_confirmed,
     save_auto_archive_delete_on_server,
     save_auto_archive_enabled,
+    save_maintenance_window,
     save_auto_archive_size_mb,
     save_body_max_size_mb,
     save_font_scale,
@@ -1596,6 +1599,7 @@ class SettingsDialog(QDialog):
         storage_stats: dict | None = None,
         auto_archive_enabled: bool = True,
         auto_archive_delete_on_server: bool = False,
+        maintenance_window: tuple[bool, int, int] = (False, 22, 7),
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -1762,6 +1766,25 @@ class SettingsDialog(QDialog):
         self.auto_archive_size_edit.setRange(50, 100000)
         self.auto_archive_size_edit.setSuffix(" МБ")
         self.auto_archive_size_edit.setValue(int(auto_archive_size_mb))
+        maintenance_enabled, maintenance_start, maintenance_end = maintenance_window
+        self.maintenance_check = QCheckBox(
+            "Обслуживать базу (автоархив, докачка писем, сжатие) только в указанные часы", self
+        )
+        self.maintenance_check.setChecked(bool(maintenance_enabled))
+        self.maintenance_start_edit = QSpinBox(self)
+        self.maintenance_start_edit.setRange(0, 23)
+        self.maintenance_start_edit.setSuffix(":00")
+        self.maintenance_start_edit.setValue(int(maintenance_start))
+        self.maintenance_end_edit = QSpinBox(self)
+        self.maintenance_end_edit.setRange(0, 23)
+        self.maintenance_end_edit.setSuffix(":00")
+        self.maintenance_end_edit.setValue(int(maintenance_end))
+        maintenance_row = QHBoxLayout()
+        maintenance_row.addWidget(QLabel("с", self))
+        maintenance_row.addWidget(self.maintenance_start_edit)
+        maintenance_row.addWidget(QLabel("до", self))
+        maintenance_row.addWidget(self.maintenance_end_edit)
+        maintenance_row.addStretch(1)
         stats = storage_stats or {}
         stats_text = (
             f"База почты: {stats.get('db_bytes', 0) / (1024 * 1024):.1f} МБ, писем {stats.get('messages', 0)}, "
@@ -1776,6 +1799,8 @@ class SettingsDialog(QDialog):
         storage_form.addRow(self.auto_archive_check)
         storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
         storage_form.addRow(self.auto_archive_delete_check)
+        storage_form.addRow(self.maintenance_check)
+        storage_form.addRow("Часы обслуживания", maintenance_row)
         storage_form.addRow(storage_stats_label)
         storage_form.addRow(storage_hint)
         storage_group = QGroupBox("Хранилище")
@@ -1961,6 +1986,13 @@ class SettingsDialog(QDialog):
 
     def auto_archive_delete_on_server(self) -> bool:
         return self.auto_archive_delete_check.isChecked()
+
+    def maintenance_window(self) -> tuple[bool, int, int]:
+        return (
+            self.maintenance_check.isChecked(),
+            self.maintenance_start_edit.value(),
+            self.maintenance_end_edit.value(),
+        )
 
     def _on_browse_archive_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог для новых архивов", self.archive_dir_edit.text())
@@ -4572,6 +4604,7 @@ class MainWindow(QMainWindow):
         self.card_list.itemDoubleClicked.connect(self._on_card_double_clicked)
         self._card_items_by_uid: dict[int, QListWidgetItem] = {}
         self._syncing_card_selection = False
+        self._compose_windows: list[ComposeDialog] = []  # открытые немодальные окна писем
         # Цепочки по теме в списке: показывается последнее письмо, остальные
         # скрыты под значком раскрытия (и в таблице, и в плитках).
         self._thread_info: dict[int, _ThreadInfo] = {}
@@ -5453,6 +5486,36 @@ class MainWindow(QMainWindow):
                     parent.addChild(node)
                     nodes[path] = node
                 parent = node
+            existing = parent.data(0, Qt.ItemDataRole.UserRole)
+            if existing is not None and existing[1] != info.name:
+                # Две разные папки с одним именем в дереве (у Gmail —
+                # служебная «[Gmail]/Отправленные» и своя метка
+                # «Отправленные»): раньше второй затирал первый, и узел
+                # «Отправленные» открывал пустую папку (жалоба: "папка
+                # отправленные пуста?"). Служебной — обычное имя, второй —
+                # с пометкой.
+                base_label = parent.data(0, _FOLDER_BASE_LABEL_ROLE) or parts[-1]
+                container = parent.parent() if parent.parent() is not None else root
+                duplicate = QTreeWidgetItem([f"{base_label} (своя папка)"])
+                duplicate.setData(0, _FOLDER_BASE_LABEL_ROLE, f"{base_label} (своя папка)")
+                container.addChild(duplicate)
+                # Служебная — та, что лежит в скрытом контейнере ([Gmail]/…);
+                # по одному имени не отличить: своя метка «Отправленные»
+                # тоже похожа на служебную.
+                new_is_special = any(seg in _HIDDEN_PATH_SEGMENTS for seg in info.name.split(delimiter))
+                old_is_special = any(seg in _HIDDEN_PATH_SEGMENTS for seg in existing[1].split(delimiter))
+                if new_is_special and not old_is_special:
+                    # Узел без пометки достаётся служебной папке; прежнюю
+                    # (свою) переносим в узел с пометкой, а ниже обычным
+                    # порядком привязываем к узлу новую папку.
+                    duplicate.setData(0, Qt.ItemDataRole.UserRole, existing)
+                    duplicate.setIcon(0, _folder_icon(None))
+                else:
+                    duplicate.setData(0, Qt.ItemDataRole.UserRole, (key, info.name))
+                    duplicate.setIcon(0, _folder_icon(_folder_role(info.name)))
+                    if first_selectable is None:
+                        first_selectable = duplicate
+                    continue
             parent.setData(0, Qt.ItemDataRole.UserRole, (key, info.name))
             # Роль/иконка по полному "сырому" имени папки на сервере — сама
             # папка может быть значима (Отправленные, Спам...), даже если
@@ -6115,6 +6178,7 @@ class MainWindow(QMainWindow):
             storage_stats=self._storage_stats(),
             auto_archive_enabled=load_auto_archive_enabled(),
             auto_archive_delete_on_server=load_auto_archive_delete_on_server(),
+            maintenance_window=load_maintenance_window(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -6135,6 +6199,7 @@ class MainWindow(QMainWindow):
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
             save_auto_archive_enabled(dialog.auto_archive_enabled())
             save_auto_archive_delete_on_server(dialog.auto_archive_delete_on_server())
+            save_maintenance_window(*dialog.maintenance_window())
             for mailbox in self.mailboxes.values():
                 if isinstance(mailbox, CachedMailbox):
                     mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024
@@ -6294,6 +6359,9 @@ class MainWindow(QMainWindow):
             reading_pane.setZoomFactor(scale)
 
     def _set_filter_column(self, column: int) -> None:
+        if column == COL_CHECK:
+            self._toggle_check_all()
+            return
         if column == COL_FLAG:
             self._open_marker_filter_menu()
             return
@@ -6661,6 +6729,8 @@ class MainWindow(QMainWindow):
         # архиватор и докачка соревнуются за одно IMAP-соединение, а база
         # растёт быстрее, чем освобождается (жалоба: "база не уменьшается").
         effective_limit = bodies_limit
+        if not in_maintenance_window():
+            effective_limit = 0  # вне часов обслуживания — только заголовки и флаги
         if load_auto_archive_enabled() and isinstance(mailbox, CachedMailbox):
             try:
                 db_bytes = self._storage_stats().get("db_bytes", 0)
@@ -6737,6 +6807,9 @@ class MainWindow(QMainWindow):
         if self._autoarchive_active:
             then()  # один архиватор за раз — иначе два потока переносят одни и те же письма
             return
+        if not in_maintenance_window():
+            then()  # часы обслуживания не наступили
+            return
         try:
             # Файлы первых сборок лежали в «Каталоге для новых архивов» — забрать в профиль.
             autoarchive.relocate_archives(Path(self.archive_storage_dir), profile.archives_dir())
@@ -6783,7 +6856,8 @@ class MainWindow(QMainWindow):
             save_auto_archive_confirmed([*confirmed, key])
         worker = _CallableWorker(
             autoarchive.run, mailbox, plan, profile.archives_dir(),
-            stop=self._sync_stop, delete_on_server=delete_on_server, parent=self,
+            stop=self._sync_stop, delete_on_server=delete_on_server,
+            full_vacuum=load_maintenance_window()[0], parent=self,
         )
 
         def done(_result: object = None) -> None:
@@ -6822,13 +6896,14 @@ class MainWindow(QMainWindow):
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
         self._refresh_folder_async(silent=True)
-        # Раз в несколько опросов — полный проход по всем папкам и докачка
-        # тел новых писем (порциями, чтобы не мешать работе).
+        # Каждый опрос — только текущая папка. Полный проход по всем папкам
+        # и докачка тел — раз в шесть опросов (полчаса при 5 минутах), и
+        # только если предыдущий уже закончился (пользователь: "не нужно
+        # делать постоянную синхронизацию; если не закончилась — не
+        # открывать новую").
         self._periodic_ticks += 1
-        if self._periodic_ticks % 6 == 0:
+        if self._periodic_ticks % 6 == 0 and self._sync_worker is None:
             QTimer.singleShot(2000, lambda: self._start_full_sync(bodies_limit=None))
-        else:
-            QTimer.singleShot(2000, lambda: self._start_full_sync(bodies_limit=100))
 
     def _clear_reading_pane(self) -> None:
         _render_mail_html(self.reading_pane, _BODY_WRAP_TEMPLATE.format(content=""))
@@ -7440,6 +7515,28 @@ class MainWindow(QMainWindow):
         self._refresh_cards()
         self.on_filter_changed(self.filter_edit.text())
 
+    def _toggle_check_all(self) -> None:
+        """Клик по заголовку колонки галочек: отметить все видимые письма
+        (или снять отметки, если все уже отмечены) — для удаления/переноса
+        всей папки разом (пожелание: "выбор всех писем в папке для
+        удаления, сейчас только вручную")."""
+        visible_rows = [row for row in range(self.table.rowCount()) if not self.table.isRowHidden(row)]
+        if not visible_rows:
+            return
+        all_checked = all(
+            self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked for row in visible_rows
+        )
+        state = Qt.CheckState.Unchecked if all_checked else Qt.CheckState.Checked
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row in visible_rows:
+                self.table.item(row, COL_CHECK).setCheckState(state)
+        finally:
+            self.table.setUpdatesEnabled(True)
+        self.statusBar().showMessage(
+            f"Отмечено писем: {len(visible_rows)}" if state == Qt.CheckState.Checked else "Отметки сняты", 4000
+        )
+
     def _checked_uids(self) -> list[int]:
         checked = [
             self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
@@ -7496,9 +7593,11 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Нечего удалять", "Отметьте галочками письма, которые нужно удалить.")
             return
 
-        if self.active_source is self.mailbox:
+        source = self.active_source
+        folder = self.current_folder
+        if source is self.mailbox:
             shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
-            already_in_trash = self.trash_folder_name is not None and self.current_folder == self.trash_folder_name
+            already_in_trash = self.trash_folder_name is not None and folder == self.trash_folder_name
             permanent = shift_held or already_in_trash or not self.trash_folder_name
 
             if permanent:
@@ -7510,18 +7609,11 @@ class MainWindow(QMainWindow):
                 )
                 if confirm != QMessageBox.StandardButton.Yes:
                     return
-                try:
-                    self.mailbox.delete_messages(self.current_folder, checked_uids)
-                except Exception as exc:
-                    QMessageBox.critical(self, "Ошибка удаления", str(exc))
-                    return
+                operation = lambda: self.mailbox.delete_messages(folder, checked_uids)  # noqa: E731
                 status_text = f"Удалено безвозвратно: {len(checked_uids)}"
             else:
-                try:
-                    self.mailbox.move_to_trash(self.current_folder, checked_uids, self.trash_folder_name)
-                except Exception as exc:
-                    QMessageBox.critical(self, "Ошибка удаления", str(exc))
-                    return
+                trash = self.trash_folder_name
+                operation = lambda: self.mailbox.move_to_trash(folder, checked_uids, trash)  # noqa: E731
                 status_text = f"Перемещено в корзину: {len(checked_uids)}"
         else:
             confirm = QMessageBox.question(
@@ -7532,22 +7624,41 @@ class MainWindow(QMainWindow):
             )
             if confirm != QMessageBox.StandardButton.Yes:
                 return
-            try:
-                self.active_source.delete_messages(self.current_folder, checked_uids)
-            except Exception as exc:
-                QMessageBox.critical(self, "Ошибка удаления", str(exc))
-                return
+            operation = lambda: source.delete_messages(folder, checked_uids)  # noqa: E731
             status_text = f"Удалено из архива: {len(checked_uids)}"
 
         if self.selected_summary and self.selected_summary.uid in checked_uids:
             self._clear_reading_pane()
-        try:
-            summaries = self.active_source.refresh_folder(self.current_folder)
-        except Exception as exc:
-            QMessageBox.warning(self, "Письма удалены, но обновить список не удалось", str(exc))
-            return
-        self._render_folder(summaries)
-        self.statusBar().showMessage(status_text, 5000)
+        # Сервер и обновление списка — в фоне: раньше удаление шло в потоке
+        # интерфейса и ждало, пока фоновая синхронизация освободит
+        # соединение (жалоба: "попробовал удалить — опять висит").
+        self._set_busy("Удаление…")
+
+        def do_delete() -> list[MessageSummary]:
+            operation()
+            return source.refresh_folder(folder)
+
+        worker = _CallableWorker(do_delete, parent=self)
+
+        def finish() -> None:
+            self._set_busy(None)
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        def on_success(summaries: object) -> None:
+            finish()
+            if source is self.active_source and folder == self.current_folder:
+                self._render_folder(summaries)
+            self.statusBar().showMessage(status_text, 5000)
+
+        def on_failure(error_text: str) -> None:
+            finish()
+            QMessageBox.critical(self, "Ошибка удаления", error_text)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_message_selected(self) -> None:
         rows = self.table.selectionModel().selectedRows()
@@ -9220,9 +9331,40 @@ class MainWindow(QMainWindow):
         source_draft: tuple[str, int] | None = None,
         reply_source: tuple[object, str, int] | None = None,
     ) -> None:
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+        """Открыть окно письма немодально. Раньше — dialog.exec(): модальный
+        вложенный цикл событий блокировал главное окно, а окно письма,
+        открытое по каналу управления (голосовой помощник) поверх другого,
+        вкладывало циклы друг в друга — главное окно «зависало» с невидимым
+        окном письма (жалоба: "отправил письмо — зависло"). Теперь окна
+        писем независимы, их может быть несколько, почту можно читать,
+        пока пишешь. Результат обрабатывается по сигналу finished."""
+        self._compose_windows.append(dialog)
 
+        def on_finished(result: int) -> None:
+            if dialog in self._compose_windows:
+                self._compose_windows.remove(dialog)
+            try:
+                if result == QDialog.DialogCode.Accepted:
+                    self._on_compose_accepted(
+                        dialog, in_reply_to=in_reply_to, source_draft=source_draft, reply_source=reply_source
+                    )
+            finally:
+                dialog.deleteLater()
+
+        dialog.finished.connect(on_finished)
+        dialog.setModal(False)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
+    def _on_compose_accepted(
+        self,
+        dialog: ComposeDialog,
+        *,
+        in_reply_to: str | None,
+        source_draft: tuple[str, int] | None,
+        reply_source: tuple[object, str, int] | None,
+    ) -> None:
         if dialog.save_as_draft_requested():
             self._save_draft(dialog, source_draft=source_draft)
             return

@@ -609,6 +609,17 @@ def initial_vacuum() -> None:
         conn.execute("VACUUM")
 
 
+def full_vacuum() -> int:
+    """Полное сжатие базы до минимума (после раунда автоархива в часы
+    обслуживания). Держит базу занятой на время перестройки файла —
+    поэтому только в часы обслуживания. Возвращает освобождённые байты."""
+    path = _db_path()
+    before = path.stat().st_size if path.exists() else 0
+    initial_vacuum()
+    after = path.stat().st_size if path.exists() else 0
+    return max(0, before - after)
+
+
 def vacuum(stop=None) -> int:
     """Вернуть место после автоархива — SQLite сам файл не ужимает.
     Только инкрементально, порциями по VACUUM_STEP_PAGES страниц: каждый

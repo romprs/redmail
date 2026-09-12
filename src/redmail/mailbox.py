@@ -42,12 +42,15 @@ class CachedMailbox:
         # лениво при первом обращении; для EWS — то же соединение.
         self._reader: ImapSession | None = None
         self._reader_lock = threading.Lock()
-        # Одна синхронизация за раз на ящик: обновление по кнопке/таймеру и
+        # Одна синхронизация папки за раз: обновление по кнопке/таймеру и
         # полный фоновый проход могли стартовать одновременно и оба качать
         # одни и те же заголовки (в журнале на реальном ящике: две строки
-        # «новых 3096» подряд). Второй ждёт первого и находит папку уже
-        # синхронизированной.
-        self._sync_lock = threading.Lock()
+        # «новых 3096» подряд). Замок — на папку, а не на весь ящик: иначе
+        # обновление папки по клику ждало полный проход по всем папкам и
+        # докачку тел (жалоба: "попробовал удалить — опять висит").
+        self._folder_locks: dict[str, threading.Lock] = {}
+        self._folder_locks_guard = threading.Lock()
+        self._bodies_lock = threading.Lock()
 
     @property
     def account_key(self) -> str:
@@ -67,14 +70,24 @@ class CachedMailbox:
     def folder_message_total(self, folder: str) -> int:
         return cache_store.count_folder_summaries(self._account_key, folder)
 
+    def _folder_lock(self, folder: str) -> threading.Lock:
+        with self._folder_locks_guard:
+            lock = self._folder_locks.get(folder)
+            if lock is None:
+                lock = self._folder_locks[folder] = threading.Lock()
+            return lock
+
     def refresh_folder(self, folder: str, limit: int | None = None, *, progress=None, stop: threading.Event | None = None) -> list[MessageSummary]:
-        with self._sync_lock:
-            sync_engine.sync_folder_headers(self.session, self._account_key, folder, progress=progress, stop=stop)
+        """Обновление одной папки по действию пользователя (клик, удаление,
+        таймер): по интерактивному соединению, ждёт только замок этой папки."""
+        with self._folder_lock(folder):
+            sync_engine.sync_folder_headers(self._reader_session(), self._account_key, folder, progress=progress, stop=stop)
         return cache_store.get_folder_summaries(self._account_key, folder, limit)
 
     def sync_all(self, folders: list[str], *, progress=None, stop: threading.Event | None = None) -> sync_engine.SyncStats:
-        with self._sync_lock:
-            return sync_engine.sync_all_folders(self.session, self._account_key, folders, progress=progress, stop=stop)
+        return sync_engine.sync_all_folders(
+            self.session, self._account_key, folders, progress=progress, stop=stop, folder_lock=self._folder_lock,
+        )
 
     # Папки, тела которых фоном не качаются (зеркало всех писем у Gmail).
     skip_body_folders: tuple[str, ...] = ()
@@ -83,16 +96,18 @@ class CachedMailbox:
         return cache_store.count_messages_without_body(self._account_key, self.body_max_bytes, skip_folders=self.skip_body_folders)
 
     def download_bodies(self, *, progress=None, stop: threading.Event | None = None, limit: int | None = None) -> int:
-        with self._sync_lock:
+        with self._bodies_lock:
             return sync_engine.download_bodies(
                 self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit,
                 skip_folders=self.skip_body_folders,
             )
 
     def _reader_session(self):
-        """Соединение для интерактивных чтений: отдельный ImapSession того же
-        аккаунта; если открыть второе не удалось (лимит сервера, сеть) —
-        основное."""
+        """Соединение для действий пользователя (открыть письмо, удалить,
+        отметить, обновить папку, положить копию в «Отправленные»):
+        отдельный ImapSession того же аккаунта — основное занято фоновой
+        синхронизацией и автоархивом по одной команде за раз. Если открыть
+        второе не удалось (лимит сервера, сеть) — основное."""
         if not isinstance(self.session, ImapSession):
             return self.session
         with self._reader_lock:
@@ -137,17 +152,17 @@ class CachedMailbox:
         if ref is not None:
             archive_store.set_marker(_Path(ref[0]), ref[1], color)  # на сервере письма уже нет
         else:
-            self.session.set_marker(folder, uid, color, previous_color=previous_color)
+            self._reader_session().set_marker(folder, uid, color, previous_color=previous_color)
         cache_store.set_marker(self._account_key, folder, uid, color)
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:
         if self._archived(folder, uid) is None:
-            self.session.set_read(folder, uid, read)
+            self._reader_session().set_read(folder, uid, read)
         cache_store.set_read(self._account_key, folder, uid, read)
 
     def set_answered(self, folder: str, uid: int) -> None:
         if self._archived(folder, uid) is None:
-            self.session.set_answered(folder, uid)
+            self._reader_session().set_answered(folder, uid)
         cache_store.set_answered(self._account_key, folder, uid)
 
     def delete_on_server(self, folder: str, uids: list[int]) -> None:
@@ -176,7 +191,7 @@ class CachedMailbox:
         удаляются из архива и индекса."""
         live, archived = self._split_archived(folder, uids)
         if live:
-            self.session.move_messages(folder, live, target_folder)
+            self._reader_session().move_messages(folder, live, target_folder)
             cache_store.delete_messages(self._account_key, folder, live)
         if archived:
             self._delete_archived(folder, archived)
@@ -197,7 +212,7 @@ class CachedMailbox:
         # хранилищу): сначала сервер, затем локальная копия.
         live, archived = self._split_archived(folder, uids)
         if live:
-            self.session.delete_messages(folder, live)
+            self._reader_session().delete_messages(folder, live)
             cache_store.delete_messages(self._account_key, folder, live)
         if archived:
             self._delete_archived(folder, archived)
@@ -213,7 +228,7 @@ class CachedMailbox:
     def append_message(self, folder: str, raw: bytes, *, flags: tuple = ()) -> None:
         # Новое письмо подхватит следующая синхронизация папки (появится
         # новый UID на сервере).
-        self.session.append_message(folder, raw, flags=flags)
+        self._reader_session().append_message(folder, raw, flags=flags)
 
 
 class ArchiveSource:

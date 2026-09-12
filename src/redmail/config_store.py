@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import keyring  # noqa: F401 - тесты подменяют keyring.get_password/set_password
@@ -132,6 +133,39 @@ def save_auto_archive_enabled(enabled: bool) -> None:
     data = _load_settings_dict()
     data["auto_archive_enabled"] = bool(enabled)
     _save_settings_dict(data)
+
+
+def load_maintenance_window() -> tuple[bool, int, int]:
+    """Часы обслуживания базы: (включено, час начала, час конца). Пока
+    включено — автоархив, фоновая докачка тел и сжатие базы идут только в
+    этот промежуток (предложение пользователя: "настроить работу с базой в
+    ночное время или в определённые часы"). Промежуток через полночь
+    (22 → 7) допустим."""
+    data = _load_settings_dict()
+    return (
+        bool(data.get("maintenance_enabled", False)),
+        int(data.get("maintenance_start_hour", 22)) % 24,
+        int(data.get("maintenance_end_hour", 7)) % 24,
+    )
+
+
+def save_maintenance_window(enabled: bool, start_hour: int, end_hour: int) -> None:
+    data = _load_settings_dict()
+    data["maintenance_enabled"] = bool(enabled)
+    data["maintenance_start_hour"] = int(start_hour) % 24
+    data["maintenance_end_hour"] = int(end_hour) % 24
+    _save_settings_dict(data)
+
+
+def in_maintenance_window(now: datetime | None = None) -> bool:
+    """Можно ли сейчас заниматься базой. Без включённых часов — всегда."""
+    enabled, start, end = load_maintenance_window()
+    if not enabled or start == end:
+        return True
+    hour = (now or datetime.now()).hour
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
 
 
 def load_auto_archive_delete_on_server() -> bool:

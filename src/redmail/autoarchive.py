@@ -33,9 +33,13 @@ _log = get_logger("autoarchive")
 # каждом новом письме.
 TARGET_RATIO = 0.8
 BATCH = 50
-# Писем за один раунд: после раунда база ужимается и снова проверяется
-# порог, а фоновая синхронизация получает свою очередь к серверу.
-ROUND = 300
+# Раунд автоархива — примерно один файл архива (порог, ~500 МБ): пока база
+# меньше порога, ничего не делаем; стала больше — переносим самые старые
+# письма объёмом в порог, затем сжимаем базу (предложение пользователя:
+# "до 500 МБ ничего не делаем, стала больше — переносим 500 МБ в архив,
+# а основную базу сжимаем до минимума"). ROUND — страховочный предел по
+# числу писем.
+ROUND = 20000
 _SKIP_HINTS = ("trash", "корзин", "spam", "junk", "спам", "draft", "черновик")
 
 ProgressCallback = Callable[[str, int, int], None]
@@ -88,7 +92,9 @@ def make_plan(account_key: str, threshold_bytes: int, *, skip_folders: set[str] 
     plan = ArchivePlan(account_key=account_key, db_bytes=db_bytes, threshold_bytes=threshold_bytes, to_free_bytes=0)
     if db_bytes <= threshold_bytes:
         return plan
-    plan.to_free_bytes = db_bytes - int(threshold_bytes * TARGET_RATIO)
+    # Раунд не меньше порога (один файл архива ~500 МБ) и не меньше, чем
+    # нужно, чтобы база ушла ниже TARGET_RATIO × порога.
+    plan.to_free_bytes = max(threshold_bytes, db_bytes - int(threshold_bytes * TARGET_RATIO))
     skip = skip_folders or set()
     freed = 0
     for folder, uid, size, date in cache_store.oldest_messages(account_key):
@@ -161,6 +167,7 @@ def run(
     progress: ProgressCallback | None = None,
     stop: threading.Event | None = None,
     delete_on_server: bool = False,
+    full_vacuum: bool = False,
 ) -> ArchiveResult:
     """Выполняет план: по одному письму — скачать целиком, записать в
     архив, проверить, пометить в индексе; удалить на сервере — только если
@@ -198,7 +205,7 @@ def run(
             cache_store.mark_archived(plan.account_key, folder, uid, str(current), archive_uid)
             result.archived += 1
             result.bytes_freed += size
-            if result.archived % 50 == 0:
+            if result.archived % 50 == 0 and not full_vacuum:
                 try:
                     cache_store.vacuum(stop)
                 except Exception as exc:
@@ -216,9 +223,13 @@ def run(
                 pass
     if result.archived:
         try:
-            freed_pages = cache_store.vacuum(stop)
-            if freed_pages:
-                _log.info("Автоархив: база ужата на %d страниц (~%.0f МБ)", freed_pages, freed_pages * 4096 / (1024 * 1024))
+            if full_vacuum:
+                freed_bytes = cache_store.full_vacuum()
+                _log.info("Автоархив: база сжата полностью, освобождено ~%.0f МБ", freed_bytes / (1024 * 1024))
+            else:
+                freed_pages = cache_store.vacuum(stop)
+                if freed_pages:
+                    _log.info("Автоархив: база ужата на %d страниц (~%.0f МБ)", freed_pages, freed_pages * 4096 / (1024 * 1024))
         except Exception as exc:
             _log.warning("Ужатие базы после автоархива не удалось: %s", exc)
         _log.info(
