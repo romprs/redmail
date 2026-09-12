@@ -616,7 +616,7 @@ def _render_mail_html(view: QWebEngineView, html_content: str, *, anchor: str | 
 
 _BODY_WRAP_TEMPLATE = (
     '<html><head><meta charset="utf-8"></head>'
-    '<body style="background:#ffffff;color:#202124;margin:8px;'
+    '<body style="background:#ffffff;color:#202124;margin:14px 12px;'
     'font-family:sans-serif;">{content}</body></html>'
 )
 
@@ -746,6 +746,18 @@ def _truncate_recipient_field(value: str, max_items: int = 3) -> tuple[str, int]
         return html.escape(value), 0
     shown_text = ", ".join(html.escape(_format_recipient_candidate(name, addr)) for name, addr in pairs[:max_items])
     return shown_text, len(pairs) - max_items
+
+
+def _html_to_preview_text(html_content: str, limit: int = 1200) -> str:
+    """Короткий текст из HTML для предпросмотра в цепочке: убрать скрипты/
+    стили и теги, свернуть пробелы."""
+    text = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", html_content)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html.unescape(text)
+    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip() for line in text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    return text[:limit] + ("…" if len(text) > limit else "")
 
 
 def _build_message_header_html(subject: str, sender: str, to: str, cc: str, date: str) -> str:
@@ -1298,6 +1310,7 @@ _MATERIAL_ICON_PATHS: dict[str, str] = {
     "forward": "m644-288-43-43 193-193-193-193 43-43 236 236-236 236ZM81-200v-156q0-85 56.5-141.5T279-554h305L421-717l43-43 236 236-236 236-43-43 163-163H279q-60 0-99 39t-39 99v156H81Z",
     "reply_all": "M316-288 80-524l236-236 43 43-193 193 193 193-43 43Zm503 88v-156q0-60-39-99t-99-39H376l163 163-43 43-236-236 236-236 43 43-163 163h305q85 0 141.5 56.5T879-356v156h-60Z",
     "filter_list": "M400-240v-60h160v60H400ZM240-450v-60h480v60H240ZM120-660v-60h720v60H120Z",
+    "sort": "M120-240v-60h240v60H120Zm0-210v-60h480v60H120Zm0-210v-60h720v60H120Z",
     "view_agenda": "M180-510q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0 450q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0-600v210-210Zm0 390v210-210Z",
     "view_list": "M350-220h470v-137H350v137ZM140-603h150v-137H140v137Zm0 187h150v-127H140v127Zm0 196h150v-137H140v137Zm210-196h470v-127H350v127Zm0-187h470v-137H350v137ZM140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h680q24 0 42 18t18 42v520q0 24-18 42t-42 18H140Z",
     "delete": "M261-120q-24.75 0-42.37-17.63Q201-155.25 201-180v-570h-41v-60h188v-30h264v30h188v60h-41v570q0 24-18 42t-42 18H261Zm438-630H261v570h438v-570ZM367-266h60v-399h-60v399Zm166 0h60v-399h-60v399ZM261-750v570-570Z",
@@ -1330,6 +1343,7 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "forward": "forward",
     "reply_all": "reply_all",
     "filter": "filter_list",
+    "sort": "sort",
     "view_table": "view_list",
     "view_cards": "view_agenda",
     "delete": "delete",
@@ -4263,6 +4277,7 @@ class MainWindow(QMainWindow):
         header.setSectionsMovable(True)
         header.sectionClicked.connect(self._set_filter_column)
         header.sectionResized.connect(self._on_mail_column_resized)
+        header.sortIndicatorChanged.connect(self._on_sort_indicator_changed)
         self.table.setIconSize(QSize(_MARKER_ICON_SIZE, _MARKER_ICON_SIZE))
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -4330,19 +4345,25 @@ class MainWindow(QMainWindow):
             if button is not None:
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
 
-        # Справа в той же панели — фильтр списка и переключатель режима
-        # отображения (таблица / плитки).
-        spacer = QWidget(self)
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        mail_actions_toolbar.addWidget(spacer)
+        # Фильтр списка и переключатель режима (таблица / плитки) — в строке
+        # поиска, а не в панели действий: там при узком окне они уезжали за
+        # стрелку «>>» и пропадали (жалоба: "при растяжении кнопки
+        # переключения режимов и фильтра скрываются").
         self.filter_button = QToolButton(self)
         self.filter_button.setText("Фильтр")
         self.filter_button.setIcon(_toolbar_icon("filter"))
         self.filter_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.filter_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.filter_button.setMenu(self._build_filter_menu())
-        mail_actions_toolbar.addWidget(self.filter_button)
-        mail_actions_toolbar.addSeparator()
+        # Сортировка списка: в таблице она есть по клику на заголовок, а в
+        # режиме плиток заголовка нет (жалоба: "в режиме плашек почту нельзя
+        # сортировать по дате") — общая кнопка для обоих режимов.
+        self.sort_button = QToolButton(self)
+        self.sort_button.setText("Сортировка")
+        self.sort_button.setIcon(_toolbar_icon("sort"))
+        self.sort_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.sort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.sort_button.setMenu(self._build_sort_menu())
         view_group = QActionGroup(self)
         view_group.setExclusive(True)
         self.view_table_action = QAction(_toolbar_icon("view_table"), "Таблица", self)
@@ -4351,9 +4372,13 @@ class MainWindow(QMainWindow):
         self.view_cards_action = QAction(_toolbar_icon("view_cards"), "Плитки", self)
         self.view_cards_action.setCheckable(True)
         self.view_cards_action.setToolTip("Список писем плитками")
+        self.view_buttons: list[QToolButton] = []
         for action in (self.view_table_action, self.view_cards_action):
             view_group.addAction(action)
-            mail_actions_toolbar.addAction(action)
+            button = QToolButton(self)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            self.view_buttons.append(button)
         self.view_table_action.triggered.connect(lambda: self._set_mail_view_mode("table"))
         self.view_cards_action.triggered.connect(lambda: self._set_mail_view_mode("cards"))
 
@@ -4377,7 +4402,15 @@ class MainWindow(QMainWindow):
         table_layout = QVBoxLayout(table_container)
         table_layout.setContentsMargins(0, 0, 0, 0)
         table_layout.addWidget(mail_actions_toolbar)
-        table_layout.addWidget(self.filter_edit)
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(4)
+        filter_row.addWidget(self.filter_edit, 1)
+        filter_row.addWidget(self.filter_button)
+        filter_row.addWidget(self.sort_button)
+        for button in self.view_buttons:
+            filter_row.addWidget(button)
+        table_layout.addLayout(filter_row)
         table_layout.addWidget(self.table)
         table_layout.addWidget(self.card_list)
         self._set_mail_view_mode(self.mail_view_mode)
@@ -4414,7 +4447,8 @@ class MainWindow(QMainWindow):
         # примешивать туда наш текст means риск сломать вёрстку письма.
         self.message_header_widget = QWidget(self)
         header_layout = QHBoxLayout(self.message_header_widget)
-        header_layout.setContentsMargins(6, 4, 6, 4)
+        # Отступы сверху и снизу — пожелание "сделай отступ от верхнего края и снизу".
+        header_layout.setContentsMargins(12, 12, 12, 12)
         self.message_header_label = QLabel(self.message_header_widget)
         self.message_header_label.setWordWrap(True)
         self.message_header_label.setTextInteractionFlags(
@@ -4682,7 +4716,7 @@ class MainWindow(QMainWindow):
         self.contacts_table.itemDoubleClicked.connect(self.on_contact_double_clicked)
 
         contacts_toolbar = QToolBar("Контакты", self)
-        contacts_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        contacts_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)  # как в почте: значок и подпись
         new_contact_action = QAction(_toolbar_icon("add"), "Новый контакт…", self)
         new_contact_action.triggered.connect(self.on_new_contact)
         contacts_toolbar.addAction(new_contact_action)
@@ -4714,6 +4748,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.pages)
 
         toolbar = QToolBar("Основная", self)
+        toolbar.setObjectName("modeBar")
         self.addToolBar(toolbar)
 
         mode_group = QActionGroup(self)
@@ -6795,19 +6830,77 @@ class MainWindow(QMainWindow):
     # uid, так что вся остальная логика (чтение письма, удаление, маркеры)
     # не дублируется.
 
-    def _populate_cards(self, summaries: list[MessageSummary], is_sent_folder: bool) -> None:
+    def _populate_cards(self, _summaries: list[MessageSummary], is_sent_folder: bool) -> None:
         self.card_delegate.sent_mode = is_sent_folder
+        self._reorder_cards_from_table()
+
+    def _reorder_cards_from_table(self) -> None:
+        """Перестроить плитки в порядке строк таблицы (после сортировки по
+        заголовку или из меню «Сортировка»); галочки и скрытие фильтром
+        берутся из таблицы, текущее письмо сохраняется."""
+        current_uid = self.selected_summary.uid if self.selected_summary is not None else None
         self.card_list.blockSignals(True)
-        self.card_list.clear()
-        self._card_items_by_uid = {}
-        for summary in summaries:
-            item = QListWidgetItem()
-            item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
-            item.setData(Qt.ItemDataRole.UserRole, summary.uid)
-            self.card_list.addItem(item)
-            self._card_items_by_uid[summary.uid] = item
-        self.card_list.blockSignals(False)
+        self._syncing_card_selection = True
+        try:
+            self.card_list.clear()
+            self._card_items_by_uid = {}
+            for row in range(self.table.rowCount()):
+                check_item = self.table.item(row, COL_CHECK)
+                if check_item is None:
+                    continue
+                uid = check_item.data(Qt.ItemDataRole.UserRole)
+                item = QListWidgetItem()
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(check_item.checkState())
+                item.setData(Qt.ItemDataRole.UserRole, uid)
+                self.card_list.addItem(item)
+                item.setHidden(self.table.isRowHidden(row))
+                self._card_items_by_uid[uid] = item
+        finally:
+            self.card_list.blockSignals(False)
+            self._syncing_card_selection = False
+        if current_uid is not None:
+            self._sync_card_selection(current_uid)
+
+    def _on_sort_indicator_changed(self, _column: int, _order: Qt.SortOrder) -> None:
+        if self._card_items_by_uid:
+            self._reorder_cards_from_table()
+
+    _SORT_CHOICES: tuple[tuple[str, int, Qt.SortOrder], ...] = (
+        ("Дата: новые сверху", COL_DATE, Qt.SortOrder.DescendingOrder),
+        ("Дата: старые сверху", COL_DATE, Qt.SortOrder.AscendingOrder),
+        ("От кого", COL_SENDER, Qt.SortOrder.AscendingOrder),
+        ("Тема", COL_SUBJECT, Qt.SortOrder.AscendingOrder),
+    )
+
+    def _build_sort_menu(self) -> QMenu:
+        menu = QMenu(self)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._sort_actions: dict[QAction, tuple[int, Qt.SortOrder]] = {}
+        for label, column, order in self._SORT_CHOICES:
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            group.addAction(action)
+            self._sort_actions[action] = (column, order)
+        group.triggered.connect(self._on_sort_action)
+        menu.aboutToShow.connect(self._sync_sort_menu)
+        return menu
+
+    def _sync_sort_menu(self) -> None:
+        header = self.table.horizontalHeader()
+        current = (header.sortIndicatorSection(), header.sortIndicatorOrder())
+        for action, value in self._sort_actions.items():
+            action.setChecked(value == current)
+
+    def _on_sort_action(self, action: QAction) -> None:
+        column, order = self._sort_actions[action]
+        # sortByColumn ставит индикатор в заголовке и сортирует; плитки
+        # перестраиваются по sortIndicatorChanged — а если индикатор не
+        # изменился (тот же выбор), перестраиваем явно.
+        self.table.sortByColumn(column, order)
+        if self._card_items_by_uid:
+            self._reorder_cards_from_table()
 
     def _refresh_cards(self) -> None:
         self.card_list.viewport().update()
@@ -7401,7 +7494,14 @@ class MainWindow(QMainWindow):
                 continue
             # Тело остальных писем цепочки — только текстом, не их родным
             # HTML: см. подробное объяснение в _build_thread_html.
-            body = _linkify(other_content.text) if other_content.text.strip() else "<i>(письмо в формате HTML — предпросмотр недоступен в цепочке)</i>"
+            if other_content.text.strip():
+                body = _linkify(other_content.text)
+            elif other_content.html:
+                # HTML-письмо без текстовой части: предпросмотр из самого HTML
+                # (жалоба: в цепочке одни заглушки «предпросмотр недоступен»).
+                body = _linkify(_html_to_preview_text(other_content.html))
+            else:
+                body = "<i>(письмо без текста)</i>"
             entries.append((other, body))
 
         thread_html = _build_thread_html(entries, summary.uid)

@@ -32,8 +32,16 @@ class CachedMailbox:
 
     def __init__(self, session: ImapSession, account: Account, *, body_max_bytes: int = sync_engine.DEFAULT_BODY_MAX_BYTES):
         self.session = session
+        self._account = account
         self._account_key = f"{account.host}:{account.username}"
         self.body_max_bytes = body_max_bytes
+        # Второе соединение для действий пользователя (открыть письмо,
+        # переслать): основное занято фоновой синхронизацией и автоархивом
+        # по одной команде за раз, и открытие письма ждало их очередь
+        # (жалоба: "опять какие-то траблы с открытием писем"). Создаётся
+        # лениво при первом обращении; для EWS — то же соединение.
+        self._reader: ImapSession | None = None
+        self._reader_lock = threading.Lock()
         # Одна синхронизация за раз на ящик: обновление по кнопке/таймеру и
         # полный фоновый проход могли стартовать одновременно и оба качать
         # одни и те же заголовки (в журнале на реальном ящике: две строки
@@ -81,7 +89,23 @@ class CachedMailbox:
                 skip_folders=self.skip_body_folders,
             )
 
-    def message_content(self, folder: str, uid: int) -> MessageContent:
+    def _reader_session(self):
+        """Соединение для интерактивных чтений: отдельный ImapSession того же
+        аккаунта; если открыть второе не удалось (лимит сервера, сеть) —
+        основное."""
+        if not isinstance(self.session, ImapSession):
+            return self.session
+        with self._reader_lock:
+            if self._reader is None:
+                try:
+                    self._reader = ImapSession(self._account)
+                    _log.info("IMAP %s: второе соединение для открытия писем", self._account.host)
+                except Exception as exc:
+                    _log.warning("IMAP %s: второе соединение не открылось (%s) — используется основное", self._account.host, exc)
+                    return self.session
+            return self._reader
+
+    def message_content(self, folder: str, uid: int, *, background: bool = False) -> MessageContent:
         cached = cache_store.get_message_content(self._account_key, folder, uid)
         if cached is not None:
             return cached
@@ -89,13 +113,15 @@ class CachedMailbox:
         if ref is not None:
             # Единый индекс: письмо перенесено автоархивом — тело из файла архива.
             return archive_store.get_message_content(_Path(ref[0]), ref[1])
-        content = self.session.fetch_message_content(folder, uid)
+        session = self.session if background else self._reader_session()
+        content = session.fetch_message_content(folder, uid)
         cache_store.save_message_content(self._account_key, folder, uid, content)
         return content
 
-    def message_raw(self, folder: str, uid: int) -> bytes:
-        """Не кэшируется — нужен только для разового экспорта в архив."""
-        return self.session.fetch_message_raw(folder, uid)
+    def message_raw(self, folder: str, uid: int, *, background: bool = False) -> bytes:
+        """Не кэшируется — нужен для экспорта в архив (фон) и «Сохранить как»."""
+        session = self.session if background else self._reader_session()
+        return session.fetch_message_raw(folder, uid)
 
     def search_uids(self, folder: str, *, before=None) -> list[int]:
         """Не кэшируется — используется только для массовой выгрузки папки
@@ -178,6 +204,11 @@ class CachedMailbox:
 
     def close(self) -> None:
         self.session.close()
+        if self._reader is not None:
+            try:
+                self._reader.close()
+            except Exception:
+                pass
 
     def append_message(self, folder: str, raw: bytes, *, flags: tuple = ()) -> None:
         # Новое письмо подхватит следующая синхронизация папки (появится

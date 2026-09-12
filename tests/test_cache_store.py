@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from redmail import cache_store
 from redmail.imap_client import Attachment, MessageContent, MessageSummary
@@ -16,6 +17,29 @@ def _summary(
         message_id=f"<{uid}@example.com>", has_attachments=has_attachments, marker_color=marker_color,
         importance=importance, is_read=is_read,
     )
+
+
+def test_needs_initial_vacuum_when_many_free_pages(tmp_path: Path) -> None:
+    # Инкрементальное ужатие на фрагментированной базе не работало (по
+    # странице за вызов) — при большой доле свободных страниц нужен полный
+    # VACUUM при старте, даже если режим auto_vacuum уже INCREMENTAL.
+    db_path = tmp_path / "mail.sqlite3"
+    with patch("redmail.cache_store._db_path", return_value=db_path):
+        with closing(cache_store._connect()) as conn:
+            conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
+            conn.execute("VACUUM")
+        assert cache_store.needs_initial_vacuum(min_bytes=0) is False
+
+        def fake_connect(free_pages: int):
+            conn = MagicMock()
+            values = {"PRAGMA auto_vacuum": (2,), "PRAGMA freelist_count": (free_pages,), "PRAGMA page_count": (900_000,)}
+            conn.execute.side_effect = lambda sql: MagicMock(fetchone=lambda: values[sql])
+            return conn
+
+        with patch("redmail.cache_store._connect", return_value=fake_connect(500_000)):
+            assert cache_store.needs_initial_vacuum(min_bytes=0) is True
+        with patch("redmail.cache_store._connect", return_value=fake_connect(1_000)):
+            assert cache_store.needs_initial_vacuum(min_bytes=0) is False
 
 
 def test_folder_round_trip(tmp_path: Path) -> None:

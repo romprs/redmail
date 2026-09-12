@@ -194,17 +194,19 @@ def import_vcard(path: Path, vcf_bytes: bytes) -> int:
 
 def _contact_from_vcard(card) -> Contact | None:
     emails = [e.value.strip() for e in card.contents.get("email", []) if e.value.strip()]
-    display_name = str(card.fn.value).strip() if hasattr(card, "fn") else ""
-    if not display_name and hasattr(card, "n"):
-        # FN пуст, но структурированное имя (N) может быть заполнено —
-        # соберём его из частей (Фамилия/Имя/Отчество и т.п.).
+    display_name = ""
+    if hasattr(card, "n"):
+        # Пожелание: "поле Имя надо заполнять с фамилии, а не имени" —
+        # структурированное имя (N) собираем как «Фамилия Имя Отчество»,
+        # даже если FN экспортёра записан как «Имя Фамилия».
         name = card.n.value
         parts = (
-            getattr(name, "prefix", ""), getattr(name, "given", ""),
-            getattr(name, "additional", ""), getattr(name, "family", ""),
-            getattr(name, "suffix", ""),
+            getattr(name, "family", ""), getattr(name, "given", ""),
+            getattr(name, "additional", ""),
         )
         display_name = " ".join(p.strip() for p in parts if p and p.strip())
+    if not display_name and hasattr(card, "fn"):
+        display_name = str(card.fn.value).strip()
     if not display_name and hasattr(card, "nickname"):
         # Найдено на реальном экспорте: FN и N оба пустые, а полное ФИО
         # лежит в NICKNAME — не по стандарту (NICKNAME предназначен для
@@ -241,6 +243,7 @@ def _contact_from_vcard(card) -> Contact | None:
 # совпадение по каждой роли.
 _CSV_NAME_HEADERS = ("display name", "полное имя", "name", "full name")
 _CSV_FIRST_LAST_HEADERS = (("first name", "имя"), ("last name", "фамилия"))
+_CSV_MIDDLE_HEADERS = ("middle name", "отчество")
 _CSV_EMAIL_HEADERS = ("e-mail address", "email", "e-mail", "электронная почта", "email address")
 _CSV_PHONE_HEADERS = ("business phone", "mobile phone", "телефон", "phone", "home phone")
 _CSV_ORG_HEADERS = ("company", "организация", "company name")
@@ -267,6 +270,7 @@ def import_csv(path: Path, csv_bytes: bytes) -> int:
     name_col = _find(_CSV_NAME_HEADERS)
     first_col = _find(_CSV_FIRST_LAST_HEADERS[0])
     last_col = _find(_CSV_FIRST_LAST_HEADERS[1])
+    middle_col = _find(_CSV_MIDDLE_HEADERS)
     email_col = _find(_CSV_EMAIL_HEADERS)
     phone_col = _find(_CSV_PHONE_HEADERS)
     org_col = _find(_CSV_ORG_HEADERS)
@@ -274,12 +278,14 @@ def import_csv(path: Path, csv_bytes: bytes) -> int:
     count = 0
     for row in reader:
         email = (row.get(email_col) or "").strip() if email_col else ""
-        if name_col:
+        # «Фамилия Имя Отчество» из отдельных колонок предпочтительнее
+        # готового полного имени (в экспорте Outlook оно «Имя Фамилия»).
+        first = (row.get(first_col) or "").strip() if first_col else ""
+        last = (row.get(last_col) or "").strip() if last_col else ""
+        middle = (row.get(middle_col) or "").strip() if middle_col else ""
+        display_name = " ".join(part for part in (last, first, middle) if part)
+        if not display_name and name_col:
             display_name = (row.get(name_col) or "").strip()
-        else:
-            first = (row.get(first_col) or "").strip() if first_col else ""
-            last = (row.get(last_col) or "").strip() if last_col else ""
-            display_name = " ".join(part for part in (first, last) if part)
         if not display_name:
             display_name = email
         if not display_name:

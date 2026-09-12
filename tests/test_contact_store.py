@@ -171,7 +171,19 @@ def test_import_vcard_uses_structured_n_when_fn_empty(tmp_path: Path) -> None:
     assert count == 1
 
     contacts = contact_store.list_contacts(path)
-    assert contacts[0].display_name == "Иван Иванович Иванов"
+    # Пожелание: "поле Имя надо заполнять с фамилии" — Фамилия Имя Отчество.
+    assert contacts[0].display_name == "Иванов Иван Иванович"
+
+
+def test_import_vcard_prefers_structured_n_over_fn_order(tmp_path: Path) -> None:
+    # Экспортёры пишут FN как «Имя Фамилия»; при наличии N собираем с фамилии.
+    path = tmp_path / "test.rmcontacts"
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nFN:Иван Иванов\r\nN:Иванов;Иван;;;\r\n"
+        "EMAIL:ivan@example.com\r\nEND:VCARD\r\n"
+    ).encode("utf-8")
+    assert contact_store.import_vcard(path, vcf) == 1
+    assert contact_store.list_contacts(path)[0].display_name == "Иванов Иван"
 
 
 def test_import_csv_with_display_name_column(tmp_path: Path) -> None:
@@ -193,11 +205,23 @@ def test_import_csv_with_display_name_column(tmp_path: Path) -> None:
 def test_import_csv_with_first_last_name_columns(tmp_path: Path) -> None:
     path = tmp_path / "test.rmcontacts"
     csv_bytes = (
-        "First Name,Last Name,E-mail Address\r\nПётр,Петров,petr@example.com\r\n"
+        "First Name,Middle Name,Last Name,E-mail Address\r\nПётр,Петрович,Петров,petr@example.com\r\n"
     ).encode("utf-8-sig")
     count = contact_store.import_csv(path, csv_bytes)
     assert count == 1
-    assert contact_store.list_contacts(path)[0].display_name == "Пётр Петров"
+    assert contact_store.list_contacts(path)[0].display_name == "Петров Пётр Петрович"
+
+
+def test_import_csv_prefers_name_parts_over_display_name(tmp_path: Path) -> None:
+    # Outlook пишет Display Name как «Имя Фамилия», а отдельные колонки
+    # позволяют собрать «Фамилия Имя».
+    path = tmp_path / "test.rmcontacts"
+    csv_bytes = (
+        "Display Name,First Name,Last Name,E-mail Address\r\n"
+        "Пётр Петров,Пётр,Петров,petr@example.com\r\n"
+    ).encode("utf-8-sig")
+    assert contact_store.import_csv(path, csv_bytes) == 1
+    assert contact_store.list_contacts(path)[0].display_name == "Петров Пётр"
 
 
 def test_import_csv_skips_blank_rows(tmp_path: Path) -> None:

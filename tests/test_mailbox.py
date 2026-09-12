@@ -191,6 +191,38 @@ def test_message_raw_and_search_uids_delegate_uncached(tmp_path: Path) -> None:
     assert session.fetch_message_raw.call_count == 2
 
 
+def test_message_content_uses_separate_reader_session(tmp_path: Path) -> None:
+    # Открытие письма не должно ждать фоновой синхронизации/автоархива на
+    # основном соединении: интерактивные чтения идут по второму IMAP-
+    # соединению того же аккаунта, фоновые (background=True) — по основному.
+    session = FakeSession({1: _summary(1)})
+    reader = MagicMock()
+    reader.fetch_message_content.return_value = MessageContent(text="via reader")
+    reader.fetch_message_raw.return_value = b"raw via reader"
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx, patch("redmail.mailbox.isinstance", create=True, return_value=True), \
+         patch("redmail.mailbox.ImapSession", return_value=reader) as factory:
+        assert mailbox.message_content("INBOX", 1).text == "via reader"
+        assert mailbox.message_raw("INBOX", 1) == b"raw via reader"
+        assert mailbox.message_raw("INBOX", 1, background=True) == b"raw bytes"
+        assert mailbox.message_content("INBOX", 1).text == "via reader"  # из кэша, второй раз в сеть не ходим
+        mailbox.close()
+    factory.assert_called_once()
+    assert session.fetch_message_content.call_count == 0
+    reader.fetch_message_content.assert_called_once_with("INBOX", 1)
+    reader.close.assert_called_once()
+    session.close.assert_called_once()
+
+
+def test_reader_session_falls_back_to_main_when_second_connection_fails(tmp_path: Path) -> None:
+    session = FakeSession({1: _summary(1)})
+    ctx, mailbox = _mailbox(tmp_path, session)
+    with ctx, patch("redmail.mailbox.isinstance", create=True, return_value=True), \
+         patch("redmail.mailbox.ImapSession", side_effect=OSError("too many connections")):
+        assert mailbox.message_content("INBOX", 1).text == "hello"
+    session.fetch_message_content.assert_called_once_with("INBOX", 1)
+
+
 def test_close_delegates_to_session() -> None:
     session = FakeSession({})
     CachedMailbox(session, _account()).close()

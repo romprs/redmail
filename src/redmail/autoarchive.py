@@ -177,7 +177,7 @@ def run(
         if stop is not None and stop.is_set():
             break
         try:
-            raw = mailbox.message_raw(folder, uid)
+            raw = mailbox.message_raw(folder, uid, background=True)
             if not raw:
                 raise ValueError("сервер вернул пустое письмо")
             if written_to_current and current.stat().st_size >= plan.threshold_bytes:
@@ -198,6 +198,11 @@ def run(
             cache_store.mark_archived(plan.account_key, folder, uid, str(current), archive_uid)
             result.archived += 1
             result.bytes_freed += size
+            if result.archived % 50 == 0:
+                try:
+                    cache_store.vacuum(stop)
+                except Exception as exc:
+                    _log.warning("Ужатие базы по ходу автоархива не удалось: %s", exc)
         except Exception as exc:
             result.failed += 1
             _log.error("Автоархив %s/%d: %s", folder, uid, exc)

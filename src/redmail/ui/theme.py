@@ -143,9 +143,54 @@ QHeaderView::section {{
     border-bottom: 1px solid {border};
     padding: 3px;
 }}
+/* Полосы прокрутки: явная дорожка и ползунок (жалоба: "скролл в перечне
+   писем для тёмной темы не виден" — Fusion рисовал ползунок почти в цвет
+   фона). */
+QScrollBar:vertical {{
+    background: {alt_base};
+    width: 12px;
+    margin: 0;
+    border: none;
+}}
+QScrollBar:horizontal {{
+    background: {alt_base};
+    height: 12px;
+    margin: 0;
+    border: none;
+}}
 QScrollBar::handle {{
-    background: {border};
-    border-radius: 4px;
+    background: {disabled_text};
+    border-radius: 5px;
+    min-height: 24px;
+    min-width: 24px;
+    margin: 2px;
+}}
+QScrollBar::handle:hover {{
+    background: {accent};
+}}
+QScrollBar::add-line, QScrollBar::sub-line {{
+    height: 0;
+    width: 0;
+    border: none;
+    background: none;
+}}
+QScrollBar::add-page, QScrollBar::sub-page {{
+    background: none;
+}}
+/* Кнопки разделов (Почта/Календарь/Контакты/Параметры/Справка) — без
+   рамок, выделяется только активный раздел (пожелание: "убери рамку у
+   кнопок меню"). */
+QToolBar#modeBar QToolButton {{
+    border: none;
+    background-color: transparent;
+    padding: 4px 10px;
+}}
+QToolBar#modeBar QToolButton:hover {{
+    background-color: {border};
+}}
+QToolBar#modeBar QToolButton:checked {{
+    background-color: {accent};
+    color: {accent_text};
 }}
 QSplitter::handle {{
     background-color: {border};

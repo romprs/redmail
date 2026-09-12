@@ -592,7 +592,15 @@ def needs_initial_vacuum(min_bytes: int = 200 * 1024 * 1024) -> bool:
         return False
     with closing(_connect()) as conn:
         mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
-    return int(mode or 0) != 2
+        free_pages = int(conn.execute("PRAGMA freelist_count").fetchone()[0] or 0)
+        total_pages = int(conn.execute("PRAGMA page_count").fetchone()[0] or 1)
+    if int(mode or 0) != 2:
+        return True
+    # Инкрементальное ужатие на сильно фрагментированной базе освобождает
+    # по одной странице за вызов (на .80: 508 тыс. свободных страниц, база
+    # 3.7 ГБ не уменьшалась) — при заметной доле свободных страниц делаем
+    # полный VACUUM при старте под заставкой.
+    return free_pages > max(25000, total_pages // 5)
 
 
 def initial_vacuum() -> None:
