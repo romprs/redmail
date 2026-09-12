@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import functools
+import html as _html
 import imaplib
+import re
 import threading
 from dataclasses import dataclass, field
 from email import message_from_bytes
@@ -52,6 +54,30 @@ def join_markers(colors) -> str | None:
 # длительность загрузки большого письма целиком — только паузу между
 # порциями данных от сервера.
 SOCKET_TIMEOUT = 120
+
+# Текст-заглушка для писем без текстовой части, из которых текст не
+# получилось извлечь даже из HTML. Старые записи кэша содержат её в поле
+# text — интерфейс проверяет по этой константе.
+HTML_ONLY_PLACEHOLDER = "(письмо в формате HTML — предпросмотр текста недоступен)"
+
+
+def html_to_text(html_content: str | bytes | None, limit: int | None = None) -> str:
+    """Текст из HTML-письма: без скриптов/стилей/тегов, переносы по блокам,
+    свёрнутые пробелы. Для цепочки, цитирования и писем без text/plain
+    (жалоба: в цепочке одни заглушки «предпросмотр текста недоступен»)."""
+    if not html_content:
+        return ""
+    if isinstance(html_content, bytes):
+        html_content = html_content.decode("utf-8", errors="replace")
+    text = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", html_content)
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>|</blockquote>", "\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = _html.unescape(text)
+    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip() for line in text.splitlines()]
+    text = "\n".join(line for line in lines if line)
+    if limit is not None and len(text) > limit:
+        return text[:limit] + "…"
+    return text
 # Таймаут вежливого LOGOUT при закрытии программы — дольше ждать незачем.
 CLOSE_TIMEOUT = 5
 
@@ -663,16 +689,15 @@ def extract_content(message: Message) -> MessageContent:
             # они такие [с текстом]").
             return MessageContent(text=_decode_payload(message) or "(нет текстового содержимого)", **header_kwargs)
         if message.get_content_type() == "text/html":
+            html_payload = _decode_payload(message)
             return MessageContent(
-                text="(письмо в формате HTML — предпросмотр текста недоступен)",
-                html=_decode_payload(message),
+                text=html_to_text(html_payload) or HTML_ONLY_PLACEHOLDER,
+                html=html_payload,
                 **header_kwargs,
             )
         if message.get_content_type() == "text/calendar":
             return MessageContent(text="", attachments=[_calendar_attachment(message)], **header_kwargs)
-        return MessageContent(
-            text="(письмо в формате HTML — предпросмотр текста недоступен)", **header_kwargs
-        )
+        return MessageContent(text=HTML_ONLY_PLACEHOLDER, **header_kwargs)
 
     text: str | None = None
     html: str | None = None
@@ -754,7 +779,7 @@ def extract_content(message: Message) -> MessageContent:
         # None → _decode_payload дала "") и оставить панель чтения молча
         # пустой без единой подсказки (жалоба: "некоторые письма
         # открываются так [пусто], а на самом деле они такие [с текстом]").
-        text = "(письмо в формате HTML — предпросмотр текста недоступен)" if html else "(нет текстового содержимого)"
+        text = (html_to_text(html) or HTML_ONLY_PLACEHOLDER) if html else "(нет текстового содержимого)"
 
     return MessageContent(
         text=text,

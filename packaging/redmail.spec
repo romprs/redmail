@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        80%{?dist}
+Release:        81%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,10 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-81
+- Письма без текстовой части: текст извлекается из HTML — в цепочке видно содержание, а не заглушка
+- Пересылка: шапка «Пересланное сообщение» с явными цветами, видна и в тёмной теме
+- Окно письма — обычное окно с полной рамкой; размер запоминается, по умолчанию 960×720
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-80
 - Цепочки по теме: письма одной темы стоят рядом под последним письмом при любой сортировке; сортировка действует на верхний уровень, внутри цепочки — по дате, новые выше
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-79

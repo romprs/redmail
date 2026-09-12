@@ -151,6 +151,7 @@ from redmail.config_store import (
     load_signatures,
     load_theme,
     load_window_geometry,
+    load_compose_geometry,
     save_accounts,
     save_archive_storage_dir,
     save_caldav_url,
@@ -175,16 +176,19 @@ from redmail.config_store import (
     save_signatures,
     save_theme,
     save_window_geometry,
+    save_compose_geometry,
 )
 from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
 from redmail import ics_subscription, remote_images
 from redmail.imap_client import (
+    HTML_ONLY_PLACEHOLDER,
     Account,
     Attachment,
     FolderInfo,
     ImapSession,
     MessageContent,
     MessageSummary,
+    html_to_text,
     join_markers,
     split_markers,
 )
@@ -848,15 +852,17 @@ def _truncate_recipient_field(value: str, max_items: int = 3) -> tuple[str, int]
 
 
 def _html_to_preview_text(html_content: str, limit: int = 1200) -> str:
-    """Короткий текст из HTML для предпросмотра в цепочке: убрать скрипты/
-    стили и теги, свернуть пробелы."""
-    text = re.sub(r"(?is)<(script|style|head)[^>]*>.*?</\1>", " ", html_content)
-    text = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>|</li>|</h[1-6]>", "\n", text)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = html.unescape(text)
-    lines = [re.sub(r"[ \t\xa0]+", " ", line).strip() for line in text.splitlines()]
-    text = "\n".join(line for line in lines if line)
-    return text[:limit] + ("…" if len(text) > limit else "")
+    """Короткий текст из HTML для предпросмотра в цепочке."""
+    return html_to_text(html_content, limit=limit)
+
+
+def _content_preview_text(content: MessageContent, limit: int = 1200) -> str:
+    """Текст письма для цепочки: текстовая часть, а если её нет или в кэше
+    лежит старая заглушка — текст из HTML."""
+    text = (content.text or "").strip()
+    if text and text != HTML_ONLY_PLACEHOLDER:
+        return text[:limit] + ("…" if len(text) > limit else "")
+    return html_to_text(content.html, limit=limit)
 
 
 def _build_message_header_html(subject: str, sender: str, to: str, cc: str, date: str) -> str:
@@ -2164,11 +2170,28 @@ class ComposeDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
-        # Шире, чем раньше (560) — панель форматирования (Ж/К/Ч + гарнитура
-        # + размер + "Вставить изображение…") на прежней ширине не
-        # помещалась и Qt прятал лишние кнопки за скрытую стрелку ">>",
-        # тем же образом, что уже однажды случилось с основным тулбаром.
-        self.resize(680, 480)
+        # Обычное окно, а не диалог: оконный менеджер рисует у диалогов
+        # уменьшенную рамку с мелким заголовком (жалоба: "название окна
+        # очень мелко"), а окно письма живёт долго, ему нужны обычная
+        # рамка, кнопки свернуть/развернуть и место в панели задач.
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        # Размер — как пользователь оставил в прошлый раз; по умолчанию
+        # просторное окно (панель форматирования на узком окне пряталась за
+        # стрелку ">>", а письмо с картинками не влезало).
+        restored = False
+        try:
+            saved = load_compose_geometry()
+            if saved:
+                restored = bool(self.restoreGeometry(QByteArray(saved)))
+        except Exception:
+            restored = False
+        if not restored:
+            self.resize(960, 720)
         self.attachments: list[OutgoingAttachment] = list(attachments) if attachments else []
 
         self._contacts = contacts or []
@@ -2368,6 +2391,14 @@ class ComposeDialog(QDialog):
         layout.addWidget(format_toolbar)
         layout.addWidget(self.body_edit)
         layout.addWidget(buttons)
+
+    def done(self, result: int) -> None:  # noqa: N802 - Qt override
+        # Любое закрытие (отправить, черновик, крестик) — запомнить размер.
+        try:
+            save_compose_geometry(bytes(self.saveGeometry()))
+        except Exception:
+            pass  # размер окна не запомнится — не критично
+        super().done(result)
 
     def _on_save_draft(self) -> None:
         self._save_as_draft = True
@@ -7718,14 +7749,10 @@ class MainWindow(QMainWindow):
                 continue
             # Тело остальных писем цепочки — только текстом, не их родным
             # HTML: см. подробное объяснение в _build_thread_html.
-            if other_content.text.strip():
-                body = _linkify(other_content.text)
-            elif other_content.html:
-                # HTML-письмо без текстовой части: предпросмотр из самого HTML
-                # (жалоба: в цепочке одни заглушки «предпросмотр недоступен»).
-                body = _linkify(_html_to_preview_text(other_content.html))
-            else:
-                body = "<i>(письмо без текста)</i>"
+            preview = _content_preview_text(other_content)
+            # Текстовая часть, а без неё — текст из HTML (жалоба: в цепочке
+            # одни заглушки «предпросмотр текста недоступен»).
+            body = _linkify(preview) if preview else "<i>(письмо без текста)</i>"
             entries.append((other, body))
 
         thread_html = _build_thread_html(entries, summary.uid)
@@ -9086,11 +9113,19 @@ class MainWindow(QMainWindow):
         # 500 Message rejected). Если у письма есть HTML — пересылаем его
         # как есть, вместе со встроенными картинками; иначе как раньше.
         if content.html:
+            # Шапка с явными цветами: пересылаемый HTML обычно несёт свой
+            # белый фон, а цвет текста редактора в тёмной теме светлый —
+            # шапка без своих цветов была не видна (жалоба: "заголовок
+            # пересылаемого письма не видно").
             forward_header_html = (
-                "<br><br>---------- Пересланное сообщение ----------<br>"
+                "<br><br>"
+                '<div style="background:#f1f3f4;color:#202124;padding:6px 10px;'
+                'border-left:3px solid #9aa0a6;font-family:sans-serif;">'
+                "---------- Пересланное сообщение ----------<br>"
                 f"От: {html.escape(summary.sender)} &lt;{html.escape(summary.sender_email)}&gt;<br>"
                 f"Дата: {html.escape(summary.date)}<br>"
-                f"Тема: {html.escape(summary.subject)}<br><br>"
+                f"Тема: {html.escape(summary.subject)}"
+                "</div><br>"
             )
             body_kwargs = {
                 "body_html": forward_header_html + content.html,

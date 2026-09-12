@@ -12,7 +12,7 @@ from imapclient.response_types import BodyData
 
 from email import message_from_bytes
 
-from redmail.imap_client import Account, FolderInfo, ImapSession, extract_content
+from redmail.imap_client import Account, FolderInfo, ImapSession, extract_content, html_to_text
 
 _FETCH_FIELDS = ["ENVELOPE", "UID", "FLAGS", "BODYSTRUCTURE", "BODY.PEEK[HEADER.FIELDS (IMPORTANCE X-PRIORITY)]"]
 
@@ -779,7 +779,7 @@ def test_fetch_message_content_plain_text() -> None:
     fake_client.select_folder.assert_called_once_with("INBOX", readonly=False)
 
 
-def test_fetch_message_content_html_only_shows_placeholder() -> None:
+def test_fetch_message_content_html_only_gets_text_from_html() -> None:
     fake_client = _client()
     raw = (
         b"From: ivan@example.com\r\n"
@@ -792,7 +792,7 @@ def test_fetch_message_content_html_only_shows_placeholder() -> None:
     with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
         content = ImapSession(_account()).fetch_message_content("INBOX", 5)
 
-    assert "HTML" in content.text
+    assert content.text == "hello"
 
 
 def test_fetch_message_content_extracts_attachment() -> None:
@@ -1097,6 +1097,37 @@ def test_fetch_message_content_bare_calendar_message() -> None:
 
     assert len(content.attachments) == 1
     assert content.attachments[0].content_type == "text/calendar"
+
+
+def test_extract_content_html_only_message_gets_text_from_html() -> None:
+    # Жалоба: в цепочке одни заглушки «предпросмотр текста недоступен» —
+    # у писем без text/plain текст извлекается из HTML.
+    raw = (
+        b"From: Ivan <ivan@example.com>\r\nSubject: Test\r\n"
+        b"Content-Type: text/html; charset=utf-8\r\n\r\n"
+        + "<html><head><style>p{}</style></head><body><p>Привет,&nbsp;мир</p><div>вторая</div></body></html>".encode("utf-8")
+    )
+    content = extract_content(message_from_bytes(raw))
+    assert content.text == "Привет, мир\nвторая"
+    assert "<p>" in content.html
+
+
+def test_extract_content_multipart_without_plain_uses_html_text() -> None:
+    raw = (
+        b"From: Ivan <ivan@example.com>\r\nSubject: Test\r\n"
+        b"Content-Type: multipart/alternative; boundary=XX\r\n\r\n"
+        b"--XX\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        + "<b>Жирный</b> текст<br>вторая".encode("utf-8") + b"\r\n--XX--\r\n"
+    )
+    content = extract_content(message_from_bytes(raw))
+    assert content.text == "Жирный текст\nвторая"
+
+
+def test_html_to_text_limits_and_handles_empty() -> None:
+    assert html_to_text("") == ""
+    assert html_to_text(None) == ""
+    assert html_to_text(b"<p>bytes</p>") == "bytes"
+    assert html_to_text("<p>" + "а" * 50 + "</p>", limit=10) == "а" * 10 + "…"
 
 
 def test_close_logs_out() -> None:

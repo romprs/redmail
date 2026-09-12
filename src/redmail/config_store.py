@@ -354,6 +354,20 @@ def save_window_geometry(data: bytes) -> None:
     _save_settings_dict(settings)
 
 
+def load_compose_geometry() -> bytes | None:
+    """Размер и положение окна письма (написать/ответить/переслать) —
+    запоминаются между открытиями (жалоба: "размер окна пересылки и
+    создания всегда один, не запоминается изменение и очень маленькое")."""
+    value = _load_settings_dict().get("compose_geometry")
+    return base64.b64decode(value) if value else None
+
+
+def save_compose_geometry(data: bytes) -> None:
+    settings = _load_settings_dict()
+    settings["compose_geometry"] = base64.b64encode(data).decode("ascii")
+    _save_settings_dict(settings)
+
+
 def load_mail_columns_state() -> bytes | None:
     value = _load_settings_dict().get("mail_columns_state")
     return base64.b64decode(value) if value else None

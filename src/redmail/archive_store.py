@@ -9,7 +9,15 @@ from email.message import EmailMessage, Message
 from email.utils import formatdate, parseaddr
 from pathlib import Path
 
-from redmail.imap_client import decode_bytes_safely, MessageContent, MessageSummary, extract_content, parse_importance
+from redmail.imap_client import (
+    HTML_ONLY_PLACEHOLDER,
+    MessageContent,
+    MessageSummary,
+    decode_bytes_safely,
+    extract_content,
+    html_to_text,
+    parse_importance,
+)
 
 # Свой формат: один файл SQLite на архив. Не PST — по назначению аналог
 # (папка с письмами, которую можно отключить от сервера и открыть локально),
@@ -421,7 +429,7 @@ def _pst_message_to_raw(message) -> bytes:
     body = message.get_plain_text_body()
     if not body:
         html_body = message.get_html_body()
-        body = "(письмо в формате HTML — предпросмотр текста недоступен)" if html_body else "(нет текстового содержимого)"
+        body = (html_to_text(html_body) or HTML_ONLY_PLACEHOLDER) if html_body else "(нет текстового содержимого)"
     elif isinstance(body, bytes):
         body = body.decode("utf-8", errors="replace")
     email_message.set_content(body)
