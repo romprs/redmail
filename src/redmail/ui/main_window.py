@@ -351,17 +351,25 @@ def _thread_subject_text(summary: MessageSummary, info: _ThreadInfo | None, expa
 
 
 class _ThreadSortItem(QTableWidgetItem):
-    """Ячейка списка писем, при сортировке держащая письма цепочки вместе:
-    сначала сравнивается значение головного письма цепочки (для всех её
-    писем одно), затем ключ цепочки, затем головное письмо ставится первым
-    в любом направлении сортировки, и только потом — собственное значение."""
+    """Ячейка списка писем, при сортировке держащая письма цепочки вместе
+    (пожелание: "все письма с одной темой выстраиваются рядом; сортировка
+    по теме и дате работает только с верхним уровнем, а внутри цепочки —
+    всегда по дате на убывание"): сначала сравнивается значение головного
+    письма цепочки (для всех её писем одно), затем ключ цепочки, затем
+    головное письмо ставится первым в любом направлении сортировки, а
+    дочерние — по дате, новые выше, тоже независимо от направления."""
 
-    def __init__(self, text: str, *, group_value: str, group_key: str, rank: int, own: str) -> None:
+    def __init__(self, text: str, *, group_value: str, group_key: str, rank: int, own: str, date: str = "") -> None:
         super().__init__(text)
         self.group_value = group_value
         self.group_key = group_key
         self.rank = rank
         self.own = own
+        self.date = date
+
+    def _descending(self) -> bool:
+        table = self.tableWidget()
+        return table is not None and table.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
 
     def __lt__(self, other) -> bool:  # noqa: D105 - Qt sort hook
         if not isinstance(other, _ThreadSortItem):
@@ -371,13 +379,14 @@ class _ThreadSortItem(QTableWidgetItem):
         if self.group_key != other.group_key:
             return self.group_key < other.group_key
         if self.rank != other.rank:
-            table = self.tableWidget()
-            descending = (
-                table is not None
-                and table.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
-            )
-            return self.rank > other.rank if descending else self.rank < other.rank
+            return self.rank > other.rank if self._descending() else self.rank < other.rank
+        if self.rank == 1 and self.group_key:
+            # Дочерние письма одной цепочки: новые выше при любом направлении.
+            return self.date < other.date if self._descending() else self.date > other.date
         return self.own < other.own
+
+
+_SORTABLE_COLUMNS = (COL_SENDER, COL_SUBJECT, COL_DATE)
 
 # Gmail заворачивает Отправленные/Корзину и т.п. в служебный контейнер
 # "[Gmail]" — сам по себе не открывается (см. \Noselect в list_folders),
@@ -6884,6 +6893,10 @@ class MainWindow(QMainWindow):
             header.blockSignals(False)
             for col in auto_columns:
                 header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+        if header.sortIndicatorSection() not in _SORTABLE_COLUMNS:
+            # Без явной сортировки строки остаются в порядке базы и письма
+            # цепочки разбросаны по списку — по умолчанию дата, новые сверху.
+            header.setSortIndicator(COL_DATE, Qt.SortOrder.DescendingOrder)
         self.table.setSortingEnabled(True)
         self._populate_cards(summaries, is_sent_folder)
 
@@ -6912,29 +6925,38 @@ class MainWindow(QMainWindow):
             check_item.setData(Qt.ItemDataRole.UserRole, summary.uid)
             self.table.setItem(row, COL_CHECK, check_item)
 
-            flag_item = self._readonly_item("")
-            if summary.marker_color:
-                flag_item.setIcon(_markers_icon(summary.marker_color))
-            self.table.setItem(row, COL_FLAG, flag_item)
-
-            self.table.setItem(row, COL_IMPORTANCE, self._readonly_item(_importance_mark(summary.importance)))
-            self.table.setItem(
-                row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
-            )
             info = self._thread_info.get(summary.uid)
             head = self.summaries_by_uid.get(info.head_uid, summary) if info is not None else summary
             group_key = info.key if info is not None else ""
             rank = 0 if info is None or info.is_head else 1
+
+            def thread_item(text: str, head_value: str, own: str | None = None) -> _ThreadSortItem:
+                return _ThreadSortItem(
+                    text, group_value=head_value, group_key=group_key, rank=rank,
+                    own=text if own is None else own, date=summary.date,
+                )
+
+            flag_item = self._readonly_item(thread_item("", head.marker_color or "", summary.marker_color or ""))
+            if summary.marker_color:
+                flag_item.setIcon(_markers_icon(summary.marker_color))
+            self.table.setItem(row, COL_FLAG, flag_item)
+
+            self.table.setItem(
+                row, COL_IMPORTANCE,
+                self._readonly_item(thread_item(_importance_mark(summary.importance), _importance_mark(head.importance))),
+            )
+            self.table.setItem(
+                row, COL_ATTACHMENT,
+                self._readonly_item(thread_item(
+                    _ATTACHMENT_MARK if summary.has_attachments else "", _ATTACHMENT_MARK if head.has_attachments else "",
+                )),
+            )
             sender_text = summary.to if is_sent_folder else summary.sender
             head_sender = head.to if is_sent_folder else head.sender
-            sender_item = _ThreadSortItem(
-                sender_text, group_value=(head_sender or "").casefold(), group_key=group_key, rank=rank,
-                own=(sender_text or "").casefold(),
-            )
-            subject_item = _ThreadSortItem(
+            sender_item = thread_item(sender_text, (head_sender or "").casefold(), (sender_text or "").casefold())
+            subject_item = thread_item(
                 _thread_subject_text(summary, info, group_key in self._expanded_threads),
-                group_value=group_key or _normalize_subject(summary.subject or "").casefold(), group_key=group_key,
-                rank=rank, own=(summary.subject or "").casefold(),
+                group_key or _normalize_subject(summary.subject or "").casefold(), (summary.subject or "").casefold(),
             )
             if not summary.is_read:
                 # Непрочитанное — жирным, как в любом другом почтовом клиенте.
@@ -6944,14 +6966,11 @@ class MainWindow(QMainWindow):
                 subject_item.setFont(bold_font)
             self.table.setItem(row, COL_SENDER, sender_item)
             self.table.setItem(row, COL_SUBJECT, subject_item)
-            self.table.setItem(
-                row, COL_DATE,
-                _ThreadSortItem(summary.date, group_value=head.date, group_key=group_key, rank=rank, own=summary.date),
-            )
+            self.table.setItem(row, COL_DATE, thread_item(summary.date, head.date))
 
     @staticmethod
-    def _readonly_item(text: str) -> QTableWidgetItem:
-        item = QTableWidgetItem(text)
+    def _readonly_item(text: str | QTableWidgetItem) -> QTableWidgetItem:
+        item = QTableWidgetItem(text) if isinstance(text, str) else text
         item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         return item

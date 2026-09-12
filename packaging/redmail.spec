@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        79%{?dist}
+Release:        80%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-80
+- Цепочки по теме: письма одной темы стоят рядом под последним письмом при любой сортировке; сортировка действует на верхний уровень, внутри цепочки — по дате, новые выше
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-79
 - Закрытие окна больше не зависает на выходе с сервера: соединения закрываются в фоне не дольше 5 с, занятое соединение просто обрывается
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-78
