@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        78%{?dist}
+Release:        79%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-79
+- Закрытие окна больше не зависает на выходе с сервера: соединения закрываются в фоне не дольше 5 с, занятое соединение просто обрывается
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-78
 - Открытие письма идёт по отдельному соединению с сервером и не ждёт фоновую синхронизацию и автоархив
 - Сортировка списка писем из меню «Сортировка» (работает и в режиме плиток); плитки следуют порядку таблицы

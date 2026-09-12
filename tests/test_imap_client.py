@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime
 from email.header import Header
 from types import SimpleNamespace
@@ -1105,6 +1107,43 @@ def test_close_logs_out() -> None:
         session.close()
 
     fake_client.logout.assert_called_once()
+    fake_client.shutdown.assert_not_called()
+
+
+def test_close_does_not_wait_for_busy_connection() -> None:
+    # Окно зависало при выходе: closeEvent ждал LOGOUT, пока фоновый поток
+    # держал соединение. Занятое соединение закрывается сокетом сразу.
+    fake_client = MagicMock()
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold_lock() -> None:
+        with session._lock:  # noqa: SLF001 - имитация фоновой команды
+            holding.set()
+            release.wait(5)
+
+    worker = threading.Thread(target=hold_lock)
+    worker.start()
+    assert holding.wait(2)
+    started = time.monotonic()
+    session.close()
+    elapsed = time.monotonic() - started
+    release.set()
+    worker.join(5)
+    assert elapsed < 1.0
+    fake_client.logout.assert_not_called()
+    fake_client.shutdown.assert_called_once()
+
+
+def test_close_falls_back_to_shutdown_when_logout_fails() -> None:
+    fake_client = MagicMock()
+    fake_client.logout.side_effect = OSError("timed out")
+    with patch("redmail.imap_client.IMAPClient", return_value=fake_client):
+        session = ImapSession(_account())
+        session.close()
+    fake_client.shutdown.assert_called_once()
 
 
 def test_session_serializes_commands_from_several_threads() -> None:

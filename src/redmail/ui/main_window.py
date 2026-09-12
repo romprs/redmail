@@ -288,6 +288,17 @@ _ATTACHMENT_MARK = "\U0001F4CE"  # 📎 — по запросу именно с�
 _REPLIED_MARK = "↩"  # ↩ — письмо, на которое уже отправлен ответ (флаг \Answered)
 
 
+# Сколько ждать закрытия сетевых соединений при выходе из программы.
+CLOSE_WAIT_SECONDS = 5
+
+
+def _close_quietly(source) -> None:
+    try:
+        source.close()
+    except Exception as exc:
+        _log.warning("Закрытие соединения: %s", exc)
+
+
 def _subject_display_text(summary: MessageSummary) -> str:
     return f"{_REPLIED_MARK} {summary.subject}" if summary.is_answered else summary.subject
 
@@ -9608,8 +9619,15 @@ class MainWindow(QMainWindow):
         except Exception:
             pass  # закрытие окна не должно падать из-за необязательного канала
         self.poll_timer.stop()
-        for mailbox in self.mailboxes.values():
-            mailbox.close()
+        # Сетевые соединения закрываются в отдельном потоке с ограничением
+        # по времени: окно не должно висеть на LOGOUT, если сервер молчит
+        # или соединение занято фоном (жалоба: "опять висит приложение").
+        mailboxes = list(self.mailboxes.values())
+        closer = threading.Thread(target=lambda: [_close_quietly(m) for m in mailboxes], daemon=True)
+        closer.start()
+        closer.join(CLOSE_WAIT_SECONDS)
+        if closer.is_alive():
+            _log.warning("Закрытие соединений не уложилось в %d с — выходим без ожидания", CLOSE_WAIT_SECONDS)
         for archive in self.archives.values():
             archive.close()
         for temp_dir in self._temp_attachment_dirs:

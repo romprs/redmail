@@ -52,6 +52,8 @@ def join_markers(colors) -> str | None:
 # длительность загрузки большого письма целиком — только паузу между
 # порциями данных от сервера.
 SOCKET_TIMEOUT = 120
+# Таймаут вежливого LOGOUT при закрытии программы — дольше ждать незачем.
+CLOSE_TIMEOUT = 5
 
 # Сентинел по умолчанию для set_marker(previous_color=...) — отличает "вызывающий
 # код не знает текущий маркер" (безопасный медленный путь: снять все
@@ -266,11 +268,31 @@ class ImapSession:
         return IMAPClient(self.account.host, port=self.account.port, ssl=self.account.use_ssl, timeout=SOCKET_TIMEOUT)
 
     def close(self) -> None:
-        with self._lock:
+        """Закрытие при выходе из программы. Не должно блокировать поток
+        интерфейса: окно зависало в closeEvent на LOGOUT (py-spy на .80 —
+        главный поток в ssl.read внутри logout), пока фоновый поток
+        (синхронизация, автоархив) держал соединение. Если соединение
+        сейчас свободно — вежливый LOGOUT с коротким таймаутом; если
+        занято — просто закрыть сокет, это же разбудит фоновый поток."""
+        acquired = self._lock.acquire(blocking=False)
+        try:
+            if acquired:
+                try:
+                    self._client._imap.sock.settimeout(CLOSE_TIMEOUT)  # noqa: SLF001 - у IMAPClient нет публичного доступа к сокету
+                except Exception:
+                    pass
+                try:
+                    self._client.logout()
+                    return
+                except Exception:
+                    pass
             try:
-                self._client.logout()
+                self._client.shutdown()  # закрывает сокет без LOGOUT (shutdown(SHUT_RDWR) будит читающий поток)
             except Exception:
                 pass
+        finally:
+            if acquired:
+                self._lock.release()
 
     def _reconnect(self) -> None:
         self._client = self._new_client()
