@@ -31,6 +31,10 @@ BuildRequires:  openssl-devel
 BuildRequires:  krb5-devel
 
 Requires:       python3 >= 3.9
+# Голосовой помощник — отдельный продукт и отдельный пакет; «рекомендуемая»
+# зависимость: dnf ставит его вместе с почтой, если пакет доступен (лежит
+# рядом или есть в репозитории), и не мешает установке, если его нет.
+Recommends:     audioreferent
 
 # Всё под /opt/redmail/venv — сторонние pip-пакеты (в основном PySide6),
 # не наш код. rpm's brp-mangle-shebangs требует, чтобы каждый исполняемый

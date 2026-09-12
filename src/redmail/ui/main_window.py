@@ -188,7 +188,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import autoarchive, profile, secret_store, sync_engine
+from redmail import autoarchive, profile, secret_store, sync_engine, voice_assistant
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -1633,6 +1633,34 @@ class SettingsDialog(QDialog):
         storage_group = QGroupBox("Хранилище")
         storage_group.setLayout(storage_form)
         layout.addWidget(storage_group)
+
+        # Голосовой помощник (audioreferent) — отдельный продукт, здесь только
+        # управление им: включить/выключить сервис, состояние, его настройки,
+        # журнал, проверка связи по локальному каналу.
+        self.voice_status_label = QLabel("", self)
+        self.voice_status_label.setWordWrap(True)
+        self.voice_enable_check = QCheckBox("Голосовое управление включено (сервис помощника запускается при входе)", self)
+        self.voice_enable_check.toggled.connect(self._on_voice_toggle)
+        self.voice_settings_button = QPushButton("Настройки помощника…", self)
+        self.voice_settings_button.clicked.connect(self._on_voice_settings)
+        self.voice_log_button = QPushButton("Журнал помощника…", self)
+        self.voice_log_button.clicked.connect(self._on_voice_log)
+        self.voice_check_button = QPushButton("Проверить связь", self)
+        self.voice_check_button.clicked.connect(self._on_voice_check)
+        voice_buttons = QHBoxLayout()
+        voice_buttons.addWidget(self.voice_settings_button)
+        voice_buttons.addWidget(self.voice_log_button)
+        voice_buttons.addWidget(self.voice_check_button)
+        voice_buttons.addStretch(1)
+        voice_form = QFormLayout()
+        voice_form.addRow(self.voice_status_label)
+        voice_form.addRow(self.voice_enable_check)
+        voice_form.addRow(voice_buttons)
+        voice_group = QGroupBox("Голосовой помощник")
+        voice_group.setLayout(voice_form)
+        layout.addWidget(voice_group)
+        self._voice_updating = False
+        self._refresh_voice_state()
         layout.addWidget(accounts_rules_group)
         layout.addWidget(buttons)
 
@@ -1697,6 +1725,73 @@ class SettingsDialog(QDialog):
         worker.failed.connect(on_failure)
         self._smtp_test_worker = worker
         worker.start()
+
+    # ---- Голосовой помощник ---------------------------------------------------
+
+    def _refresh_voice_state(self) -> None:
+        try:
+            st = voice_assistant.state()
+        except Exception as exc:  # настройки не должны падать из-за помощника
+            st = voice_assistant.AssistantState(installed=False, detail=str(exc))
+        self._voice_updating = True
+        try:
+            if not st.installed:
+                self.voice_status_label.setText(
+                    "Помощник не установлен. Установите пакет audioreferent (ставится вместе с почтой, "
+                    "если лежит рядом при установке), затем откройте этот раздел снова."
+                )
+                self.voice_enable_check.setChecked(False)
+            else:
+                parts = [f"Состояние: {st.status_text}"]
+                if st.version:
+                    parts.append(f"версия {st.version}")
+                if st.wake_word:
+                    parts.append(f"ключевое слово «{st.wake_word}»")
+                if st.detail:
+                    parts.append(st.detail)
+                self.voice_status_label.setText("; ".join(parts))
+                self.voice_enable_check.setChecked(st.enabled or st.active)
+            for widget in (self.voice_enable_check, self.voice_settings_button, self.voice_log_button, self.voice_check_button):
+                widget.setEnabled(st.installed)
+        finally:
+            self._voice_updating = False
+
+    def _on_voice_toggle(self, checked: bool) -> None:
+        if self._voice_updating:
+            return
+        ok, message = voice_assistant.set_enabled(checked)
+        if not ok:
+            QMessageBox.warning(self, "Голосовой помощник", message)
+        self._refresh_voice_state()
+
+    def _on_voice_settings(self) -> None:
+        if not voice_assistant.open_settings():
+            QMessageBox.warning(self, "Голосовой помощник", "Не удалось открыть настройки помощника.")
+
+    def _on_voice_log(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Журнал голосового помощника")
+        dialog.resize(800, 500)
+        layout = QVBoxLayout(dialog)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(voice_assistant.recent_log())
+        layout.addWidget(text)
+        close_button = QPushButton("Закрыть", dialog)
+        close_button.clicked.connect(dialog.accept)
+        layout.addWidget(close_button)
+        dialog.exec()
+
+    def _on_voice_check(self) -> None:
+        st = voice_assistant.state()
+        channel = voice_assistant.ipc_endpoint_published()
+        lines = [
+            f"Помощник: {st.status_text}.",
+            "Канал управления почты: " + ("опубликован, помощник сможет открывать письма и встречи." if channel else "не опубликован — перезапустите почту."),
+        ]
+        if st.installed and not st.active:
+            lines.append("Включите помощника галочкой выше, чтобы команды обрабатывались.")
+        QMessageBox.information(self, "Проверка связи", "\n".join(lines))
 
     def _on_browse_profile_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "Каталог профиля", self.profile_dir_edit.text())
