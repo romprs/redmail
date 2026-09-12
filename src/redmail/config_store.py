@@ -185,6 +185,18 @@ def save_mail_view_mode(mode: str) -> None:
     _save_settings_dict(data)
 
 
+def load_thread_grouping() -> bool:
+    """Группировка писем одной темы в списке: показывается последнее письмо
+    цепочки, остальные скрыты под раскрывающимся значком."""
+    return bool(_load_settings_dict().get("thread_grouping", True))
+
+
+def save_thread_grouping(enabled: bool) -> None:
+    data = _load_settings_dict()
+    data["thread_grouping"] = bool(enabled)
+    _save_settings_dict(data)
+
+
 @dataclass
 class Signature:
     id: str

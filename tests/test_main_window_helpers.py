@@ -1,13 +1,52 @@
 from __future__ import annotations
 
 from redmail import contact_store
+from redmail.imap_client import MessageSummary
 from redmail.ui.main_window import (
     _contact_candidates,
     _format_recipient_candidate,
+    _html_to_preview_text,
     _normalize_subject,
     _parse_recipient_list,
     _safe_attachment_filename,
+    _thread_infos,
+    _thread_subject_text,
 )
+
+
+def _summary(uid: int, date: str, subject: str) -> MessageSummary:
+    return MessageSummary(uid=uid, subject=subject, sender="Ivan", sender_email="ivan@example.com", date=date, message_id=f"<{uid}@x>")
+
+
+def test_thread_infos_groups_by_normalized_subject_with_newest_head() -> None:
+    # Пожелание: "надо скрывать более ранние письма и показывать символ
+    # группировки" — цепочка по теме без Re:/Fwd:, головное — самое новое.
+    infos = _thread_infos([
+        _summary(1, "2026-09-10 10:00", "Посылка"),
+        _summary(2, "2026-09-12 10:00", "Re: Посылка"),
+        _summary(3, "2026-09-11 10:00", "Fwd: посылка"),
+        _summary(4, "2026-09-11 10:00", "Другое"),
+        _summary(5, "2026-09-11 10:00", ""),
+    ])
+    assert infos[2].is_head and infos[2].count == 3
+    assert not infos[1].is_head and infos[1].head_uid == 2 and infos[3].head_uid == 2
+    assert infos[4].count == 1 and infos[4].is_head
+    assert 5 not in infos  # без темы не группируем
+
+
+def test_thread_subject_text_marks_head_and_indents_children() -> None:
+    infos = _thread_infos([_summary(1, "2026-09-10 10:00", "Тема"), _summary(2, "2026-09-12 10:00", "Re: Тема")])
+    assert _thread_subject_text(_summary(2, "", "Re: Тема"), infos[2], expanded=False) == "▸ Re: Тема (2)"
+    assert _thread_subject_text(_summary(2, "", "Re: Тема"), infos[2], expanded=True) == "▾ Re: Тема (2)"
+    assert _thread_subject_text(_summary(1, "", "Тема"), infos[1], expanded=True).endswith("Тема")
+    assert _thread_subject_text(_summary(1, "", "Тема"), infos[1], expanded=True).startswith(" ")
+    assert _thread_subject_text(_summary(9, "", "Одно"), None, expanded=False) == "Одно"
+
+
+def test_html_to_preview_text_strips_markup_and_scripts() -> None:
+    html_content = "<html><head><style>p{}</style></head><body><p>Привет,&nbsp;мир</p><div>вторая</div><script>x()</script></body></html>"
+    assert _html_to_preview_text(html_content) == "Привет, мир\nвторая"
+    assert _html_to_preview_text("<p>" + "а" * 50 + "</p>", limit=10) == "а" * 10 + "…"
 
 
 def test_normalize_subject_strips_single_prefix() -> None:

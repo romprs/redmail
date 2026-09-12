@@ -5,7 +5,7 @@ import html
 import math
 import os
 from collections.abc import Callable
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 import mimetypes
 import re
 import shutil
@@ -140,6 +140,7 @@ from redmail.config_store import (
     load_font_scale,
     load_profile_dir,
     load_mail_view_mode,
+    load_thread_grouping,
     load_mail_columns_state,
     load_mail_date_column_pinned,
     load_mail_rules,
@@ -163,6 +164,7 @@ from redmail.config_store import (
     save_font_scale,
     save_profile_dir,
     save_mail_view_mode,
+    save_thread_grouping,
     save_mail_columns_state,
     save_mail_date_column_pinned,
     save_mail_rules,
@@ -288,6 +290,83 @@ _REPLIED_MARK = "↩"  # ↩ — письмо, на которое уже отп
 
 def _subject_display_text(summary: MessageSummary) -> str:
     return f"{_REPLIED_MARK} {summary.subject}" if summary.is_answered else summary.subject
+
+
+_THREAD_COLLAPSED_MARK = "▸"
+_THREAD_EXPANDED_MARK = "▾"
+_THREAD_CHILD_INDENT = "      "
+_THREAD_TOGGLE_WIDTH = 22  # px слева в ячейке темы / строке плитки, где клик сворачивает/раскрывает
+
+
+@dataclass
+class _ThreadInfo:
+    """Место письма в цепочке по теме: ключ группы, головное ли оно
+    (самое новое — оно и остаётся видимым в свёрнутой цепочке), сколько
+    писем в цепочке, uid головного."""
+
+    key: str
+    is_head: bool
+    count: int
+    head_uid: int
+
+
+def _thread_infos(summaries: list[MessageSummary]) -> dict[int, _ThreadInfo]:
+    """Группировка списка по нормализованной теме (без Re:/Fwd:). Головное
+    письмо — самое новое по дате (при равенстве — с большим uid). Письма
+    без темы не группируются (пожелание: "надо скрывать более ранние
+    письма и показывать символ группировки типа раскрывающегося списка")."""
+    groups: dict[str, list[MessageSummary]] = {}
+    for summary in summaries:
+        key = _normalize_subject(summary.subject or "").casefold()
+        if not key:
+            continue
+        groups.setdefault(key, []).append(summary)
+    infos: dict[int, _ThreadInfo] = {}
+    for key, members in groups.items():
+        head = max(members, key=lambda s: (s.date, s.uid))
+        for summary in members:
+            infos[summary.uid] = _ThreadInfo(key, summary is head, len(members), head.uid)
+    return infos
+
+
+def _thread_subject_text(summary: MessageSummary, info: _ThreadInfo | None, expanded: bool) -> str:
+    text = _subject_display_text(summary)
+    if info is None or info.count < 2:
+        return text
+    if info.is_head:
+        mark = _THREAD_EXPANDED_MARK if expanded else _THREAD_COLLAPSED_MARK
+        return f"{mark} {text} ({info.count})"
+    return _THREAD_CHILD_INDENT + text
+
+
+class _ThreadSortItem(QTableWidgetItem):
+    """Ячейка списка писем, при сортировке держащая письма цепочки вместе:
+    сначала сравнивается значение головного письма цепочки (для всех её
+    писем одно), затем ключ цепочки, затем головное письмо ставится первым
+    в любом направлении сортировки, и только потом — собственное значение."""
+
+    def __init__(self, text: str, *, group_value: str, group_key: str, rank: int, own: str) -> None:
+        super().__init__(text)
+        self.group_value = group_value
+        self.group_key = group_key
+        self.rank = rank
+        self.own = own
+
+    def __lt__(self, other) -> bool:  # noqa: D105 - Qt sort hook
+        if not isinstance(other, _ThreadSortItem):
+            return super().__lt__(other)
+        if self.group_value != other.group_value:
+            return self.group_value < other.group_value
+        if self.group_key != other.group_key:
+            return self.group_key < other.group_key
+        if self.rank != other.rank:
+            table = self.tableWidget()
+            descending = (
+                table is not None
+                and table.horizontalHeader().sortIndicatorOrder() == Qt.SortOrder.DescendingOrder
+            )
+            return self.rank > other.rank if descending else self.rank < other.rank
+        return self.own < other.own
 
 # Gmail заворачивает Отправленные/Корзину и т.п. в служебный контейнер
 # "[Gmail]" — сам по себе не открывается (см. \Noselect в list_folders),
@@ -1100,9 +1179,12 @@ class _MessageCardDelegate(QStyledItemDelegate):
     AVATAR = 36
     PAD = 8
 
-    def __init__(self, summaries_by_uid, parent=None) -> None:
+    def __init__(self, summaries_by_uid, parent=None, *, thread_info=None, on_thread_toggle=None) -> None:
         super().__init__(parent)
         self._summaries_by_uid = summaries_by_uid
+        self._thread_info = thread_info or (lambda uid: None)
+        self._on_thread_toggle = on_thread_toggle
+        self.expanded_keys: set[str] = set()
         self.sent_mode = False
 
     def _summary(self, index) -> MessageSummary | None:
@@ -1197,9 +1279,22 @@ class _MessageCardDelegate(QStyledItemDelegate):
             indicator_x -= w + 6
             painter.setPen(muted)
             painter.drawText(QRect(indicator_x, y2, w, line_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        # Цепочка по теме: у головного письма — значок раскрытия и число
+        # писем, у дочерних — отступ.
+        info = self._thread_info(summary.uid)
+        subject_x = x
+        if info is not None and info.count > 1:
+            if info.is_head:
+                mark = _THREAD_EXPANDED_MARK if info.key in self.expanded_keys else _THREAD_COLLAPSED_MARK
+                painter.setPen(muted)
+                painter.setFont(normal)
+                painter.drawText(QRect(x, y2, _THREAD_TOGGLE_WIDTH, line_h), Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, f"{mark} {info.count}")
+                subject_x = x + _THREAD_TOGGLE_WIDTH + painter.fontMetrics().horizontalAdvance(str(info.count)) + 2
+            else:
+                subject_x = x + _THREAD_TOGGLE_WIDTH
         painter.setPen(text_color)
         painter.setFont(normal if summary.is_read else bold)
-        subject_rect = QRect(x, y2, max(10, indicator_x - self.PAD - x), line_h)
+        subject_rect = QRect(subject_x, y2, max(10, indicator_x - self.PAD - subject_x), line_h)
         painter.drawText(
             subject_rect,
             Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
@@ -1220,7 +1315,20 @@ class _MessageCardDelegate(QStyledItemDelegate):
                 new_state = Qt.CheckState.Unchecked if current == Qt.CheckState.Checked else Qt.CheckState.Checked
                 model.setData(index, new_state, Qt.ItemDataRole.CheckStateRole)
                 return True
+        if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
+            # Клик по значку цепочки — свернуть/раскрыть, не меняя выбор.
+            uid = index.data(Qt.ItemDataRole.UserRole)
+            info = self._thread_info(uid)
+            if info is not None and info.count > 1 and info.is_head and self._on_thread_toggle is not None:
+                toggle_rect = self._thread_toggle_rect(option.rect)
+                if toggle_rect.contains(event.position().toPoint()):
+                    self._on_thread_toggle(info.key)
+                    return True
         return super().editorEvent(event, model, option, index)
+
+    def _thread_toggle_rect(self, rect: QRect) -> QRect:
+        x = self._check_rect(rect).right() + self.PAD + 2 + self.AVATAR + self.PAD + 2
+        return QRect(x - 4, rect.top(), _THREAD_TOGGLE_WIDTH + 18, rect.height())
 
 
 def _icon_color() -> str:
@@ -4364,6 +4472,8 @@ class MainWindow(QMainWindow):
         self.sort_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         self.sort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.sort_button.setMenu(self._build_sort_menu())
+        self.thread_grouping = load_thread_grouping()
+        self.thread_grouping_action.setChecked(self.thread_grouping)
         view_group = QActionGroup(self)
         view_group.setExclusive(True)
         self.view_table_action = QAction(_toolbar_icon("view_table"), "Таблица", self)
@@ -4384,7 +4494,10 @@ class MainWindow(QMainWindow):
 
         # Плитки — второй режим списка (см. _populate_cards и далее).
         self.card_list = QListWidget(self)
-        self.card_delegate = _MessageCardDelegate(lambda: self.summaries_by_uid, self.card_list)
+        self.card_delegate = _MessageCardDelegate(
+            lambda: self.summaries_by_uid, self.card_list,
+            thread_info=lambda uid: self._thread_info.get(uid), on_thread_toggle=self._toggle_thread,
+        )
         self.card_list.setItemDelegate(self.card_delegate)
         self.card_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.card_list.setMouseTracking(True)
@@ -4396,6 +4509,11 @@ class MainWindow(QMainWindow):
         self.card_list.itemDoubleClicked.connect(self._on_card_double_clicked)
         self._card_items_by_uid: dict[int, QListWidgetItem] = {}
         self._syncing_card_selection = False
+        # Цепочки по теме в списке: показывается последнее письмо, остальные
+        # скрыты под значком раскрытия (и в таблице, и в плитках).
+        self._thread_info: dict[int, _ThreadInfo] = {}
+        self._expanded_threads: set[str] = set()
+        self.table.viewport().installEventFilter(self)
         self.mail_view_mode = load_mail_view_mode()
 
         table_container = QWidget(self)
@@ -6670,7 +6788,7 @@ class MainWindow(QMainWindow):
                 visible = needle in value
             summary = self._summary_for_row(row)
             if visible and summary is not None:
-                visible = self._summary_passes_filters(summary)
+                visible = self._summary_passes_filters(summary) and not self._thread_hidden(summary, needle)
             self.table.setRowHidden(row, not visible)
             if summary is not None:
                 card = self._card_items_by_uid.get(summary.uid)
@@ -6746,6 +6864,8 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
         header.blockSignals(True)
         self.table.setUpdatesEnabled(False)
+        self._thread_info = _thread_infos(summaries) if self.thread_grouping else {}
+        self.card_delegate.expanded_keys = self._expanded_threads
         try:
             self._fill_message_rows(summaries, is_sent_folder)
         finally:
@@ -6790,8 +6910,21 @@ class MainWindow(QMainWindow):
             self.table.setItem(
                 row, COL_ATTACHMENT, self._readonly_item(_ATTACHMENT_MARK if summary.has_attachments else "")
             )
-            sender_item = QTableWidgetItem(summary.to if is_sent_folder else summary.sender)
-            subject_item = QTableWidgetItem(_subject_display_text(summary))
+            info = self._thread_info.get(summary.uid)
+            head = self.summaries_by_uid.get(info.head_uid, summary) if info is not None else summary
+            group_key = info.key if info is not None else ""
+            rank = 0 if info is None or info.is_head else 1
+            sender_text = summary.to if is_sent_folder else summary.sender
+            head_sender = head.to if is_sent_folder else head.sender
+            sender_item = _ThreadSortItem(
+                sender_text, group_value=(head_sender or "").casefold(), group_key=group_key, rank=rank,
+                own=(sender_text or "").casefold(),
+            )
+            subject_item = _ThreadSortItem(
+                _thread_subject_text(summary, info, group_key in self._expanded_threads),
+                group_value=group_key or _normalize_subject(summary.subject or "").casefold(), group_key=group_key,
+                rank=rank, own=(summary.subject or "").casefold(),
+            )
             if not summary.is_read:
                 # Непрочитанное — жирным, как в любом другом почтовом клиенте.
                 bold_font = sender_item.font()
@@ -6800,7 +6933,10 @@ class MainWindow(QMainWindow):
                 subject_item.setFont(bold_font)
             self.table.setItem(row, COL_SENDER, sender_item)
             self.table.setItem(row, COL_SUBJECT, subject_item)
-            self.table.setItem(row, COL_DATE, QTableWidgetItem(summary.date))
+            self.table.setItem(
+                row, COL_DATE,
+                _ThreadSortItem(summary.date, group_value=head.date, group_key=group_key, rank=rank, own=summary.date),
+            )
 
     @staticmethod
     def _readonly_item(text: str) -> QTableWidgetItem:
@@ -6884,8 +7020,66 @@ class MainWindow(QMainWindow):
             group.addAction(action)
             self._sort_actions[action] = (column, order)
         group.triggered.connect(self._on_sort_action)
+        menu.addSeparator()
+        self.thread_grouping_action = menu.addAction("Группировать письма по теме")
+        self.thread_grouping_action.setCheckable(True)
+        self.thread_grouping_action.toggled.connect(self._on_thread_grouping_toggled)
         menu.aboutToShow.connect(self._sync_sort_menu)
         return menu
+
+    # ---- Цепочки по теме в списке ------------------------------------------
+
+    def _on_thread_grouping_toggled(self, enabled: bool) -> None:
+        if enabled == self.thread_grouping:
+            return
+        self.thread_grouping = enabled
+        try:
+            save_thread_grouping(enabled)
+        except Exception:
+            pass
+        if self.current_folder is not None:
+            self._render_folder(list(self.current_summaries))
+
+    def _toggle_thread(self, key: str) -> None:
+        if key in self._expanded_threads:
+            self._expanded_threads.discard(key)
+        else:
+            self._expanded_threads.add(key)
+        self.card_delegate.expanded_keys = self._expanded_threads
+        for uid, info in self._thread_info.items():
+            if info.key == key and info.is_head:
+                row = self._row_for_uid(uid)
+                summary = self.summaries_by_uid.get(uid)
+                if row is not None and summary is not None:
+                    item = self.table.item(row, COL_SUBJECT)
+                    if item is not None:
+                        item.setText(_thread_subject_text(summary, info, key in self._expanded_threads))
+                break
+        self.on_filter_changed(self.filter_edit.text())
+        self._refresh_cards()
+
+    def _thread_hidden(self, summary: MessageSummary, needle: str) -> bool:
+        """Дочернее письмо свёрнутой цепочки скрыто — кроме случая, когда
+        идёт поиск по строке: найденное показываем всегда."""
+        if needle:
+            return False
+        info = self._thread_info.get(summary.uid)
+        return info is not None and info.count > 1 and not info.is_head and info.key not in self._expanded_threads
+
+    def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        if watched is self.table.viewport() and event.type() == QEvent.Type.MouseButtonPress \
+                and event.button() == Qt.MouseButton.LeftButton:
+            pos = event.position().toPoint()
+            index = self.table.indexAt(pos)
+            if index.isValid() and index.column() == COL_SUBJECT:
+                summary = self._summary_for_row(index.row())
+                info = self._thread_info.get(summary.uid) if summary is not None else None
+                if info is not None and info.count > 1 and info.is_head:
+                    cell_left = self.table.visualRect(index).left()
+                    if pos.x() - cell_left <= _THREAD_TOGGLE_WIDTH:
+                        self._toggle_thread(info.key)
+                        return True
+        return super().eventFilter(watched, event)
 
     def _sync_sort_menu(self) -> None:
         header = self.table.horizontalHeader()
@@ -7563,14 +7757,15 @@ class MainWindow(QMainWindow):
         self._run_in_background(source.set_answered, folder, uid)  # необязательная отметка — письмо уже реально отправлено
         if self.current_folder != folder or self.active_source is not source:
             return
-        for row, summary in enumerate(self.current_summaries):
-            if summary.uid == uid:
-                summary.is_answered = True
-                item = self.table.item(row, COL_SUBJECT)
-                if item is not None:
-                    item.setText(_subject_display_text(summary))
-                self._refresh_cards()
-                break
+        summary = self.summaries_by_uid.get(uid)
+        if summary is not None:
+            summary.is_answered = True
+            row = self._row_for_uid(uid)
+            item = self.table.item(row, COL_SUBJECT) if row is not None else None
+            if item is not None:
+                info = self._thread_info.get(uid)
+                item.setText(_thread_subject_text(summary, info, info is not None and info.key in self._expanded_threads))
+            self._refresh_cards()
 
     def _update_invite_bar(self, content: MessageContent) -> None:
         calendar_part = next((a for a in content.attachments if a.content_type == "text/calendar"), None)
