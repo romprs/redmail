@@ -102,6 +102,10 @@ class CachedMailbox:
                 skip_folders=self.skip_body_folders,
             )
 
+    def interactive_session(self):
+        """Соединение для запросов из интерфейса (счётчики непрочитанных и т.п.)."""
+        return self._reader_session()
+
     def _reader_session(self):
         """Соединение для действий пользователя (открыть письмо, удалить,
         отметить, обновить папку, положить копию в «Отправленные»):

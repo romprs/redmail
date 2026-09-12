@@ -5541,9 +5541,10 @@ class MainWindow(QMainWindow):
 
         def fetch_counts() -> dict[str, int]:
             counts: dict[str, int] = {}
+            session = mailbox.interactive_session() if isinstance(mailbox, CachedMailbox) else mailbox.session
             for info in folders:
                 try:
-                    counts[info.name] = mailbox.session.folder_unseen_count(info.name)
+                    counts[info.name] = session.folder_unseen_count(info.name)
                 except Exception:
                     continue
             return counts
@@ -6889,6 +6890,44 @@ class MainWindow(QMainWindow):
         self._set_busy(f"{key}: автоархив, раунд {plan.count} писем ({plan.db_bytes / (1024 * 1024):.0f} МБ → цель {plan.threshold_bytes * 0.8 / (1024 * 1024):.0f} МБ)…")
         worker.start()
 
+    def _refresh_inbox_async(self) -> None:
+        """Тихая проверка «Входящих» по таймеру, когда открыта другая папка:
+        заголовки и счётчик непрочитанных в дереве."""
+        mailbox = self.mailbox
+        if not isinstance(mailbox, CachedMailbox) or getattr(self, "_inbox_refresh_in_progress", False):
+            return
+        key = next((k for k, m in self.mailboxes.items() if m is mailbox), None)
+        if key is None:
+            return
+        self._inbox_refresh_in_progress = True
+
+        def refresh() -> dict[str, int]:
+            mailbox.refresh_folder("INBOX")
+            try:
+                return {"INBOX": mailbox.interactive_session().folder_unseen_count("INBOX")}
+            except Exception:
+                return {}
+
+        worker = _CallableWorker(refresh, parent=self)
+
+        def finish() -> None:
+            self._inbox_refresh_in_progress = False
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
+        def on_success(counts: object) -> None:
+            finish()
+            if counts:
+                self._apply_folder_unread_counts(key, counts)
+
+        def on_failure(_error_text: str) -> None:
+            finish()
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._background_workers.append(worker)
+        worker.start()
+
     def _on_periodic_refresh(self) -> None:
         # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
         # чтобы не перебивать пользователя, если тот занят (например, пишет письмо).
@@ -6896,11 +6935,13 @@ class MainWindow(QMainWindow):
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
         self._refresh_folder_async(silent=True)
-        # Каждый опрос — только текущая папка. Полный проход по всем папкам
-        # и докачка тел — раз в шесть опросов (полчаса при 5 минутах), и
-        # только если предыдущий уже закончился (пользователь: "не нужно
-        # делать постоянную синхронизацию; если не закончилась — не
-        # открывать новую").
+        # Каждый опрос — «Входящие» (ради новых писем) и текущая папка.
+        # Полный проход по всем папкам и докачка тел — раз в шесть опросов
+        # (полчаса при 5 минутах), и только если предыдущий уже закончился
+        # (пользователь: "опрос раз в 5 минут нужен для входящих; не нужно
+        # делать постоянную синхронизацию").
+        if self.current_folder != "INBOX":
+            self._refresh_inbox_async()
         self._periodic_ticks += 1
         if self._periodic_ticks % 6 == 0 and self._sync_worker is None:
             QTimer.singleShot(2000, lambda: self._start_full_sync(bodies_limit=None))

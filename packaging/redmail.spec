@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        85%{?dist}
+Release:        86%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-86
+- Опрос раз в 5 минут всегда проверяет «Входящие» (и текущую папку); счётчики непрочитанных — по интерактивному соединению
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-85
 - Окно письма немодальное: главное окно не блокируется, окон писем может быть несколько, окно по каналу управления не вешает программу
 - Действия пользователя (удалить, переместить, отметить, обновить папку, копия в «Отправленные») — по своему соединению, не ждут фоновую синхронизацию; удаление идёт в фоне
