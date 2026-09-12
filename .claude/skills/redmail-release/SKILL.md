@@ -53,3 +53,20 @@ description: Выпуск сборки redmail — прогон тестов, б
 - Пароли пользователя в keyring VM недоступны из ssh — офлайн-проверки делать через
   `QT_QPA_PLATFORM=offscreen` и подмену `app_dir`; настоящий IMAP — Dovecot на VM
   (`syncuser`/`SyncPass123`, 127.0.0.1:143 без SSL).
+
+## Второй продукт: голосовой помощник audioreferent
+
+Отдельный репозиторий `E:\Claudeudioreferent` (ветка `claude/voice-assistant-red-os-hg8jpx`),
+чекаут на VM `/home/test/audioreferent`. Почта объявляет `Recommends: audioreferent`; при выпуске,
+затрагивающем канал управления (ipc_server.py / redmail_actions.py), собирать ОБА пакета:
+
+1. Помощник: бамп `Release:` в `packaging/audioreferent.spec` + changelog, commit, push ветки.
+2. На VM: `cd /home/test/audioreferent && git pull -q && bash packaging/build_rpm.sh` — нужны модели
+   `~/rpmbuild/SOURCES/vosk-model-ru-0.42-noextras.tar.gz` и `vosk-model-spk-0.4.tar.gz`
+   (alphacephei.com с VM и .80 отдаёт 16 КБ вместо архива — качать на Windows в `D:I\models`,
+   затем scp на VM). RPM помощника ~1.3 ГБ — на .80 доставлять только `scripts/ship80.sh`.
+3. Установка на .80 обоих: `dnf -y install /var/tmp/redmail-*.rpm /var/tmp/audioreferent-*.rpm`
+   (тогда Recommends удовлетворяется из локального файла), затем
+   `sudo -u test XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart audioreferent`.
+4. Не собирать два rpmbuild одновременно.
+
