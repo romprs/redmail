@@ -2678,7 +2678,9 @@ class SignatureEditDialog(QDialog):
         form = QFormLayout()
         form.addRow("Название", self.name_edit)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Save).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
@@ -2688,6 +2690,16 @@ class SignatureEditDialog(QDialog):
         layout.addWidget(self.body_edit)
         layout.addStretch(1)
         layout.addWidget(buttons)
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        # Без названия подпись не сохранить: раньше окно молча закрывалось
+        # и подпись пропадала (жалоба: "не сохраняется, если нет названия —
+        # просто закрывается; надо предупреждать и не давать сохранить").
+        if not self.name():
+            QMessageBox.warning(self, "Подпись", "Укажите название подписи — без него её нельзя сохранить.")
+            self.name_edit.setFocus()
+            return
+        super().accept()
 
     def _on_bold_toggled(self, checked: bool) -> None:
         fmt = QTextCharFormat()
@@ -5003,7 +5015,8 @@ class MainWindow(QMainWindow):
         self.archive_folder_action.triggered.connect(self.on_archive_folder)
 
         self.folder_toolbar = QToolBar("Архивы", self)
-        self.folder_toolbar.setIconSize(QSize(18, 18))
+        # Размер значков — как у остальных панелей (жалоба: "кнопки архива
+        # над деревом папок меньше других").
         self.folder_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
         for action in (open_archive_action, import_action, self.archive_folder_action):
             self.folder_toolbar.addAction(action)

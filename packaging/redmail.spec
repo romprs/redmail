@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        81%{?dist}
+Release:        82%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-82
+- Подпись без названия не сохраняется: предупреждение вместо молчаливого закрытия; кнопки «Сохранить»/«Отмена»
+- Кнопки архива над деревом папок того же размера, что и остальные панели
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-81
 - Письма без текстовой части: текст извлекается из HTML — в цепочке видно содержание, а не заглушка
 - Пересылка: шапка «Пересланное сообщение» с явными цветами, видна и в тёмной теме
