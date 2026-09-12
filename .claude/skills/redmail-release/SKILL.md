@@ -70,3 +70,16 @@ description: Выпуск сборки redmail — прогон тестов, б
    `sudo -u test XDG_RUNTIME_DIR=/run/user/1000 systemctl --user restart audioreferent`.
 4. Не собирать два rpmbuild одновременно.
 
+## Установка на .80 — обязательно с проверкой после установки
+
+Из-за сбойной ОЗУ .80 файлы портятся даже при распаковке RPM (libQt6WebEngineCore.so.6
+однажды встал битым, `rpm -V redmail` показал `..5......`). Поэтому на .80 ставить циклом:
+
+```bash
+for a in 1 2 3 4 5; do sync; echo 3 > /proc/sys/vm/drop_caches;
+  rpm -K /var/tmp/<rpm> && rpm -Uvh --force /var/tmp/<rpm> && bad=$(rpm -V <pkg> | grep -vE '^\.{9}  c' | wc -l) && [ "$bad" = 0 ] && break; done
+```
+Проверять `rpm -V redmail` и `rpm -V audioreferent` (пусто = целы). Проверку связи с почтой
+делать питоном из venv помощника: `/opt/audioreferent/venv/bin/python -c "from audioreferent import redmail_client as c; print(c.send_request('ping'))"`
+(pip --user копии помощника на .80 больше нет, юнит — из RPM `/usr/lib/systemd/user/audioreferent.service`).
+
