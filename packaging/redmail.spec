@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        76%{?dist}
+Release:        77%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-77
+- Параметры → «Голосовой помощник»: включение/выключение сервиса audioreferent, состояние, его настройки и журнал, проверка связи; пакет audioreferent — рекомендуемая зависимость
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-76
 - Только один экземпляр программы: повторный запуск поднимает уже открытое окно
 - Ужатие базы после автоархива порциями без замирания окна; первичное ужатие — при старте под заставкой
