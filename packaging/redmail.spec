@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        100%{?dist}
+Release:        101%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-101
+- Папка назначения досинхронизируется при каждом переносе: «Отправленные» после отправки (в фоне, без подвисания окна), «Черновики» после сохранения черновика, папки правил сортировки
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-100
 - Удалённые письма сразу видны в «Корзине»: папка назначения досинхронизируется после переноса
 - Открытие любой папки тихо сверяется с сервером (раньше уже синхронизированная папка показывалась только из кэша до следующего полного прохода)

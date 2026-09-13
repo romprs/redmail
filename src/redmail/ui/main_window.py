@@ -6531,6 +6531,7 @@ class MainWindow(QMainWindow):
                 self, "Ошибка применения правил", f"{exc}\n\nПеремещено до сбоя: {moved_total}."
             )
 
+        self._sync_folders_async(list(moves))
         try:
             summaries = self.mailbox.refresh_folder(source_folder)
         except Exception:
@@ -10060,16 +10061,9 @@ class MainWindow(QMainWindow):
             # обновляем кэш этой папки сразу, не дожидаясь следующего
             # ручного "Обновить" или счастливого совпадения exists_count.
             if self.account_protocol == "imap" and self.sent_folder_name and self.mailbox is not None:
-                try:
-                    sent_summaries = self.mailbox.refresh_folder(self.sent_folder_name)
-                except Exception:
-                    sent_summaries = None
-                if (
-                    sent_summaries is not None
-                    and self.current_folder == self.sent_folder_name
-                    and self.active_source is self.mailbox
-                ):
-                    self._render_folder(sent_summaries)
+                # В фоне: сетевой запрос в потоке интерфейса подвешивал окно
+                # сразу после отправки.
+                self._sync_folders_async([self.sent_folder_name])
 
         # Раньше отправка шла синхронно прямо здесь — окно подвисало на
         # время SMTP-разговора с сервером, как и у календарных приглашений
@@ -10135,8 +10129,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Не удалось сохранить черновик", str(exc))
             return
         self.statusBar().showMessage("Черновик сохранён", 5000)
-        if self.active_source is self.mailbox and self.current_folder == self.drafts_folder_name:
-            self.on_refresh()
+        self._sync_folders_async([self.drafts_folder_name])
 
     def _delete_draft(self, source_draft: tuple[str, int]) -> None:
         if self.mailbox is None:
@@ -10536,6 +10529,7 @@ class MainWindow(QMainWindow):
                 moved_total += len(uids)
         except Exception as exc:
             failure = exc
+        self._sync_folders_async(list(moves))
         if source_folder == self.current_folder:
             try:
                 summaries = self.mailbox.refresh_folder(source_folder)

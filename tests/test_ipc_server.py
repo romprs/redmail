@@ -1135,7 +1135,11 @@ class _FakeMailbox:
         self.moves.append((folder, list(uids), target_folder))
 
 
+synced: list[str] = []
+
+
 def _rules_window_stub(mailbox, **overrides):
+    synced.clear()
     defaults = {
         "mailbox": mailbox,
         "active_source": mailbox,
@@ -1146,6 +1150,8 @@ def _rules_window_stub(mailbox, **overrides):
             _summary(2, sender_email="x@y.z"),
         ],
         "_render_folder": lambda summaries: None,
+        # Досинхронизация папок-получателей после переноса (в окне — в фоне).
+        "_sync_folders_async": lambda folders: synced.extend(folders),
         "statusBar": lambda: SimpleNamespace(showMessage=lambda *a, **k: None),
     }
     defaults.update(overrides)
@@ -1158,6 +1164,7 @@ def test_ipc_apply_mail_rules_moves_in_current_folder() -> None:
     result = MainWindow.ipc_apply_mail_rules(stub)
     assert result == {"folder": "INBOX", "moved": 1, "moves": {"Счета": 1}}
     assert mailbox.moves == [("INBOX", [1], "Счета")]
+    assert synced == ["Счета"]  # папка-получатель досинхронизирована
 
 
 def test_ipc_apply_mail_rules_explicit_other_folder() -> None:
