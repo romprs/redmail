@@ -24,6 +24,7 @@ from PySide6.QtCore import (
     QDateTime,
     QEvent,
     QIODevice,
+    QItemSelectionModel,
     QObject,
     QPointF,
     QRect,
@@ -4853,12 +4854,18 @@ class MainWindow(QMainWindow):
             thread_info=lambda uid: self._thread_info.get(uid), on_thread_toggle=self._toggle_thread,
         )
         self.card_list.setItemDelegate(self.card_delegate)
-        self.card_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Выделение в плитках — то же, что в таблице (Ctrl/Shift-клик,
+        # несколько строк): раньше плитки показывали одну, а таблица
+        # хранила прежний набор — удаление действовало на невидимое
+        # выделение (жалоба: "в режиме плиток записи не выделяются, но в
+        # таблице письма выделены").
+        self.card_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.card_list.setMouseTracking(True)
         self.card_list.setUniformItemSizes(True)
         self.card_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.card_list.customContextMenuRequested.connect(self._on_card_context_menu)
         self.card_list.currentItemChanged.connect(self._on_card_current_changed)
+        self.card_list.itemSelectionChanged.connect(self._on_card_selection_changed)
         self.card_list.itemChanged.connect(self._on_card_item_changed)
         self.card_list.itemDoubleClicked.connect(self._on_card_double_clicked)
         self._card_items_by_uid: dict[int, QListWidgetItem] = {}
@@ -7620,17 +7627,48 @@ class MainWindow(QMainWindow):
             return
         self._syncing_card_selection = True
         try:
-            self.table.selectRow(row)  # дальше — обычный on_message_selected
+            self.table.setCurrentCell(row, COL_SUBJECT)
+            self._mirror_cards_selection_to_table()
+        finally:
+            self._syncing_card_selection = False
+        self.on_message_selected()
+
+    def _on_card_selection_changed(self) -> None:
+        if self._syncing_card_selection:
+            return
+        self._syncing_card_selection = True
+        try:
+            self._mirror_cards_selection_to_table()
         finally:
             self._syncing_card_selection = False
 
+    def _mirror_cards_selection_to_table(self) -> None:
+        """Набор выделенных плиток → выделенные строки таблицы (источник
+        правды для массовых действий)."""
+        selected_uids = {item.data(Qt.ItemDataRole.UserRole) for item in self.card_list.selectedItems()}
+        model = self.table.selectionModel()
+        model.clearSelection()
+        for row in range(self.table.rowCount()):
+            check_item = self.table.item(row, COL_CHECK)
+            if check_item is not None and check_item.data(Qt.ItemDataRole.UserRole) in selected_uids:
+                model.select(self.table.model().index(row, 0), QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
+
     def _sync_card_selection(self, uid: int) -> None:
+        """Выделение таблицы → плитки: все выделенные строки и текущая."""
         item = self._card_items_by_uid.get(uid)
         if item is None or self._syncing_card_selection:
             return
         self._syncing_card_selection = True
         try:
-            self.card_list.setCurrentItem(item)
+            selected_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
+            selected_uids = {
+                self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) for row in selected_rows
+                if self.table.item(row, COL_CHECK) is not None
+            }
+            self.card_list.clearSelection()
+            for card_uid, card_item in self._card_items_by_uid.items():
+                card_item.setSelected(card_uid in selected_uids or card_uid == uid)
+            self.card_list.setCurrentItem(item, QItemSelectionModel.SelectionFlag.NoUpdate)
         finally:
             self._syncing_card_selection = False
 
@@ -7929,18 +7967,12 @@ class MainWindow(QMainWindow):
         ]
         if checked:
             return self._expand_collapsed_threads(checked)
-        # Ничего не отмечено галочками — при ДВУХ и более выделенных
-        # строках (обычный Ctrl+клик/Shift+клик) считаем это тем же самым:
-        # раньше массовые действия (удаление, восстановление из корзины)
-        # требовали ставить галочку на каждое письмо по отдельности, даже
-        # если уже была выделена целая группа строк (жалоба: "невозможно
-        # удалить письма из корзины сразу (только выбор по 1)"). Одно
-        # выделение НЕ считаем — это обычно просто открытое для чтения
-        # письмо (клик по строке = его выделение), а не намерение
-        # массового действия; так одиночный клик по письму по-прежнему не
-        # рискует случайно попасть под "Удалить".
+        # Ничего не отмечено галочками — действуем на выделенные строки
+        # (Ctrl/Shift-клик или одно открытое письмо): пожелание "при
+        # удалении выделенного письма не просить поставить галочку".
+        # Удаление в корзину обратимо, безвозвратное — с подтверждением.
         selected_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
-        if len(selected_rows) < 2:
+        if not selected_rows:
             return []
         return self._expand_collapsed_threads(
             [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) for row in selected_rows]

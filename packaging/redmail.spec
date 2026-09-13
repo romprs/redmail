@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        92%{?dist}
+Release:        93%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-93
+- Удаление и другие массовые действия работают по выделенным письмам без галочек, в том числе по одному открытому
+- Плитки: множественное выделение, зеркальное таблице (Ctrl/Shift-клик)
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-92
 - Счётчики непрочитанных в дереве обновляются после удаления, переноса, отметки «прочитано» и обновления папки; опрос «Входящих» больше не сбрасывает числа у других папок
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-91
