@@ -457,9 +457,42 @@ def _contact_words(contact) -> list[str]:
     return [w for w in words if w]
 
 
-def match_contacts(contacts, query: str) -> list:
+def _levenshtein(a: str, b: str) -> int:
+    if a == b:
+        return 0
+    if not a or not b:
+        return len(a) + len(b)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        curr = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            curr[j] = min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (ca != cb))
+        prev = curr
+    return prev[-1]
+
+
+def _fuzzy_distance(query_word: str, name_word: str) -> int | None:
+    """Расстояние между основами, если слова «похожи»: одна-две ошибки
+    распознавания («бутько» ≈ «Будько», «шилки» ≈ «Шилкин»). None — не
+    похожи. Порог зависит от длины: короткие слова — одна ошибка."""
+    if _word_matches(query_word, name_word):
+        return 0
+    q, w = _stem(query_word), _stem(name_word)
+    if not q or not w or min(len(q), len(w)) < 4:
+        return None
+    distance = _levenshtein(q, w)
+    limit = 1 if min(len(q), len(w)) <= 5 else 2
+    return distance if distance <= limit else None
+
+
+def match_contacts(contacts, query: str, *, fuzzy: bool = False) -> list:
     """Контакты (с адресом), у которых КАЖДОЕ слово запроса совпало с
-    каким-то словом имени или локальной части адреса — см. _stem."""
+    каким-то словом имени или локальной части адреса — см. _stem.
+
+    fuzzy=True — допускаются ошибки распознавания в 1-2 буквы (см.
+    _fuzzy_distance); результат отсортирован от самых похожих, а у
+    каждого контакта заполнен атрибут-подсказка fuzzy_distance (сумма
+    расстояний по словам)."""
     query_words = [w for w in re.split(r"[\s,;]+", query) if w]
     if not query_words:
         return []
@@ -468,16 +501,32 @@ def match_contacts(contacts, query: str) -> list:
         if not contact.emails:
             continue
         words = _contact_words(contact)
-        if all(any(_word_matches(qw, nw) for nw in words) for qw in query_words):
-            result.append(contact)
-    return result
+        if not fuzzy:
+            if all(any(_word_matches(qw, nw) for nw in words) for qw in query_words):
+                result.append(contact)
+            continue
+        total = 0
+        for qw in query_words:
+            distances = [d for d in (_fuzzy_distance(qw, nw) for nw in words) if d is not None]
+            if not distances:
+                total = None
+                break
+            total += min(distances)
+        if total is not None:
+            result.append((total, contact))
+    if not fuzzy:
+        return result
+    result.sort(key=lambda pair: pair[0])
+    return [contact for _distance, contact in result]
 
 
 def _handle_find_contacts(controller, args) -> dict:
     query = _text(args.get("query"), "query")
     if not query:
         raise ValueError("query обязателен: фамилия или имя")
-    matches = match_contacts(controller.ipc_contacts(), query)
+    # fuzzy: true — с допуском на ошибки распознавания («бутько» -> Будько),
+    # от самых похожих; голосовая сторона зовёт так, когда точно не нашлось.
+    matches = match_contacts(controller.ipc_contacts(), query, fuzzy=bool(args.get("fuzzy", False)))
     return {
         "contacts": [
             {"name": c.display_name, "email": c.emails[0], "emails": list(c.emails)} for c in matches

@@ -414,6 +414,20 @@ def test_match_contacts_short_query_needs_exact_stem() -> None:
     assert ipc_server.match_contacts(CONTACTS, "Без адреса") == []  # без email участник бесполезен
 
 
+def test_match_contacts_fuzzy_tolerates_recognition_errors() -> None:
+    # «бутько» вместо Будько, «шилки» вместо Шилкин — точный поиск молчит,
+    # нечёткий находит; результат — от самых похожих
+    assert ipc_server.match_contacts(CONTACTS, "бутько") == []
+    assert [c.emails[0] for c in ipc_server.match_contacts(CONTACTS, "бутько", fuzzy=True)] == ["budko@example.com"]
+    assert [c.emails[0] for c in ipc_server.match_contacts(CONTACTS, "шилки", fuzzy=True)][:1] == ["shilkin@example.com"]
+    assert ipc_server.match_contacts(CONTACTS, "Сидоров", fuzzy=True) == []  # три и больше ошибок — не похоже
+    assert ipc_server.match_contacts(CONTACTS, "Ли", fuzzy=True) == [c for c in CONTACTS if c.display_name.startswith("Ли")]
+    controller = FakeController()
+    controller.contacts = CONTACTS
+    response = handle_request(controller, {"action": "find_contacts", "args": {"query": "бутько", "fuzzy": True}})
+    assert [c["email"] for c in response["contacts"]] == ["budko@example.com"]
+
+
 def test_find_contacts_handler() -> None:
     controller = FakeController()
     controller.contacts = CONTACTS
