@@ -2434,6 +2434,7 @@ class ComposeDialog(QDialog):
         self._contacts = contacts or []
 
         self.to_edit = QLineEdit(to)
+        self.to_edit.setClearButtonEnabled(True)  # крестик в самом поле (пожелание: "кнопка очищения поля Кому")
         self.to_edit.setPlaceholderText("Через запятую, если получателей несколько")
         # Поля «Кому»/«Тема» повыше (жалоба: "поле кому и тема расширь —
         # в тёмной теме всё сливается"; рамка/фон — в theme.py).
@@ -2561,11 +2562,13 @@ class ComposeDialog(QDialog):
         to_row.addWidget(cc_bcc_button)
 
         self.cc_edit = QLineEdit(cc, self)
+        self.cc_edit.setClearButtonEnabled(True)
         self.cc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.cc_edit, contacts)
             _install_recipient_tooltip(self.cc_edit, contacts)
         self.bcc_edit = QLineEdit(bcc, self)
+        self.bcc_edit.setClearButtonEnabled(True)
         self.bcc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.bcc_edit, contacts)
@@ -3834,6 +3837,7 @@ class EventDialog(QDialog):
 
         other_attendees = [a.email for a in event.attendees if a.email != my_email] if event else []
         self.attendees_edit = QLineEdit(", ".join(other_attendees))
+        self.attendees_edit.setClearButtonEnabled(True)
         self.attendees_edit.setPlaceholderText("Выберите участников")
         if contacts:
             _install_recipient_completer(self.attendees_edit, contacts)

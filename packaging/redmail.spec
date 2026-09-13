@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        93%{?dist}
+Release:        94%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-94
+- Поля «Кому», «Копия», «Скрытая копия» и «Участники» с крестиком очистки прямо в поле
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-93
 - Удаление и другие массовые действия работают по выделенным письмам без галочек, в том числе по одному открытому
 - Плитки: множественное выделение, зеркальное таблице (Ctrl/Shift-клик)
