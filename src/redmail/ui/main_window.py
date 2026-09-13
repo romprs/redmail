@@ -6024,6 +6024,51 @@ class MainWindow(QMainWindow):
     def _mailbox_key(self) -> str | None:
         return next((k for k, m in self.mailboxes.items() if m is self.mailbox), None)
 
+    def _sync_folders_async(self, folders: list[str]) -> None:
+        """Досинхронизировать локальные копии указанных папок в фоне.
+        Нужно после переноса писем: письмо уже лежит в корзине на сервере,
+        но в кэше «Корзины» его нет до следующего полного прохода — и
+        папка выглядела пустой (жалоба: "удалились полностью, без
+        помещения в корзину"). Счётчики в дереве обновляются здесь же."""
+        mailbox = self.mailbox
+        key = self._mailbox_key()
+        folders = [f for f in dict.fromkeys(folders) if f]
+        if not isinstance(mailbox, CachedMailbox) or key is None or not folders:
+            return
+
+        def sync() -> dict[str, int]:
+            counts: dict[str, int] = {}
+            for folder in folders:
+                try:
+                    mailbox.refresh_folder(folder)
+                except Exception as exc:
+                    _log.warning("Досинхронизация папки %s не удалась: %s", folder, exc)
+                    continue
+                try:
+                    counts[folder] = mailbox.interactive_session().folder_unseen_count(folder)
+                except Exception:
+                    continue
+            return counts
+
+        worker = _CallableWorker(sync, parent=self)
+
+        def done(counts: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if counts:
+                self._apply_folder_unread_counts(key, counts, partial=True)
+            if self.current_folder in folders and self.active_source is mailbox:
+                # Пользователь уже открыл эту папку — показать обновлённый список.
+                try:
+                    self._render_folder(mailbox.folder_summaries(self.current_folder))
+                except Exception:
+                    pass
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(lambda _e: done())
+        self._background_workers.append(worker)
+        worker.start()
+
     def _refresh_counts_async(self, folders: list[str]) -> None:
         """Счётчики непрочитанных в дереве для указанных папок — после
         удаления, переноса, отметки «прочитано» (жалоба: "после удаления
@@ -6932,10 +6977,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка загрузки папки", str(exc))
             return
         self._render_folder(summaries)
-        is_synced = getattr(source, "is_folder_synced", None)
-        if is_synced is not None and not is_synced(folder_name):
-            # Папка ещё не синхронизирована (первое открытие) — дозапросить
-            # с сервера в фоне, окно при этом не ждёт.
+        if getattr(source, "is_folder_synced", None) is not None:
+            # Открыли папку — тихо сверяемся с сервером в фоне (окно не
+            # ждёт): раньше уже синхронизированная папка показывалась
+            # только из кэша, и письма, перенесённые другим действием или
+            # другим клиентом, появлялись лишь при следующем полном
+            # проходе (раз в полчаса).
             self._refresh_folder_async(silent=True)
 
     def on_folder_tree_context_menu(self, pos) -> None:
@@ -8147,6 +8194,7 @@ class MainWindow(QMainWindow):
         # восстанавливаем во "Входящие" как разумное значение по умолчанию.
         try:
             self.mailbox.move_to_folder(self.current_folder, checked_uids, "INBOX")
+            self._sync_folders_async(["INBOX"])
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось восстановить", str(exc))
             return
@@ -8167,6 +8215,7 @@ class MainWindow(QMainWindow):
 
         source = self.active_source
         folder = self.current_folder
+        moved_to_folder: str | None = None  # куда переехали письма (для досинхронизации папки)
         if source is self.mailbox:
             shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
             already_in_trash = self.trash_folder_name is not None and folder == self.trash_folder_name
@@ -8187,6 +8236,7 @@ class MainWindow(QMainWindow):
                 trash = self.trash_folder_name
                 operation = lambda: self.mailbox.move_to_trash(folder, checked_uids, trash)  # noqa: E731
                 status_text = f"Перемещено в корзину: {len(checked_uids)}"
+                moved_to_folder = trash
         else:
             confirm = QMessageBox.question(
                 self,
@@ -8226,6 +8276,8 @@ class MainWindow(QMainWindow):
                 self._render_folder(summaries)
             self.statusBar().showMessage(status_text, 5000)
             if source is self.mailbox:
+                if moved_to_folder:
+                    self._sync_folders_async([moved_to_folder])
                 self._refresh_counts_async([folder, self.trash_folder_name or ""])
 
         def on_failure(error_text: str) -> None:

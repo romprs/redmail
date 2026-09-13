@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        99%{?dist}
+Release:        100%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-100
+- Удалённые письма сразу видны в «Корзине»: папка назначения досинхронизируется после переноса
+- Открытие любой папки тихо сверяется с сервером (раньше уже синхронизированная папка показывалась только из кэша до следующего полного прохода)
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-99
 - Адресаты с именами: список ФИО под полем, имена в подсказке и в карточке встречи (ветка claude/recipients-list)
 - Канал управления: нечёткий поиск контактов (find_contacts)
