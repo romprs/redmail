@@ -18,6 +18,17 @@ def _summary(uid: int, date: str, subject: str) -> MessageSummary:
     return MessageSummary(uid=uid, subject=subject, sender="Ivan", sender_email="ivan@example.com", date=date, message_id=f"<{uid}@x>")
 
 
+def test_contact_candidates_person_single_address_and_group_syntax() -> None:
+    # Человек — один адрес; группа — «Имя: a, b;» (RFC 5322), раскрывается
+    # _parse_recipient_list в адреса участников.
+    person = contact_store.Contact(display_name="Иванов Иван", emails=["ivan@x.ru", "ivan2@x.ru"])
+    group = contact_store.Contact(display_name="Все получатели", emails=["a@x.ru", "b@x.ru"], is_group=True)
+    candidates = _contact_candidates([person, group])
+    assert candidates == ["Иванов Иван <ivan@x.ru>", "Все получатели: a@x.ru, b@x.ru;"]
+    assert _parse_recipient_list(candidates[1]) == ["a@x.ru", "b@x.ru"]
+    assert _parse_recipient_list(", ".join(candidates)) == ["ivan@x.ru", "a@x.ru", "b@x.ru"]
+
+
 def test_thread_infos_groups_by_normalized_subject_with_newest_head() -> None:
     # Пожелание: "надо скрывать более ранние письма и показывать символ
     # группировки" — цепочка по теме без Re:/Fwd:, головное — самое новое.

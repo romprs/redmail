@@ -937,11 +937,23 @@ def _format_recipient_candidate(name: str, email: str) -> str:
 
 
 def _contact_candidates(contacts: list[contact_store.Contact]) -> list[str]:
+    """Варианты для автодополнения и окна выбора. Человек — один адрес
+    («Имя <адрес>»); группа — «Имя группы: a@x, b@x;» (групповой синтаксис
+    RFC 5322: getaddresses в _parse_recipient_list раскрывает его в адреса
+    участников, а в поле «Кому» видно, что это список)."""
     candidates = []
     for contact in contacts:
-        for email in contact.emails:
-            candidates.append(_format_recipient_candidate(contact.display_name, email))
+        if contact.is_group:
+            if contact.emails:
+                candidates.append(_format_group_candidate(contact.display_name, contact.emails))
+        elif contact.emails:
+            candidates.append(_format_recipient_candidate(contact.display_name, contact.emails[0]))
     return candidates
+
+
+def _format_group_candidate(name: str, emails: list[str]) -> str:
+    safe_name = name.replace(":", " ").replace(";", " ").replace(",", " ").strip() or "Группа"
+    return f"{safe_name}: {', '.join(emails)};"
 
 
 def _parse_recipient_list(text: str) -> list[str]:
@@ -4183,7 +4195,10 @@ class ContactDialog(QDialog):
 
         self.name_edit = QLineEdit(contact.display_name if contact else "")
         self.emails_edit = QLineEdit(", ".join(contact.emails) if contact else "")
-        self.emails_edit.setPlaceholderText("Через запятую, если несколько")
+        self.group_check = QCheckBox("Группа — список адресов рассылки (у обычного контакта один адрес)", self)
+        self.group_check.setChecked(bool(contact.is_group) if contact else False)
+        self.group_check.toggled.connect(self._on_group_toggled)
+        self._on_group_toggled(self.group_check.isChecked())
         self.phone_edit = QLineEdit(contact.phone if contact else "")
         self.org_edit = QLineEdit(contact.organization if contact else "")
         self.notes_edit = QPlainTextEdit(contact.notes if contact else "")
@@ -4191,6 +4206,7 @@ class ContactDialog(QDialog):
         form = QFormLayout()
         form.addRow("Имя", self.name_edit)
         form.addRow("Email", self.emails_edit)
+        form.addRow(self.group_check)
         form.addRow("Телефон", self.phone_edit)
         form.addRow("Организация", self.org_edit)
 
@@ -4206,6 +4222,23 @@ class ContactDialog(QDialog):
         layout.addWidget(self.notes_edit)
         layout.addWidget(buttons)
 
+    def _on_group_toggled(self, checked: bool) -> None:
+        self.emails_edit.setPlaceholderText(
+            "Адреса участников через запятую" if checked else "Один адрес (для списка адресов отметьте «Группа»)"
+        )
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        emails = [e.strip() for e in self.emails_edit.text().split(",") if e.strip()]
+        if not self.group_check.isChecked() and len(emails) > 1:
+            QMessageBox.warning(
+                self, "Контакт",
+                "У обычного контакта один адрес — иначе письмо уйдёт на все сразу.\n"
+                "Оставьте один адрес или отметьте «Группа», если это список рассылки.",
+            )
+            self.emails_edit.setFocus()
+            return
+        super().accept()
+
     def to_contact(self) -> contact_store.Contact:
         return contact_store.Contact(
             id=self._contact.id if self._contact else None,
@@ -4215,6 +4248,7 @@ class ContactDialog(QDialog):
             phone=self.phone_edit.text().strip(),
             organization=self.org_edit.text().strip(),
             notes=self.notes_edit.toPlainText(),
+            is_group=self.group_check.isChecked(),
         )
 
 
@@ -8770,8 +8804,13 @@ class MainWindow(QMainWindow):
         self._contacts_by_row = contacts
         self.contacts_table.setRowCount(len(contacts))
         for row, contact in enumerate(contacts):
-            self.contacts_table.setItem(row, 0, QTableWidgetItem(contact.display_name))
-            self.contacts_table.setItem(row, 1, QTableWidgetItem(", ".join(contact.emails)))
+            name_text = f"{contact.display_name} (группа)" if contact.is_group else contact.display_name
+            self.contacts_table.setItem(row, 0, QTableWidgetItem(name_text))
+            emails_text = (
+                f"{len(contact.emails)} адресов: " + ", ".join(contact.emails[:3]) + ("…" if len(contact.emails) > 3 else "")
+                if contact.is_group else ", ".join(contact.emails)
+            )
+            self.contacts_table.setItem(row, 1, QTableWidgetItem(emails_text))
             self.contacts_table.setItem(row, 2, QTableWidgetItem(contact.phone))
             self.contacts_table.setItem(row, 3, QTableWidgetItem(contact.organization))
 

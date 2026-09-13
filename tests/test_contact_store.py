@@ -104,10 +104,11 @@ def test_import_vcard_multiple_cards(tmp_path: Path) -> None:
     contacts = contact_store.list_contacts(path)
     ivan = next(c for c in contacts if c.display_name == "Иван Иванов")
     assert ivan.uid == "abc-1"
-    assert ivan.emails == ["ivan@example.com", "ivan.home@example.com"]
+    assert ivan.emails == ["ivan@example.com"]  # у человека один адрес, запасной уходит в заметки
+    assert "ivan.home@example.com" in ivan.notes
     assert ivan.phone == "+79001234567"
     assert ivan.organization == "ООО Ромашка"
-    assert ivan.notes == "Коллега"
+    assert ivan.notes.startswith("Коллега")
 
     petr = next(c for c in contacts if c.display_name == "Пётр Петров")
     assert petr.emails == ["petr@example.com"]

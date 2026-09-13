@@ -5,6 +5,8 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
+from email.header import decode_header, make_header
+from email.utils import getaddresses
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,11 +33,12 @@ CREATE TABLE IF NOT EXISTS contacts (
     emails TEXT NOT NULL DEFAULT '[]',
     phone TEXT NOT NULL DEFAULT '',
     organization TEXT NOT NULL DEFAULT '',
-    notes TEXT NOT NULL DEFAULT ''
+    notes TEXT NOT NULL DEFAULT '',
+    is_group INTEGER NOT NULL DEFAULT 0
 );
 """
 
-_COLUMNS = "id, uid, display_name, emails, phone, organization, notes"
+_COLUMNS = "id, uid, display_name, emails, phone, organization, notes, is_group"
 
 
 @dataclass
@@ -47,6 +50,75 @@ class Contact:
     phone: str = ""
     organization: str = ""
     notes: str = ""
+    # Группа — список адресов рассылки (участники в emails); у обычного
+    # контакта один адрес (пожелание: "у одного человека не может быть
+    # двух адресов — письма пойдут на оба; группа — это перечисление
+    # нескольких адресов, нужен признак").
+    is_group: bool = False
+
+    @property
+    def primary_email(self) -> str:
+        return self.emails[0] if self.emails else ""
+
+
+def _decode_rfc2047(value: str) -> str:
+    """"=?koi8-r?q?...?=" из экспорта Outlook → читаемое имя."""
+    if "=?" not in value:
+        return value
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def normalize_emails(values: list[str]) -> tuple[list[str], bool, list[str]]:
+    """Разбор списка адресов из импорта: элементы бывают «Имя <адрес>»
+    (участники списка рассылки, имена в RFC 2047) и просто «адрес».
+    Возвращает (адреса, это группа, подписи участников «Имя <адрес>»).
+    Группа — два и более адреса, хотя бы у одного из которых есть имя
+    участника (экспорт списка рассылки); просто несколько адресов без
+    имён — обычный контакт с запасными адресами."""
+    addresses: list[str] = []
+    labels: list[str] = []
+    has_member_names = False
+    for value in values:
+        decoded = _decode_rfc2047((value or "").strip())
+        if not decoded:
+            continue
+        for name, addr in getaddresses([decoded]):
+            addr = addr.strip().lower()
+            if not addr or "@" not in addr:
+                continue
+            if addr in addresses:
+                continue
+            addresses.append(addr)
+            name = name.strip().strip('"')
+            if name and name.lower() != addr:
+                has_member_names = True
+                labels.append(f"{name} <{addr}>")
+            else:
+                labels.append(addr)
+    is_group = len(addresses) >= 2 and has_member_names
+    return addresses, is_group, labels
+
+
+def _apply_imported_emails(contact: Contact, raw_values: list[str]) -> Contact:
+    """Нормализовать адреса импортированного контакта: группа получает все
+    адреса участников и их перечень в заметках; обычный контакт — один
+    адрес, остальные (запасные) уходят в заметки, чтобы письмо не
+    уходило на два адреса сразу."""
+    addresses, is_group, labels = normalize_emails(raw_values)
+    contact.is_group = is_group
+    if is_group:
+        contact.emails = addresses
+        members = "Участники:\n" + "\n".join(labels)
+        contact.notes = f"{contact.notes}\n\n{members}".strip() if contact.notes else members
+    else:
+        contact.emails = addresses[:1]
+        if len(addresses) > 1:
+            extra = "Другие адреса: " + ", ".join(addresses[1:])
+            contact.notes = f"{contact.notes}\n{extra}".strip() if contact.notes else extra
+    return contact
 
 
 def new_uid() -> str:
@@ -69,6 +141,7 @@ def create_contacts_book(path: Path) -> None:
                 "INSERT INTO meta (key, value) VALUES ('format_version', ?)", (str(_FORMAT_VERSION),)
             )
             conn.commit()
+        _migrate(conn)
 
 
 def is_contacts_file(path: Path) -> bool:
@@ -91,7 +164,32 @@ def _row_to_contact(row) -> Contact:
         phone=row[4],
         organization=row[5],
         notes=row[6],
+        is_group=bool(row[7]) if len(row) > 7 else False,
     )
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Книги прежних сборок: добавить признак группы и разобрать уже
+    импортированные списки рассылки («Имя <адрес>» с именами в RFC 2047
+    лежали как есть в списке адресов контакта)."""
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(contacts)").fetchall()}
+    if "is_group" in columns:
+        return
+    conn.execute("ALTER TABLE contacts ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0")
+    rows = conn.execute("SELECT id, emails, notes FROM contacts").fetchall()
+    for contact_id, emails_json, notes in rows:
+        try:
+            raw = json.loads(emails_json)
+        except ValueError:
+            continue
+        if not any("<" in value or "=?" in value for value in raw) and len(raw) <= 1:
+            continue
+        contact = _apply_imported_emails(Contact(notes=notes or ""), raw)
+        conn.execute(
+            "UPDATE contacts SET emails = ?, notes = ?, is_group = ? WHERE id = ?",
+            (json.dumps(contact.emails, ensure_ascii=False), contact.notes, int(contact.is_group), contact_id),
+        )
+    conn.commit()
 
 
 def list_contacts(path: Path) -> list[Contact]:
@@ -139,11 +237,11 @@ def save_contact(path: Path, contact: Contact) -> Contact:
             emails.append(normalized)
     with closing(_connect(path)) as conn:
         conn.execute(
-            "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes) "
-            "VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes, is_group) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "display_name=excluded.display_name, emails=excluded.emails, phone=excluded.phone, "
-            "organization=excluded.organization, notes=excluded.notes",
+            "organization=excluded.organization, notes=excluded.notes, is_group=excluded.is_group",
             (
                 uid,
                 contact.display_name,
@@ -151,6 +249,7 @@ def save_contact(path: Path, contact: Contact) -> Contact:
                 contact.phone,
                 contact.organization,
                 contact.notes,
+                int(bool(contact.is_group)),
             ),
         )
         conn.commit()
@@ -187,7 +286,7 @@ def import_vcard(path: Path, vcf_bytes: bytes) -> int:
         contact = _contact_from_vcard(card)
         if contact is None:
             continue
-        save_contact(path, contact)
+        save_contact(path, _reuse_existing_uid(path, contact))
         count += 1
     return count
 
@@ -228,14 +327,32 @@ def _contact_from_vcard(card) -> Contact | None:
     organization = ", ".join(part for part in org_value if part) if isinstance(org_value, list) else (org_value or "")
     notes = str(card.note.value).strip() if hasattr(card, "note") else ""
 
-    return Contact(
+    contact = Contact(
         uid=uid,
-        display_name=display_name,
+        display_name=_decode_rfc2047(display_name),
         emails=emails,
         phone=phones[0] if phones else "",
         organization=organization,
         notes=notes,
     )
+    contact = _apply_imported_emails(contact, emails)
+    kind = str(card.kind.value).strip().lower() if hasattr(card, "kind") else ""
+    if kind == "group" or (hasattr(card, "x_addressbookserver_kind") and "group" in str(card.x_addressbookserver_kind.value).lower()):
+        contact.is_group = True
+    return contact
+
+
+def _reuse_existing_uid(path: Path, contact: Contact) -> Contact:
+    """Контакт с таким адресом уже есть (другой источник/UID) — обновляем
+    его, а не заводим второго (пожелание: "нет проверки на существование
+    адреса")."""
+    if contact.is_group or not contact.emails:
+        return contact
+    existing = find_by_email(path, contact.emails[0])
+    if existing is not None and not existing.is_group:
+        contact.uid = existing.uid
+        contact.id = existing.id
+    return contact
 
 
 # Заголовки, под которыми Outlook (в т.ч. русская локаль) и другие клиенты
@@ -298,6 +415,7 @@ def import_csv(path: Path, csv_bytes: bytes) -> int:
             phone=(row.get(phone_col) or "").strip() if phone_col else "",
             organization=(row.get(org_col) or "").strip() if org_col else "",
         )
-        save_contact(path, contact)
+        contact = _apply_imported_emails(contact, [email] if email else [])
+        save_contact(path, _reuse_existing_uid(path, contact))
         count += 1
     return count
