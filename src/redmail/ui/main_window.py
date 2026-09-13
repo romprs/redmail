@@ -2557,8 +2557,8 @@ class ComposeDialog(QDialog):
         clear_recipients_button.clicked.connect(self._clear_recipients)
         to_row = QHBoxLayout()
         to_row.addWidget(self.to_edit)
+        to_row.addWidget(clear_recipients_button)  # сразу за полем (пожелание: "крестик не там")
         to_row.addWidget(address_book_button)
-        to_row.addWidget(clear_recipients_button)
         to_row.addWidget(cc_bcc_button)
 
         self.cc_edit = QLineEdit(cc, self)
@@ -7643,13 +7643,19 @@ class MainWindow(QMainWindow):
         row = self._row_for_uid(current.data(Qt.ItemDataRole.UserRole))
         if row is None:
             return
+        # Только текущая ячейка таблицы, без изменения выделения: Qt при
+        # Ctrl-клике сначала меняет текущий элемент, потом переключает
+        # выделение (toggle) — если здесь заранее выделить строку, toggle
+        # её тут же снимет, и набор «сбрасывается» (жалоба). Выделение
+        # зеркалится по itemSelectionChanged (см. _on_card_selection_changed),
+        # а таблица по своему itemSelectionChanged открывает письмо.
         self._syncing_card_selection = True
         try:
-            self.table.setCurrentCell(row, COL_SUBJECT)
-            self._mirror_cards_selection_to_table()
+            self.table.selectionModel().setCurrentIndex(
+                self.table.model().index(row, COL_SUBJECT), QItemSelectionModel.SelectionFlag.NoUpdate
+            )
         finally:
             self._syncing_card_selection = False
-        self.on_message_selected()
 
     def _on_card_selection_changed(self) -> None:
         if self._syncing_card_selection:

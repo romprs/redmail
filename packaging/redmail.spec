@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        94%{?dist}
+Release:        95%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,9 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-95
+- Плитки: Ctrl-клик накапливает выделение и не сбрасывает набор
+- Окно письма: кнопка очистки получателей стоит сразу за полем «Кому»
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-94
 - Поля «Кому», «Копия», «Скрытая копия» и «Участники» с крестиком очистки прямо в поле
 - Письмо без получателя не отправляется и окно не закрывается (предупреждение); черновик сохраняется без получателей
