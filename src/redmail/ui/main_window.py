@@ -2558,6 +2558,7 @@ class ComposeDialog(QDialog):
         to_row = QHBoxLayout()
         to_row.addWidget(self.to_edit)
         to_row.addWidget(clear_recipients_button)  # сразу за полем (пожелание: "крестик не там")
+        to_row.addSpacing(12)  # зазор до «Адресной книги» (пожелание пользователя)
         to_row.addWidget(address_book_button)
         to_row.addWidget(cc_bcc_button)
 
@@ -3959,8 +3960,9 @@ class EventDialog(QDialog):
         attendees_row = QHBoxLayout()
         attendees_row.addWidget(_icon_label("people", self))
         attendees_row.addWidget(self.attendees_edit)
+        attendees_row.addWidget(clear_attendees_button)  # сразу за полем, как в письме
+        attendees_row.addSpacing(12)
         attendees_row.addWidget(attendees_address_book_button)
-        attendees_row.addWidget(clear_attendees_button)
 
         location_row = QHBoxLayout()
         location_row.addWidget(_icon_label("location", self))

@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        95%{?dist}
+Release:        96%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-96
+- Крестик очистки в письме и во встрече — сразу за полем, с отступом до «Адресной книги»
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-95
 - Плитки: Ctrl-клик накапливает выделение и не сбрасывает набор
 - Окно письма: кнопка очистки получателей стоит сразу за полем «Кому»
