@@ -23,9 +23,11 @@ scp -q -i "$KEY" -o StrictHostKeyChecking=no "$W/SUMS" "$HOST:$DEST_DIR/" 2>/dev
 scp -q -i "$KEY" -o StrictHostKeyChecking=no "$W"/p.* "$HOST:$DEST_DIR/" 2>/dev/null
 
 bad=""
-for round in 1 2 3 4 5 6; do
-  # Проверка на .80: имена битых/отсутствующих кусков.
-  bad=$($SSH "cd $DEST_DIR && sha256sum -c --quiet SUMS 2>&1 | sed -n 's/: .*//p'" </dev/null 2>/dev/null | tr -d '\r')
+for round in 1 2 3 4 5 6 7 8 9 10; do
+  # Проверка на .80: имена битых/отсутствующих кусков. Перед проверкой —
+  # сброс страничного кэша: битая ОЗУ .80 портит кусок в кэше, после сброса
+  # он перечитывается с диска (иначе один и тот же кусок «бился» 6 раундов).
+  bad=$($SSH "sync; echo 3 > /proc/sys/vm/drop_caches; cd $DEST_DIR && sha256sum -c --quiet SUMS 2>&1 | sed -n 's/: .*//p'" </dev/null 2>/dev/null | tr -d '\r')
   if [ -z "$bad" ]; then
     break
   fi
