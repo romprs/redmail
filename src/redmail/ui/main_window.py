@@ -1138,6 +1138,9 @@ class ContactPickerDialog(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, candidate)
             item.setData(Qt.ItemDataRole.UserRole + 1, len(contact.emails))
+            item.setData(Qt.ItemDataRole.UserRole + 2, label)  # подпись без номера
+            item.setData(Qt.ItemDataRole.UserRole + 3, contact.display_name)
+            item.setData(Qt.ItemDataRole.UserRole + 4, ", ".join(contact.emails))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
             if contact.is_group:
@@ -1145,6 +1148,7 @@ class ContactPickerDialog(QDialog):
             self.list_widget.addItem(item)
         self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
         self.list_widget.itemChanged.connect(lambda _item: self._update_summary())
+        self._renumber()
 
         self.summary_label = QLabel("", self)
         self._update_summary()
@@ -1175,7 +1179,71 @@ class ContactPickerDialog(QDialog):
         needle = text.strip().lower()
         for row in range(self.list_widget.count()):
             item = self.list_widget.item(row)
-            item.setHidden(bool(needle) and needle not in item.text().lower())
+            label = str(item.data(Qt.ItemDataRole.UserRole + 2) or item.text()).lower()
+            item.setHidden(bool(needle) and needle not in label)
+        self._renumber()
+
+    # ---- голосовое управление (канал управления, contact_picker_*) ----------
+    # Видимые строки нумеруются «1. Имя <адрес>» — помощник называет номер
+    # или имя, redmail отмечает строку; «принять» = ОК.
+
+    def _visible_items(self) -> list[QListWidgetItem]:
+        return [self.list_widget.item(r) for r in range(self.list_widget.count()) if not self.list_widget.item(r).isHidden()]
+
+    def _renumber(self) -> None:
+        self.list_widget.blockSignals(True)
+        try:
+            for number, item in enumerate(self._visible_items(), start=1):
+                item.setText(f"{number}. {item.data(Qt.ItemDataRole.UserRole + 2)}")
+        finally:
+            self.list_widget.blockSignals(False)
+
+    def set_filter(self, text: str) -> None:
+        self.filter_edit.setText(text)
+
+    def candidates(self) -> list[dict]:
+        return [
+            {
+                "number": number,
+                "name": item.data(Qt.ItemDataRole.UserRole + 3),
+                "email": item.data(Qt.ItemDataRole.UserRole + 4),
+                "checked": item.checkState() == Qt.CheckState.Checked,
+            }
+            for number, item in enumerate(self._visible_items(), start=1)
+        ]
+
+    def picker_state(self) -> dict:
+        return {"query": self.filter_edit.text(), "candidates": self.candidates()}
+
+    def select(self, *, number: int | None = None, query: str | None = None, all_visible: bool = False, checked: bool = True) -> int:
+        """Отметить (снять) строки: по номеру на экране, по словам имени
+        (все слова должны встретиться) или все видимые. Возвращает число
+        затронутых строк."""
+        visible = self._visible_items()
+        targets: list[QListWidgetItem] = []
+        if all_visible:
+            targets = visible
+        elif number is not None:
+            if 1 <= number <= len(visible):
+                targets = [visible[number - 1]]
+        elif query:
+            words = [w for w in query.casefold().split() if w]
+            for item in visible:
+                label = str(item.data(Qt.ItemDataRole.UserRole + 2) or "").casefold()
+                if words and all(w in label for w in words):
+                    targets.append(item)
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for item in targets:
+            item.setCheckState(state)
+            self.list_widget.scrollToItem(item)
+        return len(targets)
+
+    def selected_entries(self) -> list[dict]:
+        return [
+            {"name": item.data(Qt.ItemDataRole.UserRole + 3), "email": item.data(Qt.ItemDataRole.UserRole + 4)}
+            for item in (self.list_widget.item(r) for r in range(self.list_widget.count()))
+            if item.checkState() == Qt.CheckState.Checked
+        ]
 
     def selected_candidates(self) -> list[str]:
         # Галочки + текущее выделение: одиночный клик по строке (без
@@ -1195,10 +1263,14 @@ def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_st
     dialog = ContactPickerDialog(parent, contacts, preselected=line_edit.text())
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return
-    picked = dialog.selected_candidates()
-    # Окно показывало текущий выбор — его результат и есть новое содержимое
-    # поля (снятые галочки убирают адресата); вручную набранные адреса, которых
-    # нет в книге, сохраняются.
+    _apply_picker_to_field(line_edit, contacts, dialog.selected_candidates())
+    return
+
+
+def _apply_picker_to_field(line_edit: QLineEdit, contacts: list[contact_store.Contact], picked: list[str]) -> None:
+    """Окно показывало текущий выбор — его результат и есть новое содержимое
+    поля (снятые галочки убирают адресата); вручную набранные адреса,
+    которых нет в книге, сохраняются."""
     known_addrs = {c.emails[0].lower() for c in contacts if not c.is_group and c.emails}
     _groups_in_field, rest = _split_recipient_text(line_edit.text())
     manual = [
@@ -1206,7 +1278,6 @@ def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_st
         for name, addr in getaddresses([rest]) if addr and "@" in addr and addr.lower() not in known_addrs
     ]
     line_edit.setText(", ".join(manual + picked))
-    return
     # getaddresses (не наивный split(",")) при разборе уже введённого — иначе
     # имя в кавычках со своей запятой внутри (см. _contact_candidates)
     # резалось бы пополам при пересборке поля.
@@ -10010,6 +10081,74 @@ class MainWindow(QMainWindow):
         if self._ipc_event_form is None:
             raise RuntimeError("Форма встречи не открыта.")
         return self._ipc_event_form
+
+    # ---- адресная книга на экране для формы встречи (помощник) --------------
+    # Помощник при неоднозначной фамилии открывает книгу с фильтром: строки
+    # пронумерованы, уже выбранные отмечены; «второй», «евгений», «все»,
+    # «принять», «отмена» — команды канала ниже. Окно немодальное (канал
+    # должен отвечать, пока оно открыто) и привязано к форме встречи.
+
+    def _ipc_picker(self) -> ContactPickerDialog:
+        picker = getattr(self, "_ipc_contact_picker", None)
+        if picker is None:
+            raise RuntimeError("Адресная книга не открыта.")
+        return picker
+
+    def ipc_contact_picker_open(self, query: str = "") -> dict:
+        dialog, _existing = self._ipc_open_event_form()
+        existing_picker = getattr(self, "_ipc_contact_picker", None)
+        if existing_picker is not None:
+            existing_picker.set_filter(query)
+            existing_picker.raise_()
+            return existing_picker.picker_state()
+        contacts = dialog._contacts or self._load_contacts()
+        if not contacts:
+            raise RuntimeError("Адресная книга пуста.")
+        parent = dialog if isinstance(dialog, QWidget) else self
+        picker = ContactPickerDialog(parent, contacts, preselected=dialog.attendees_edit.text())
+        picker.setModal(False)
+        picker.setWindowTitle("Адресная книга — участники встречи")
+        picker.set_filter(query)
+        self._ipc_contact_picker = picker
+
+        def on_finished(result: int) -> None:
+            if getattr(self, "_ipc_contact_picker", None) is picker:
+                self._ipc_contact_picker = None
+            if result == QDialog.DialogCode.Accepted:
+                try:
+                    _apply_picker_to_field(dialog.attendees_edit, contacts, picker.selected_candidates())
+                except RuntimeError:
+                    pass  # форма уже закрыта
+            picker.deleteLater()
+
+        picker.finished.connect(on_finished)
+        picker.show()
+        picker.raise_()
+        picker.activateWindow()
+        return picker.picker_state()
+
+    def ipc_contact_picker_select(
+        self, *, number: int | None = None, query: str | None = None, all_visible: bool = False, checked: bool = True
+    ) -> dict:
+        picker = self._ipc_picker()
+        touched = picker.select(number=number, query=query, all_visible=all_visible, checked=checked)
+        state = picker.picker_state()
+        state["touched"] = touched
+        return state
+
+    def ipc_contact_picker_state(self) -> dict:
+        return self._ipc_picker().picker_state()
+
+    def ipc_contact_picker_accept(self) -> list[dict]:
+        picker = self._ipc_picker()
+        selected = picker.selected_entries()
+        picker.accept()  # finished → выбор ложится в поле «Участники»
+        return selected
+
+    def ipc_contact_picker_cancel(self) -> None:
+        picker = getattr(self, "_ipc_contact_picker", None)
+        if picker is not None:
+            picker.reject()
 
     def ipc_event_form_open(self, *, uid: str | None = None, **changes) -> dict:
         if not self.account:

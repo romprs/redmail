@@ -386,6 +386,43 @@ def _handle_event_form_cancel(controller, _args) -> dict:
     return {"cancelled": True}
 
 
+# Адресная книга на экране для формы встречи: помощник открывает её с
+# фильтром (строки пронумерованы), отмечает по номеру/имени/все, принимает
+# или отменяет. Ответ — {"picker": {"query", "candidates": [{number, name,
+# email, checked}], ["touched"]}}.
+def _handle_contact_picker_open(controller, args) -> dict:
+    query = _text(args.get("query"), "query") or ""
+    return {"opened": "contact_picker", "picker": controller.ipc_contact_picker_open(query)}
+
+
+def _handle_contact_picker_select(controller, args) -> dict:
+    number = args.get("number")
+    if number is not None:
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise ValueError("number: ожидается целое число от 1")
+    query = _text(args.get("query"), "query") or None
+    all_visible = bool(args.get("all", False))
+    checked = args.get("checked", True)
+    if not isinstance(checked, bool):
+        raise ValueError("checked: ожидается true/false")
+    if number is None and not query and not all_visible:
+        raise ValueError("укажите number, query или all")
+    return {"picker": controller.ipc_contact_picker_select(number=number, query=query, all_visible=all_visible, checked=checked)}
+
+
+def _handle_contact_picker_state(controller, _args) -> dict:
+    return {"picker": controller.ipc_contact_picker_state()}
+
+
+def _handle_contact_picker_accept(controller, _args) -> dict:
+    return {"accepted": True, "selected": controller.ipc_contact_picker_accept()}
+
+
+def _handle_contact_picker_cancel(controller, _args) -> dict:
+    controller.ipc_contact_picker_cancel()
+    return {"cancelled": True}
+
+
 # Сравнение фамилий "на слух": в речи фамилия почти всегда в косвенном
 # падеже («пригласить Шилкина, Пономарёва»), в адресной книге — в
 # именительном («Шилкин»). Сравниваем основы: без ё/е-различия и без
@@ -461,6 +498,11 @@ _HANDLERS = {
     "event_form_state": _handle_event_form_state,
     "event_form_save": _handle_event_form_save,
     "event_form_cancel": _handle_event_form_cancel,
+    "contact_picker_open": _handle_contact_picker_open,
+    "contact_picker_select": _handle_contact_picker_select,
+    "contact_picker_state": _handle_contact_picker_state,
+    "contact_picker_accept": _handle_contact_picker_accept,
+    "contact_picker_cancel": _handle_contact_picker_cancel,
     "find_contacts": _handle_find_contacts,
     "apply_mail_rules": _handle_apply_mail_rules,
     "list_mail_rules": _handle_list_mail_rules,
