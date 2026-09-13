@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        97%{?dist}
+Release:        98%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-98
+- Календарь: ширина боковой панели считается по мини-календарю при текущем шрифте и масштабе — левая колонка больше не обрезается
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-97
 - Параметры разнесены по вкладкам: Почта, Общие, Хранилище, Помощник, Учётные записи — окно помещается на экран
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-96

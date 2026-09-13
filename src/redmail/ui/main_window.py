@@ -5147,8 +5147,14 @@ class MainWindow(QMainWindow):
         self._refresh_calendars_list()
 
         calendar_sidebar = QWidget(self)
-        calendar_sidebar.setFixedWidth(240)
         sidebar_layout = QVBoxLayout(calendar_sidebar)
+        # Ширина боковой панели — по мини-календарю при текущем шрифте и
+        # масштабе, а не жёсткие 240 px: при крупном масштабе левая колонка
+        # календаря обрезалась (жалоба: "криво отрабатывает масштаб").
+        # Фиксированная политика по горизонтали: ширина панели = её sizeHint
+        # (мини-календарь + отступы) и пересчитывается вместе со шрифтом.
+        calendar_sidebar.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
+        calendar_sidebar.setMinimumWidth(240)
         sidebar_layout.addWidget(self.calendar_mini_picker)
         sidebar_layout.addWidget(calendars_group)
         sidebar_layout.addStretch(1)
