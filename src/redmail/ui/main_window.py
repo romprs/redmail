@@ -994,12 +994,33 @@ def _expand_recipients(text: str, contacts: list[contact_store.Contact] | None) 
     return result
 
 
+def _contact_name_for(email: str, contacts: list[contact_store.Contact] | None) -> str:
+    """Имя из адресной книги по адресу («» — нет такого контакта)."""
+    needle = email.strip().casefold()
+    for contact in contacts or ():
+        if not contact.is_group and any(addr.casefold() == needle for addr in contact.emails):
+            return contact.display_name
+    return ""
+
+
+def _recipient_entry(email: str, contacts: list[contact_store.Contact] | None, name: str = "") -> str:
+    """"Фамилия Имя Отчество <email>" для поля адресатов — имя из книги,
+    если не задано: голый email в поле нечитаем (жалоба: "добавляется не
+    ФИО, а email — непонятно, кого добавили")."""
+    return _format_recipient_candidate(name or _contact_name_for(email, contacts), email)
+
+
 def _recipients_tooltip(text: str, contacts: list[contact_store.Contact] | None, limit: int = 40) -> str:
-    """Подсказка к полю адресатов: все адреса, в которые раскроется поле."""
+    """Подсказка к полю адресатов: все адреса, в которые раскроется поле,
+    с именами из книги («Фамилия Имя Отчество — email»)."""
     addrs = _expand_recipients(text, contacts)
     if not addrs:
         return ""
-    shown = "\n".join(addrs[:limit])
+    lines = []
+    for addr in addrs[:limit]:
+        name = _contact_name_for(addr, contacts)
+        lines.append(f"{name} — {addr}" if name else addr)
+    shown = "\n".join(lines)
     if len(addrs) > limit:
         shown += f"\n… и ещё {len(addrs) - limit}"
     return f"Адресатов: {len(addrs)}\n{shown}"
@@ -1011,6 +1032,68 @@ def _install_recipient_tooltip(line_edit: QLineEdit, contacts: list[contact_stor
 
     line_edit.textChanged.connect(update)
     update(line_edit.text())
+
+
+class RecipientListView(QListWidget):
+    """Читаемый список адресатов под полем «Кому»/«Участники»: одна строка
+    на человека — «Фамилия Имя Отчество — email» (группы раскрываются по
+    книге). Само поле остаётся источником данных, список лишь отражает его
+    содержимое и даёт убрать адресата клавишей Delete или из контекстного
+    меню. Жалоба: "всё в одну строку — непонятно, кого добавили"."""
+
+    def __init__(self, line_edit: QLineEdit, contacts: list[contact_store.Contact] | None, parent=None):
+        super().__init__(parent)
+        self._line_edit = line_edit
+        self._contacts = contacts or []
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._context_menu)
+        self.setToolTip("Выбранные адресаты. Delete или правая кнопка — убрать.")
+        line_edit.textChanged.connect(self._refresh)
+        self._refresh(line_edit.text())
+
+    def _refresh(self, _text: str) -> None:
+        self.clear()
+        addrs = _expand_recipients(self._line_edit.text(), self._contacts)
+        typed_names = {addr.casefold(): name for name, addr in getaddresses([self._line_edit.text()]) if addr}
+        for addr in addrs:
+            name = _contact_name_for(addr, self._contacts) or typed_names.get(addr.casefold(), "")
+            item = QListWidgetItem(f"{name} — {addr}" if name else addr)
+            item.setData(Qt.ItemDataRole.UserRole, addr)
+            self.addItem(item)
+        rows = len(addrs)
+        self.setVisible(rows > 0)
+        row_height = max(self.sizeHintForRow(0), 18) if rows else 0
+        self.setFixedHeight(min(rows, 4) * row_height + 6 if rows else 0)
+
+    def _remove_selected(self) -> None:
+        drop = {item.data(Qt.ItemDataRole.UserRole).casefold() for item in self.selectedItems()}
+        if not drop:
+            return
+        groups, rest = _split_recipient_text(self._line_edit.text())
+        kept = [
+            _format_recipient_candidate(name, addr)
+            for name, addr in getaddresses([rest])
+            if addr and "@" in addr and addr.casefold() not in drop
+        ]
+        # Ссылки на группы оставляем как есть: убрать одного человека из
+        # группы через этот список нельзя, только всю группу — из поля.
+        group_tokens = [f"[{name}]" for name in groups]
+        self._line_edit.setText(", ".join(group_tokens + kept))
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            self._remove_selected()
+            return
+        super().keyPressEvent(event)
+
+    def _context_menu(self, pos) -> None:
+        if self.itemAt(pos) is None:
+            return
+        menu = QMenu(self)
+        remove_action = menu.addAction("Убрать")
+        if menu.exec(self.mapToGlobal(pos)) is remove_action:
+            self._remove_selected()
 
 
 def _parse_recipient_list(text: str, contacts: list[contact_store.Contact] | None = None) -> list[str]:
@@ -2577,6 +2660,8 @@ class ComposeDialog(QDialog):
         to_row.addSpacing(12)  # зазор до «Адресной книги» (пожелание пользователя)
         to_row.addWidget(address_book_button)
         to_row.addWidget(cc_bcc_button)
+        # contacts, а не self._contacts: тот присваивается ниже по __init__.
+        self.to_list_view = RecipientListView(self.to_edit, contacts or [], self)
 
         self.cc_edit = QLineEdit(cc, self)
         self.cc_edit.setClearButtonEnabled(True)
@@ -2596,6 +2681,7 @@ class ComposeDialog(QDialog):
         form.setVerticalSpacing(10)
         form.setHorizontalSpacing(12)
         form.addRow("Кому", to_row)
+        form.addRow("", self.to_list_view)
         self._cc_row_label = "Копия"
         form.addRow("Копия", self.cc_edit)
         form.addRow("Скрытая копия", self.bcc_edit)
@@ -3979,6 +4065,7 @@ class EventDialog(QDialog):
         attendees_row.addWidget(clear_attendees_button)  # сразу за полем, как в письме
         attendees_row.addSpacing(12)
         attendees_row.addWidget(attendees_address_book_button)
+        self.attendees_list_view = RecipientListView(self.attendees_edit, self._contacts, self)
 
         location_row = QHBoxLayout()
         location_row.addWidget(_icon_label("location", self))
@@ -4013,6 +4100,10 @@ class EventDialog(QDialog):
         layout.addLayout(repeat_row)
         layout.addLayout(calendar_row)
         layout.addLayout(attendees_row)
+        attendees_list_row = QHBoxLayout()
+        attendees_list_row.addSpacing(22)
+        attendees_list_row.addWidget(self.attendees_list_view)
+        layout.addLayout(attendees_list_row)
         layout.addLayout(location_row)
         layout.addLayout(description_row)
         layout.addLayout(attach_row)
@@ -4207,9 +4298,17 @@ def _apply_event_form_changes(dialog: EventDialog, changes: dict) -> None:
     if "participants" in changes:
         dialog.attendees_edit.setText(", ".join(changes["participants"]))
     if "add_participants" in changes:
-        current = dialog.attendee_emails()
-        merged = current + [email for email in changes["add_participants"] if email not in current]
-        dialog.attendees_edit.setText(", ".join(merged))
+        # С именами из адресной книги («Шилкин Евгений Александрович <...>»)
+        # — голый email в поле нечитаем; уже введённое не трогаем.
+        contacts = getattr(dialog, "_contacts", None) or []
+        current = {addr.casefold() for addr in dialog.attendee_emails()}
+        text = dialog.attendees_edit.text().strip()
+        entries = [text] if text else []
+        for email in changes["add_participants"]:
+            if email.casefold() not in current:
+                entries.append(_recipient_entry(email, contacts))
+                current.add(email.casefold())
+        dialog.attendees_edit.setText(", ".join(entries))
 
     if "location" in changes:
         dialog.location_edit.setText(changes["location"])
@@ -4263,11 +4362,14 @@ class EventDetailsDialog(QDialog):
     поменять только через приглашение в почте, что неудобно, если письмо
     уже прочитано/не под рукой."""
 
-    def __init__(self, parent, event: calendar_store.Event):
+    def __init__(self, parent, event: calendar_store.Event, contacts: list[contact_store.Contact] | None = None):
         super().__init__(parent)
         self.setWindowTitle(event.summary or "(без темы)")
         self.resize(440, 460)
         self.event = event
+        # Участники приглашений часто приходят без имени — подставляем его
+        # из адресной книги, чтобы в карточке были люди, а не адреса.
+        contacts = contacts or []
         self._temp_dirs: list[Path] = []
         self.chosen_participation: str | None = None
         self.copy_requested = False
@@ -4293,12 +4395,16 @@ class EventDetailsDialog(QDialog):
             display = html.escape(name or email)
             return f'<tr><td><img src="{url}"></td><td>&nbsp;{display}{suffix}</td></tr>'
 
-        organizer_display = event.organizer_name or event.organizer_email
+        organizer_display = (
+            event.organizer_name or _contact_name_for(event.organizer_email, contacts) or event.organizer_email
+        )
         attendee_rows.append(_avatar_row(organizer_display, event.organizer_email, " — организатор"))
         for attendee in event.attendees:
             label = _PARTICIPATION_LABELS.get(attendee.participation, "")
             suffix = f" — {label}" if attendee.participation != "needs-action" else ""
-            attendee_rows.append(_avatar_row(attendee.name, attendee.email, suffix))
+            attendee_rows.append(
+                _avatar_row(attendee.name or _contact_name_for(attendee.email, contacts), attendee.email, suffix)
+            )
         parts.append(
             "<br><b>Участники</b><table cellspacing=\"4\">" + "".join(attendee_rows) + "</table>"
         )
@@ -9024,7 +9130,7 @@ class MainWindow(QMainWindow):
         self.selected_calendar_event = event
         self._apply_calendar_selection_highlight()
         if not event.is_organizer:
-            dialog = EventDetailsDialog(self, event)
+            dialog = EventDetailsDialog(self, event, contacts=self._load_contacts())
             if dialog.exec() == QDialog.DialogCode.Accepted:
                 if dialog.chosen_participation is not None:
                     self.on_calendar_rsvp(event, dialog.chosen_participation)
