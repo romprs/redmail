@@ -79,6 +79,11 @@ description: Выпуск сборки redmail — прогон тестов, б
 for a in 1 2 3 4 5; do sync; echo 3 > /proc/sys/vm/drop_caches;
   rpm -K /var/tmp/<rpm> && rpm -Uvh --force /var/tmp/<rpm> && bad=$(rpm -V <pkg> | grep -vE '^\.{9}  c' | wc -l) && [ "$bad" = 0 ] && break; done
 ```
+После цикла ОБЯЗАТЕЛЬНО сверить `rpm -q <pkg>` с ожидаемой версией: `rpm -Uvh` может не выполниться
+(например, «can't create transaction lock» — второй rpm шёл параллельно), а `rpm -V` старого пакета
+пройдёт чисто, и цикл сочтёт установку успешной. Два пакета на .80 ставить последовательно, не параллельно.
+Параллельные доставки — с разными каталогами: `SHIP_DIR=/var/tmp/ship-ar bash scripts/ship80.sh …`.
+На D:\111 держать только последние RPM: диск 29 ГБ забивался сборками (scp падал «No space left»).
 Проверять `rpm -V redmail` и `rpm -V audioreferent` (пусто = целы). Проверку связи с почтой
 делать питоном из venv помощника: `/opt/audioreferent/venv/bin/python -c "from audioreferent import redmail_client as c; print(c.send_request('ping'))"`
 (pip --user копии помощника на .80 больше нет, юнит — из RPM `/usr/lib/systemd/user/audioreferent.service`).
