@@ -8,7 +8,7 @@ SRC="$1"
 NAME=$(basename "$SRC")
 HOST=root@192.168.0.80
 KEY="$HOME/.ssh/redos_80"
-DEST_DIR=/var/tmp/ship
+DEST_DIR="${SHIP_DIR:-/var/tmp/ship}"  # свой каталог через SHIP_DIR, если доставки идут параллельно
 SSH="ssh -i $KEY -o StrictHostKeyChecking=no -o ConnectTimeout=15 $HOST"
 
 W=$(mktemp -d)
