@@ -198,7 +198,21 @@ class CachedMailbox:
             self._reader_session().move_messages(folder, live, target_folder)
             cache_store.delete_messages(self._account_key, folder, live)
         if archived:
+            # Архивные письма при выключенном «удалять с сервера» всё ещё
+            # лежат на сервере — иначе после переноса синхронизация вернёт
+            # их как новые (жалоба: "почистил корзину — синхронизация её
+            # заполнила обратно"). Ошибку сервера (письма там уже нет)
+            # игнорируем.
+            self._server_op_for_archived(folder, [uid for uid, _p, _a in archived], lambda s, ids: s.move_messages(folder, ids, target_folder))
             self._delete_archived(folder, archived)
+
+    def _server_op_for_archived(self, folder: str, uids: list[int], operation) -> None:
+        if not uids:
+            return
+        try:
+            operation(self._reader_session(), uids)
+        except Exception as exc:
+            _log.info("Архивные письма %s %s: на сервере не тронуты (%s)", folder, uids[:5], exc)
 
     def _delete_archived(self, folder: str, archived: list[tuple[int, str, int]]) -> None:
         by_file: dict[str, list[int]] = {}
@@ -219,6 +233,7 @@ class CachedMailbox:
             self._reader_session().delete_messages(folder, live)
             cache_store.delete_messages(self._account_key, folder, live)
         if archived:
+            self._server_op_for_archived(folder, [uid for uid, _p, _a in archived], lambda s, ids: s.delete_messages(folder, ids))
             self._delete_archived(folder, archived)
 
     def close(self) -> None:

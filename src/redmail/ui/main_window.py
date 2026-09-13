@@ -270,9 +270,15 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         accent = option.palette.color(QPalette.ColorRole.Highlight)
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        # На выделенной строке фон и так цвета акцента — отмеченный квадрат
+        # сливался с ним (жалоба: "непонятно, что выбрал письмо галочкой,
+        # цвета совпадают"): там квадрат рисуем цветом текста выделения, а
+        # галочку внутри — акцентом.
+        fill = option.palette.color(QPalette.ColorRole.HighlightedText) if selected else accent
         if checked:
-            painter.setBrush(accent)
-            painter.setPen(QPen(accent, self._PEN_WIDTH))
+            painter.setBrush(fill)
+            painter.setPen(QPen(fill, self._PEN_WIDTH))
         else:
             painter.setBrush(Qt.BrushStyle.NoBrush)
             # Серый, а не палитровый Text (белый в тёмной теме/почти чёрный
@@ -280,9 +286,20 @@ class _ThinCheckboxDelegate(QStyledItemDelegate):
             # линии) — светло-серый на тёмном фоне, тёмно-серый на светлом.
             # На тёмном фоне светлее прежнего (жалоба: "рамку почти не
             # видно, сделай на пару тонов ярче").
-            border_color = QColor("#a9adb3") if app_theme.is_dark() else QColor("#5f6368")
+            border_color = fill if selected else (QColor("#a9adb3") if app_theme.is_dark() else QColor("#5f6368"))
             painter.setPen(QPen(border_color, self._PEN_WIDTH))
         painter.drawRoundedRect(square, 3, 3)
+        if checked:
+            # Галочка внутри квадрата — видна и на обычной, и на выделенной строке.
+            mark_color = accent if selected else option.palette.color(QPalette.ColorRole.HighlightedText)
+            painter.setPen(QPen(mark_color, 1.6))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            x0, y0, w, h = square.x(), square.y(), square.width(), square.height()
+            path = QPainterPath()
+            path.moveTo(x0 + w * 0.22, y0 + h * 0.52)
+            path.lineTo(x0 + w * 0.43, y0 + h * 0.73)
+            path.lineTo(x0 + w * 0.78, y0 + h * 0.30)
+            painter.drawPath(path)
         painter.restore()
 
 _FLAG_MARK = "⚑"
@@ -7583,6 +7600,26 @@ class MainWindow(QMainWindow):
             f"Отмечено писем: {len(visible_rows)}" if state == Qt.CheckState.Checked else "Отметки сняты", 4000
         )
 
+    def _expand_collapsed_threads(self, uids: list[int]) -> list[int]:
+        """Отмеченное головное письмо свёрнутой цепочки означает всю цепочку:
+        её остальные письма скрыты, отметить их нельзя (жалоба: "если
+        удаляю группу — удаляется 1 письмо")."""
+        result: list[int] = []
+        seen: set[int] = set()
+        for uid in uids:
+            if uid in seen:
+                continue
+            info = self._thread_info.get(uid)
+            if info is not None and info.is_head and info.count > 1 and info.key not in self._expanded_threads:
+                for member_uid, member in self._thread_info.items():
+                    if member.key == info.key and member_uid not in seen:
+                        seen.add(member_uid)
+                        result.append(member_uid)
+            elif uid not in seen:
+                seen.add(uid)
+                result.append(uid)
+        return result
+
     def _checked_uids(self) -> list[int]:
         checked = [
             self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole)
@@ -7590,7 +7627,7 @@ class MainWindow(QMainWindow):
             if self.table.item(row, COL_CHECK).checkState() == Qt.CheckState.Checked
         ]
         if checked:
-            return checked
+            return self._expand_collapsed_threads(checked)
         # Ничего не отмечено галочками — при ДВУХ и более выделенных
         # строках (обычный Ctrl+клик/Shift+клик) считаем это тем же самым:
         # раньше массовые действия (удаление, восстановление из корзины)
@@ -7604,7 +7641,9 @@ class MainWindow(QMainWindow):
         selected_rows = {index.row() for index in self.table.selectionModel().selectedRows()}
         if len(selected_rows) < 2:
             return []
-        return [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) for row in selected_rows]
+        return self._expand_collapsed_threads(
+            [self.table.item(row, COL_CHECK).data(Qt.ItemDataRole.UserRole) for row in selected_rows]
+        )
 
     def on_restore_from_trash(self) -> None:
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
@@ -7675,9 +7714,12 @@ class MainWindow(QMainWindow):
 
         if self.selected_summary and self.selected_summary.uid in checked_uids:
             self._clear_reading_pane()
-        # Сервер и обновление списка — в фоне: раньше удаление шло в потоке
-        # интерфейса и ждало, пока фоновая синхронизация освободит
-        # соединение (жалоба: "попробовал удалить — опять висит").
+        # Строки исчезают из списка сразу (жалоба: "удаление идёт как-то
+        # медленно"); сервер и обновление списка — в фоне: раньше удаление
+        # шло в потоке интерфейса и ждало, пока фоновая синхронизация
+        # освободит соединение (жалоба: "попробовал удалить — опять висит").
+        removed = set(checked_uids)
+        self._render_folder([s for s in self.current_summaries if s.uid not in removed])
         self._set_busy("Удаление…")
 
         def do_delete() -> list[MessageSummary]:

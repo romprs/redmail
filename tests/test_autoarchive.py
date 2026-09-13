@@ -126,11 +126,14 @@ def test_run_archives_verifies_then_deletes_on_server_and_keeps_index(tmp_path: 
         again = mailbox.refresh_folder("INBOX")
         assert [s.uid for s in again] == [3, 2, 1]
 
-        # Флаги и удаление архивного письма — без обращения к серверу.
-        server.delete_messages = MagicMock()
+        # Флаги архивного письма — без обращения к серверу; удаление —
+        # попытка и на сервере (при выключенном «удалять с сервера» письмо
+        # там ещё лежит и иначе вернулось бы синхронизацией), ошибка
+        # сервера не мешает локальному удалению.
+        server.delete_messages = MagicMock(side_effect=OSError("no such message"))
         mailbox.set_read("INBOX", 1, True)
         mailbox.delete_messages("INBOX", [1])
-        server.delete_messages.assert_not_called()
+        server.delete_messages.assert_called_once_with("INBOX", [1])
         assert [s.uid for s in mailbox.folder_summaries("INBOX")] == [3, 2]
         assert len(archive_store.list_messages(archive_path, "INBOX")) == 1
 

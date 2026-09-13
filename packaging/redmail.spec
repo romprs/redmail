@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        87%{?dist}
+Release:        88%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,11 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-88
+- Отметка головного письма свёрнутой цепочки действует на всю цепочку (удаление группы удаляло одно письмо)
+- Удалённые письма исчезают из списка сразу, сервер и обновление — в фоне
+- Архивные письма при удалении/переносе трогаются и на сервере: иначе синхронизация возвращала их (корзина «наполнялась обратно»)
+- Галочка на выделенной строке видна: квадрат цветом текста выделения, внутри отметка
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-87
 - Панель разделов: отступы сверху и снизу заданы компоновкой (QSS-отступ панель игнорировала)
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-86
