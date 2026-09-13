@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        91%{?dist}
+Release:        92%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-92
+- Счётчики непрочитанных в дереве обновляются после удаления, переноса, отметки «прочитано» и обновления папки; опрос «Входящих» больше не сбрасывает числа у других папок
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-91
 - Канал управления: адресная книга на экране для формы встречи (contact_picker_open/select/state/accept/cancel) — помощник открывает книгу с фильтром, строки пронумерованы, выбор по номеру или имени, «принять» кладёт участников в форму
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-90

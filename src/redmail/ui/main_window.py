@@ -5848,14 +5848,16 @@ class MainWindow(QMainWindow):
         self._background_workers.append(worker)
         worker.start()
 
-    def _apply_folder_unread_counts(self, key: str, counts: dict[str, int]) -> None:
+    def _apply_folder_unread_counts(self, key: str, counts: dict[str, int], *, partial: bool = False) -> None:
+        """partial=True — обновить только папки из counts (остальные не
+        трогать); иначе папки, которых нет в counts, показываются без числа."""
         root = self.mailbox_tree_roots.get(key)
         if root is None:
             return
 
         def walk(item: QTreeWidgetItem) -> None:
             data = item.data(0, Qt.ItemDataRole.UserRole)
-            if isinstance(data, tuple) and len(data) == 2 and data[0] == key:
+            if isinstance(data, tuple) and len(data) == 2 and data[0] == key and (not partial or data[1] in counts):
                 base = item.data(0, _FOLDER_BASE_LABEL_ROLE) or item.text(0)
                 count = counts.get(data[1], 0)
                 item.setText(0, f"{base} ({count})" if count else base)
@@ -5863,6 +5865,42 @@ class MainWindow(QMainWindow):
                 walk(item.child(i))
 
         walk(root)
+
+    def _mailbox_key(self) -> str | None:
+        return next((k for k, m in self.mailboxes.items() if m is self.mailbox), None)
+
+    def _refresh_counts_async(self, folders: list[str]) -> None:
+        """Счётчики непрочитанных в дереве для указанных папок — после
+        удаления, переноса, отметки «прочитано» (жалоба: "после удаления
+        число остаётся"). STATUS по интерактивному соединению, в фоне."""
+        mailbox = self.mailbox
+        key = self._mailbox_key()
+        folders = [f for f in dict.fromkeys(folders) if f]
+        if not isinstance(mailbox, CachedMailbox) or key is None or not folders:
+            return
+
+        def fetch() -> dict[str, int]:
+            counts: dict[str, int] = {}
+            session = mailbox.interactive_session()
+            for folder in folders:
+                try:
+                    counts[folder] = session.folder_unseen_count(folder)
+                except Exception:
+                    continue
+            return counts
+
+        worker = _CallableWorker(fetch, parent=self)
+
+        def done(counts: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if counts:
+                self._apply_folder_unread_counts(key, counts, partial=True)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(lambda _e: done())
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_open_archive(self) -> None:
         dialog = QFileDialog(self, "Открыть или создать архив")
@@ -6973,6 +7011,8 @@ class MainWindow(QMainWindow):
 
         def on_success(summaries: object) -> None:
             finish()
+            if source is self.mailbox:
+                self._refresh_counts_async([folder])
             if source is not self.active_source or folder != self.current_folder:
                 return  # пользователь уже переключил папку — не подменяем список
             self._render_folder(summaries)
@@ -7201,7 +7241,7 @@ class MainWindow(QMainWindow):
         def on_success(counts: object) -> None:
             finish()
             if counts:
-                self._apply_folder_unread_counts(key, counts)
+                self._apply_folder_unread_counts(key, counts, partial=True)
 
         def on_failure(_error_text: str) -> None:
             finish()
@@ -7999,6 +8039,8 @@ class MainWindow(QMainWindow):
             if source is self.active_source and folder == self.current_folder:
                 self._render_folder(summaries)
             self.statusBar().showMessage(status_text, 5000)
+            if source is self.mailbox:
+                self._refresh_counts_async([folder, self.trash_folder_name or ""])
 
         def on_failure(error_text: str) -> None:
             finish()
@@ -8278,6 +8320,8 @@ class MainWindow(QMainWindow):
             font.setBold(not read)
             item.setFont(font)
         self._refresh_cards()
+        if self.active_source is self.mailbox and self.current_folder:
+            self._refresh_counts_async([self.current_folder])
 
     def _mark_summary_answered(self, source: object, folder: str, uid: int) -> None:
         """Ставит \\Answered на письмо, на которое только что отправлен
