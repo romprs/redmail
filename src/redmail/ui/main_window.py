@@ -102,6 +102,7 @@ from PySide6.QtWidgets import (
     QStyleOptionViewItem,
     QToolTip,
     QTableWidget,
+    QTabWidget,
     QTableWidgetItem,
     QTextBrowser,
     QTextEdit,
@@ -1784,6 +1785,17 @@ def _icon_label(kind: str, parent: QWidget | None = None) -> QLabel:
     return label
 
 
+def _settings_tab(*groups: QWidget) -> QWidget:
+    """Страница вкладки параметров: группы сверху, свободное место снизу."""
+    page = QWidget()
+    page_layout = QVBoxLayout(page)
+    page_layout.setContentsMargins(8, 8, 8, 8)
+    for group in groups:
+        page_layout.addWidget(group)
+    page_layout.addStretch(1)
+    return page
+
+
 class SettingsDialog(QDialog):
     """Один диалог на всё: учётная запись (было отдельным «Подключиться…»),
     интервал проверки почты и расположение панели чтения."""
@@ -1944,11 +1956,13 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        # Вкладки вместо одного длинного столбца: окно не помещалось на
+        # экран (жалоба: "окно параметров не входит на экран — сделай
+        # вкладки, разнеси функционал").
+        tabs = QTabWidget(self)
+        tabs.addTab(_settings_tab(imap_group, smtp_group), "Почта")
+        tabs.addTab(_settings_tab(general_group, archive_dir_group), "Общие")
         layout = QVBoxLayout(self)
-        layout.addWidget(imap_group)
-        layout.addWidget(smtp_group)
-        layout.addWidget(general_group)
-        layout.addWidget(archive_dir_group)
 
         # Хранилище (переход на хранение «как в Outlook»): каталог профиля с
         # базами почты/календаря/контактов, порог размера письма для фоновой
@@ -2010,7 +2024,7 @@ class SettingsDialog(QDialog):
         storage_form.addRow(storage_hint)
         storage_group = QGroupBox("Хранилище")
         storage_group.setLayout(storage_form)
-        layout.addWidget(storage_group)
+        tabs.addTab(_settings_tab(storage_group), "Хранилище")
 
         # Голосовой помощник (audioreferent) — отдельный продукт, здесь только
         # управление им: включить/выключить сервис, состояние, его настройки,
@@ -2036,11 +2050,13 @@ class SettingsDialog(QDialog):
         voice_form.addRow(voice_buttons)
         voice_group = QGroupBox("Голосовой помощник")
         voice_group.setLayout(voice_form)
-        layout.addWidget(voice_group)
+        tabs.addTab(_settings_tab(voice_group), "Помощник")
         self._voice_updating = False
         self._refresh_voice_state()
-        layout.addWidget(accounts_rules_group)
+        tabs.addTab(_settings_tab(accounts_rules_group), "Учётные записи")
+        layout.addWidget(tabs)
         layout.addWidget(buttons)
+        self.resize(760, 560)
 
         self._update_password_enabled()
 
