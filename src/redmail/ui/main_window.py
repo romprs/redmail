@@ -938,32 +938,90 @@ def _format_recipient_candidate(name: str, email: str) -> str:
 
 def _contact_candidates(contacts: list[contact_store.Contact]) -> list[str]:
     """Варианты для автодополнения и окна выбора. Человек — один адрес
-    («Имя <адрес>»); группа — «Имя группы: a@x, b@x;» (групповой синтаксис
-    RFC 5322: getaddresses в _parse_recipient_list раскрывает его в адреса
-    участников, а в поле «Кому» видно, что это список)."""
+    («Имя <адрес>»); группа — короткая ссылка «[Имя группы]»: в поле
+    «Кому» остаётся читаемое имя, а адреса участников подставляются при
+    отправке (_parse_recipient_list с адресной книгой). Жалоба: "выбрал
+    группу — подставились адреса, просмотреть их невозможно"."""
     candidates = []
     for contact in contacts:
         if contact.is_group:
             if contact.emails:
-                candidates.append(_format_group_candidate(contact.display_name, contact.emails))
+                candidates.append(_format_group_candidate(contact.display_name))
         elif contact.emails:
             candidates.append(_format_recipient_candidate(contact.display_name, contact.emails[0]))
     return candidates
 
 
-def _format_group_candidate(name: str, emails: list[str]) -> str:
-    safe_name = name.replace(":", " ").replace(";", " ").replace(",", " ").strip() or "Группа"
-    return f"{safe_name}: {', '.join(emails)};"
+_GROUP_TOKEN_RE = re.compile(r"\[([^\[\]]+)\]")
 
 
-def _parse_recipient_list(text: str) -> list[str]:
+def _format_group_candidate(name: str) -> str:
+    safe_name = name.replace("[", "(").replace("]", ")").replace(",", " ").strip() or "Группа"
+    return f"[{safe_name}]"
+
+
+def _find_group(contacts: list[contact_store.Contact] | None, name: str) -> contact_store.Contact | None:
+    needle = name.strip().casefold()
+    for contact in contacts or ():
+        if contact.is_group and _format_group_candidate(contact.display_name).strip("[]").casefold() == needle:
+            return contact
+    return None
+
+
+def _split_recipient_text(text: str) -> tuple[list[str], str]:
+    """(имена групп из ссылок «[…]», остальной текст без них)."""
+    groups = [m.group(1) for m in _GROUP_TOKEN_RE.finditer(text)]
+    rest = _GROUP_TOKEN_RE.sub("", text)
+    return groups, rest
+
+
+def _expand_recipients(text: str, contacts: list[contact_store.Contact] | None) -> list[str]:
+    """Адреса из поля: ссылки на группы раскрываются по адресной книге,
+    остальное — обычный разбор списка адресов. Порядок и уникальность
+    сохраняются."""
+    groups, rest = _split_recipient_text(text)
+    result: list[str] = []
+    for name in groups:
+        group = _find_group(contacts, name)
+        for addr in (group.emails if group is not None else []):
+            if addr not in result:
+                result.append(addr)
+    for _name, addr in getaddresses([rest]):
+        if addr and "@" in addr and addr not in result:
+            result.append(addr)
+    return result
+
+
+def _recipients_tooltip(text: str, contacts: list[contact_store.Contact] | None, limit: int = 40) -> str:
+    """Подсказка к полю адресатов: все адреса, в которые раскроется поле."""
+    addrs = _expand_recipients(text, contacts)
+    if not addrs:
+        return ""
+    shown = "\n".join(addrs[:limit])
+    if len(addrs) > limit:
+        shown += f"\n… и ещё {len(addrs) - limit}"
+    return f"Адресатов: {len(addrs)}\n{shown}"
+
+
+def _install_recipient_tooltip(line_edit: QLineEdit, contacts: list[contact_store.Contact] | None) -> None:
+    def update(text: str) -> None:
+        line_edit.setToolTip(_recipients_tooltip(text, contacts))
+
+    line_edit.textChanged.connect(update)
+    update(line_edit.text())
+
+
+def _parse_recipient_list(text: str, contacts: list[contact_store.Contact] | None = None) -> list[str]:
     """Достаёт голые адреса из поля через запятую — элементы могут быть как
     просто email, так и "Имя <email>" (так автодополнение по контактам
-    вставляет выбранный вариант). getaddresses() (не parseaddr — тот не
-    умеет список) разбирает полноценный список адресов сразу, включая
-    случай, когда имя в кавычках само содержит запятую (см.
+    вставляет выбранный вариант), так и ссылка на группу «[Имя группы]»
+    (раскрывается по адресной книге contacts). getaddresses() (не
+    parseaddr — тот не умеет список) разбирает полноценный список адресов
+    сразу, включая случай, когда имя в кавычках само содержит запятую (см.
     _contact_candidates/_format_recipient_candidate) — раньше text.split(",") резал такое
     имя пополам, и второй адрес в списке переставал распознаваться."""
+    if "[" in text:
+        return _expand_recipients(text, contacts)
     return [addr for _name, addr in getaddresses([text]) if addr]
 
 
@@ -1042,10 +1100,16 @@ class ContactPickerDialog(QDialog):
     набора в поле «Кому»/«Участники» уже было, но по отзыву с реального
     использования оказалось незаметным — эта кнопка даёт то же самое явно."""
 
-    def __init__(self, parent, contacts: list[contact_store.Contact]):
+    def __init__(self, parent, contacts: list[contact_store.Contact], *, preselected: str = "", persons_only: bool = False):
         super().__init__(parent)
         self.setWindowTitle("Адресная книга")
-        self.resize(380, 420)
+        self.resize(420, 480)
+        self._contacts = contacts
+        # Что уже стоит в поле — отмечаем (жалоба: "провалился в адресную
+        # книгу — не видно, кто выбран").
+        pre_groups, pre_rest = _split_recipient_text(preselected)
+        pre_groups_cf = {g.strip().casefold() for g in pre_groups}
+        pre_addrs = {addr.lower() for _n, addr in getaddresses([pre_rest]) if addr and "@" in addr}
 
         self.filter_edit = QLineEdit(self)
         self.filter_edit.setPlaceholderText("Поиск по имени или email")
@@ -1060,12 +1124,30 @@ class ContactPickerDialog(QDialog):
         # Галочки очевидны и, в отличие от выделения, переживают фильтрацию
         # списка (выделение скрытых строк Qt сбрасывает, отмеченные
         # галочки — нет).
-        for candidate in _contact_candidates(contacts):
-            item = QListWidgetItem(candidate)
+        for contact in contacts:
+            if not contact.emails or (persons_only and contact.is_group):
+                continue
+            if contact.is_group:
+                candidate = _format_group_candidate(contact.display_name)
+                label = f"{candidate}  — группа, адресов: {len(contact.emails)}"
+                checked = candidate.strip("[]").casefold() in pre_groups_cf
+            else:
+                candidate = _format_recipient_candidate(contact.display_name, contact.emails[0])
+                label = candidate
+                checked = contact.emails[0].lower() in pre_addrs
+            item = QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, candidate)
+            item.setData(Qt.ItemDataRole.UserRole + 1, len(contact.emails))
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(Qt.CheckState.Unchecked)
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+            if contact.is_group:
+                item.setToolTip("\n".join(contact.emails[:40]) + ("\n…" if len(contact.emails) > 40 else ""))
             self.list_widget.addItem(item)
         self.list_widget.itemDoubleClicked.connect(lambda _item: self.accept())
+        self.list_widget.itemChanged.connect(lambda _item: self._update_summary())
+
+        self.summary_label = QLabel("", self)
+        self._update_summary()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1076,7 +1158,18 @@ class ContactPickerDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self.filter_edit)
         layout.addWidget(self.list_widget)
+        layout.addWidget(self.summary_label)
         layout.addWidget(buttons)
+
+    def _update_summary(self) -> None:
+        checked = 0
+        addresses = 0
+        for row in range(self.list_widget.count()):
+            item = self.list_widget.item(row)
+            if item.checkState() == Qt.CheckState.Checked:
+                checked += 1
+                addresses += int(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
+        self.summary_label.setText(f"Отмечено: {checked}, адресов: {addresses}")
 
     def _apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
@@ -1091,7 +1184,7 @@ class ContactPickerDialog(QDialog):
         for row in range(self.list_widget.count()):
             item = self.list_widget.item(row)
             if item.checkState() == Qt.CheckState.Checked or item.isSelected():
-                picked.append(item.text())
+                picked.append(item.data(Qt.ItemDataRole.UserRole) or item.text())
         return picked
 
 
@@ -1099,12 +1192,21 @@ def _open_contact_picker(parent, line_edit: QLineEdit, contacts: list[contact_st
     if not contacts:
         QMessageBox.information(parent, "Адресная книга", "Адресная книга пуста — сначала добавьте контакты.")
         return
-    dialog = ContactPickerDialog(parent, contacts)
+    dialog = ContactPickerDialog(parent, contacts, preselected=line_edit.text())
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return
     picked = dialog.selected_candidates()
-    if not picked:
-        return
+    # Окно показывало текущий выбор — его результат и есть новое содержимое
+    # поля (снятые галочки убирают адресата); вручную набранные адреса, которых
+    # нет в книге, сохраняются.
+    known_addrs = {c.emails[0].lower() for c in contacts if not c.is_group and c.emails}
+    _groups_in_field, rest = _split_recipient_text(line_edit.text())
+    manual = [
+        _format_recipient_candidate(name, addr)
+        for name, addr in getaddresses([rest]) if addr and "@" in addr and addr.lower() not in known_addrs
+    ]
+    line_edit.setText(", ".join(manual + picked))
+    return
     # getaddresses (не наивный split(",")) при разборе уже введённого — иначе
     # имя в кавычках со своей запятой внутри (см. _contact_candidates)
     # резалось бы пополам при пересборке поля.
@@ -1477,6 +1579,7 @@ _MATERIAL_ICON_PATHS: dict[str, str] = {
     "reply_all": "M316-288 80-524l236-236 43 43-193 193 193 193-43 43Zm503 88v-156q0-60-39-99t-99-39H376l163 163-43 43-236-236 236-236 43 43-163 163h305q85 0 141.5 56.5T879-356v156h-60Z",
     "filter_list": "M400-240v-60h160v60H400ZM240-450v-60h480v60H240ZM120-660v-60h720v60H120Z",
     "sort": "M120-240v-60h240v60H120Zm0-210v-60h480v60H120Zm0-210v-60h720v60H120Z",
+    "group": "M40-160v-112q0-34 17.5-62.5T104-378q62-31 126-46.5T360-440q66 0 130 15.5T616-378q29 15 46.5 43.5T680-272v112H40Zm720 0v-120q0-44-24.5-84.5T666-434q51 6 96 20.5t84 35.5q36 20 55 44.5t19 53.5v120H760ZM360-480q-66 0-113-47t-47-113q0-66 47-113t113-47q66 0 113 47t47 113q0 66-47 113t-113 47Zm400-160q0 66-47 113t-113 47q-11 0-28-2.5t-28-5.5q27-32 41.5-71t14.5-81q0-42-14.5-81T544-792q14-5 28-6.5t28-1.5q66 0 113 47t47 113ZM120-240h480v-32q0-11-5.5-20T580-306q-54-27-109-40.5T360-360q-56 0-111 13.5T140-306q-9 5-14.5 14t-5.5 20v32Zm240-320q33 0 56.5-23.5T440-640q0-33-23.5-56.5T360-720q-33 0-56.5 23.5T280-640q0 33 23.5 56.5T360-560Zm0 320Zm0-400Z",
     "view_agenda": "M180-510q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0 450q-24 0-42-18t-18-42v-210q0-24 18-42t42-18h600q24 0 42 18t18 42v210q0 24-18 42t-42 18H180Zm0-60h600v-210H180v210Zm0-600v210-210Zm0 390v210-210Z",
     "view_list": "M350-220h470v-137H350v137ZM140-603h150v-137H140v137Zm0 187h150v-127H140v127Zm0 196h150v-137H140v137Zm210-196h470v-127H350v127Zm0-187h470v-137H350v137ZM140-160q-24 0-42-18t-18-42v-520q0-24 18-42t42-18h680q24 0 42 18t18 42v520q0 24-18 42t-42 18H140Z",
     "delete": "M261-120q-24.75 0-42.37-17.63Q201-155.25 201-180v-570h-41v-60h188v-30h264v30h188v60h-41v570q0 24-18 42t-42 18H261Zm438-630H261v570h438v-570ZM367-266h60v-399h-60v399Zm166 0h60v-399h-60v399ZM261-750v570-570Z",
@@ -1510,6 +1613,7 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "reply_all": "reply_all",
     "filter": "filter_list",
     "sort": "sort",
+    "group": "group",
     "view_table": "view_list",
     "view_cards": "view_agenda",
     "delete": "delete",
@@ -2264,6 +2368,7 @@ class ComposeDialog(QDialog):
         self.to_edit.setMinimumHeight(30)
         if contacts:
             _install_recipient_completer(self.to_edit, contacts)
+            _install_recipient_tooltip(self.to_edit, contacts)
         self.subject_edit = QLineEdit(subject)
         self.subject_edit.setMinimumHeight(30)
 
@@ -2387,10 +2492,12 @@ class ComposeDialog(QDialog):
         self.cc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.cc_edit, contacts)
+            _install_recipient_tooltip(self.cc_edit, contacts)
         self.bcc_edit = QLineEdit(bcc, self)
         self.bcc_edit.setPlaceholderText("Через запятую, если получателей несколько")
         if contacts:
             _install_recipient_completer(self.bcc_edit, contacts)
+            _install_recipient_tooltip(self.bcc_edit, contacts)
 
         form = QFormLayout()
         # Пожелание: "немного разнеси поля тема и кому".
@@ -2503,10 +2610,10 @@ class ComposeDialog(QDialog):
         self._form.setRowVisible(self.bcc_edit, visible)
 
     def cc_recipients(self) -> list[str]:
-        return _parse_recipient_list(self.cc_edit.text())
+        return _parse_recipient_list(self.cc_edit.text(), self._contacts)
 
     def bcc_recipients(self) -> list[str]:
-        return _parse_recipient_list(self.bcc_edit.text())
+        return _parse_recipient_list(self.bcc_edit.text(), self._contacts)
 
     def _on_attach(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(self, "Прикрепить файлы")
@@ -2529,7 +2636,7 @@ class ComposeDialog(QDialog):
         del self.attachments[row]
 
     def recipients(self) -> list[str]:
-        return _parse_recipient_list(self.to_edit.text())
+        return _parse_recipient_list(self.to_edit.text(), self._contacts)
 
     def subject(self) -> str:
         return self.subject_edit.text().strip()
@@ -3658,6 +3765,7 @@ class EventDialog(QDialog):
         self.attendees_edit.setPlaceholderText("Выберите участников")
         if contacts:
             _install_recipient_completer(self.attendees_edit, contacts)
+            _install_recipient_tooltip(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
         self.description_edit.setPlaceholderText("Добавьте описание")
         self.description_edit.setFixedHeight(140)  # пожелание: "поле текст в карточке событий увеличь в 2 раза"
@@ -3919,7 +4027,7 @@ class EventDialog(QDialog):
         return self.description_edit.toPlainText()
 
     def attendee_emails(self) -> list[str]:
-        return _parse_recipient_list(self.attendees_edit.text())
+        return _parse_recipient_list(self.attendees_edit.text(), self._contacts)
 
     def start_utc(self) -> datetime:
         return self._utc(self.start_edit.dateTime())
@@ -4187,11 +4295,15 @@ class EventDetailsDialog(QDialog):
 
 
 class ContactDialog(QDialog):
-    def __init__(self, parent=None, *, contact: contact_store.Contact | None = None):
+    def __init__(
+        self, parent=None, *, contact: contact_store.Contact | None = None,
+        contacts: list[contact_store.Contact] | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Изменить контакт" if contact else "Новый контакт")
-        self.resize(420, 380)
+        self.resize(460, 420)
         self._contact = contact
+        self._contacts = [c for c in (contacts or []) if contact is None or c.uid != contact.uid]
 
         self.name_edit = QLineEdit(contact.display_name if contact else "")
         self.emails_edit = QLineEdit(", ".join(contact.emails) if contact else "")
@@ -4203,9 +4315,19 @@ class ContactDialog(QDialog):
         self.org_edit = QLineEdit(contact.organization if contact else "")
         self.notes_edit = QPlainTextEdit(contact.notes if contact else "")
 
+        # Участников группы — из книги, а не только руками (жалоба: "при
+        # создании группы нет возможности выбрать адреса из имеющихся").
+        self.pick_members_button = QPushButton("Добавить из книги…", self)
+        self.pick_members_button.clicked.connect(self._on_pick_members)
+        self.pick_members_button.setVisible(self.group_check.isChecked())
+        self.group_check.toggled.connect(self.pick_members_button.setVisible)
+        emails_row = QHBoxLayout()
+        emails_row.addWidget(self.emails_edit, 1)
+        emails_row.addWidget(self.pick_members_button)
+
         form = QFormLayout()
         form.addRow("Имя", self.name_edit)
-        form.addRow("Email", self.emails_edit)
+        form.addRow("Email", emails_row)
         form.addRow(self.group_check)
         form.addRow("Телефон", self.phone_edit)
         form.addRow("Организация", self.org_edit)
@@ -4226,6 +4348,21 @@ class ContactDialog(QDialog):
         self.emails_edit.setPlaceholderText(
             "Адреса участников через запятую" if checked else "Один адрес (для списка адресов отметьте «Группа»)"
         )
+
+    def _on_pick_members(self) -> None:
+        if not self._contacts:
+            QMessageBox.information(self, "Адресная книга", "В книге пока нет других контактов.")
+            return
+        dialog = ContactPickerDialog(self, self._contacts, preselected=self.emails_edit.text(), persons_only=True)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        existing = [e.strip().lower() for e in self.emails_edit.text().split(",") if e.strip()]
+        for candidate in dialog.selected_candidates():
+            pairs = getaddresses([candidate])
+            addr = pairs[0][1].lower() if pairs else ""
+            if addr and "@" in addr and addr not in existing:
+                existing.append(addr)
+        self.emails_edit.setText(", ".join(existing))
 
     def accept(self) -> None:  # noqa: N802 - Qt override
         emails = [e.strip() for e in self.emails_edit.text().split(",") if e.strip()]
@@ -4999,11 +5136,30 @@ class MainWindow(QMainWindow):
         contacts_refresh_action.triggered.connect(self.refresh_contacts_view)
         contacts_toolbar.addAction(contacts_refresh_action)
 
+        # Поиск и фильтр по типу (жалобы: "по книге нет поиска", "не
+        # отфильтровать группы, признак не виден").
+        self.contacts_search_edit = QLineEdit(self)
+        self.contacts_search_edit.setObjectName("searchField")
+        self.contacts_search_edit.setPlaceholderText("Поиск по имени, адресу, организации")
+        self.contacts_search_edit.addAction(_toolbar_icon("search", 14), QLineEdit.ActionPosition.LeadingPosition)
+        self.contacts_search_edit.setClearButtonEnabled(True)
+        self.contacts_search_edit.textChanged.connect(self._apply_contacts_filter)
+        self.contacts_kind_combo = QComboBox(self)
+        self.contacts_kind_combo.addItems(["Все", "Люди", "Группы"])
+        self.contacts_kind_combo.currentIndexChanged.connect(self._apply_contacts_filter)
+        contacts_filter_row = QHBoxLayout()
+        contacts_filter_row.setContentsMargins(6, 4, 6, 4)
+        contacts_filter_row.addWidget(self.contacts_search_edit, 1)
+        contacts_filter_row.addWidget(self.contacts_kind_combo)
+        self.contacts_count_label = QLabel("", self)
+        contacts_filter_row.addWidget(self.contacts_count_label)
+
         contacts_page = QWidget(self)
         contacts_layout = QVBoxLayout(contacts_page)
         contacts_layout.setContentsMargins(0, 0, 0, 0)
         contacts_layout.setSpacing(0)
         contacts_layout.addWidget(contacts_toolbar)
+        contacts_layout.addLayout(contacts_filter_row)
         contacts_layout.addWidget(self.contacts_table)
 
         self.pages = QStackedWidget(self)
@@ -7508,12 +7664,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 existing = None
         if existing is not None:
-            dialog = ContactDialog(self, contact=existing)
+            dialog = ContactDialog(self, contact=existing, contacts=self._load_contacts())
         else:
             prefilled = contact_store.Contact(
                 display_name=summary.sender, emails=[summary.sender_email] if summary.sender_email else []
             )
-            dialog = ContactDialog(self, contact=prefilled)
+            dialog = ContactDialog(self, contact=prefilled, contacts=self._load_contacts())
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -8804,8 +8960,11 @@ class MainWindow(QMainWindow):
         self._contacts_by_row = contacts
         self.contacts_table.setRowCount(len(contacts))
         for row, contact in enumerate(contacts):
-            name_text = f"{contact.display_name} (группа)" if contact.is_group else contact.display_name
-            self.contacts_table.setItem(row, 0, QTableWidgetItem(name_text))
+            name_item = QTableWidgetItem(f"{contact.display_name} (группа)" if contact.is_group else contact.display_name)
+            if contact.is_group:
+                name_item.setIcon(_toolbar_icon("group"))
+                name_item.setToolTip("Группа — список адресов рассылки")
+            self.contacts_table.setItem(row, 0, name_item)
             emails_text = (
                 f"{len(contact.emails)} адресов: " + ", ".join(contact.emails[:3]) + ("…" if len(contact.emails) > 3 else "")
                 if contact.is_group else ", ".join(contact.emails)
@@ -8813,6 +8972,24 @@ class MainWindow(QMainWindow):
             self.contacts_table.setItem(row, 1, QTableWidgetItem(emails_text))
             self.contacts_table.setItem(row, 2, QTableWidgetItem(contact.phone))
             self.contacts_table.setItem(row, 3, QTableWidgetItem(contact.organization))
+        self._apply_contacts_filter()
+
+    def _apply_contacts_filter(self, *_args) -> None:
+        needle = self.contacts_search_edit.text().strip().casefold()
+        kind = self.contacts_kind_combo.currentIndex()  # 0 все, 1 люди, 2 группы
+        shown = 0
+        for row, contact in enumerate(self._contacts_by_row):
+            visible = True
+            if kind == 1 and contact.is_group:
+                visible = False
+            elif kind == 2 and not contact.is_group:
+                visible = False
+            if visible and needle:
+                haystack = " ".join([contact.display_name, " ".join(contact.emails), contact.organization, contact.phone]).casefold()
+                visible = needle in haystack
+            self.contacts_table.setRowHidden(row, not visible)
+            shown += int(visible)
+        self.contacts_count_label.setText(f"{shown} из {len(self._contacts_by_row)}")
 
     def on_contact_selection_changed(self) -> None:
         rows = self.contacts_table.selectionModel().selectedRows()
@@ -8820,7 +8997,7 @@ class MainWindow(QMainWindow):
 
     def on_contact_double_clicked(self, item: QTableWidgetItem) -> None:
         contact = self._contacts_by_row[item.row()]
-        dialog = ContactDialog(self, contact=contact)
+        dialog = ContactDialog(self, contact=contact, contacts=self._contacts_by_row)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         try:
@@ -8831,7 +9008,7 @@ class MainWindow(QMainWindow):
         self.refresh_contacts_view()
 
     def on_new_contact(self) -> None:
-        dialog = ContactDialog(self)
+        dialog = ContactDialog(self, contacts=self._contacts_by_row)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         new_contact = dialog.to_contact()
