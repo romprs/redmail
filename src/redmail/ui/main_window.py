@@ -2647,6 +2647,20 @@ class ComposeDialog(QDialog):
         self._save_as_draft = True
         self.accept()
 
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        # Без получателя письмо не отправить — и окно не закрывать: раньше
+        # окно закрывалось, выходило предупреждение, а письмо пропадало
+        # (жалоба). Черновик сохраняется и без получателей.
+        if not self._save_as_draft and not (self.recipients() or self.cc_recipients() or self.bcc_recipients()):
+            QMessageBox.warning(
+                self, "Нет получателя",
+                "Укажите хотя бы одного получателя в «Кому», «Копия» или «Скрытая копия».\n"
+                "Чтобы отложить письмо, нажмите «Сохранить черновик».",
+            )
+            self.to_edit.setFocus()
+            return
+        super().accept()
+
     def save_as_draft_requested(self) -> bool:
         return self._save_as_draft
 
