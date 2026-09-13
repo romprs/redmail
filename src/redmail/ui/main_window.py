@@ -4963,6 +4963,11 @@ class MainWindow(QMainWindow):
 
         toolbar = QToolBar("Основная", self)
         toolbar.setObjectName("modeBar")
+        # Отступы сверху и снизу — через компоновку, а не QSS: padding у
+        # QToolBar стиль Fusion игнорирует (пожелание: "добавь отступы
+        # сверху и снизу меню").
+        toolbar.layout().setContentsMargins(8, 8, 8, 8)
+        toolbar.layout().setSpacing(6)
         self.addToolBar(toolbar)
 
         mode_group = QActionGroup(self)

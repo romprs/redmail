@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        86%{?dist}
+Release:        87%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -107,6 +107,8 @@ install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.deskto
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-87
+- Панель разделов: отступы сверху и снизу заданы компоновкой (QSS-отступ панель игнорировала)
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-86
 - Опрос раз в 5 минут всегда проверяет «Входящие» (и текущую папку); счётчики непрочитанных — по интерактивному соединению
 * Sat Sep 12 2026 redmail <redmail@example.com> - 0.0.1-85
