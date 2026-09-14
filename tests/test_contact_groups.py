@@ -83,3 +83,56 @@ def test_migration_adds_group_flag_and_reparses_old_lists(tmp_path: Path) -> Non
     assert not contacts["p1"].is_group and contacts["p1"].emails == ["p@x.ru"]
     # Повторное открытие — миграция не повторяется и ничего не ломает.
     assert {c.uid: c.is_group for c in contact_store.list_contacts(path)} == {"g1": True, "p1": False}
+
+
+def test_import_vcard_reads_title_department_and_photo(tmp_path: Path) -> None:
+    # Корпоративная выгрузка (Exchange через Evolution): должность в TITLE,
+    # подразделение — вторая часть ORG, фотография в PHOTO (base64).
+    import base64
+
+    png = base64.b64encode(
+        b"\x89PNG\r\n\x1a\n" + b"0" * 32
+    ).decode("ascii")
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:p1\r\n"
+        "N:Патутин;Алексей;Владимирович;;\r\n"
+        'ORG:ООО "Газпром переработка Благовещенск";Служба ИУС;\r\n'
+        "TITLE:Начальник отдела\r\nTEL;TYPE=WORK:42319\r\n"
+        "EMAIL:patutin@amurgpz.ru\r\n"
+        f"PHOTO;ENCODING=b;TYPE=PNG:{png}\r\n"
+        "END:VCARD\r\n"
+    ).encode("utf-8")
+    assert contact_store.import_vcard(tmp_path / "book.rmcontacts", vcf) == 1
+    contact = contact_store.list_contacts(tmp_path / "book.rmcontacts")[0]
+    assert contact.display_name == "Патутин Алексей Владимирович"
+    assert contact.title == "Начальник отдела"
+    assert contact.organization == 'ООО "Газпром переработка Благовещенск"'
+    assert contact.department == "Служба ИУС"
+    assert contact.phone == "42319"
+    assert contact.photo.startswith(b"\x89PNG") and contact.photo_type == "image/png"
+
+
+def test_import_vcard_skips_broken_card_but_keeps_the_rest(tmp_path: Path) -> None:
+    # В реальном экспорте встречается карточка с экранированным
+    # BEGIN/END внутри значения — раньше такая обрывала импорт целиком.
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ok1\r\nFN:Первый\r\nEMAIL:one@x.ru\r\nEND:VCARD\r\n"
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nX-EWS-ORIGINAL-VCARD:BEGIN:VCARD\nN:кривая\r\n"
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:ok2\r\nFN:Второй\r\nEMAIL:two@x.ru\r\nEND:VCARD\r\n"
+    ).encode("utf-8")
+    count = contact_store.import_vcard(tmp_path / "book2.rmcontacts", vcf)
+    names = sorted(c.display_name for c in contact_store.list_contacts(tmp_path / "book2.rmcontacts"))
+    assert count == 2 and names == ["Второй", "Первый"]
+
+
+def test_import_vcard_photo_from_file_uri(tmp_path: Path) -> None:
+    # Evolution выгружает фото ссылкой на файл в своём кэше.
+    photo_file = tmp_path / "PHOTO-1"
+    photo_file.write_bytes(b"\xff\xd8\xff" + b"0" * 64)
+    vcf = (
+        "BEGIN:VCARD\r\nVERSION:3.0\r\nUID:p2\r\nFN:Сотрудник\r\nEMAIL:s@x.ru\r\n"
+        f"PHOTO;VALUE=uri:{photo_file.as_uri()}\r\nEND:VCARD\r\n"
+    ).encode("utf-8")
+    assert contact_store.import_vcard(tmp_path / "book3.rmcontacts", vcf) == 1
+    contact = contact_store.list_contacts(tmp_path / "book3.rmcontacts")[0]
+    assert contact.photo.startswith(b"\xff\xd8\xff") and contact.photo_type == "image/jpeg"

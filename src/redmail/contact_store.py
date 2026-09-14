@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import csv as csv_module
 import json
 import sqlite3
@@ -8,9 +9,15 @@ from dataclasses import dataclass, field
 from email.header import decode_header, make_header
 from email.utils import getaddresses
 from pathlib import Path
+from urllib.parse import unquote, urlparse
+from urllib.request import url2pathname
 from uuid import uuid4
 
 import vobject
+
+from redmail.applog import get_logger
+
+_log = get_logger("contacts")
 
 # Свой формат: один файл SQLite, тот же принцип, что у calendar_store.py и
 # archive_store.py. Адресная книга — не источник живой синхронизации
@@ -34,11 +41,15 @@ CREATE TABLE IF NOT EXISTS contacts (
     phone TEXT NOT NULL DEFAULT '',
     organization TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
-    is_group INTEGER NOT NULL DEFAULT 0
+    is_group INTEGER NOT NULL DEFAULT 0,
+    title TEXT NOT NULL DEFAULT '',
+    department TEXT NOT NULL DEFAULT '',
+    photo BLOB,
+    photo_type TEXT NOT NULL DEFAULT ''
 );
 """
 
-_COLUMNS = "id, uid, display_name, emails, phone, organization, notes, is_group"
+_COLUMNS = "id, uid, display_name, emails, phone, organization, notes, is_group, title, department, photo, photo_type"
 
 
 @dataclass
@@ -55,6 +66,15 @@ class Contact:
     # двух адресов — письма пойдут на оба; группа — это перечисление
     # нескольких адресов, нужен признак").
     is_group: bool = False
+    # Должность и подразделение: в корпоративном экспорте (Exchange через
+    # Evolution) это TITLE и вторая часть ORG — раньше терялись (жалоба:
+    # "в адресной книге заполняются не все поля, в файле есть должность").
+    title: str = ""
+    department: str = ""
+    # Фотография сотрудника (PHOTO): байты и тип содержимого; в экспорте
+    # встречается и base64, и ссылка file:// на локальный файл.
+    photo: bytes = b""
+    photo_type: str = ""
 
     @property
     def primary_email(self) -> str:
@@ -165,6 +185,10 @@ def _row_to_contact(row) -> Contact:
         organization=row[5],
         notes=row[6],
         is_group=bool(row[7]) if len(row) > 7 else False,
+        title=row[8] if len(row) > 8 and row[8] else "",
+        department=row[9] if len(row) > 9 and row[9] else "",
+        photo=bytes(row[10]) if len(row) > 10 and row[10] else b"",
+        photo_type=row[11] if len(row) > 11 and row[11] else "",
     )
 
 
@@ -173,6 +197,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     импортированные списки рассылки («Имя <адрес>» с именами в RFC 2047
     лежали как есть в списке адресов контакта)."""
     columns = {row[1] for row in conn.execute("PRAGMA table_info(contacts)").fetchall()}
+    for name, definition in (
+        ("title", "TEXT NOT NULL DEFAULT ''"),
+        ("department", "TEXT NOT NULL DEFAULT ''"),
+        ("photo", "BLOB"),
+        ("photo_type", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if name not in columns:
+            conn.execute(f"ALTER TABLE contacts ADD COLUMN {name} {definition}")
+    conn.commit()
     if "is_group" in columns:
         return
     conn.execute("ALTER TABLE contacts ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0")
@@ -237,11 +270,18 @@ def save_contact(path: Path, contact: Contact) -> Contact:
             emails.append(normalized)
     with closing(_connect(path)) as conn:
         conn.execute(
-            "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes, is_group) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes, is_group, "
+            "title, department, photo, photo_type) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "display_name=excluded.display_name, emails=excluded.emails, phone=excluded.phone, "
-            "organization=excluded.organization, notes=excluded.notes, is_group=excluded.is_group",
+            "organization=excluded.organization, notes=excluded.notes, is_group=excluded.is_group, "
+            "title=excluded.title, department=excluded.department, "
+            # Фото при повторном импорте не затираем пустым значением: в одних
+            # выгрузках оно есть, в других (та же книга без кэша картинок) нет.
+            "photo=COALESCE(NULLIF(excluded.photo, X''), contacts.photo), "
+            "photo_type=CASE WHEN excluded.photo IS NOT NULL AND LENGTH(excluded.photo) > 0 "
+            "THEN excluded.photo_type ELSE contacts.photo_type END",
             (
                 uid,
                 contact.display_name,
@@ -250,6 +290,10 @@ def save_contact(path: Path, contact: Contact) -> Contact:
                 contact.organization,
                 contact.notes,
                 int(bool(contact.is_group)),
+                contact.title,
+                contact.department,
+                contact.photo or b"",
+                contact.photo_type,
             ),
         )
         conn.commit()
@@ -282,13 +326,37 @@ def import_vcard(path: Path, vcf_bytes: bytes) -> int:
     create_contacts_book(path)
     text = vcf_bytes.decode("utf-8", errors="replace")
     count = 0
-    for card in vobject.readComponents(text, ignoreUnreadable=True):
+    for block in _iter_vcard_blocks(text):
+        try:
+            card = vobject.readOne(block, ignoreUnreadable=True)
+        except Exception as exc:
+            # Одна кривая карточка (в корпоративной выгрузке встречается
+            # X-EWS-ORIGINAL-VCARD с экранированным BEGIN/END внутри
+            # значения) не должна обрывать импорт всей книги.
+            _log.warning("Импорт vCard: карточка пропущена (%s)", exc)
+            continue
         contact = _contact_from_vcard(card)
         if contact is None:
             continue
         save_contact(path, _reuse_existing_uid(path, contact))
         count += 1
     return count
+
+
+def _iter_vcard_blocks(text: str):
+    """Разбор по одной карточке: строки BEGIN:VCARD/END:VCARD в начале
+    строки. Продолжения свёрнутых значений начинаются с пробела, поэтому
+    вложенный «END:VCARD» внутри значения границей не считается."""
+    buffer: list[str] = []
+    for line in text.splitlines(keepends=True):
+        upper = line.upper()
+        if upper.startswith("BEGIN:VCARD"):
+            buffer = [line]
+        elif buffer:
+            buffer.append(line)
+            if upper.startswith("END:VCARD"):
+                yield "".join(buffer)
+                buffer = []
 
 
 def _contact_from_vcard(card) -> Contact | None:
@@ -324,7 +392,22 @@ def _contact_from_vcard(card) -> Contact | None:
 
     phones = [t.value.strip() for t in card.contents.get("tel", []) if t.value.strip()]
     org_value = card.org.value if hasattr(card, "org") else None
-    organization = ", ".join(part for part in org_value if part) if isinstance(org_value, list) else (org_value or "")
+    if isinstance(org_value, list):
+        parts = [str(part).strip() for part in org_value if str(part).strip()]
+        organization = parts[0] if parts else ""
+        department = ", ".join(parts[1:])
+    else:
+        organization = str(org_value or "").strip()
+        department = ""
+    # Должность: TITLE (в корпоративной выгрузке заполнена почти у всех),
+    # запасной вариант — ROLE.
+    title = ""
+    for attr in ("title", "role"):
+        value = getattr(card, attr, None)
+        if value is not None and str(value.value).strip():
+            title = _decode_rfc2047(str(value.value).strip())
+            break
+    photo, photo_type = _photo_from_vcard(card)
     notes = str(card.note.value).strip() if hasattr(card, "note") else ""
 
     contact = Contact(
@@ -334,12 +417,63 @@ def _contact_from_vcard(card) -> Contact | None:
         phone=phones[0] if phones else "",
         organization=organization,
         notes=notes,
+        title=title,
+        department=department,
+        photo=photo,
+        photo_type=photo_type,
     )
     contact = _apply_imported_emails(contact, emails)
     kind = str(card.kind.value).strip().lower() if hasattr(card, "kind") else ""
     if kind == "group" or (hasattr(card, "x_addressbookserver_kind") and "group" in str(card.x_addressbookserver_kind.value).lower()):
         contact.is_group = True
     return contact
+
+
+_PHOTO_TYPES = {"JPEG": "image/jpeg", "JPG": "image/jpeg", "PNG": "image/png", "GIF": "image/gif"}
+_MAX_PHOTO_BYTES = 2 * 1024 * 1024
+
+
+def _photo_from_vcard(card) -> tuple[bytes, str]:
+    """Фотография из PHOTO: либо встроенная (base64), либо ссылка
+    file:// на локальный файл — так её выгружает Evolution/Exchange."""
+    photo = getattr(card, "photo", None)
+    if photo is None:
+        return b"", ""
+    params = {key.upper(): [str(v).upper() for v in values] for key, values in getattr(photo, "params", {}).items()}
+    declared = next((_PHOTO_TYPES.get(value, "") for value in params.get("TYPE", []) if value in _PHOTO_TYPES), "")
+    value = photo.value
+    if isinstance(value, bytes):
+        data = value
+    else:
+        text = str(value).strip()
+        if text.lower().startswith("file://"):
+            try:
+                # url2pathname, а не голый путь из URL: на разных системах
+                # file:// раскрывается по-своему.
+                file_path = Path(url2pathname(unquote(urlparse(text).path)))
+                data = file_path.read_bytes() if file_path.is_file() else b""
+            except OSError:
+                data = b""
+        elif text.lower().startswith(("http://", "https://")):
+            return b"", ""  # за картинкой в сеть не ходим
+        else:
+            try:
+                data = base64.b64decode(text, validate=False)
+            except (ValueError, TypeError):
+                data = b""
+    if not data or len(data) > _MAX_PHOTO_BYTES:
+        return b"", ""
+    return data, declared or _sniff_image_type(data)
+
+
+def _sniff_image_type(data: bytes) -> str:
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n"):
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    return "application/octet-stream"
 
 
 def _reuse_existing_uid(path: Path, contact: Contact) -> Contact:

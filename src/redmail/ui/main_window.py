@@ -1221,6 +1221,7 @@ class ContactPickerDialog(QDialog):
         self.filter_edit.addAction(_toolbar_icon("search", 14), QLineEdit.ActionPosition.LeadingPosition)
 
         self.list_widget = QListWidget(self)
+        self.list_widget.setIconSize(QSize(28, 28))
         self.list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         # Жалоба: "нельзя выбрать сразу несколько" — множественный выбор
         # был, но только через Ctrl/Shift, о чём никто не догадывался.
@@ -1236,9 +1237,14 @@ class ContactPickerDialog(QDialog):
                 checked = candidate.strip("[]").casefold() in pre_groups_cf
             else:
                 candidate = _format_recipient_candidate(contact.display_name, contact.emails[0])
-                label = candidate
+                label = f"{contact.display_name} — {contact.title}" if contact.title else candidate
                 checked = contact.emails[0].lower() in pre_addrs
             item = QListWidgetItem(label)
+            if not contact.is_group:
+                item.setIcon(_contact_avatar(contact, 28))
+                item.setToolTip(
+                    "\n".join(part for part in (contact.display_name, contact.title, contact.department, contact.emails[0]) if part)
+                )
             item.setData(Qt.ItemDataRole.UserRole, candidate)
             item.setData(Qt.ItemDataRole.UserRole + 1, len(contact.emails))
             item.setData(Qt.ItemDataRole.UserRole + 2, label)  # подпись без номера
@@ -1463,6 +1469,33 @@ def _avatar_pixmap(letter: str, color: str, size: int = 24) -> QPixmap:
 def _attendee_avatar_letter(name: str, email: str) -> str:
     source = (name or email or "?").strip()
     return source[0] if source else "?"
+
+
+def _contact_avatar(contact, size: int = 32) -> QIcon:
+    """Аватар контакта: фотография из адресной книги (в корпоративной
+    выгрузке она есть у части сотрудников), иначе кружок с инициалами."""
+    photo = getattr(contact, "photo", b"")
+    if photo:
+        image = QImage.fromData(photo)
+        if not image.isNull():
+            scaled = QPixmap.fromImage(image).scaled(
+                size, size, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation
+            )
+            rounded = QPixmap(size, size)
+            rounded.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(rounded)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            path = QPainterPath()
+            path.addEllipse(0, 0, size, size)
+            painter.setClipPath(path)
+            painter.drawPixmap(
+                int((size - scaled.width()) / 2), int((size - scaled.height()) / 2), scaled
+            )
+            painter.end()
+            return QIcon(rounded)
+    name = getattr(contact, "display_name", "") or ""
+    key = (getattr(contact, "emails", None) or [name])[0] if getattr(contact, "emails", None) else name
+    return QIcon(_avatar_pixmap(_message_initials(name), _avatar_color(key or name), size))
 
 
 def _message_initials(name: str) -> str:
@@ -3078,8 +3111,11 @@ class SignatureEditDialog(QDialog):
                         QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image
                     )
             self.body_edit.setHtml(signature.body_html)
+        # Минимум четыре строки, дальше поле растёт вместе с окном (было
+        # setFixedHeight — окно растягивалось, а поле нет).
         line_height = self.body_edit.fontMetrics().lineSpacing()
-        self.body_edit.setFixedHeight(line_height * 4 + 24)
+        self.body_edit.setMinimumHeight(line_height * 4 + 24)
+        self.body_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         self.bold_action = QAction("Ж", self)
         self.bold_action.setCheckable(True)
@@ -3109,6 +3145,13 @@ class SignatureEditDialog(QDialog):
         insert_image_button = QPushButton("Вставить изображение…", self)
         insert_image_button.clicked.connect(self._on_insert_image)
 
+        self.text_color_button = QToolButton(self)
+        self.text_color_button.setText("A")
+        self.text_color_button.setToolTip("Цвет текста")
+        self.text_color_button.clicked.connect(self._on_text_color)
+        self._text_color = self.body_edit.textColor()
+        self._update_color_button()
+
         toolbar = QToolBar("Форматирование", self)
         toolbar.addAction(self.bold_action)
         toolbar.addAction(self.italic_action)
@@ -3125,6 +3168,7 @@ class SignatureEditDialog(QDialog):
                 button.setFont(font)
         toolbar.addWidget(self.font_family_combo)
         toolbar.addWidget(self.font_size_combo)
+        toolbar.addWidget(self.text_color_button)
         toolbar.addSeparator()
         toolbar.addWidget(insert_image_button)
 
@@ -3142,8 +3186,11 @@ class SignatureEditDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(toolbar)
-        layout.addWidget(self.body_edit)
-        layout.addStretch(1)
+        # Текст подписи занимает всё свободное место: раньше ниже стоял
+        # addStretch, и при растягивании окна поле оставалось прежним, а
+        # росла пустота (жалоба: "окно редактирования не меняется при
+        # изменении окна").
+        layout.addWidget(self.body_edit, 1)
         layout.addWidget(buttons)
 
     def accept(self) -> None:  # noqa: N802 - Qt override
@@ -3186,6 +3233,24 @@ class SignatureEditDialog(QDialog):
         if size > 0:
             self.body_edit.setFontPointSize(size)
 
+    def _on_text_color(self) -> None:
+        """Цвет текста подписи (жалоба: "нет возможности задать цвет
+        текста"). Действует на выделенный фрагмент, а без выделения — на
+        то, что будет напечатано дальше."""
+        color = QColorDialog.getColor(self._text_color, self, "Цвет текста подписи")
+        if not color.isValid():
+            return
+        self._text_color = color
+        self.body_edit.setTextColor(color)
+        self._update_color_button()
+        self.body_edit.setFocus()
+
+    def _update_color_button(self) -> None:
+        color = self._text_color if self._text_color.isValid() else self.palette().color(QPalette.ColorRole.Text)
+        self.text_color_button.setStyleSheet(
+            f"QToolButton {{ color: {color.name()}; font-weight: bold; text-decoration: underline; }}"
+        )
+
     def _sync_format_toolbar(self, fmt: QTextCharFormat) -> None:
         self.bold_action.blockSignals(True)
         self.bold_action.setChecked(fmt.fontWeight() >= QFont.Weight.Bold)
@@ -3196,6 +3261,10 @@ class SignatureEditDialog(QDialog):
         self.underline_action.blockSignals(True)
         self.underline_action.setChecked(fmt.fontUnderline())
         self.underline_action.blockSignals(False)
+        color = fmt.foreground().color() if fmt.foreground().style() != Qt.BrushStyle.NoBrush else QColor()
+        if color.isValid():
+            self._text_color = color
+            self._update_color_button()
 
     def _on_insert_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -4615,6 +4684,8 @@ class ContactDialog(QDialog):
         self._contacts = [c for c in (contacts or []) if contact is None or c.uid != contact.uid]
 
         self.name_edit = QLineEdit(contact.display_name if contact else "")
+        self.title_edit = QLineEdit(contact.title if contact else "")
+        self.department_edit = QLineEdit(contact.department if contact else "")
         self.emails_edit = QLineEdit(", ".join(contact.emails) if contact else "")
         self.group_check = QCheckBox("Группа — список адресов рассылки (у обычного контакта один адрес)", self)
         self.group_check.setChecked(bool(contact.is_group) if contact else False)
@@ -4636,10 +4707,22 @@ class ContactDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Имя", self.name_edit)
+        form.addRow("Должность", self.title_edit)
+        form.addRow("Подразделение", self.department_edit)
         form.addRow("Email", emails_row)
         form.addRow(self.group_check)
         form.addRow("Телефон", self.phone_edit)
         form.addRow("Организация", self.org_edit)
+
+        # Фотография сотрудника рядом с полями — как в корпоративной книге.
+        self.photo_label = QLabel(self)
+        self.photo_label.setFixedSize(96, 96)
+        self.photo_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        if contact is not None:
+            self.photo_label.setPixmap(_contact_avatar(contact, 96).pixmap(96, 96))
+        header_row = QHBoxLayout()
+        header_row.addLayout(form, 1)
+        header_row.addWidget(self.photo_label)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -4648,7 +4731,7 @@ class ContactDialog(QDialog):
         buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
-        layout.addLayout(form)
+        layout.addLayout(header_row)
         layout.addWidget(QLabel("Заметки", self))
         layout.addWidget(self.notes_edit)
         layout.addWidget(buttons)
@@ -4695,6 +4778,10 @@ class ContactDialog(QDialog):
             organization=self.org_edit.text().strip(),
             notes=self.notes_edit.toPlainText(),
             is_group=self.group_check.isChecked(),
+            title=self.title_edit.text().strip(),
+            department=self.department_edit.text().strip(),
+            photo=self._contact.photo if self._contact else b"",
+            photo_type=self._contact.photo_type if self._contact else "",
         )
 
 
@@ -5493,9 +5580,12 @@ class MainWindow(QMainWindow):
         calendar_layout.addWidget(calendar_main, 1)
 
         # --- Контакты ---
-        self.contacts_table = QTableWidget(0, 4, self)
-        self.contacts_table.setHorizontalHeaderLabels(["Имя", "Email", "Телефон", "Организация"])
+        self.contacts_table = QTableWidget(0, 6, self)
+        self.contacts_table.setHorizontalHeaderLabels(
+            ["Имя", "Должность", "Подразделение", "Email", "Телефон", "Организация"]
+        )
         self.contacts_table.verticalHeader().setVisible(False)
+        self.contacts_table.setIconSize(QSize(32, 32))
         self.contacts_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.contacts_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         # Раньше растягивался только первый столбец (Stretch стоял только
@@ -5504,7 +5594,7 @@ class MainWindow(QMainWindow):
         # контактах таблица расширяется не пропорционально, а не каждый
         # столбец"). Растягиваем все столбцы поровну.
         contacts_header = self.contacts_table.horizontalHeader()
-        for col in range(4):
+        for col in range(self.contacts_table.columnCount()):
             contacts_header.setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
         self.contacts_table.itemSelectionChanged.connect(self.on_contact_selection_changed)
         self.contacts_table.itemDoubleClicked.connect(self.on_contact_double_clicked)
@@ -9638,14 +9728,22 @@ class MainWindow(QMainWindow):
             if contact.is_group:
                 name_item.setIcon(_toolbar_icon("group"))
                 name_item.setToolTip("Группа — список адресов рассылки")
+            else:
+                name_item.setIcon(_contact_avatar(contact))
+                tooltip = "\n".join(
+                    part for part in (contact.display_name, contact.title, contact.department, contact.organization) if part
+                )
+                name_item.setToolTip(tooltip)
             self.contacts_table.setItem(row, 0, name_item)
+            self.contacts_table.setItem(row, 1, QTableWidgetItem(contact.title))
+            self.contacts_table.setItem(row, 2, QTableWidgetItem(contact.department))
             emails_text = (
                 f"{len(contact.emails)} адресов: " + ", ".join(contact.emails[:3]) + ("…" if len(contact.emails) > 3 else "")
                 if contact.is_group else ", ".join(contact.emails)
             )
-            self.contacts_table.setItem(row, 1, QTableWidgetItem(emails_text))
-            self.contacts_table.setItem(row, 2, QTableWidgetItem(contact.phone))
-            self.contacts_table.setItem(row, 3, QTableWidgetItem(contact.organization))
+            self.contacts_table.setItem(row, 3, QTableWidgetItem(emails_text))
+            self.contacts_table.setItem(row, 4, QTableWidgetItem(contact.phone))
+            self.contacts_table.setItem(row, 5, QTableWidgetItem(contact.organization))
         self._apply_contacts_filter()
 
     def _apply_contacts_filter(self, *_args) -> None:
@@ -9659,7 +9757,10 @@ class MainWindow(QMainWindow):
             elif kind == 2 and not contact.is_group:
                 visible = False
             if visible and needle:
-                haystack = " ".join([contact.display_name, " ".join(contact.emails), contact.organization, contact.phone]).casefold()
+                haystack = " ".join([
+                    contact.display_name, " ".join(contact.emails), contact.organization,
+                    contact.phone, contact.title, contact.department,
+                ]).casefold()
                 visible = needle in haystack
             self.contacts_table.setRowHidden(row, not visible)
             shown += int(visible)
