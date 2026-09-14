@@ -3,11 +3,23 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
 from redmail.calendar_store import Event
 from redmail.ui import theme
+
+
+def _scaled_font(base: QFont, factor: float) -> QFont:
+    """Шрифт надписей в сетке календаря — доля от общего шрифта программы,
+    чтобы масштаб шрифта менял и календарь (жалоба: «тут тоже мелко»)."""
+    font = QFont(base)
+    size = base.pointSizeF()
+    if size > 0:
+        font.setPointSizeF(max(6.0, size * factor))
+    else:
+        font.setPixelSize(max(8, int(base.pixelSize() * factor)))
+    return font
 
 # Недельная сетка "как в Google Calendar/Outlook" (см. присланный
 # пользователем скриншот) — часы по вертикали, дни по горизонтали, события
@@ -150,7 +162,11 @@ class _EventBlock(QFrame):
         text = f"{time_text} {calendar_event.summary or '(без темы)'}".strip()
         label = QLabel(text, self)
         text_color = "white" if pill else "#202124"
-        label.setStyleSheet(f"color: {text_color}; background: transparent; font-size: 11px;")
+        # Размер шрифта берём от общего шрифта программы, а не фиксированные
+        # 11 px: при увеличении масштаба надписи в сетке оставались мелкими
+        # (жалоба: "тут тоже мелко").
+        label.setStyleSheet(f"color: {text_color}; background: transparent;")
+        label.setFont(_scaled_font(self.font(), 0.92))
         # Таблетке "весь день" перенос только мешает — узкая колонка и
         # заголовок пары строк сминались в кашу; здесь одна строка,
         # обрезанная по ширине, как в референсе.
@@ -635,7 +651,8 @@ class MonthCellWidget(QFrame):
         self.events_layout.setSpacing(1)
 
         self.more_label = QLabel("", self)
-        self.more_label.setStyleSheet("color: #5f6368; font-size: 10px; background: transparent;")
+        self.more_label.setStyleSheet("color: #5f6368; background: transparent;")
+        self.more_label.setFont(_scaled_font(self.font(), 0.85))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(3, 2, 3, 2)

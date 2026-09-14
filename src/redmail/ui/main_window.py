@@ -2054,6 +2054,7 @@ class SettingsDialog(QDialog):
         maintenance_window: tuple[bool, int, int] = (False, 22, 7),
         tls_ca_file: str = "",
         domain_rewrites: str = "",
+        font_scale: float = 1.0,
         accounts: list[tuple[str, str]] | None = None,
         disabled_accounts: tuple[str, ...] = (),
     ):
@@ -2172,8 +2173,18 @@ class SettingsDialog(QDialog):
         tls_ca_row.addWidget(self.tls_ca_edit, 1)
         tls_ca_row.addWidget(tls_ca_browse)
 
+        # Масштаб шрифта: раньше был только ползунок в строке состояния и
+        # его никто не находил (пожелание: "может в параметры вынести
+        # настройку?"). Меняет размер во всём окне, включая календарь.
+        self.font_scale_spin = QSpinBox(self)
+        self.font_scale_spin.setRange(50, 200)
+        self.font_scale_spin.setSingleStep(5)
+        self.font_scale_spin.setSuffix(" %")
+        self.font_scale_spin.setValue(int(round(font_scale * 100)))
+
         general_form = QFormLayout()
         general_form.addRow("Проверять почту каждые", self.interval_edit)
+        general_form.addRow("Масштаб шрифта", self.font_scale_spin)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
         general_form.addRow("Тема оформления", self.theme_combo)
@@ -2504,6 +2515,9 @@ class SettingsDialog(QDialog):
 
     def domain_rewrites(self) -> str:
         return self.domain_rewrites_edit.toPlainText().strip()
+
+    def font_scale(self) -> float:
+        return self.font_scale_spin.value() / 100
 
     def disabled_accounts(self) -> list[str]:
         return [
@@ -7187,6 +7201,7 @@ class MainWindow(QMainWindow):
             domain_rewrites=load_domain_rewrites(),
             accounts=self._known_accounts(),
             disabled_accounts=tuple(load_disabled_accounts()),
+            font_scale=load_font_scale(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -7213,6 +7228,10 @@ class MainWindow(QMainWindow):
             save_domain_rewrites(dialog.domain_rewrites())
             self.domain_rewrites = address_rules.parse_rules(dialog.domain_rewrites())
             self._apply_disabled_accounts(dialog.disabled_accounts())
+            if abs(dialog.font_scale() - load_font_scale()) > 0.001:
+                # Тот же путь, что у ползунка в строке состояния.
+                self.font_scale_slider.setValue(int(round(dialog.font_scale() * 100)))
+                self.on_font_scale_committed()
             for mailbox in self.mailboxes.values():
                 if isinstance(mailbox, CachedMailbox):
                     mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024
