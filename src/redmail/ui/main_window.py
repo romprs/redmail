@@ -1066,6 +1066,7 @@ class RecipientListView(QListWidget):
         self._line_edit = line_edit
         self._contacts = contacts or []
         self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        self.setIconSize(QSize(24, 24))
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._context_menu)
         self.setToolTip("Выбранные адресаты. Delete или правая кнопка — убрать.")
@@ -1076,15 +1077,28 @@ class RecipientListView(QListWidget):
         self.clear()
         addrs = _expand_recipients(self._line_edit.text(), self._contacts)
         typed_names = {addr.casefold(): name for name, addr in getaddresses([self._line_edit.text()]) if addr}
+        by_email = {
+            (contact.emails[0].casefold() if contact.emails else ""): contact
+            for contact in self._contacts if not contact.is_group and contact.emails
+        }
         for addr in addrs:
+            contact = by_email.get(addr.casefold())
             name = _contact_name_for(addr, self._contacts) or typed_names.get(addr.casefold(), "")
             item = QListWidgetItem(f"{name} — {addr}" if name else addr)
             item.setData(Qt.ItemDataRole.UserRole, addr)
+            # Фотография адресата из книги (пожелание: "нет фото у получателей").
+            item.setIcon(_contact_avatar(contact, 24) if contact is not None
+                         else QIcon(_avatar_pixmap(_message_initials(name or addr), _avatar_color(addr), 24)))
+            if contact is not None and (contact.title or contact.department):
+                item.setToolTip("\n".join(p for p in (name, contact.title, contact.department, addr) if p))
             self.addItem(item)
         rows = len(addrs)
         self.setVisible(rows > 0)
-        row_height = max(self.sizeHintForRow(0), 18) if rows else 0
-        self.setFixedHeight(min(rows, 4) * row_height + 6 if rows else 0)
+        row_height = max(self.sizeHintForRow(0), 24) if rows else 0
+        # Минимум — до трёх строк, дальше список растягивается вместе с окном
+        # (пожелание: "растягивай список получателей и текст письма").
+        self.setMinimumHeight(min(rows, 3) * row_height + 6 if rows else 0)
+        self.setMaximumHeight(16777215 if rows else 0)
 
     def _remove_selected(self) -> None:
         drop = {item.data(Qt.ItemDataRole.UserRole).casefold() for item in self.selectedItems()}
@@ -2834,6 +2848,13 @@ class ComposeDialog(QDialog):
         insert_image_button = QPushButton("Вставить изображение…", self)
         insert_image_button.clicked.connect(self._on_insert_image)
 
+        # Цвет текста письма (пожелание: "нет цвета текста у редактора").
+        self.text_color_button = QToolButton(self)
+        self.text_color_button.setText("A")
+        self.text_color_button.setToolTip("Цвет текста")
+        self.text_color_button.clicked.connect(self._on_text_color)
+        self._text_color = self.body_edit.textColor()
+
         format_toolbar = QToolBar("Форматирование", self)
         format_toolbar.addAction(self.bold_action)
         format_toolbar.addAction(self.italic_action)
@@ -2852,6 +2873,8 @@ class ComposeDialog(QDialog):
                 button.setFont(font)
         format_toolbar.addWidget(self.font_family_combo)
         format_toolbar.addWidget(self.font_size_combo)
+        format_toolbar.addWidget(self.text_color_button)
+        self._update_color_button()
         format_toolbar.addSeparator()
         format_toolbar.addWidget(insert_image_button)
         self._format_toolbar = format_toolbar
@@ -2896,7 +2919,6 @@ class ComposeDialog(QDialog):
         form.setVerticalSpacing(10)
         form.setHorizontalSpacing(12)
         form.addRow("Кому", to_row)
-        form.addRow("", self.to_list_view)
         self._cc_row_label = "Копия"
         form.addRow("Копия", self.cc_edit)
         form.addRow("Скрытая копия", self.bcc_edit)
@@ -2940,8 +2962,13 @@ class ComposeDialog(QDialog):
         self.save_draft_button.clicked.connect(self._on_save_draft)
 
         layout = QVBoxLayout(self)
+        # Поля прижаты к верху, свободное место делят список адресатов и
+        # текст письма (жалоба: "слишком большие расстояния между
+        # элементами при растягивании").
         layout.addLayout(form)
+        layout.addWidget(self.to_list_view, 2)
         layout.addLayout(attach_row)
+        self.attachments_list.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
         layout.addWidget(self.attachments_list)
         if self.signature_combo is not None:
             signature_row = QHBoxLayout()
@@ -2950,7 +2977,7 @@ class ComposeDialog(QDialog):
             signature_row.addStretch(1)
             layout.addLayout(signature_row)
         layout.addWidget(format_toolbar)
-        layout.addWidget(self.body_edit)
+        layout.addWidget(self.body_edit, 5)
         layout.addWidget(buttons)
 
     def done(self, result: int) -> None:  # noqa: N802 - Qt override
@@ -3100,6 +3127,26 @@ class ComposeDialog(QDialog):
         self.underline_action.blockSignals(True)
         self.underline_action.setChecked(fmt.fontUnderline())
         self.underline_action.blockSignals(False)
+        color = fmt.foreground().color() if fmt.foreground().style() != Qt.BrushStyle.NoBrush else QColor()
+        if color.isValid():
+            self._text_color = color
+            self._update_color_button()
+
+    def _on_text_color(self) -> None:
+        """Цвет текста письма (пожелание: "нет цвета текста у редактора")."""
+        color = QColorDialog.getColor(self._text_color, self, "Цвет текста письма")
+        if not color.isValid():
+            return
+        self._text_color = color
+        self.body_edit.setTextColor(color)
+        self._update_color_button()
+        self.body_edit.setFocus()
+
+    def _update_color_button(self) -> None:
+        color = self._text_color if self._text_color.isValid() else self.palette().color(QPalette.ColorRole.Text)
+        self.text_color_button.setStyleSheet(
+            f"QToolButton {{ color: {color.name()}; font-weight: bold; text-decoration: underline; }}"
+        )
 
     def _on_insert_image(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -4164,7 +4211,16 @@ class EventDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Изменить встречу" if event else "Новая встреча")
-        self.resize(460, 560)
+        # Обычное окно, а не диалог: у диалогов оконный менеджер рисует
+        # уменьшенную рамку с мелким заголовком (жалоба: "заголовок окон
+        # очень маленький"), а окно встречи живёт долго.
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.resize(520, 640)
         self.attachments: list[Attachment] = list(event.attachments) if event else []
         self._color = event.color if event else None
         self._temp_dirs: list[Path] = []
@@ -4212,7 +4268,10 @@ class EventDialog(QDialog):
             _install_recipient_tooltip(self.attendees_edit, contacts)
         self.description_edit = QPlainTextEdit(event.description if event else "")
         self.description_edit.setPlaceholderText("Добавьте описание")
-        self.description_edit.setFixedHeight(140)  # пожелание: "поле текст в карточке событий увеличь в 2 раза"
+        # Минимум как раньше (пожелание "поле текста увеличь в 2 раза"),
+        # дальше описание растягивается вместе с окном.
+        self.description_edit.setMinimumHeight(140)
+        self.description_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         # Жалоба "убери внутреннюю рамку" была про это поле — стандартная
         # рамка QPlainTextEdit вокруг текста описания, а не про карточку
         # события в недельной сетке (которую я по ошибке трогал раньше).
@@ -4354,9 +4413,12 @@ class EventDialog(QDialog):
         attendees_list_row = QHBoxLayout()
         attendees_list_row.addSpacing(22)
         attendees_list_row.addWidget(self.attendees_list_view)
-        layout.addLayout(attendees_list_row)
+        # Свободное место делят список участников и описание, остальные
+        # поля прижаты к верху (жалоба: "слишком большие расстояния между
+        # элементами при растягивании; подними всё вверх").
+        layout.addLayout(attendees_list_row, 2)
         layout.addLayout(location_row)
-        layout.addLayout(description_row)
+        layout.addLayout(description_row, 3)
         layout.addLayout(attach_row)
         layout.addLayout(attachments_list_row)
         layout.addLayout(color_row)
