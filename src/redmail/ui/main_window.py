@@ -4610,7 +4610,43 @@ def _exception_text(exc: BaseException) -> str:
     str() на исключении с bytes-аргументом возвращает repr этих байт, а не
     читаемый текст) — декодируем перед показом."""
     parts = [arg.decode("utf-8", errors="replace") if isinstance(arg, bytes) else str(arg) for arg in exc.args]
-    return "; ".join(parts) if parts else str(exc)
+    text = "; ".join(parts) if parts else str(exc)
+    hint = _error_hint(text)
+    return f"{text}\n\n{hint}" if hint else text
+
+
+# Понятные подсказки к сырым ответам серверов, которые реально встречались.
+_ERROR_HINTS: tuple[tuple[str, str], ...] = (
+    (
+        "parol prilozheniya",
+        "Сервер требует пароль приложения: обычный пароль учётной записи для почтовых программ "
+        "не подходит. Создайте пароль приложения в веб-интерфейсе почты и укажите его здесь.",
+    ),
+    (
+        "CERTIFICATE_VERIFY_FAILED",
+        "Сертификат сервера подписан центром сертификации, которого нет в списке доверенных. "
+        "Добавьте корневой сертификат организации в системное хранилище "
+        "(/etc/pki/ca-trust/source/anchors/ и update-ca-trust) и перезапустите программу.",
+    ),
+    (
+        "SERVERBUG",
+        "Внутренний сбой почтового сервера на этой команде. Программа переподключается и повторяет "
+        "запрос сама; если повторяется часто — вопрос к администратору сервера.",
+    ),
+    (
+        "autodiscover",
+        "Автопоиск настроек Exchange не удался. Укажите адрес сервера EWS вручную "
+        "(https://<сервер>/EWS/Exchange.asmx).",
+    ),
+)
+
+
+def _error_hint(text: str) -> str | None:
+    lowered = text.lower()
+    for needle, hint in _ERROR_HINTS:
+        if needle.lower() in lowered:
+            return hint
+    return None
 
 
 class _CallableWorker(QThread):
@@ -9708,6 +9744,15 @@ class MainWindow(QMainWindow):
         for attachment in self.current_attachments:
             item = QListWidgetItem(icon, f"{attachment.filename} ({_format_size(attachment.size)})")
             self.attachments_list.addItem(item)
+        # Высота — по числу вложений (до трёх строк), а не постоянные 110 px:
+        # одно вложение растягивало панель на пустое место (жалоба: "опять
+        # растянул поле вложений").
+        row_height = self.attachments_list.sizeHintForRow(0)
+        if row_height <= 0:
+            row_height = QFontMetrics(self.attachments_list.font()).height() + 8
+        rows = min(len(self.current_attachments), 3)
+        frame = 2 * self.attachments_list.frameWidth() + 4
+        self.attachments_list.setFixedHeight(rows * row_height + frame)
         self.attachments_list.show()
 
     def on_open_attachment(self, item: QListWidgetItem) -> None:

@@ -40,6 +40,9 @@ BATCH = 50
 # а основную базу сжимаем до минимума"). ROUND — страховочный предел по
 # числу писем.
 ROUND = 20000
+# Сколько подряд неудачных писем терпит раунд, прежде чем остановиться:
+# сбой сервера не должен превращаться в тысячи ошибок в журнале.
+MAX_CONSECUTIVE_FAILURES = 20
 _SKIP_HINTS = ("trash", "корзин", "spam", "junk", "спам", "draft", "черновик")
 
 ProgressCallback = Callable[[str, int, int], None]
@@ -175,6 +178,7 @@ def run(
     выключена: пользователь усомнился — «что значит удаляет?»). Без неё
     автоархив лишь освобождает локальную базу, сервер не трогает."""
     result = ArchiveResult()
+    consecutive_failures = 0
     if not plan.candidates:
         return result
     current = _archive_file(archive_dir, plan.account_key, plan.threshold_bytes)
@@ -204,6 +208,7 @@ def run(
                 mailbox.delete_on_server(folder, [uid])
             cache_store.mark_archived(plan.account_key, folder, uid, str(current), archive_uid)
             result.archived += 1
+            consecutive_failures = 0
             result.bytes_freed += size
             if result.archived % 50 == 0 and not full_vacuum:
                 try:
@@ -212,9 +217,16 @@ def run(
                     _log.warning("Ужатие базы по ходу автоархива не удалось: %s", exc)
         except Exception as exc:
             result.failed += 1
+            consecutive_failures += 1
             _log.error("Автоархив %s/%d: %s", folder, uid, exc)
-            if result.failed >= 20 and result.archived == 0:
-                _log.error("Автоархив остановлен: подряд не удались 20 писем")
+            # Раньше условие было "20 неудач И ни одного успеха" — после
+            # успешного начала раунда сбой сервера давал тысячи ошибок
+            # подряд (на реальном сервере 2008 штук) и «зависший» автоархив.
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                _log.error(
+                    "Автоархив остановлен: %d писем подряд не удались (последняя ошибка: %s)",
+                    consecutive_failures, exc,
+                )
                 break
         if progress is not None and (index % 10 == 0 or index == len(plan.candidates)):
             try:

@@ -104,9 +104,16 @@ def _is_recoverable_by_reconnect(exc: Exception) -> bool:
       подключение, обновление даёт ошибку") — сессия после такого сбоя
       сервера обычно уже невалидна, свежее соединение проходит."""
     text = str(exc)
-    if "illegal in state" in text and "NONAUTH" in text:
+    if "illegal in state" in text:
+        # NONAUTH — сессия разлогинена; AUTH — папка «отвалилась» (сервер
+        # снял выбор после своего же сбоя). И то, и другое лечится свежим
+        # соединением с повторным SELECT.
         return True
-    return "[UNAVAILABLE]" in text.upper()
+    upper = text.upper()
+    # [SERVERBUG] — внутренний сбой сервера на конкретной команде (реально
+    # встречен на VK Mail: STATUS/SELECT/MOVE). Сессия после него обычно
+    # непригодна, свежая проходит.
+    return "[UNAVAILABLE]" in upper or "[SERVERBUG]" in upper
 
 
 def _reconnecting(method):
@@ -321,6 +328,7 @@ class ImapSession:
                 self._lock.release()
 
     def _reconnect(self) -> None:
+        self._selected_folder = None  # новое соединение — папка не выбрана
         self._client = self._new_client()
         try:
             self._login()
@@ -642,9 +650,17 @@ class ImapSession:
 
     def _select(self, folder: str) -> None:
         # Папка уже открыта этой же сессией — второй SELECT только теряет время.
-        if self._selected_folder != folder:
-            self._client.select_folder(folder, readonly=False)
-            self._selected_folder = folder
+        if self._selected_folder == folder:
+            return
+        # Пока SELECT не подтверждён, выбранной папки нет: неудачный SELECT
+        # (RFC 3501: "если SELECT не удался, ни одна папка не выбрана")
+        # переводил сервер в состояние AUTH, а клиент продолжал считать
+        # выбранной ПРЕЖНЮЮ папку и слал UID FETCH без SELECT — на реальном
+        # сервере это дало 2000 подряд ошибок "command UID illegal in state
+        # AUTH" и зависший автоархив.
+        self._selected_folder = None
+        self._client.select_folder(folder, readonly=False)
+        self._selected_folder = folder
 
 
 def _iter_body_parts(message: Message):

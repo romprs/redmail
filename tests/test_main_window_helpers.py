@@ -4,6 +4,7 @@ from redmail import contact_store
 from redmail.imap_client import MessageSummary
 from redmail.ui.main_window import (
     _contact_candidates,
+    _exception_text,
     _recipients_tooltip,
     _format_recipient_candidate,
     _html_to_preview_text,
@@ -17,6 +18,16 @@ from redmail.ui.main_window import (
 
 def _summary(uid: int, date: str, subject: str) -> MessageSummary:
     return MessageSummary(uid=uid, subject=subject, sender="Ivan", sender_email="ivan@example.com", date=date, message_id=f"<{uid}@x>")
+
+
+def test_error_text_adds_hint_for_known_server_answers() -> None:
+    # Сырые ответы серверов, которые реально видел пользователь: пароль
+    # приложения (VK Mail), корпоративный сертификат (CalDAV/EWS).
+    text = _exception_text(Exception(b"[AUTHENTICATIONFAILED] NEOBHODIM parol prilozheniya / Application password is REQUIRED"))
+    assert "пароль приложения" in text and "NEOBHODIM" in text
+    cert = _exception_text(Exception("SSLError([SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate)"))
+    assert "update-ca-trust" in cert
+    assert _exception_text(Exception("что-то своё")) == "что-то своё"
 
 
 def test_contact_candidates_person_single_address_and_group_reference() -> None:

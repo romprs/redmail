@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        101%{?dist}
+Release:        102%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -101,12 +101,33 @@ ln -s /opt/redmail/venv/bin/redmail %{buildroot}%{_bindir}/redmail
 
 install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.desktop
 
+%posttrans
+if ! rpm -q audioreferent >/dev/null 2>&1; then
+cat <<'EOF'
+
+Голосовой помощник (audioreferent) не установлен — он рекомендуемый пакет и
+ставится вместе с почтой, только если указан в той же команде или доступен в
+репозитории:
+
+    dnf install ./redmail-*.rpm ./audioreferent-*.rpm
+
+EOF
+fi
+
 %files
 /opt/redmail
 %{_bindir}/redmail
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-102
+- Неудачный SELECT больше не «теряет» папку: после сбоя сервера программа выбирает её заново (в журнале было 2000 ошибок «UID illegal in state AUTH» и стоящий автоархив)
+- Ошибки [SERVERBUG] и потеря выбранной папки лечатся переподключением
+- Автоархив останавливается после 20 неудач подряд, а не долбит сервер тысячами запросов
+- HTTPS (CalDAV, Exchange, подписка на календарь) доверяет системному хранилищу сертификатов — корпоративный ЦС теперь известен
+- Понятные подсказки к ответам серверов: пароль приложения, неизвестный сертификат, сбой сервера, автопоиск Exchange
+- Список вложений по высоте содержимого, не постоянные 110 px
+- После установки почты подсказка, как поставить голосовой помощник
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-101
 - Папка назначения досинхронизируется при каждом переносе: «Отправленные» после отправки (в фоне, без подвисания окна), «Черновики» после сохранения черновика, папки правил сортировки
 * Sun Sep 13 2026 redmail <redmail@example.com> - 0.0.1-100

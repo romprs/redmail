@@ -9,7 +9,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
-from redmail import applog
+from redmail import applog, tls_trust
 from redmail import profile
 from redmail import config_store
 from redmail.ui import theme
@@ -96,6 +96,9 @@ def _ensure_session_bus_address() -> None:
 def main() -> int:
     log_file = applog.setup_logging()
     _ensure_session_bus_address()
+    # HTTPS (CalDAV, Exchange, подписка на календарь) — доверенные корни из
+    # системного хранилища, иначе корпоративный ЦС неизвестен requests.
+    tls_trust.use_system_ca_bundle()
     applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
     app = QApplication(sys.argv)
 
