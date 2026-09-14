@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        110%{?dist}
+Release:        111%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -120,6 +120,9 @@ fi
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 15 2026 redmail <redmail@example.com> - 0.0.1-111
+- Календарь Exchange по EWS: встречи читаются и отправляются тем же подключением, что и почта Exchange (источник «Exchange (EWS)» при создании календаря)
+- Инструкция дополнена разделом про источники календаря
 * Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-110
 - Надписи встреч в сетке календаря следуют масштабу шрифта, а не фиксированным 11 px
 - Параметры → Общие: «Масштаб шрифта» (раньше только ползунок в строке состояния)

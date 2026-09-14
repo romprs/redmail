@@ -207,7 +207,17 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import address_rules, autoarchive, html_cleanup, profile, secret_store, sync_engine, tls_trust, voice_assistant
+from redmail import (
+    address_rules,
+    autoarchive,
+    ews_calendar,
+    html_cleanup,
+    profile,
+    secret_store,
+    sync_engine,
+    tls_trust,
+    voice_assistant,
+)
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -3986,6 +3996,7 @@ class AddCalendarDialog(QDialog):
         self.source_combo.addItem("Локальный", calendar_store.SOURCE_LOCAL)
         self.source_combo.addItem("CalDAV (VK Mail, Exchange и др.)", calendar_store.SOURCE_CALDAV)
         self.source_combo.addItem("Google Календарь / подписка по ссылке (.ics)", calendar_store.SOURCE_ICS)
+        self.source_combo.addItem("Exchange (EWS) — из подключённой учётной записи", calendar_store.SOURCE_EWS)
         self.source_combo.currentIndexChanged.connect(self._on_source_changed)
 
         # Подписка на .ics: Google отдаёт весь календарь по «закрытому
@@ -4180,6 +4191,9 @@ class AddCalendarDialog(QDialog):
     def _on_accept(self) -> None:
         if not self.name_edit.text().strip():
             QMessageBox.warning(self, "Укажите название", "Название календаря обязательно.")
+            return
+        if self.source_combo.currentData() == calendar_store.SOURCE_EWS:
+            self.accept()
             return
         if self.source_combo.currentData() == calendar_store.SOURCE_CALDAV and not self.caldav_url_edit.text().strip():
             QMessageBox.warning(self, "Укажите адрес", "Адрес CalDAV-сервера обязателен для этого источника.")
@@ -7101,6 +7115,18 @@ class MainWindow(QMainWindow):
             "<p>Автор: Пономарев Роман Сергеевич</p>",
         )
 
+    def _ews_session_for_calendar(self):
+        """Сессия Exchange для календаря: берём её у уже подключённой
+        почтовой учётной записи Exchange (её же логин и способ входа)."""
+        for key, protocol in self.mailbox_protocols.items():
+            if protocol != "ews":
+                continue
+            mailbox = self.mailboxes.get(key)
+            session = getattr(mailbox, "session", None)
+            if session is not None:
+                return session
+        return None
+
     def _storage_stats(self) -> dict:
         try:
             from redmail import cache_store
@@ -9426,7 +9452,7 @@ class MainWindow(QMainWindow):
             return
         caldav_calendars = [
             cal for cal in calendar_store.list_calendars(self.calendar_path)
-            if cal.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_ICS)
+            if cal.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_ICS, calendar_store.SOURCE_EWS)
         ]
         if not caldav_calendars:
             QMessageBox.information(
@@ -9456,6 +9482,25 @@ class MainWindow(QMainWindow):
             _log.info("CalDAV: синхронизация, календарей %d", len(caldav_calendars))
             local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
             for cal in caldav_calendars:
+                if cal.source_type == calendar_store.SOURCE_EWS:
+                    # Календарь Exchange: то же подключение, что и у почты
+                    # Exchange — отдельный адрес и пароль не нужны.
+                    session = self._ews_session_for_calendar()
+                    if session is None:
+                        _log.warning("Календарь Exchange: нет подключённой учётной записи Exchange")
+                        continue
+                    for event in local_events:
+                        if event.calendar_id == cal.id and event.is_organizer and event.status != "cancelled":
+                            ews_calendar.push_event(session, event)
+                            total_pushed += 1
+                    for event in ews_calendar.fetch_events(session, window_start, window_end, self.account.email if hasattr(self.account, "email") else username):
+                        event = replace(event, calendar_id=cal.id)
+                        existing_local = calendar_store.get_event(calendar_path, event.uid)
+                        if existing_local and not event.color and existing_local.color:
+                            event.color = existing_local.color
+                        calendar_store.save_event(calendar_path, event)
+                        total_pulled += 1
+                    continue
                 if cal.source_type == calendar_store.SOURCE_ICS:
                     # Подписка по ссылке (Google и др.): только чтение —
                     # локальные правки на сервер не уходят.
