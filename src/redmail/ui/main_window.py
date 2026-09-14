@@ -146,6 +146,7 @@ from redmail.config_store import (
     load_body_max_size_mb,
     load_font_scale,
     load_profile_dir,
+    load_contacts_view_mode,
     load_mail_view_mode,
     load_thread_grouping,
     load_mail_columns_state,
@@ -175,6 +176,7 @@ from redmail.config_store import (
     save_body_max_size_mb,
     save_font_scale,
     save_profile_dir,
+    save_contacts_view_mode,
     save_mail_view_mode,
     save_thread_grouping,
     save_mail_columns_state,
@@ -1533,6 +1535,91 @@ def _markers_icon(value: str | None) -> QIcon:
         painter.drawEllipse(x, y, dot, dot)
     painter.end()
     return QIcon(pixmap)
+
+
+class _ContactCardDelegate(QStyledItemDelegate):
+    """Карточка контакта: круглый аватар (фотография сотрудника или
+    инициалы), имя, должность с подразделением, адрес и телефон —
+    пожелание «хочу карточки с аватаром»."""
+
+    AVATAR = 44
+    PAD = 10
+
+    def __init__(self, contacts_provider, parent=None) -> None:
+        super().__init__(parent)
+        self._contacts = contacts_provider
+
+    def _contact(self, index):
+        contacts = self._contacts()
+        row = index.data(Qt.ItemDataRole.UserRole)
+        return contacts[row] if isinstance(row, int) and 0 <= row < len(contacts) else None
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802 - Qt override
+        line = QFontMetrics(option.font).height()
+        return QSize(option.rect.width(), max(self.AVATAR + 2 * self.PAD, 2 * line + 2 * self.PAD + 6))
+
+    def paint(self, painter: QPainter, option, index) -> None:  # noqa: N802 - Qt override
+        contact = self._contact(index)
+        if contact is None:
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        rect = option.rect
+        palette = option.palette
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        if selected:
+            painter.fillRect(rect, palette.highlight())
+        elif option.state & QStyle.StateFlag.State_MouseOver:
+            painter.fillRect(rect, palette.alternateBase())
+        text_color = palette.highlightedText().color() if selected else palette.text().color()
+        muted = palette.highlightedText().color() if selected else palette.placeholderText().color()
+
+        avatar_x = rect.left() + self.PAD
+        avatar_y = rect.center().y() - self.AVATAR // 2
+        icon = _toolbar_icon("group", self.AVATAR) if contact.is_group else _contact_avatar(contact, self.AVATAR)
+        painter.drawPixmap(avatar_x, avatar_y, icon.pixmap(self.AVATAR, self.AVATAR))
+
+        normal = QFont(option.font)
+        bold = QFont(option.font)
+        bold.setBold(True)
+        line_h = QFontMetrics(bold).height()
+        x = avatar_x + self.AVATAR + self.PAD
+        right = rect.right() - self.PAD
+        top = rect.center().y() - line_h - 2
+
+        name = contact.display_name + (" (группа)" if contact.is_group else "")
+        contacts_text = ", ".join(contact.emails[:1]) if not contact.is_group else f"адресов: {len(contact.emails)}"
+        if contact.phone:
+            contacts_text = f"{contacts_text}   тел. {contact.phone}" if contacts_text else f"тел. {contact.phone}"
+        second_line = ", ".join(part for part in (contact.title, contact.department) if part) or contact.organization
+
+        painter.setFont(normal)
+        contacts_width = min(painter.fontMetrics().horizontalAdvance(contacts_text), rect.width() // 3)
+        painter.setPen(muted)
+        painter.drawText(
+            QRect(right - contacts_width, top, contacts_width, line_h),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(contacts_text, Qt.TextElideMode.ElideMiddle, contacts_width),
+        )
+        painter.setFont(bold)
+        painter.setPen(text_color)
+        name_rect = QRect(x, top, max(10, right - contacts_width - self.PAD - x), line_h)
+        painter.drawText(
+            name_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            painter.fontMetrics().elidedText(name, Qt.TextElideMode.ElideRight, name_rect.width()),
+        )
+        if second_line:
+            painter.setFont(normal)
+            painter.setPen(muted)
+            second_rect = QRect(x, top + line_h + 4, max(10, right - x), line_h)
+            painter.drawText(
+                second_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                painter.fontMetrics().elidedText(second_line, Qt.TextElideMode.ElideRight, second_rect.width()),
+            )
+        painter.setPen(QPen(palette.mid().color()))
+        painter.drawLine(rect.left() + self.PAD, rect.bottom(), rect.right() - self.PAD, rect.bottom())
+        painter.restore()
 
 
 class _MessageCardDelegate(QStyledItemDelegate):
@@ -5636,6 +5723,31 @@ class MainWindow(QMainWindow):
         self.contacts_count_label = QLabel("", self)
         contacts_filter_row.addWidget(self.contacts_count_label)
 
+        # Два режима книги: таблица и карточки с фотографией (пожелание
+        # «хочу карточки с аватаром»).
+        self.contacts_view_table_action = QAction(_toolbar_icon("view_table"), "Таблицей", self)
+        self.contacts_view_table_action.setCheckable(True)
+        self.contacts_view_cards_action = QAction(_toolbar_icon("view_cards"), "Карточками", self)
+        self.contacts_view_cards_action.setCheckable(True)
+        contacts_view_group = QActionGroup(self)
+        for action in (self.contacts_view_table_action, self.contacts_view_cards_action):
+            contacts_view_group.addAction(action)
+            button = QToolButton(self)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+            contacts_filter_row.addWidget(button)
+        self.contacts_view_table_action.triggered.connect(lambda: self._set_contacts_view_mode("table"))
+        self.contacts_view_cards_action.triggered.connect(lambda: self._set_contacts_view_mode("cards"))
+
+        self.contacts_card_list = QListWidget(self)
+        self.contacts_card_delegate = _ContactCardDelegate(lambda: self._contacts_by_row, self.contacts_card_list)
+        self.contacts_card_list.setItemDelegate(self.contacts_card_delegate)
+        self.contacts_card_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.contacts_card_list.setMouseTracking(True)
+        self.contacts_card_list.setUniformItemSizes(True)
+        self.contacts_card_list.itemSelectionChanged.connect(self._on_contact_card_selected)
+        self.contacts_card_list.itemDoubleClicked.connect(self._on_contact_card_double_clicked)
+
         contacts_page = QWidget(self)
         contacts_layout = QVBoxLayout(contacts_page)
         contacts_layout.setContentsMargins(0, 0, 0, 0)
@@ -5643,6 +5755,9 @@ class MainWindow(QMainWindow):
         contacts_layout.addWidget(contacts_toolbar)
         contacts_layout.addLayout(contacts_filter_row)
         contacts_layout.addWidget(self.contacts_table)
+        contacts_layout.addWidget(self.contacts_card_list)
+        self.contacts_view_mode = load_contacts_view_mode()
+        self._set_contacts_view_mode(self.contacts_view_mode)
 
         self.pages = QStackedWidget(self)
         self.pages.addWidget(self.main_splitter)  # 0: почта
@@ -9744,6 +9859,15 @@ class MainWindow(QMainWindow):
             self.contacts_table.setItem(row, 3, QTableWidgetItem(emails_text))
             self.contacts_table.setItem(row, 4, QTableWidgetItem(contact.phone))
             self.contacts_table.setItem(row, 5, QTableWidgetItem(contact.organization))
+        self.contacts_card_list.blockSignals(True)
+        try:
+            self.contacts_card_list.clear()
+            for row in range(len(contacts)):
+                item = QListWidgetItem()
+                item.setData(Qt.ItemDataRole.UserRole, row)
+                self.contacts_card_list.addItem(item)
+        finally:
+            self.contacts_card_list.blockSignals(False)
         self._apply_contacts_filter()
 
     def _apply_contacts_filter(self, *_args) -> None:
@@ -9763,15 +9887,44 @@ class MainWindow(QMainWindow):
                 ]).casefold()
                 visible = needle in haystack
             self.contacts_table.setRowHidden(row, not visible)
+            card = self.contacts_card_list.item(row)
+            if card is not None:
+                card.setHidden(not visible)
             shown += int(visible)
         self.contacts_count_label.setText(f"{shown} из {len(self._contacts_by_row)}")
+
+    def _set_contacts_view_mode(self, mode: str) -> None:
+        self.contacts_view_mode = mode
+        is_cards = mode == "cards"
+        self.contacts_table.setVisible(not is_cards)
+        self.contacts_card_list.setVisible(is_cards)
+        self.contacts_view_table_action.setChecked(not is_cards)
+        self.contacts_view_cards_action.setChecked(is_cards)
+        try:
+            save_contacts_view_mode(mode)
+        except Exception:
+            pass  # режим не запомнится между запусками — не критично
+
+    def _on_contact_card_selected(self) -> None:
+        items = self.contacts_card_list.selectedItems()
+        row = items[0].data(Qt.ItemDataRole.UserRole) if items else None
+        self.selected_contact = (
+            self._contacts_by_row[row] if isinstance(row, int) and 0 <= row < len(self._contacts_by_row) else None
+        )
+
+    def _on_contact_card_double_clicked(self, item: QListWidgetItem) -> None:
+        row = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(row, int) or not (0 <= row < len(self._contacts_by_row)):
+            return
+        self.on_contact_double_clicked(self.contacts_table.item(row, 0) or QTableWidgetItem())
 
     def on_contact_selection_changed(self) -> None:
         rows = self.contacts_table.selectionModel().selectedRows()
         self.selected_contact = self._contacts_by_row[rows[0].row()] if rows else None
 
     def on_contact_double_clicked(self, item: QTableWidgetItem) -> None:
-        contact = self._contacts_by_row[item.row()]
+        row = item.row() if item.row() >= 0 else (self.contacts_card_list.currentRow())
+        contact = self._contacts_by_row[row]
         dialog = ContactDialog(self, contact=contact, contacts=self._contacts_by_row)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return

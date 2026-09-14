@@ -245,6 +245,19 @@ def save_auto_archive_size_mb(value: int) -> None:
     _save_settings_dict(data)
 
 
+def load_contacts_view_mode() -> str:
+    """Режим адресной книги: "table" — таблица, "cards" — карточки с
+    фотографией сотрудника."""
+    value = _load_settings_dict().get("contacts_view_mode", "cards")
+    return value if value in _MAIL_VIEW_MODES else "cards"
+
+
+def save_contacts_view_mode(mode: str) -> None:
+    data = _load_settings_dict()
+    data["contacts_view_mode"] = mode if mode in _MAIL_VIEW_MODES else "cards"
+    _save_settings_dict(data)
+
+
 def load_mail_view_mode() -> str:
     """Режим списка писем: "table" — колонки (как раньше), "cards" — плитки
     с аватаром/двумя строками (по дизайн-референсу; договорённость —
