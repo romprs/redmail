@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        102%{?dist}
+Release:        103%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -120,6 +120,8 @@ fi
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-103
+- Версия в заставке, «О программе» и журнале берётся у пакета, которому принадлежит запущенный файл: во время обновления в базе rpm недолго числятся обе версии, и показывалась старая
 * Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-102
 - Неудачный SELECT больше не «теряет» папку: после сбоя сервера программа выбирает её заново (в журнале было 2000 ошибок «UID illegal in state AUTH» и стоящий автоархив)
 - Ошибки [SERVERBUG] и потеря выбранной папки лечатся переподключением

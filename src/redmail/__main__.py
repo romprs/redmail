@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 import os
 import sys
 from importlib.metadata import PackageNotFoundError, version
@@ -28,17 +29,22 @@ def app_version() -> str:
     (даёт "0.0.1-30", ровно то, что нужно, чтобы отличить сборки друг от
     друга); вне RED OS (разработка, другой дистрибутив) rpm просто нет —
     тогда версия пакета Python как раньше."""
-    try:
-        result = subprocess.run(
-            ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}", "redmail"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        pass
+    # Спрашиваем пакет, которому принадлежит ЗАПУЩЕННЫЙ файл (rpm -qf), а
+    # не пакет по имени: во время обновления в базе rpm недолго числятся
+    # обе версии, и `rpm -q redmail` отдаёт две строки — показывалась
+    # старая (жалоба: "тянет старые версии"). -qf всегда про тот код,
+    # который сейчас работает.
+    for args in (
+        ["rpm", "-qf", "--queryformat", "%{VERSION}-%{RELEASE}\n", str(Path(__file__).resolve())],
+        ["rpm", "-q", "--queryformat", "%{VERSION}-%{RELEASE}\n", "redmail"],
+    ):
+        try:
+            result = subprocess.run(args, capture_output=True, text=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            break
+        lines = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        if result.returncode == 0 and lines:
+            return lines[-1]  # при нескольких версиях — последняя (новая)
     try:
         return version("redmail")
     except PackageNotFoundError:
