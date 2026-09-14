@@ -541,6 +541,18 @@ def _mail_rule_moves(summaries: list[MessageSummary], rules: list[MailRule]) -> 
 # текущего) это отдельный сетевой запрос при первом открытии, а цепочка
 # вопрос-ответ в рабочей переписке легко насчитывает десятки писем.
 _THREAD_DEPTH_LIMIT = 8
+# Сколько писем цепочки держать в памяти. Кэш нужен только для
+# предпросмотра соседних писем, поэтому вложения и встроенные картинки из
+# него выбрасываются: письмо с десятком вложений по 5 МБ раздувало память
+# программы на сотни мегабайт (жалоба: "почему так много памяти съедает?").
+_THREAD_CACHE_LIMIT = 12
+
+
+def _lightweight_content(content: MessageContent) -> MessageContent:
+    """Копия письма без тяжёлых данных — для кэша цепочки."""
+    if not content.attachments and not content.inline_images:
+        return content
+    return replace(content, attachments=[], inline_images={})
 
 
 def _build_thread_html(entries: list[tuple[MessageSummary, str]], current_uid: int) -> str:
@@ -4696,6 +4708,30 @@ def account_key(account, protocol: str) -> str:
     return f"imap:{account.host}:{account.username}"
 
 
+def _process_memory_mb() -> float:
+    """Память процесса и его дочерних процессов (просмотр письма живёт в
+    отдельных процессах QtWebEngine) в мегабайтах. Без сторонних
+    библиотек: /proc на Linux, иначе 0."""
+    try:
+        total = 0
+        for status in Path("/proc").glob("[0-9]*/status"):
+            try:
+                text = status.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            pid_line = [line for line in text.splitlines() if line.startswith(("Pid:", "PPid:", "VmRSS:"))]
+            values = {line.split(":", 1)[0]: line.split(":", 1)[1].strip() for line in pid_line}
+            if "VmRSS" not in values:
+                continue
+            pid = int(values.get("Pid", "0"))
+            ppid = int(values.get("PPid", "0"))
+            if pid == os.getpid() or ppid == os.getpid():
+                total += int(values["VmRSS"].split()[0])
+        return total / 1024
+    except Exception:
+        return 0.0
+
+
 def _exception_text(exc: BaseException) -> str:
     """Текст ошибки для показа пользователю. Некоторые исключения imaplib
     несут "сырой" ответ сервера как bytes прямо в args (жалоба: окно с
@@ -5580,6 +5616,10 @@ class MainWindow(QMainWindow):
         log_action.setToolTip("Журнал входов, переподключений, отправок и синхронизаций")
         log_action.triggered.connect(self.on_show_log)
         help_menu.addAction(log_action)
+        diag_action = QAction("Расход памяти…", self)
+        diag_action.setToolTip("Сколько памяти занимает программа и на что она уходит")
+        diag_action.triggered.connect(self.on_show_memory)
+        help_menu.addAction(diag_action)
         help_button.setMenu(help_menu)
         toolbar.addWidget(help_button)
 
@@ -6787,6 +6827,38 @@ class MainWindow(QMainWindow):
             return cache_store.storage_stats()
         except Exception:
             return {}
+
+    def on_show_memory(self) -> None:
+        """Справка → «Расход памяти…»: сколько занимает программа целиком и
+        что именно держит в памяти (список писем, кэш цепочки, открытое
+        письмо со вложениями, фоновые задачи). Нужно, чтобы отвечать на
+        вопрос «почему так много памяти» не гаданием, а цифрами."""
+        lines = [f"Всего у процесса: {_process_memory_mb():.0f} МБ (вместе с окном просмотра письма)"]
+        lines.append(f"Писем в списке: {len(self.current_summaries)}")
+        thread_bytes = sum(
+            len(c.text or "") + len(c.html or "") for c in self._thread_content_cache.values()
+        )
+        lines.append(f"Кэш цепочки: {len(self._thread_content_cache)} писем, {thread_bytes / (1024 * 1024):.1f} МБ текста")
+        content = self.current_content
+        if content is not None:
+            attachments_bytes = sum(len(a.payload or b"") for a in (content.attachments or []))
+            inline_bytes = sum(len(data) for _t, data in (content.inline_images or {}).values())
+            lines.append(
+                f"Открытое письмо: текст {(len(content.text or '') + len(content.html or '')) / (1024 * 1024):.1f} МБ, "
+                f"вложения {attachments_bytes / (1024 * 1024):.1f} МБ, картинки {inline_bytes / (1024 * 1024):.1f} МБ"
+            )
+        lines.append(f"Фоновых задач: {len(self._background_workers)}")
+        lines.append(f"Учётных записей подключено: {len(self.mailboxes)}, архивов открыто: {len(self.archives)}")
+        stats = self._storage_stats()
+        if stats:
+            lines.append(f"База почты на диске: {stats.get('db_bytes', 0) / (1024 * 1024):.0f} МБ")
+        lines.append("")
+        lines.append(
+            "Основную часть занимает сам интерфейс Qt вместе со встроенным просмотром письма "
+            "(обычно 350–500 МБ). Список писем, кэш цепочки и открытое письмо освобождаются "
+            "при переходе к другой папке."
+        )
+        QMessageBox.information(self, "Расход памяти", "\n".join(lines))
 
     def on_show_log(self) -> None:
         """Справка → «Журнал подключений…» (пожелание: "писать лог
@@ -8677,7 +8749,7 @@ class MainWindow(QMainWindow):
             return
 
         all_in_thread = sorted([summary, *thread], key=lambda s: s.date)[-_THREAD_DEPTH_LIMIT:]
-        self._thread_content_cache[summary.uid] = content
+        self._remember_thread_content(summary.uid, content)
         self._thread_render_token += 1
         token = self._thread_render_token
 
@@ -8712,7 +8784,7 @@ class MainWindow(QMainWindow):
                 return  # пользователь уже открыл другое письмо — этот ответ больше не актуален
             for uid, other_content in results.items():
                 if other_content is not None:
-                    self._thread_content_cache[uid] = other_content
+                    self._remember_thread_content(uid, other_content)
             self._paint_thread(summary, all_in_thread, content)
 
         def on_failure(_message: str) -> None:
@@ -8722,6 +8794,13 @@ class MainWindow(QMainWindow):
         worker.failed.connect(on_failure)
         self._background_workers.append(worker)
         worker.start()
+
+    def _remember_thread_content(self, uid: int, content: MessageContent) -> None:
+        """Положить письмо в кэш цепочки: без вложений и встроенных картинок
+        и не больше _THREAD_CACHE_LIMIT писем (самые старые вытесняются)."""
+        self._thread_content_cache[uid] = _lightweight_content(content)
+        while len(self._thread_content_cache) > _THREAD_CACHE_LIMIT:
+            self._thread_content_cache.pop(next(iter(self._thread_content_cache)))
 
     def _paint_thread(
         self, summary: MessageSummary, all_in_thread: list[MessageSummary], content: MessageContent
