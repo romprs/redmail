@@ -72,6 +72,18 @@ def save_pane_orientation(orientation: str) -> None:
     _save_settings_dict(data)
 
 
+def load_tls_ca_file() -> str:
+    """Файл с корневым сертификатом организации для HTTPS (CalDAV, Exchange,
+    подписка на календарь). Пусто — системное хранилище."""
+    return str(_load_settings_dict().get("tls_ca_file", "") or "")
+
+
+def save_tls_ca_file(path: str) -> None:
+    data = _load_settings_dict()
+    data["tls_ca_file"] = str(path or "")
+    _save_settings_dict(data)
+
+
 def load_theme() -> str:
     """Своя тема (светлая/тёмная), не зависящая от темы рабочего стола/GTK
     хоста (жалоба: "сделай фон программы независимым") — раньше приложение

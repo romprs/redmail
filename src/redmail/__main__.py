@@ -103,8 +103,12 @@ def main() -> int:
     log_file = applog.setup_logging()
     _ensure_session_bus_address()
     # HTTPS (CalDAV, Exchange, подписка на календарь) — доверенные корни из
-    # системного хранилища, иначе корпоративный ЦС неизвестен requests.
-    tls_trust.use_system_ca_bundle()
+    # файла, указанного в настройках, иначе из системного хранилища:
+    # корпоративный ЦС неизвестен requests сам по себе.
+    try:
+        tls_trust.apply_trust(config_store.load_tls_ca_file())
+    except Exception as exc:  # настройки не должны мешать запуску
+        applog.get_logger("app").warning("Доверенные корни HTTPS: %s", exc)
     applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
     app = QApplication(sys.argv)
 

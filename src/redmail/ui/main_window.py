@@ -138,6 +138,7 @@ from redmail.config_store import (
     load_auto_archive_delete_on_server,
     load_auto_archive_enabled,
     load_maintenance_window,
+    load_tls_ca_file,
     in_maintenance_window,
     load_auto_archive_size_mb,
     load_body_max_size_mb,
@@ -165,6 +166,7 @@ from redmail.config_store import (
     save_auto_archive_delete_on_server,
     save_auto_archive_enabled,
     save_maintenance_window,
+    save_tls_ca_file,
     save_auto_archive_size_mb,
     save_body_max_size_mb,
     save_font_scale,
@@ -199,7 +201,7 @@ from redmail.imap_client import (
 )
 from redmail.ipc_server import IpcServer
 from redmail.mailbox import ArchiveSource, CachedMailbox
-from redmail import autoarchive, html_cleanup, profile, secret_store, sync_engine, voice_assistant
+from redmail import autoarchive, html_cleanup, profile, secret_store, sync_engine, tls_trust, voice_assistant
 from redmail.paths import app_dir
 from redmail.smtp_client import (
     OutgoingAttachment,
@@ -1900,6 +1902,7 @@ class SettingsDialog(QDialog):
         auto_archive_enabled: bool = True,
         auto_archive_delete_on_server: bool = False,
         maintenance_window: tuple[bool, int, int] = (False, 22, 7),
+        tls_ca_file: str = "",
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -1986,11 +1989,25 @@ class SettingsDialog(QDialog):
         self.theme_combo.addItem("Тёмная", "dark")
         self.theme_combo.setCurrentIndex(self.theme_combo.findData(theme))
 
+        # Корневой сертификат организации: браузер берёт его из системного
+        # хранилища Windows, а программа на RED OS — из своего набора, где
+        # внутреннего ЦС нет (жалоба: "в браузере открывается, а тут
+        # сертификат"). Пусто — системное хранилище.
+        self.tls_ca_edit = QLineEdit(tls_ca_file, self)
+        self.tls_ca_edit.setPlaceholderText("Пусто — системное хранилище сертификатов")
+        self.tls_ca_edit.setClearButtonEnabled(True)
+        tls_ca_browse = QPushButton("Обзор…", self)
+        tls_ca_browse.clicked.connect(self._on_browse_tls_ca)
+        tls_ca_row = QHBoxLayout()
+        tls_ca_row.addWidget(self.tls_ca_edit, 1)
+        tls_ca_row.addWidget(tls_ca_browse)
+
         general_form = QFormLayout()
         general_form.addRow("Проверять почту каждые", self.interval_edit)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
         general_form.addRow("Тема оформления", self.theme_combo)
+        general_form.addRow("Корневой сертификат (PEM)", tls_ca_row)
         general_group = QGroupBox("Общие")
         general_group.setLayout(general_form)
 
@@ -2290,6 +2307,17 @@ class SettingsDialog(QDialog):
 
     def auto_archive_delete_on_server(self) -> bool:
         return self.auto_archive_delete_check.isChecked()
+
+    def tls_ca_file(self) -> str:
+        return self.tls_ca_edit.text().strip()
+
+    def _on_browse_tls_ca(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Корневой сертификат организации", self.tls_ca_edit.text() or str(Path.home()),
+            "Сертификаты (*.pem *.crt *.cer);;Все файлы (*)",
+        )
+        if path:
+            self.tls_ca_edit.setText(path)
 
     def maintenance_window(self) -> tuple[bool, int, int]:
         return (
@@ -6738,6 +6766,7 @@ class MainWindow(QMainWindow):
             auto_archive_enabled=load_auto_archive_enabled(),
             auto_archive_delete_on_server=load_auto_archive_delete_on_server(),
             maintenance_window=load_maintenance_window(),
+            tls_ca_file=load_tls_ca_file(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -6759,6 +6788,8 @@ class MainWindow(QMainWindow):
             save_auto_archive_enabled(dialog.auto_archive_enabled())
             save_auto_archive_delete_on_server(dialog.auto_archive_delete_on_server())
             save_maintenance_window(*dialog.maintenance_window())
+            save_tls_ca_file(dialog.tls_ca_file())
+            tls_trust.apply_trust(dialog.tls_ca_file())
             for mailbox in self.mailboxes.values():
                 if isinstance(mailbox, CachedMailbox):
                     mailbox.body_max_bytes = dialog.body_max_size_mb() * 1024 * 1024

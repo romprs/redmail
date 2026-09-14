@@ -33,8 +33,10 @@ SYSTEM_CA_BUNDLES = (
 _ENV_VARS = ("REQUESTS_CA_BUNDLE", "SSL_CERT_FILE", "CURL_CA_BUNDLE")
 
 
-def system_ca_bundle(candidates: tuple[str, ...] = SYSTEM_CA_BUNDLES) -> str | None:
-    for candidate in candidates:
+def system_ca_bundle(candidates: tuple[str, ...] | None = None) -> str | None:
+    # Список берём в момент вызова, а не в момент объявления функции:
+    # иначе его нельзя подменить (тесты, будущая настройка).
+    for candidate in candidates if candidates is not None else SYSTEM_CA_BUNDLES:
         path = Path(candidate)
         try:
             if path.is_file() and path.stat().st_size > 0:
@@ -44,7 +46,7 @@ def system_ca_bundle(candidates: tuple[str, ...] = SYSTEM_CA_BUNDLES) -> str | N
     return None
 
 
-def use_system_ca_bundle(environ: dict | None = None, candidates: tuple[str, ...] = SYSTEM_CA_BUNDLES) -> str | None:
+def use_system_ca_bundle(environ: dict | None = None, candidates: tuple[str, ...] | None = None) -> str | None:
     """Прописать системный набор корней в окружение процесса. Возвращает
     путь к набору или None, если менять нечего."""
     env = os.environ if environ is None else environ
@@ -57,3 +59,26 @@ def use_system_ca_bundle(environ: dict | None = None, candidates: tuple[str, ...
         env[name] = bundle
     _log.info("HTTPS: доверенные корни из системного хранилища %s", bundle)
     return bundle
+
+
+def use_ca_file(ca_file: str, environ: dict | None = None) -> str | None:
+    """Явно указанный файл корневого сертификата организации (Параметры →
+    Общие). Корпоративный ЦС часто стоит только в браузере/в Windows, а на
+    рабочей станции с RED OS его в системном хранилище нет — тогда CalDAV и
+    Exchange падают с CERTIFICATE_VERIFY_FAILED, хотя браузер тот же адрес
+    открывает. Возвращает путь или None, если файла нет."""
+    env = os.environ if environ is None else environ
+    path = Path(ca_file) if ca_file else None
+    if path is None or not path.is_file():
+        if ca_file:
+            _log.warning("HTTPS: файл сертификата %s не найден — остаюсь на системном хранилище", ca_file)
+        return None
+    for name in _ENV_VARS:
+        env[name] = str(path)
+    _log.info("HTTPS: доверенные корни из файла %s", path)
+    return str(path)
+
+
+def apply_trust(ca_file: str = "", environ: dict | None = None) -> str | None:
+    """Общая точка: сначала файл из настроек, иначе системное хранилище."""
+    return use_ca_file(ca_file, environ) or use_system_ca_bundle(environ)

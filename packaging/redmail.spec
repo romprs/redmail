@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        103%{?dist}
+Release:        104%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -120,6 +120,8 @@ fi
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-104
+- Параметры → Общие: «Корневой сертификат (PEM)» — файл корневого сертификата организации для CalDAV, Exchange и подписки на календарь; пусто — системное хранилище
 * Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-103
 - Версия в заставке, «О программе» и журнале берётся у пакета, которому принадлежит запущенный файл: во время обновления в базе rpm недолго числятся обе версии, и показывалась старая
 * Mon Sep 14 2026 redmail <redmail@example.com> - 0.0.1-102
