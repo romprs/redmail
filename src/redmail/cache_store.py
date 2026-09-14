@@ -218,6 +218,16 @@ def delete_folder(account_key: str, folder: str) -> None:
         conn.commit()
 
 
+def delete_account(account_key: str) -> None:
+    """Убрать локальную копию учётной записи целиком (письма, вложения,
+    список папок) — при удалении записи из программы, если пользователь
+    выбрал «удалить и локальную копию»."""
+    with closing(_connect()) as conn:
+        for table in ("messages", "attachments", "inline_images", "folders"):
+            conn.execute(f"DELETE FROM {table} WHERE account = ?", (account_key,))
+        conn.commit()
+
+
 def list_folders(account_key: str) -> list[str]:
     with closing(_connect()) as conn:
         rows = conn.execute("SELECT folder FROM folders WHERE account = ? ORDER BY folder", (account_key,)).fetchall()

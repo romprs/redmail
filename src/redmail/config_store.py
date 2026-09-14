@@ -72,6 +72,34 @@ def save_pane_orientation(orientation: str) -> None:
     _save_settings_dict(data)
 
 
+def load_disabled_accounts() -> list[str]:
+    """Ключи выключенных учётных записей («imap:сервер:логин»,
+    «ews:сервер:адрес»). Выключенная запись не подключается при запуске,
+    её настройки и локальная копия сохраняются — нужно на время работы
+    сразу в двух системах, чтобы не держать два одинаковых ящика."""
+    value = _load_settings_dict().get("disabled_accounts", [])
+    return [str(item) for item in value] if isinstance(value, list) else []
+
+
+def save_disabled_accounts(keys: list[str]) -> None:
+    data = _load_settings_dict()
+    data["disabled_accounts"] = sorted({str(key) for key in keys})
+    _save_settings_dict(data)
+
+
+def load_domain_rewrites() -> str:
+    """Правила замены домена у получателей при отправке (текстом, по одному
+    в строке: «старый = новый»). Нужны на время переезда между почтовыми
+    системами, когда у людей два адреса."""
+    return str(_load_settings_dict().get("domain_rewrites", "") or "")
+
+
+def save_domain_rewrites(text: str) -> None:
+    data = _load_settings_dict()
+    data["domain_rewrites"] = str(text or "")
+    _save_settings_dict(data)
+
+
 def load_tls_ca_file() -> str:
     """Файл с корневым сертификатом организации для HTTPS (CalDAV, Exchange,
     подписка на календарь). Пусто — системное хранилище."""
