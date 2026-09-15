@@ -6,7 +6,7 @@ from email import message_from_bytes
 
 from exchangelib import BASIC, DELEGATE, GSSAPI, HTMLBody, NTLM
 from exchangelib import Account as ExchangeAccount
-from exchangelib import Configuration, Credentials, FileAttachment, Folder, Mailbox
+from exchangelib import Configuration, Credentials, FaultTolerance, FileAttachment, Folder, Mailbox
 from exchangelib.items import Message as EwsMessage
 
 from redmail.applog import get_logger
@@ -112,6 +112,9 @@ _SUMMARY_FIELDS = (
     "subject", "sender", "datetime_received", "message_id",
     "has_attachments", "categories", "importance", "is_read",
 )
+#: Сколько ждать, если сервер просит притормозить (секунды).
+_MAX_THROTTLE_WAIT = 60
+
 #: Сколько писем запрашивать у сервера одним запросом (по умолчанию в
 #: exchangelib — 100, на 250 круг по папке заметно короче).
 _FETCH_CHUNK = 250
@@ -151,7 +154,16 @@ class EwsSession:
             # Kerberos/SSO: билет берётся из окружения ОС (см. GSSAPI в
             # exchangelib) — пароль в приложении не нужен и не хранится.
             credentials = Credentials(account.username or account.email, account.password)
-        config_kwargs: dict = {"auth_type": auth_type, "credentials": credentials}
+        # Exchange отвечает "The server cannot service this request right
+        # now", когда клиент выбрал свою долю запросов. По умолчанию
+        # библиотека сразу поднимает ошибку — вместо этого подождём,
+        # сколько просит сервер, но не дольше минуты, чтобы закрытие окна
+        # не упиралось в это ожидание.
+        config_kwargs: dict = {
+            "auth_type": auth_type,
+            "credentials": credentials,
+            "retry_policy": FaultTolerance(max_wait=_MAX_THROTTLE_WAIT),
+        }
         if account.server:
             config_kwargs["server"] = account.server
         try:

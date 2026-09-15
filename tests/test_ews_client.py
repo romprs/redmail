@@ -276,3 +276,12 @@ def test_server_address_is_reduced_to_host_name() -> None:
 def test_empty_server_means_autodiscover() -> None:
     assert _account(server="").server == ""
     assert _account(server="   ").server == ""
+
+
+def test_connection_waits_when_server_asks_to_throttle() -> None:
+    """Сервер, попросивший подождать, не должен сразу ронять обход папок."""
+    with patch("redmail.ews_client.Configuration") as config, patch("redmail.ews_client.ExchangeAccount"):
+        EwsSession(_account(server="mail.example.com"))
+
+    policy = config.call_args.kwargs["retry_policy"]
+    assert policy.max_wait == 60
