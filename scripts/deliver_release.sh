@@ -7,14 +7,15 @@ H80="ssh -i $HOME/.ssh/redos_80 -o StrictHostKeyChecking=no -o ConnectTimeout=15
 
 $VM "rpm -K $SRC && dnf -y install $SRC >/dev/null 2>&1; rpm -qf /usr/bin/redmail" </dev/null 2>/dev/null
 scp -q -i "$HOME/.ssh/redos_vm" -o StrictHostKeyChecking=no root@192.168.0.10:$SRC /e/rrr/dist/ 2>/dev/null
-cp /e/rrr/dist/$RPM /d/111/
+mkdir -p /d/111/mail
+cp /e/rrr/dist/$RPM /d/111/mail/
 VMSUM=$($VM "sha256sum $SRC | cut -c1-16" </dev/null 2>/dev/null | tr -d '\r')
 LOCSUM=$(sha256sum /e/rrr/dist/$RPM | cut -c1-16)
-D11SUM=$(sha256sum /d/111/$RPM | cut -c1-16)
+D11SUM=$(sha256sum /d/111/mail/$RPM | cut -c1-16)
 echo "SUMS vm=$VMSUM dist=$LOCSUM d111=$D11SUM"
 [ "$VMSUM" = "$LOCSUM" ] && [ "$VMSUM" = "$D11SUM" ] || { echo "COPY_MISMATCH"; exit 1; }
 
-bash /e/rrr/redos-mail-client/scripts/ship80.sh /d/111/$RPM
+bash /e/rrr/redos-mail-client/scripts/ship80.sh /d/111/mail/$RPM
 $H80 "rpm -K /var/tmp/$RPM && dnf -y install /var/tmp/$RPM 2>&1 | tail -1; rpm -qf /usr/bin/redmail" </dev/null 2>/dev/null
 $H80 "pkill -u test -f '/usr/bin/redmail'; sleep 2; sudo -u test env HOME=/home/test DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority XDG_RUNTIME_DIR=/run/user/1000 setsid nohup /usr/bin/redmail >/tmp/redmail-launch.log 2>&1 < /dev/null & sleep 40; pgrep -u test -f /usr/bin/redmail >/dev/null && echo CLIENT_RUNNING || echo CLIENT_DOWN" </dev/null 2>/dev/null
 $H80 "grep -c ERROR /home/test/.config/redmail/logs/redmail.log 2>/dev/null | sed 's/^/ERRORS_IN_LOG=/'" </dev/null 2>/dev/null
