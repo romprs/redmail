@@ -2071,15 +2071,21 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
 
-        self.host_edit = QLineEdit(account.host if account else "")
+        # Учётная запись Exchange не описывает IMAP-подключение: её поля
+        # (host/port/use_ssl) в этом окне пустые, правится она отдельной
+        # кнопкой «Подключить Exchange (EWS)».
+        self.host_edit = QLineEdit(getattr(account, "host", "") if account else "")
         self.port_edit = QSpinBox()
         self.port_edit.setRange(1, 65535)
-        self.port_edit.setValue(account.port if account else 993)
-        self.user_edit = QLineEdit(account.username if account else "")
+        # account может быть учётной записью Exchange (у неё нет ни порта,
+        # ни отдельного IMAP-хоста) — окно параметров из-за этого вообще не
+        # открывалось (жалоба: "кнопка Параметры недоступна").
+        self.port_edit.setValue(getattr(account, "port", 993) if account else 993)
+        self.user_edit = QLineEdit(getattr(account, "username", "") if account else "")
         self.password_edit = QLineEdit(account.password if account else "")
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.ssl_check = QCheckBox("Использовать SSL")
-        self.ssl_check.setChecked(account.use_ssl if account else True)
+        self.ssl_check.setChecked(getattr(account, "use_ssl", True) if account else True)
 
         self.auth_combo = QComboBox()
         self.auth_combo.addItem("Логин и пароль", "password")
@@ -2091,7 +2097,7 @@ class SettingsDialog(QDialog):
             "его смену на стороне домена обрабатывает сама SSO-инфраструктура."
         )
         self.auth_combo.setCurrentIndex(
-            self.auth_combo.findData(account.auth_type if account else "password")
+            self.auth_combo.findData(getattr(account, "auth_type", "password") if account else "password")
         )
         self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
 
@@ -7208,10 +7214,14 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def on_settings(self) -> None:
+        # Для учётной записи Exchange поля IMAP/SMTP в этом окне не имеют
+        # смысла: там своё подключение (кнопка «Подключить Exchange»).
+        imap_account = self.account if self.account_protocol == "imap" else None
+        smtp_account = self.smtp_account if self.account_protocol == "imap" else None
         dialog = SettingsDialog(
             self,
-            account=self.account,
-            smtp=self.smtp_account,
+            account=imap_account,
+            smtp=smtp_account,
             poll_interval_minutes=self.poll_interval_minutes,
             pane_orientation=self.pane_orientation,
             archive_storage_dir=self.archive_storage_dir,

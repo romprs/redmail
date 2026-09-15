@@ -66,6 +66,18 @@ class EwsAccount:
         return self.server or self.email.rsplit("@", 1)[-1]
 
 
+#: Служебные папки Exchange, которые не показываем и не синхронизируем:
+#: почты в них нет, а серверу лишние запросы дорого обходятся.
+_SERVICE_FOLDER_NAMES = {
+    "Conversation Action Settings", "ExternalContacts", "Files", "Файлы",
+    "Quick Step Settings", "Настройка быстрых действий", "SearchLog",
+    "Yammer Root", "Корневая папка Yammer", "RSS Feeds", "RSS-подписки",
+    "Sync Issues", "Ошибки синхронизации", "Recoverable Items",
+    "Journal", "Журнал", "Notes", "Заметки", "Tasks", "Задачи",
+    "Outbox", "Исходящие",
+}
+
+
 class EwsConnectionError(Exception):
     """Не удалось подключиться или авторизоваться на сервере Exchange."""
 
@@ -134,11 +146,25 @@ class EwsSession:
         self.close()
 
     def list_folders(self) -> list[FolderInfo]:
+        """Только почтовые папки. Раньше возвращались все подряд, включая
+        служебные (Задачи, Заметки, Файлы, Yammer, SearchLog, Conversation
+        Action Settings) — синхронизация ломилась в 64 папки и упиралась в
+        ограничение сервера «The server cannot service this request right
+        now» (жалоба: "всё висит на синхронизации с ящиком ews")."""
         self._folders_by_path = {}
         result: list[FolderInfo] = []
 
+        def is_mail_folder(folder: Folder) -> bool:
+            folder_class = (getattr(folder, "folder_class", "") or "").upper()
+            if folder_class and not folder_class.startswith("IPF.NOTE"):
+                return False  # задачи, заметки, контакты, календари и прочее
+            name = (folder.name or "")
+            return name not in _SERVICE_FOLDER_NAMES
+
         def walk(folder: Folder, prefix: str) -> None:
             for child in folder.children:
+                if not is_mail_folder(child):
+                    continue
                 path = f"{prefix}/{child.name}" if prefix else child.name
                 self._folders_by_path[path] = child
                 result.append(FolderInfo(name=path, delimiter="/"))

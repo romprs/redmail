@@ -49,6 +49,7 @@ class SyncStats:
     folders: list[FolderSyncResult] = field(default_factory=list)
     bodies_downloaded: int = 0
     bodies_pending: int = 0  # сколько тел ещё не скачано после этого прохода
+    server_busy: bool = False  # сервер попросил подождать — круг прерван
 
     @property
     def added(self) -> int:
@@ -158,6 +159,21 @@ def sync_folder_headers(
     return result
 
 
+#: Признаки того, что сервер попросил притормозить (Exchange/EWS).
+_BUSY_HINTS = (
+    "cannot service this request",
+    "server is busy",
+    "errorserverbusy",
+    "too many concurrent",
+    "throttl",
+)
+
+
+def is_server_busy(exc: Exception) -> bool:
+    text = str(exc).casefold()
+    return any(hint in text for hint in _BUSY_HINTS)
+
+
 def sync_all_folders(
     session,
     account_key: str,
@@ -180,6 +196,13 @@ def sync_all_folders(
                 stats.folders.append(sync_folder_headers(session, account_key, folder, progress=progress, stop=stop))
         except Exception as exc:
             _log.error("Папка %s: синхронизация заголовков не удалась: %s", folder, exc)
+            if is_server_busy(exc):
+                # Дальше по списку будет то же самое: на реальном Exchange
+                # так набегало по ошибке на каждую из 64 папок, а обход
+                # выглядел зависанием. Останавливаемся до следующего круга.
+                _log.warning("Сервер просит подождать — синхронизация папок прервана до следующего раза")
+                stats.server_busy = True
+                break
     return stats
 
 

@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        111%{?dist}
+Release:        112%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -120,6 +120,10 @@ fi
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Tue Sep 15 2026 redmail <redmail@example.com> - 0.0.1-112
+- Параметры открываются, когда текущая учётная запись — Exchange (окно вообще не открывалось)
+- Exchange: синхронизируются только почтовые папки, служебные (Задачи, Заметки, Файлы, SearchLog, Yammer и прочие) пропускаются — вместо 64 папок около десятка
+- Если сервер просит подождать («The server cannot service this request right now»), круг по папкам прекращается до следующего раза, а не повторяет ошибку для каждой папки
 * Tue Sep 15 2026 redmail <redmail@example.com> - 0.0.1-111
 - Календарь Exchange по EWS: встречи читаются и отправляются тем же подключением, что и почта Exchange (источник «Exchange (EWS)» при создании календаря)
 - Инструкция дополнена разделом про источники календаря
