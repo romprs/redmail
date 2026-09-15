@@ -39,6 +39,33 @@ MARKER_CATEGORIES: dict[str, str] = {
 _COLOR_BY_CATEGORY = {v: k for k, v in MARKER_CATEGORIES.items()}
 
 
+#: Хвосты адреса, которые остаются, если скопировать ссылку из браузера.
+_EWS_PATH_SUFFIXES = ("/ews/exchange.asmx", "/ews/services.wsdl", "/ews")
+
+
+def normalize_ews_server(value: str) -> str:
+    """Оставляет от адреса сервера только имя узла.
+
+    В поле "Сервер" естественно вставить ссылку целиком, как она
+    открывается в браузере (https://svb-mail.corp.amurgpz.ru/EWS/
+    Exchange.asmx). Библиотека ждёт здесь только имя узла и сама
+    дописывает путь, а разные написания одного и того же сервера ещё и
+    давали разные ключи локальной копии — после правки адреса почта
+    выглядела как пропавшая и скачивалась заново."""
+    server = (value or "").strip()
+    if not server:
+        return ""
+    if "://" in server:
+        server = server.split("://", 1)[1]
+    server = server.split("?", 1)[0].rstrip("/")
+    lowered = server.lower()
+    for suffix in _EWS_PATH_SUFFIXES:
+        if lowered.endswith(suffix):
+            server = server[: -len(suffix)]
+            break
+    return server.rstrip("/")
+
+
 @dataclass
 class EwsAccount:
     email: str
@@ -48,6 +75,7 @@ class EwsAccount:
     auth_type: str = "basic"  # "basic" | "ntlm" | "kerberos"
 
     def __post_init__(self) -> None:
+        self.server = normalize_ews_server(self.server)
         if not self.username:
             # Для Kerberos/SSO логин не нужен для входа (билет и так
             # привязан к пользователю ОС), но username всё равно

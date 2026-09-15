@@ -257,3 +257,22 @@ def test_search_uids_keeps_only_last_folder_in_memory() -> None:
     session.search_uids("Архив")
 
     assert list(session._flags) == ["Архив"]
+
+
+def test_server_address_is_reduced_to_host_name() -> None:
+    """Адрес, скопированный из браузера, должен работать так же, как имя
+    узла: иначе и подключение не поднимется, и локальная копия заведётся
+    вторая."""
+    from_browser = _account(server="https://svb-mail.corp.amurgpz.ru/EWS/Exchange.asmx")
+    wsdl = _account(server="https://svb-mail.corp.amurgpz.ru/EWS/Services.wsdl")
+    plain = _account(server="svb-mail.corp.amurgpz.ru")
+
+    assert from_browser.server == "svb-mail.corp.amurgpz.ru"
+    assert wsdl.server == "svb-mail.corp.amurgpz.ru"
+    assert plain.server == "svb-mail.corp.amurgpz.ru"
+    assert from_browser.host == plain.host
+
+
+def test_empty_server_means_autodiscover() -> None:
+    assert _account(server="").server == ""
+    assert _account(server="   ").server == ""

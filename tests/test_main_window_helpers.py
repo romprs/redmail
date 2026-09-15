@@ -8,6 +8,7 @@ from redmail.ui.main_window import (
     _recipients_tooltip,
     _format_recipient_candidate,
     _html_to_preview_text,
+    _needs_another_bodies_round,
     _normalize_subject,
     _parse_recipient_list,
     _safe_attachment_filename,
@@ -166,3 +167,32 @@ def test_safe_attachment_filename_rejects_dot_and_dotdot() -> None:
 
 def test_safe_attachment_filename_keeps_normal_name() -> None:
     assert _safe_attachment_filename("Отчёт.pdf") == "Отчёт.pdf"
+
+
+class _Stats:
+    def __init__(self, downloaded: int, pending: int, server_busy: bool = False) -> None:
+        self.bodies_downloaded = downloaded
+        self.bodies_pending = pending
+        self.server_busy = server_busy
+
+
+def test_another_round_only_when_previous_one_downloaded_something() -> None:
+    assert _needs_another_bodies_round(_Stats(downloaded=200, pending=500), None) is True
+
+
+def test_no_round_when_nothing_was_downloaded() -> None:
+    """Вне часов обслуживания тела не качаются: раунд за раундом крутился
+    вхолостую и занимал процессор целиком."""
+    assert _needs_another_bodies_round(_Stats(downloaded=0, pending=500), None) is False
+
+
+def test_no_round_when_server_asked_to_wait() -> None:
+    assert _needs_another_bodies_round(_Stats(downloaded=10, pending=500, server_busy=True), None) is False
+
+
+def test_no_round_when_everything_is_downloaded() -> None:
+    assert _needs_another_bodies_round(_Stats(downloaded=200, pending=0), None) is False
+
+
+def test_periodic_mode_does_one_round_per_tick() -> None:
+    assert _needs_another_bodies_round(_Stats(downloaded=200, pending=500), 200) is False
