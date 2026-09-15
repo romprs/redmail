@@ -160,11 +160,11 @@ from redmail.config_store import (
     load_theme,
     load_window_geometry,
     load_compose_geometry,
-    save_accounts,
+    merge_accounts,
+    merge_ews_accounts,
     save_archive_storage_dir,
     save_caldav_url,
     save_default_signature_id,
-    save_ews_accounts,
     save_auto_archive_confirmed,
     save_auto_archive_delete_on_server,
     save_auto_archive_enabled,
@@ -6704,17 +6704,24 @@ class MainWindow(QMainWindow):
         self._save_open_archives()
         self.statusBar().showMessage("Архив отключён", 3000)
 
-    def _disconnect_account(self, key: str) -> None:
+    def _disconnect_account(self, key: str, *, forget: bool = False) -> None:
         # Раньше живую учётную запись (IMAP/EWS) нельзя было отключить
         # вообще, только закрыть всё приложение (жалоба: "нет возможности
         # отключить ящик") — по аналогии с "Закрыть архив" выше, но здесь
         # ещё нужно перевыбрать "текущую" запись, если отключаем именно её.
+        # forget=True — пункт "Отключить ящик": запись убирается и из
+        # сохранённых. Снятая в параметрах галочка вызывает этот же метод
+        # без forget, и настройки записи остаются на месте.
         mailbox = self.mailboxes.pop(key, None)
         if mailbox is not None:
-            mailbox.close()
+            try:
+                mailbox.close()
+            except Exception as exc:
+                _log.warning("Отключение %s: соединение не закрылось: %s", key, exc)
         self.mailbox_accounts.pop(key, None)
         self.mailbox_smtp_accounts.pop(key, None)
         self.mailbox_protocols.pop(key, None)
+        self.mailbox_folders.pop(key, None)
         self.mailbox_trash_folders.pop(key, None)
         self.mailbox_sent_folders.pop(key, None)
         self.mailbox_drafts_folders.pop(key, None)
@@ -6751,8 +6758,9 @@ class MainWindow(QMainWindow):
                 self.sent_folder_name = None
                 self.drafts_folder_name = None
 
-        self._save_all_accounts()
-        self.statusBar().showMessage("Ящик отключён", 3000)
+        if forget:
+            self._save_all_accounts(forget=key)
+        self.statusBar().showMessage("Ящик отключён" if forget else "Учётная запись отключена", 3000)
 
     def _empty_trash(self, mailbox: CachedMailbox, folder: str) -> None:
         confirm = QMessageBox.question(
@@ -7437,55 +7445,25 @@ class MainWindow(QMainWindow):
                 "Включённые записи подключатся при следующем запуске программы.",
             )
 
-    def _disconnect_account(self, key: str) -> None:
-        """Закрыть соединение и убрать запись из дерева, не трогая её
-        настройки и локальную копию."""
-        mailbox = self.mailboxes.pop(key, None)
-        if mailbox is not None:
-            try:
-                mailbox.close()
-            except Exception:
-                pass
-        root = self.mailbox_tree_roots.pop(key, None)
-        if root is not None:
-            index = self.folder_tree.indexOfTopLevelItem(root)
-            if index >= 0:
-                self.folder_tree.takeTopLevelItem(index)
-        for mapping in (
-            self.mailbox_accounts, self.mailbox_smtp_accounts, self.mailbox_protocols,
-            self.mailbox_folders, self.mailbox_trash_folders, self.mailbox_sent_folders,
-            self.mailbox_drafts_folders,
-        ):
-            mapping.pop(key, None)
-        if self.mailbox is mailbox or self.active_source is mailbox:
-            self.mailbox = None
-            self.active_source = None
-            self.current_folder = None
-            self._clear_reading_pane()
-            self.table.setRowCount(0)
-            self._populate_cards([], False)
-        remaining = next(iter(self.mailboxes), None)
-        if remaining is not None and self.mailbox is None:
-            self.mailbox = self.mailboxes[remaining]
-            self.account = self.mailbox_accounts.get(remaining)
-            self.account_protocol = self.mailbox_protocols.get(remaining, "imap")
-            self.smtp_account = self.mailbox_smtp_accounts.get(remaining)
-            self.trash_folder_name = self.mailbox_trash_folders.get(remaining)
-            self.sent_folder_name = self.mailbox_sent_folders.get(remaining)
-            self.drafts_folder_name = self.mailbox_drafts_folders.get(remaining)
-        self.statusBar().showMessage("Учётная запись отключена", 5000)
-
-    def _save_all_accounts(self) -> None:
+    def _save_all_accounts(self, *, forget: str | None = None) -> None:
+        """Записи, выключенные галочкой, в программе не открыты, а раньше
+        сохранялись только открытые — следующее сохранение стирало
+        выключенную запись из файла, и в списке параметров её уже не было
+        (жалоба: "чтобы поставить галочку, она должна быть в списке — её
+        нет"). Теперь открытые записи дописываются к сохранённым, а
+        убирается только та, которую отключили явно."""
         try:
-            save_accounts(
+            merge_accounts(
                 [
                     (self.mailbox_accounts[key], self.mailbox_smtp_accounts[key])
                     for key in self.mailboxes
                     if self.mailbox_protocols[key] == "imap"
-                ]
+                ],
+                forget=forget,
             )
-            save_ews_accounts(
-                [self.mailbox_accounts[key] for key in self.mailboxes if self.mailbox_protocols[key] == "ews"]
+            merge_ews_accounts(
+                [self.mailbox_accounts[key] for key in self.mailboxes if self.mailbox_protocols[key] == "ews"],
+                forget=forget,
             )
         except Exception as exc:
             QMessageBox.warning(
@@ -7693,7 +7671,7 @@ class MainWindow(QMainWindow):
             self._empty_trash(mailbox, data[1])
             return
         if disconnect_action is not None and chosen is disconnect_action:
-            self._disconnect_account(account_key)
+            self._disconnect_account(account_key, forget=True)
             return
         if chosen is not create_action:
             return

@@ -78,6 +78,17 @@ _SERVICE_FOLDER_NAMES = {
 }
 
 
+#: Поля, которых хватает для строки в списке писем. Тела и MIME здесь
+#: нет намеренно: именно из-за них обход папок тянул каждое письмо целиком.
+_SUMMARY_FIELDS = (
+    "subject", "sender", "datetime_received", "message_id",
+    "has_attachments", "categories", "importance", "is_read",
+)
+#: Сколько писем запрашивать у сервера одним запросом (по умолчанию в
+#: exchangelib — 100, на 250 круг по папке заметно короче).
+_FETCH_CHUNK = 250
+
+
 class EwsConnectionError(Exception):
     """Не удалось подключиться или авторизоваться на сервере Exchange."""
 
@@ -97,6 +108,12 @@ class EwsSession:
     поэтому весь остальной UI (дерево папок, таблица писем, кэш) подходит
     без изменений для обоих протоколов.
     """
+
+    #: Цвет маркера хранится в categories — это "сложное" поле EWS, и
+    #: чтобы прочитать его у всех писем папки, пришлось бы запрашивать
+    #: письма целиком. Цвета с сервера не перечитываем, локальные
+    #: остаются как есть (см. sync_engine.sync_folder_headers).
+    supports_marker_sync = False
 
     def __init__(self, account: EwsAccount):
         self.account = account
@@ -134,7 +151,10 @@ class EwsSession:
         # тип идентификатора письма. crc32 — детерминированный, не зависит
         # от PYTHONHASHSEED (в отличие от встроенного hash()).
         self._id_map: dict[int, tuple[str, str]] = {}
-        self._listing: dict[str, dict[int, object]] = {}
+        # Признак "прочитано" по последней просмотренной папке. Раньше тут
+        # лежали сами письма всех папок сразу — на настоящем ящике это
+        # съедало и память, и время.
+        self._flags: dict[str, dict[int, bool]] = {}
 
     def close(self) -> None:
         pass  # exchangelib сам управляет пулом HTTP-соединений, отдельно закрывать нечего
@@ -231,7 +251,7 @@ class EwsSession:
     def fetch_summaries(self, limit: int = 50) -> list[MessageSummary]:
         if self._selected_folder_obj is None:
             return []
-        items = self._selected_folder_obj.all().order_by("-datetime_received")[:limit]
+        items = self._selected_folder_obj.all().only(*_SUMMARY_FIELDS).order_by("-datetime_received")[:limit]
         return [self._to_summary(item) for item in items]
 
     def fetch_folder_summaries(self, folder: str, limit: int = 50) -> list[MessageSummary]:
@@ -239,44 +259,59 @@ class EwsSession:
         return self.fetch_summaries(limit)
 
     def search_uids(self, folder: str, *, before=None) -> list[int]:
+        """Перечисляет письма папки, запрашивая только идентификатор, ключ
+        изменения и признак "прочитано": такой запрос сервер отдаёт
+        страницами и не читает письма целиком. Раньше здесь был
+        folder.all() без ограничения полей — exchangelib на каждую сотню
+        писем дозапрашивал их целиком, с телом и вложениями. На настоящем
+        ящике обход папок из-за этого не заканчивался, письма в список не
+        попадали, а процессор был занят разбором тел (жалоба: "пробегал по
+        всем папкам, но письма не подтягивались, потом всё зависало с
+        загрузкой процессора до 120%")."""
         folder_obj = self._folder(folder)
-        items = folder_obj.all()
+        items = folder_obj.all().only("id", "changekey", "is_read")
         if before is not None:
             items = items.filter(datetime_received__lt=before)
-        listing: dict[int, object] = {}
+        flags: dict[int, bool] = {}
         for item in items:
-            listing[self._register(item)] = item
+            flags[self._register(item)] = bool(item.is_read)
         if before is None:
-            # Полная синхронизация (sync_engine) сразу после search_uids
-            # запрашивает сводки и флаги порциями — отдаём их из этого же
-            # списка, а не перечитываем папку с сервера на каждую порцию.
-            self._listing[folder] = listing
-        return list(listing)
+            # Синхронизация сразу после search_uids спрашивает флаги
+            # порциями — отвечаем из этого же списка. Держим только
+            # последнюю папку: весь ящик в памяти держать незачем.
+            self._flags = {folder: flags}
+        return list(flags)
 
     def folder_status(self, folder: str) -> tuple[int, int]:
         """(UIDVALIDITY, число писем): у EWS нет UIDVALIDITY — наши uid
         детерминированы (crc32 от id письма), возвращаем 0."""
         return 0, self._folder(folder).total_count
 
-    def _listed(self, folder: str) -> dict[int, object]:
-        if folder not in self._listing:
+    def _folder_flags(self, folder: str) -> dict[int, bool]:
+        if folder not in self._flags:
             self.search_uids(folder)
-        return self._listing[folder]
+        return self._flags.get(folder, {})
 
     def fetch_summaries_by_uids(self, folder: str, uids: list[int]) -> list[MessageSummary]:
-        listing = self._listed(folder)
-        return [self._to_summary(listing[uid]) for uid in uids if uid in listing]
+        """Заголовки запрашиваются только для перечисленных писем и только
+        нужными полями — без тела и вложений."""
+        ids = [self._id_map[uid] for uid in uids if uid in self._id_map]
+        if not ids:
+            return []
+        summaries: list[MessageSummary] = []
+        for item in self._account.fetch(ids=ids, only_fields=_SUMMARY_FIELDS, chunk_size=_FETCH_CHUNK):
+            if isinstance(item, Exception):
+                _log.warning("EWS: заголовок письма не прочитан: %s", item)
+                continue
+            summaries.append(self._to_summary(item))
+        return summaries
 
     def fetch_flags(self, folder: str, uids: list[int]) -> dict[int, tuple[bool, bool, str | None]]:
-        listing = self._listed(folder)
-        result: dict[int, tuple[bool, bool, str | None]] = {}
-        for uid in uids:
-            item = listing.get(uid)
-            if item is None:
-                continue
-            summary = self._to_summary(item)
-            result[uid] = (summary.is_read, summary.is_answered, summary.marker_color)
-        return result
+        """Отвечает из списка, полученного при перечислении папки. Признак
+        "отвечено" и цвет маркера EWS дёшево не отдаёт, поэтому цвет
+        синхронизация не трогает (см. supports_marker_sync)."""
+        flags = self._folder_flags(folder)
+        return {uid: (flags[uid], False, None) for uid in uids if uid in flags}
 
     def fetch_message_content(self, folder: str, uid: int) -> MessageContent:
         return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))

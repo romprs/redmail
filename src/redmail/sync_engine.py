@@ -127,6 +127,9 @@ def sync_folder_headers(
 
     existing = sorted(server_uids & local_uids)
     if existing:
+        # Exchange цвет маркера дёшево не отдаёт (см. EwsSession) — у такой
+        # сессии локальные цвета оставляем нетронутыми.
+        marker_sync = bool(getattr(session, "supports_marker_sync", True))
         local_flags = cache_store.get_folder_flags(account_key, folder)
         changes: list[tuple[int, bool, bool, str | None]] = []
         for part in _chunks(existing, FLAGS_CHUNK):
@@ -139,7 +142,9 @@ def sync_folder_headers(
                 old_read, old_answered, old_marker = old
                 # Сервер знает, ЕСТЬ ли маркер (\Flagged); цвет помнит
                 # локальная база (VK не хранит keyword-флаги).
-                if server_marker is None:
+                if not marker_sync:
+                    marker = old_marker
+                elif server_marker is None:
                     marker = None
                 elif old_marker:
                     marker = old_marker

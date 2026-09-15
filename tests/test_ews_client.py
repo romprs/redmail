@@ -80,7 +80,7 @@ def test_list_folders_walks_tree_and_builds_paths() -> None:
 def test_folder_message_count_then_fetch_summaries() -> None:
     item = _fake_item(date=datetime(2026, 1, 15, 10, 30))
     inbox = _fake_folder("Входящие", total_count=1)
-    inbox.all.return_value.order_by.return_value = [item]
+    inbox.all.return_value.only.return_value.order_by.return_value = [item]
     exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[inbox]))
     session = _session(exchange_account)
     session.list_folders()
@@ -106,7 +106,7 @@ def test_fetch_summaries_without_selected_folder_returns_empty() -> None:
 def test_marker_color_round_trip_via_categories() -> None:
     item = _fake_item()
     inbox = _fake_folder("Входящие", total_count=1)
-    inbox.all.return_value.order_by.return_value = [item]
+    inbox.all.return_value.only.return_value.order_by.return_value = [item]
     exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[inbox]), fetch=MagicMock())
     exchange_account.fetch.return_value = [item]
     session = _session(exchange_account)
@@ -132,7 +132,7 @@ def test_set_marker_same_color_is_a_noop() -> None:
 def test_fetch_message_raw_uses_mime_content() -> None:
     item = _fake_item(mime_content=b"From: a@example.com\r\n\r\nhi")
     inbox = _fake_folder("Входящие", total_count=1)
-    inbox.all.return_value.order_by.return_value = [item]
+    inbox.all.return_value.only.return_value.order_by.return_value = [item]
     exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[inbox]), fetch=MagicMock())
     exchange_account.fetch.return_value = [item]
     session = _session(exchange_account)
@@ -159,7 +159,7 @@ def test_get_item_for_unknown_uid_raises() -> None:
 def test_move_and_delete_messages() -> None:
     item = _fake_item()
     inbox = _fake_folder("Входящие", total_count=1)
-    inbox.all.return_value.order_by.return_value = [item]
+    inbox.all.return_value.only.return_value.order_by.return_value = [item]
     trash = _fake_folder("Корзина")
     exchange_account = SimpleNamespace(
         msg_folder_root=_fake_folder("root", children=[inbox, trash]), fetch=MagicMock()
@@ -205,3 +205,55 @@ def test_send_message_builds_ews_message_and_sends() -> None:
 
     mock_message.attach.assert_called_once()
     mock_message.send.assert_called_once()
+
+
+def test_search_uids_asks_only_light_fields() -> None:
+    """Перечисление папки не должно тянуть письма целиком: именно из-за
+    этого обход папок на настоящем ящике не заканчивался."""
+    item = _fake_item()
+    inbox = _fake_folder("Входящие", total_count=1)
+    only_query = inbox.all.return_value.only
+    only_query.return_value = [item]
+    exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[inbox]))
+    session = _session(exchange_account)
+    session.list_folders()
+
+    uids = session.search_uids("Входящие")
+
+    only_query.assert_called_once_with("id", "changekey", "is_read")
+    assert len(uids) == 1
+    assert session.fetch_flags("Входящие", uids) == {uids[0]: (False, False, None)}
+
+
+def test_fetch_summaries_by_uids_requests_headers_without_body() -> None:
+    item = _fake_item(date=datetime(2026, 3, 1, 9, 0))
+    inbox = _fake_folder("Входящие", total_count=1)
+    inbox.all.return_value.only.return_value = [item]
+    exchange_account = SimpleNamespace(
+        msg_folder_root=_fake_folder("root", children=[inbox]), fetch=MagicMock(return_value=[item])
+    )
+    session = _session(exchange_account)
+    session.list_folders()
+    uids = session.search_uids("Входящие")
+
+    summaries = session.fetch_summaries_by_uids("Входящие", uids)
+
+    fields = exchange_account.fetch.call_args.kwargs["only_fields"]
+    assert "mime_content" not in fields and "body" not in fields
+    assert "subject" in fields and "sender" in fields
+    assert [s.subject for s in summaries] == ["Тест"]
+
+
+def test_search_uids_keeps_only_last_folder_in_memory() -> None:
+    first = _fake_folder("Входящие", total_count=1)
+    first.all.return_value.only.return_value = [_fake_item(id_="a")]
+    second = _fake_folder("Архив", total_count=1)
+    second.all.return_value.only.return_value = [_fake_item(id_="b")]
+    exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[first, second]))
+    session = _session(exchange_account)
+    session.list_folders()
+
+    session.search_uids("Входящие")
+    session.search_uids("Архив")
+
+    assert list(session._flags) == ["Архив"]

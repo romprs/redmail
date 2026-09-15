@@ -612,6 +612,48 @@ def load_accounts() -> list[tuple[Account, SmtpAccount | None]]:
     return result
 
 
+def _imap_entry_key(entry: dict) -> str:
+    return "imap:{}:{}".format(entry.get("imap_host", ""), entry.get("username", ""))
+
+
+def _ews_entry_key(entry: dict) -> str:
+    return "ews:{}:{}".format(entry.get("server", "") or "autodiscover", entry.get("email", ""))
+
+
+def _read_raw_entries(path: Path, required_field: str) -> list[dict]:
+    if not path.exists():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(raw, list):
+        return []
+    return [entry for entry in raw if isinstance(entry, dict) and entry.get(required_field)]
+
+
+def merge_accounts(
+    accounts: list[tuple[Account, SmtpAccount | None]], *, forget: str | None = None
+) -> None:
+    """Дописывает переданные записи к уже сохранённым, а не заменяет файл
+    целиком. Запись, выключенную галочкой, программа не держит открытой, и
+    прежнее сохранение стирало её насовсем — включить обратно было нечем
+    (жалоба: "чтобы поставить галочку, она должна быть в списке — её
+    нет"). Прежние записи читаются сырыми, поэтому уцелеет и та, чей
+    пароль сейчас недоступен в хранилище ключей. forget — ключ записи,
+    которую пользователь отключил через "Отключить ящик"."""
+    path = _accounts_path()
+    merged = {_imap_entry_key(entry): entry for entry in _read_raw_entries(path, "username")}
+    for account, smtp in accounts:
+        if account.auth_type != "kerberos":
+            secret_store.set_password(_KEYRING_SERVICE, account.username, account.password)
+        merged["imap:{}:{}".format(account.host, account.username)] = _account_dict(account, smtp)
+    if forget:
+        merged.pop(forget, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(list(merged.values()), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def save_accounts(accounts: list[tuple[Account, SmtpAccount | None]]) -> None:
     path = _accounts_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -669,6 +711,25 @@ def load_ews_accounts() -> list[EwsAccount]:
         except KeyError:
             continue
     return result
+
+
+def merge_ews_accounts(accounts: list[EwsAccount], *, forget: str | None = None) -> None:
+    """То же, что merge_accounts, но для учётных записей Exchange."""
+    path = _ews_accounts_path()
+    merged = {_ews_entry_key(entry): entry for entry in _read_raw_entries(path, "email")}
+    for account in accounts:
+        if account.auth_type != "kerberos":
+            secret_store.set_password(_EWS_KEYRING_SERVICE, account.email, account.password)
+        merged["ews:{}:{}".format(account.server or "autodiscover", account.email)] = {
+            "email": account.email,
+            "username": account.username,
+            "server": account.server,
+            "auth_type": account.auth_type,
+        }
+    if forget:
+        merged.pop(forget, None)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(list(merged.values()), ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def save_ews_accounts(accounts: list[EwsAccount]) -> None:

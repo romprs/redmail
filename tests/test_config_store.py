@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -40,6 +41,7 @@ from redmail.config_store import (
     save_signatures,
     save_theme,
 )
+from redmail import config_store
 from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
 from redmail.smtp_client import SmtpAccount
@@ -530,3 +532,78 @@ def test_open_archives_survives_corrupt_or_wrong_shaped_value(tmp_path: Path) ->
     settings_file.write_text('{"open_archives": "not-a-list"}', encoding="utf-8")
     with patch("redmail.config_store._settings_path", return_value=settings_file):
         assert load_open_archives() == []
+
+
+def test_merge_accounts_keeps_disabled_entry(tmp_path: Path) -> None:
+    """Запись, выключенную галочкой, программа не держит открытой; при
+    сохранении остальных она не должна пропадать из файла."""
+    accounts_file = tmp_path / "accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    disabled = Account(host="imap.corp.local", username="ivan@corp.local", password="p1")
+    active = Account(host="imap.vk.example", username="ivan@vk.example", password="p2")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        config_store.save_accounts([(disabled, None)])
+        config_store.merge_accounts([(active, None)])
+        loaded = config_store.load_accounts()
+
+    assert sorted(account.username for account, _smtp in loaded) == ["ivan@corp.local", "ivan@vk.example"]
+
+
+def test_merge_accounts_forgets_requested_key(tmp_path: Path) -> None:
+    accounts_file = tmp_path / "accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    first = Account(host="imap.corp.local", username="ivan@corp.local", password="p1")
+    second = Account(host="imap.vk.example", username="ivan@vk.example", password="p2")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        config_store.save_accounts([(first, None), (second, None)])
+        config_store.merge_accounts([(second, None)], forget="imap:imap.corp.local:ivan@corp.local")
+        loaded = config_store.load_accounts()
+
+    assert [account.username for account, _smtp in loaded] == ["ivan@vk.example"]
+
+
+def test_merge_accounts_keeps_entry_without_stored_password(tmp_path: Path) -> None:
+    """Пароль может быть недоступен (другая машина, отозван) — такая
+    запись всё равно остаётся в файле, иначе её не вернуть в список."""
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(
+        json.dumps([
+            {
+                "imap_host": "imap.corp.local", "imap_port": 993, "imap_use_ssl": True,
+                "username": "ivan@corp.local", "auth_type": "password",
+                "smtp_host": "", "smtp_port": 587, "smtp_use_ssl": False,
+            }
+        ], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+    active = Account(host="imap.vk.example", username="ivan@vk.example", password="p2")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), set_patch, get_patch:
+        config_store.merge_accounts([(active, None)])
+
+    saved = json.loads(accounts_file.read_text(encoding="utf-8"))
+    assert sorted(entry["username"] for entry in saved) == ["ivan@corp.local", "ivan@vk.example"]
+
+
+def test_merge_ews_accounts_keeps_disabled_entry(tmp_path: Path) -> None:
+    ews_file = tmp_path / "ews_accounts.json"
+    store: dict[str, str] = {}
+    set_patch, get_patch = _fake_keyring(store)
+
+    disabled = EwsAccount(email="ivan@corp.local", server="mail.corp.local", auth_type="kerberos")
+    active = EwsAccount(email="ivan@vk.example", server="mail.vk.example", auth_type="kerberos")
+
+    with patch("redmail.config_store._ews_accounts_path", return_value=ews_file), set_patch, get_patch:
+        config_store.save_ews_accounts([disabled])
+        config_store.merge_ews_accounts([active])
+        loaded = config_store.load_ews_accounts()
+
+    assert sorted(account.email for account in loaded) == ["ivan@corp.local", "ivan@vk.example"]
