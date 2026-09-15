@@ -607,3 +607,60 @@ def test_merge_ews_accounts_keeps_disabled_entry(tmp_path: Path) -> None:
         loaded = config_store.load_ews_accounts()
 
     assert sorted(account.email for account in loaded) == ["ivan@corp.local", "ivan@vk.example"]
+
+
+def test_legacy_single_account_file_returns_lost_entry(tmp_path: Path) -> None:
+    """Запись, стёртая прежней ошибкой сохранения, уцелела в старом
+    account.json — возвращаем её в общий список один раз."""
+    legacy = tmp_path / "account.json"
+    legacy.write_text(
+        json.dumps({
+            "imap_host": "imap.corp.local", "imap_port": 993, "imap_use_ssl": True,
+            "username": "ivan@corp.local", "auth_type": "password",
+            "smtp_host": "smtp.corp.local", "smtp_port": 587, "smtp_use_ssl": False,
+        }, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    accounts_file = tmp_path / "accounts.json"
+    store = {"ivan@corp.local": "p1"}
+    set_patch, get_patch = _fake_keyring(store)
+    other = Account(host="imap.vk.example", username="ivan@vk.example", password="p2")
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), \
+         patch("redmail.config_store._config_path", return_value=legacy), set_patch, get_patch:
+        config_store.save_accounts([(other, None)])
+
+        recovered = config_store.recover_legacy_account()
+        loaded = config_store.load_accounts()
+
+    assert recovered == "ivan@corp.local"
+    assert sorted(account.username for account, _smtp in loaded) == ["ivan@corp.local", "ivan@vk.example"]
+    assert not legacy.exists() and (tmp_path / "account.json.migrated").exists()
+
+
+def test_legacy_recovery_runs_once_and_ignores_duplicates(tmp_path: Path) -> None:
+    legacy = tmp_path / "account.json"
+    entry = {
+        "imap_host": "imap.corp.local", "imap_port": 993, "imap_use_ssl": True,
+        "username": "ivan@corp.local", "auth_type": "password",
+        "smtp_host": "", "smtp_port": 587, "smtp_use_ssl": False,
+    }
+    legacy.write_text(json.dumps([entry][0], ensure_ascii=False), encoding="utf-8")
+    accounts_file = tmp_path / "accounts.json"
+    accounts_file.write_text(json.dumps([entry], ensure_ascii=False), encoding="utf-8")
+    store = {"ivan@corp.local": "p1"}
+    set_patch, get_patch = _fake_keyring(store)
+
+    with patch("redmail.config_store._accounts_path", return_value=accounts_file), \
+         patch("redmail.config_store._config_path", return_value=legacy), set_patch, get_patch:
+        assert config_store.recover_legacy_account() is None  # такая запись уже есть
+        assert config_store.recover_legacy_account() is None  # файла больше нет
+        loaded = config_store.load_accounts()
+
+    assert [account.username for account, _smtp in loaded] == ["ivan@corp.local"]
+
+
+def test_legacy_recovery_without_file_does_nothing(tmp_path: Path) -> None:
+    with patch("redmail.config_store._accounts_path", return_value=tmp_path / "accounts.json"), \
+         patch("redmail.config_store._config_path", return_value=tmp_path / "account.json"):
+        assert config_store.recover_legacy_account() is None

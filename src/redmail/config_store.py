@@ -9,6 +9,7 @@ from pathlib import Path
 import keyring  # noqa: F401 - тесты подменяют keyring.get_password/set_password
 
 from redmail import secret_store
+from redmail.applog import get_logger
 
 from redmail.ews_client import EwsAccount
 from redmail.imap_client import Account
@@ -26,6 +27,9 @@ _DEFAULT_THEME = "light"
 
 def _config_path() -> Path:
     return app_dir() / "account.json"
+
+
+_log = get_logger("config")
 
 
 def _settings_path() -> Path:
@@ -576,6 +580,43 @@ def _account_from_dict(data: dict, username: str, password: str) -> tuple[Accoun
 
 def _accounts_path() -> Path:
     return app_dir() / "accounts.json"
+
+
+def recover_legacy_account() -> str | None:
+    """Возвращает в общий список учётную запись из старого однозаписевого
+    account.json, если такой в списке ещё нет.
+
+    Файл остался от первых версий и с тех пор только читался — при
+    переходе на список учётных записей он не удалялся. Это единственное
+    место, где уцелела запись, потерянная из-за прежней ошибки сохранения
+    (сохранялись только открытые подключения, и подключение второй записи
+    стирало выключенную). Перенос делается один раз: после него файл
+    получает имя account.json.migrated и больше ни на что не влияет.
+    Возвращает логин перенесённой записи либо None."""
+    legacy_path = _config_path()
+    if not legacy_path.exists():
+        return None
+    recovered = None
+    try:
+        data = json.loads(legacy_path.read_text(encoding="utf-8"))
+        username = data.get("username") if isinstance(data, dict) else None
+        if username and "imap_host" in data:
+            key = "imap:{}:{}".format(data.get("imap_host", ""), username)
+            existing = {_imap_entry_key(entry) for entry in _read_raw_entries(_accounts_path(), "username")}
+            if key not in existing:
+                # Пароль трогать не нужно: он лежит в хранилище ключей под
+                # тем же логином, а в файле его никогда и не было.
+                merged = _read_raw_entries(_accounts_path(), "username") + [data]
+                _accounts_path().parent.mkdir(parents=True, exist_ok=True)
+                _accounts_path().write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
+                recovered = username
+        legacy_path.rename(legacy_path.with_name(legacy_path.name + ".migrated"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _log.warning("Старый account.json не перенесён: %s", exc)
+        return None
+    if recovered:
+        _log.info("Учётная запись %s возвращена в список из старого account.json", recovered)
+    return recovered
 
 
 def load_accounts() -> list[tuple[Account, SmtpAccount | None]]:

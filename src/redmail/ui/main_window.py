@@ -161,6 +161,7 @@ from redmail.config_store import (
     load_window_geometry,
     load_compose_geometry,
     merge_accounts,
+    recover_legacy_account,
     merge_ews_accounts,
     save_archive_storage_dir,
     save_caldav_url,
@@ -6204,6 +6205,14 @@ class MainWindow(QMainWindow):
         # архив…"/создании, а не будет тихо усечён прямо на старте.
 
     def _restore_saved_account(self) -> None:
+        try:
+            # Запись, потерянная прежней ошибкой сохранения, уцелела в
+            # старом account.json — возвращаем её в список один раз.
+            recovered = recover_legacy_account()
+            if recovered:
+                self.statusBar().showMessage(f"Учётная запись {recovered} восстановлена из прежних настроек", 10000)
+        except Exception as exc:
+            _log.warning("Восстановление записи из старых настроек не удалось: %s", exc)
         try:
             saved_accounts = load_accounts()
         except secret_store.SecretsUnavailable as exc:
