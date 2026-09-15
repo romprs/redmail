@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        114%{?dist}
+Release:        115%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -120,6 +120,8 @@ fi
 %{_datadir}/applications/redmail.desktop
 
 %changelog
+* Mon Sep 15 2026 redmail <redmail@example.com> - 0.0.1-115
+- Учётная запись, которой вернули галочку в «Параметрах», подключается сразу, без перезапуска программы
 * Mon Sep 15 2026 redmail <redmail@example.com> - 0.0.1-114
 - Учётная запись, потерянная прежней ошибкой сохранения, возвращается в список из старых настроек при первом запуске
 - Правка своей учётной записи в «Параметрах» больше не оставляет в списке вторую запись со старым адресом
