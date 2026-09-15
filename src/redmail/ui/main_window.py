@@ -7349,6 +7349,11 @@ class MainWindow(QMainWindow):
         if new_account == self.account and new_smtp == self.smtp_account:
             return  # данные подключения не менялись — незачем переподключаться
 
+        previous_key = (
+            account_key(self.account, "imap")
+            if self.account is not None and self.account_protocol == "imap"
+            else None
+        )
         try:
             session = ImapSession(new_account)
             folders = session.list_folders()
@@ -7356,7 +7361,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
             return
         self._add_or_replace_account(new_account, new_smtp, session, folders)
-        self._save_all_accounts()
+        if previous_key is not None and previous_key != account_key(new_account, "imap"):
+            # Здесь правят СВОЮ запись, а не добавляют вторую (для второй
+            # есть "Добавить учётную запись"). Раз сервер или логин стали
+            # другими, прежнее подключение закрываем и убираем из
+            # сохранённых, иначе в списке учётных записей остаётся призрак.
+            self._disconnect_account(previous_key)
+            self._save_all_accounts(forget=previous_key)
+        else:
+            self._save_all_accounts()
 
     def on_add_account(self) -> None:
         """Добавить ЕЩЁ одну учётную запись, не закрывая уже открытые
