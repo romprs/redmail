@@ -109,3 +109,33 @@ def test_download_bodies_marks_failed_message_deferred_and_moves_on(tmp_path: Pa
         assert cache_store.get_message_content("acc", "INBOX", 2) is None
         stats = cache_store.storage_stats("acc")
     assert stats["messages"] == 3 and stats["with_body"] == 2
+
+
+class ServerWithoutMarkers(Server):
+    """Сессия Exchange: цвет маркера сервер дёшево не отдаёт."""
+
+    supports_marker_sync = False
+
+
+def test_local_marker_survives_sync_when_server_has_no_markers(tmp_path: Path) -> None:
+    server = ServerWithoutMarkers(3)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+        cache_store.update_flags("acc", "INBOX", [(2, False, False, "red")])
+
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+
+        flags = cache_store.get_folder_flags("acc", "INBOX")
+    assert flags[2][2] == "red"
+
+
+def test_marker_cleared_by_server_when_session_reports_markers(tmp_path: Path) -> None:
+    server = Server(3)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+        cache_store.update_flags("acc", "INBOX", [(2, False, False, "red")])
+
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+
+        flags = cache_store.get_folder_flags("acc", "INBOX")
+    assert flags[2][2] is None
