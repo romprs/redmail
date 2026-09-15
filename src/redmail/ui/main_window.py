@@ -6317,6 +6317,32 @@ class MainWindow(QMainWindow):
         self, account: EwsAccount, session: EwsSession, folders: list[FolderInfo]
     ) -> None:
         self._add_or_replace_account_generic(account, _EWS_SEND_MARKER, session, folders, protocol="ews")
+        self._ensure_ews_calendar(account)
+
+    def _ensure_ews_calendar(self, account: EwsAccount) -> None:
+        """Календарь Exchange заводится сам при подключении почты Exchange.
+        Отдельный адрес и пароль ему не нужны — встречи идут по тому же
+        подключению EWS (вопрос: "календарь не надо подключать для
+        exchange, как тогда он создастся в календаре?")."""
+        try:
+            calendars = calendar_store.list_calendars(self.calendar_path)
+            if any(cal.source_type == calendar_store.SOURCE_EWS for cal in calendars):
+                return  # уже заведён, второй такой же не нужен
+            used_colors = {cal.color for cal in calendars}
+            color = next(
+                (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
+                _EVENT_COLOR_PALETTE[0][1],
+            )
+            created = calendar_store.create_user_calendar(
+                self.calendar_path, f"Exchange: {account.email}", color,
+                source_type=calendar_store.SOURCE_EWS,
+            )
+        except Exception as exc:
+            _log.warning("Не удалось завести календарь Exchange: %s", exc)
+            return
+        _log.info("Заведён календарь Exchange «%s»", created.name)
+        self._refresh_calendars_list(select_id=created.id)
+        self.refresh_calendar_view()
 
     def _add_or_replace_account_generic(
         self,
