@@ -94,3 +94,43 @@ def test_explicit_disconnect_removes_account_from_the_list(tmp_path: Path) -> No
         titles = [title for _key, title in window._known_accounts()]
 
     assert titles == ["IMAP: ivan@vk.example (imap.vk.example)"]
+
+
+class ConnectWindow(SimpleNamespace):
+    """Окно без виджетов: запоминает, что поставили в очередь подключения."""
+
+    def __init__(self, connected=()):
+        super().__init__(mailboxes={key: object() for key in connected}, queued=None, told=None)
+
+    _connect_enabled_accounts = MainWindow._connect_enabled_accounts
+
+    def _connect_accounts_async(self, queue):
+        self.queued = queue
+
+
+def test_enabled_account_connects_without_restart() -> None:
+    imap = Account(host="imap.corp.local", username="ivan@corp.local", password="p1")
+    exchange = EwsAccount(email="ivan@vk.example", server="mail.vk.example", auth_type="kerberos")
+    window = ConnectWindow()
+
+    with patch("redmail.ui.main_window.load_accounts", return_value=[(imap, None)]), patch(
+        "redmail.ui.main_window.load_ews_accounts", return_value=[exchange]
+    ):
+        window._connect_enabled_accounts({account_key(imap, "imap")})
+
+    assert [(protocol, account.username) for protocol, account, _smtp in window.queued] == [
+        ("imap", "ivan@corp.local")
+    ]
+
+
+def test_already_connected_account_is_not_queued_twice() -> None:
+    imap = Account(host="imap.corp.local", username="ivan@corp.local", password="p1")
+    window = ConnectWindow(connected=[account_key(imap, "imap")])
+
+    with patch("redmail.ui.main_window.load_accounts", return_value=[(imap, None)]), patch(
+        "redmail.ui.main_window.load_ews_accounts", return_value=[]
+    ), patch("redmail.ui.main_window.QMessageBox.information") as told:
+        window._connect_enabled_accounts({account_key(imap, "imap")})
+
+    assert window.queued is None
+    assert told.called

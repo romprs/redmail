@@ -6270,6 +6270,13 @@ class MainWindow(QMainWindow):
             _log.info("Выключенных учётных записей пропущено при запуске: %d", skipped)
         if not queue:
             return
+        self._connect_accounts_async(queue)
+
+    def _connect_accounts_async(self, queue: list[tuple[str, object, object]]) -> None:
+        """Подключает учётные записи из очереди по одной в фоне, показывая
+        ход в отдельном окне. Тем же путём идёт и включение записи
+        галочкой в параметрах: раньше включение ждало перезапуска
+        программы, хотя выключение срабатывало сразу."""
         progress = QProgressDialog("Подключение к почте…", None, 0, len(queue), self)
         progress.setWindowTitle("Подключение")
         progress.setWindowModality(Qt.WindowModality.NonModal)
@@ -7477,11 +7484,37 @@ class MainWindow(QMainWindow):
         for key in disabled_set - previous:
             if key in self.mailboxes:
                 self._disconnect_account(key)
-        if previous - disabled_set:
+        enabled_again = previous - disabled_set
+        if enabled_again:
+            self._connect_enabled_accounts(enabled_again)
+
+    def _connect_enabled_accounts(self, keys: set[str]) -> None:
+        """Подключает записи, которым вернули галочку, не дожидаясь
+        перезапуска (во время перехода с одной почтовой системы на другую
+        записи переключают туда-обратно, и перезапуск ради этого неудобен)."""
+        try:
+            saved_imap = load_accounts()
+            saved_ews = load_ews_accounts()
+        except Exception as exc:
+            QMessageBox.warning(self, "Учётные записи", f"Не удалось прочитать сохранённые записи: {exc}")
+            return
+        queue: list[tuple[str, object, object]] = [
+            ("imap", account, smtp)
+            for account, smtp in saved_imap
+            if account_key(account, "imap") in keys and account_key(account, "imap") not in self.mailboxes
+        ]
+        queue += [
+            ("ews", account, None)
+            for account in saved_ews
+            if account_key(account, "ews") in keys and account_key(account, "ews") not in self.mailboxes
+        ]
+        if not queue:
             QMessageBox.information(
                 self, "Учётные записи",
-                "Включённые записи подключатся при следующем запуске программы.",
+                "Настроек включённой записи не нашлось — добавьте её заново через «Добавить учётную запись».",
             )
+            return
+        self._connect_accounts_async(queue)
 
     def _save_all_accounts(self, *, forget: str | None = None) -> None:
         """Записи, выключенные галочкой, в программе не открыты, а раньше
