@@ -151,6 +151,14 @@ class CachedMailbox:
         session = self.session if background else self._reader_session()
         return session.fetch_message_raw(folder, uid)
 
+    def original_message(self, folder: str, uid: int) -> bytes:
+        """Оригинал письма для «Исходного текста»: из архива, если письмо
+        перенесено автоархивом (на сервере его уже нет), иначе с сервера."""
+        ref = self._archived(folder, uid)
+        if ref is not None:
+            return archive_store.get_message_raw(_Path(ref[0]), ref[1])
+        return self._reader_session().fetch_message_raw(folder, uid)
+
     def search_uids(self, folder: str, *, before=None) -> list[int]:
         """Не кэшируется — используется только для массовой выгрузки папки
         в архив (вся папка / всё до даты), где важна полная папка на
@@ -287,6 +295,9 @@ class ArchiveSource:
 
     def message_content(self, folder: str, uid: int) -> MessageContent:
         return archive_store.get_message_content(self.path, uid)
+
+    def original_message(self, folder: str, uid: int) -> bytes:
+        return archive_store.get_message_raw(self.path, uid)
 
     def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         archive_store.set_marker(self.path, uid, color)

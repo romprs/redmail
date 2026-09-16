@@ -34,3 +34,21 @@ def test_simplify_handles_empty_and_plain_html() -> None:
     assert simplify_html_for_editor("") == ""
     assert simplify_html_for_editor("<p>Привет</p>") == "<p>Привет</p>"
     assert simplify_html_for_editor("<!-- c --><!DOCTYPE html><b>x</b>") == "<b>x</b>"
+
+
+def test_force_utf8_charset_replaces_qt_koi8_declaration() -> None:
+    from redmail.html_cleanup import force_utf8_charset
+
+    qt_html = (
+        '<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.0//EN">\n<html>\n<head>\n'
+        '<meta http-equiv="Content-Type" content="text/html; charset=koi8-r">\n'
+        '<meta name="qrichtext" content="1"></head><body><p>Привет</p></body></html>'
+    )
+    result = force_utf8_charset(qt_html)
+    assert "koi8" not in result.lower()
+    assert result.count("charset") == 1 and '<head>\n<meta charset="utf-8">' not in result
+    assert '<head><meta charset="utf-8">' in result.replace("\n", "")
+    assert '<meta name="qrichtext" content="1">' in result
+    assert force_utf8_charset("<META CHARSET='windows-1251'><p>x</p>") == '<meta charset="utf-8"><p>x</p>'
+    assert force_utf8_charset("<html><body>x</body></html>").startswith('<html><head><meta charset="utf-8"></head>')
+    assert force_utf8_charset("") == ""

@@ -70,3 +70,32 @@ def nesting_depth(html: str, tag: str = "table") -> int:
             depth += 1
             best = max(best, depth)
     return best
+
+
+# Объявления кодировки внутри HTML: <meta charset=...> и
+# <meta http-equiv="Content-Type" content="text/html; charset=...">.
+_CHARSET_META = re.compile(
+    r"""(?is)<meta\b(?=[^>]*(?:\bcharset\s*=|http-equiv\s*=\s*["']?content-type))[^>]*>"""
+)
+_HEAD_OPEN = re.compile(r"(?is)<head\b[^>]*>")
+_HTML_OPEN = re.compile(r"(?is)<html\b[^>]*>")
+
+
+def force_utf8_charset(html: str) -> str:
+    """HTML письма хранится и передаётся уже раскодированной строкой, а
+    записывается в UTF-8 — старое объявление кодировки внутри разметки
+    врёт. Редактор Qt при локали KOI8-R пишет в toHtml()
+    charset=koi8-r, и браузер показывал такое письмо кракозябрами (жалоба:
+    «не отображается тело письма»); получатели в других программах видели
+    бы то же. Все объявления убираются, ставится одно — utf-8."""
+    if not html:
+        return html
+    cleaned = _CHARSET_META.sub("", html)
+    meta = '<meta charset="utf-8">'
+    head = _HEAD_OPEN.search(cleaned)
+    if head:
+        return cleaned[: head.end()] + meta + cleaned[head.end():]
+    root = _HTML_OPEN.search(cleaned)
+    if root:
+        return cleaned[: root.end()] + "<head>" + meta + "</head>" + cleaned[root.end():]
+    return meta + cleaned

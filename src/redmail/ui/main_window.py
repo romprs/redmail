@@ -131,6 +131,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail import mail_export, profile_transfer
+from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
     MailRule,
@@ -809,7 +810,10 @@ def _render_mail_html(view: QWebEngineView, html_content: str, *, anchor: str | 
     _get_mail_web_profile)."""
     fd, path_str = tempfile.mkstemp(suffix=".html", prefix="redmail_body_")
     with os.fdopen(fd, "w", encoding="utf-8") as f:
-        f.write(html_content)
+        # Файл пишется в UTF-8 — объявление другой кодировки внутри письма
+        # (Qt при локали KOI8-R пишет charset=koi8-r) превращало текст в
+        # кракозябры.
+        f.write(html_cleanup.force_utf8_charset(html_content))
     path = Path(path_str)
     url = QUrl.fromLocalFile(str(path))
     # В белый список для _MailRequestInterceptor кладём то же значение,
@@ -2018,6 +2022,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
 # референсах, отрисованный через QSvgRenderer и перекрашенный в цвет
 # _icon_color().
 _MATERIAL_ICON_PATHS: dict[str, str] = {
+    "code": "M320-240 80-480l240-240 57 57-184 184 183 183-56 56Zm320 0-57-57 184-184-183-183 56-56 240 240-240 240Z",
     "open_in_new": "M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z",
     "edit": "M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z",
     "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
@@ -2077,6 +2082,7 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "search": "search",
     "more": "more_vert",
     "open_window": "open_in_new",
+    "source": "code",
 }
 
 _FOLDER_ICON_MATERIAL: dict[str, str] = {
@@ -4100,7 +4106,7 @@ class ComposeDialog(QDialog):
     def body_html(self) -> str:
         # Цвет текста из оформления организации — в разметку письма, чтобы
         # его увидел получатель.
-        return branding.letter_html(app_theme.current_brand(), self.body_edit.toHtml())
+        return branding.letter_html(app_theme.current_brand(), html_cleanup.force_utf8_charset(self.body_edit.toHtml()))
 
     def inline_images(self) -> dict[str, tuple[str, bytes]]:
         return dict(self._inline_images)
@@ -6669,11 +6675,19 @@ class MainWindow(QMainWindow):
         self.open_message_window_action = QAction(_toolbar_icon("open_window"), "Открыть в окне", self)
         self.open_message_window_action.setToolTip("Открыть письмо в отдельном окне")
         self.open_message_window_action.triggered.connect(self.on_open_message_window)
+        self.view_source_action = QAction(_toolbar_icon("source"), "Исходный текст", self)
+        self.view_source_action.setToolTip("Оригинал письма: все заголовки и тело как есть (Ctrl+U)")
+        self.view_source_action.setShortcut(QKeySequence("Ctrl+U"))
+        self.view_source_action.triggered.connect(self.on_view_message_source)
+        self.addAction(self.view_source_action)
         self.message_actions_bar = QWidget(self.message_header_widget)
         actions_row = QHBoxLayout(self.message_actions_bar)
         actions_row.setContentsMargins(0, 0, 0, 0)
         actions_row.setSpacing(6)
-        for action in (self.reply_action, self.reply_all_action, self.forward_action, self.open_message_window_action):
+        for action in (
+            self.reply_action, self.reply_all_action, self.forward_action, self.open_message_window_action,
+            self.view_source_action,
+        ):
             button = QToolButton(self.message_actions_bar)
             button.setDefaultAction(action)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
@@ -10149,8 +10163,13 @@ class MainWindow(QMainWindow):
             category_menu.addSeparator()
             category_actions[category_menu.addAction("Без категории")] = None
         menu.addSeparator()
+        source_action = menu.addAction(_toolbar_icon("source"), "Исходный текст письма…")
         add_contact_action = menu.addAction("Добавить отправителя в контакты…")
         chosen = menu.exec(global_pos)
+
+        if chosen is source_action:
+            self._show_message_source(summary)
+            return
 
         if chosen in category_actions:
             self._set_category_manually(summary, category_actions[chosen])
@@ -10691,6 +10710,62 @@ class MainWindow(QMainWindow):
         # без отдельного отложенного вызова после setHtml(), как было
         # нужно для scrollToAnchor() у QTextDocument.
         _render_mail_html(self.reading_pane, wrapped_html, anchor=f"msg-{summary.uid}")
+
+    def on_view_message_source(self) -> None:
+        if self.selected_summary is not None:
+            self._show_message_source(self.selected_summary)
+
+    def _show_message_source(self, summary: MessageSummary) -> None:
+        """Оригинал письма в отдельном окне. Берётся с сервера (или из
+        архива) в фоне; нет сети или письма на сервере — собираем из
+        локальной копии и честно помечаем, что это не оригинал."""
+        source, folder = self.active_source, self.current_folder
+        if source is None or folder is None:
+            return
+        content = self.current_content if self.selected_summary is summary else None
+        title = summary.subject or "(без темы)"
+
+        def load() -> tuple[bytes, bool]:
+            try:
+                return source.original_message(folder, summary.uid), True
+            except Exception as exc:
+                _log.warning("Исходный текст письма %s/%s с сервера не получен: %s", folder, summary.uid, exc)
+                local = content if content is not None else source.message_content(folder, summary.uid)
+                raw = mail_export.build_message(
+                    subject=local.subject or summary.subject, sender=summary.sender, sender_email=summary.sender_email,
+                    date=summary.date, message_id=summary.message_id, importance=summary.importance, to=summary.to,
+                    body=local.text, html=local.html, content_from=local.from_, content_to=local.to,
+                    content_cc=local.cc,
+                    attachments=[(item.filename, item.content_type, item.payload) for item in local.attachments],
+                    inline_images=[(cid, ctype, data) for cid, (ctype, data) in local.inline_images.items()],
+                )
+                return raw, False
+
+        self.statusBar().showMessage("Загружаю исходный текст письма…")
+        worker = _CallableWorker(load, parent=self)
+
+        def done(result: object) -> None:
+            self.statusBar().clearMessage()
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            raw, original = result
+            window = MessageSourceWindow(title, raw, original=original, parent=self)
+            window.destroyed.connect(
+                lambda: self._message_windows.remove(window) if window in self._message_windows else None
+            )
+            self._message_windows.append(window)
+            window.show()
+
+        def failed(message: str) -> None:
+            self.statusBar().clearMessage()
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            QMessageBox.warning(self, "Исходный текст письма", message)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_open_message_window(self) -> None:
         if self.selected_summary is None or self.current_content is None:

@@ -31,6 +31,7 @@ from typing import Callable
 
 from redmail import profile
 from redmail.applog import get_logger
+from redmail.html_cleanup import force_utf8_charset
 
 _log = get_logger("mail_export")
 
@@ -169,7 +170,7 @@ def build_message(
         return message.as_bytes()
     message.set_content(body or "")
     if html:
-        message.add_alternative(html, subtype="html")
+        message.add_alternative(force_utf8_charset(html), subtype="html")
         if inline_images:
             html_part = message.get_body(("html",))
             for content_id, content_type, payload in inline_images:
