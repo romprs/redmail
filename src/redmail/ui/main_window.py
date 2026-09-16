@@ -6668,6 +6668,17 @@ class MainWindow(QMainWindow):
         self.mailboxes[key] = CachedMailbox(
             session, account, body_max_bytes=load_body_max_size_mb() * 1024 * 1024
         )
+        if protocol == "ews":
+            # Прежние сборки сохраняли даты писем Exchange по Гринвичу —
+            # один раз переводим их в местное время, до первой синхронизации.
+            try:
+                from redmail import cache_store
+
+                shifted = cache_store.localize_utc_dates_once(self.mailboxes[key].account_key)
+                if shifted:
+                    _log.info("Exchange %s: даты %d писем переведены в местное время", key, shifted)
+            except Exception as exc:
+                _log.warning("Exchange %s: даты писем не переведены в местное время: %s", key, exc)
         # «Вся почта»/All Mail у Gmail — зеркало всех остальных папок: в полную
         # локальную копию не входит, иначе база удваивается (на .80: 3.3 ГБ).
         self.mailbox_folders[key] = [info.name for info in folders if _folder_role(info.name) != "all"]

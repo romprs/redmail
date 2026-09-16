@@ -410,3 +410,16 @@ def test_unread_counter_is_read_fresh_from_server() -> None:
     session.list_folders()
 
     assert session.folder_unseen_count("Входящие") == 2
+
+
+def test_message_date_is_shown_in_local_time() -> None:
+    """Exchange отдаёт время в UTC; в списке — местное, как у писем VK."""
+    from datetime import timezone
+
+    item = _fake_item(date=datetime(2026, 9, 16, 5, 30, tzinfo=timezone.utc))
+    session, _account, uid = _session_with_listed_item(item, fetch=MagicMock(return_value=[item]))
+
+    [summary] = session.fetch_summaries_by_uids("Входящие", [uid])
+
+    expected = datetime(2026, 9, 16, 5, 30, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    assert summary.date == expected

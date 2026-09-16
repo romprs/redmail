@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import closing
 from pathlib import Path
 
@@ -273,6 +274,31 @@ def get_folder_uids(account_key: str, folder: str, *, include_archived: bool = F
             (account_key, folder),
         ).fetchall()
     return {r[0] for r in rows}
+
+
+def localize_utc_dates_once(account_key: str) -> int:
+    """Один раз на учётную запись переводит даты писем из UTC в местное
+    время. Нужно для Exchange: до сборки 117 даты его писем сохранялись по
+    Гринвичу. Повторный вызов ничего не делает (отметка в meta), поэтому
+    новые записи, уже сохранённые в местном времени, не сдвигаются."""
+    marker = f"dates_local:{account_key}"
+    with closing(_connect()) as conn:
+        if conn.execute("SELECT 1 FROM meta WHERE key = ?", (marker,)).fetchone():
+            return 0
+        rows = conn.execute("SELECT folder, uid, date FROM messages WHERE account = ?", (account_key,)).fetchall()
+        updates = []
+        for folder, uid, text in rows:
+            try:
+                utc = datetime.strptime(text, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+            except (TypeError, ValueError):
+                continue
+            local = utc.astimezone().strftime("%Y-%m-%d %H:%M")
+            if local != text:
+                updates.append((local, account_key, folder, uid))
+        conn.executemany("UPDATE messages SET date = ? WHERE account = ? AND folder = ? AND uid = ?", updates)
+        conn.execute("INSERT INTO meta (key, value) VALUES (?, '1')", (marker,))
+        conn.commit()
+    return len(updates)
 
 
 def uids_without_recipients(account_key: str, folder: str) -> set[int]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import zlib
+from datetime import datetime
 from dataclasses import dataclass
 from email import message_from_bytes
 
@@ -121,6 +122,17 @@ _GONE_ERRORS = ("ErrorItemNotFound", "ErrorInvalidIdMalformed", "ErrorInvalidIdN
 
 def _is_gone(result) -> bool:
     return isinstance(result, Exception) and type(result).__name__ in _GONE_ERRORS
+
+
+def _local_date_text(value) -> str:
+    """Дата письма для списка — в местном времени, как у IMAP. Exchange отдаёт
+    время в UTC, и раньше оно записывалось как есть: письма Exchange были
+    «датированы по Гринвичу», а письма VK — по местному времени."""
+    if value is None:
+        return ""
+    if getattr(value, "tzinfo", None) is not None:
+        value = datetime.fromtimestamp(value.timestamp())
+    return value.strftime("%Y-%m-%d %H:%M")
 
 
 def _format_mailboxes(mailboxes) -> str:
@@ -547,7 +559,7 @@ class EwsSession:
             subject=item.subject or "",
             sender=sender_name or sender_email or "(неизвестно)",
             sender_email=sender_email,
-            date=item.datetime_received.strftime("%Y-%m-%d %H:%M") if item.datetime_received else "",
+            date=_local_date_text(item.datetime_received),
             message_id=item.message_id or "",
             has_attachments=bool(item.has_attachments),
             marker_color=marker_color,

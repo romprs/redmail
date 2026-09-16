@@ -259,3 +259,21 @@ def test_compatible_schema_bump_keeps_data_and_marks_bodies(tmp_path: Path) -> N
         cached = cache_store.get_folder_summaries("acc", "INBOX")
         assert [s.marker_color for s in cached] == ["green"]
         assert cache_store.count_messages_without_body("acc", 10**9) == 0  # тело уже есть — докачивать нечего
+
+
+def test_utc_dates_are_localized_once_per_account(tmp_path) -> None:
+    from datetime import datetime, timezone
+    from unittest.mock import patch
+
+    from redmail import cache_store
+    from redmail.imap_client import MessageSummary
+
+    summary = MessageSummary(uid=1, subject="S", sender="A", sender_email="a@x", date="2026-09-16 05:30", message_id="<1>")
+    expected = datetime(2026, 9, 16, 5, 30, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        cache_store.upsert_summaries("ews-acc", "INBOX", [summary])
+        cache_store.localize_utc_dates_once("ews-acc")
+        cache_store.localize_utc_dates_once("ews-acc")  # второй раз не сдвигает
+        stored = cache_store.get_folder_summaries("ews-acc", "INBOX", None)[0].date
+
+    assert stored == expected
