@@ -9,6 +9,8 @@ from redmail.ui.main_window import (
     _format_recipient_candidate,
     _html_to_preview_text,
     _needs_another_bodies_round,
+    _pick_calendar_account,
+    _shared_domain_labels,
     _normalize_subject,
     _parse_recipient_list,
     _safe_attachment_filename,
@@ -196,3 +198,22 @@ def test_no_round_when_everything_is_downloaded() -> None:
 
 def test_periodic_mode_does_one_round_per_tick() -> None:
     assert _needs_another_bodies_round(_Stats(downloaded=200, pending=500), 200) is False
+
+
+def test_shared_domain_labels_counts_matching_tail() -> None:
+    assert _shared_domain_labels("calendar.vkm.corp.amurgpz.ru", "imap.vkm.corp.amurgpz.ru") == 4
+    assert _shared_domain_labels("calendar.vkm.corp.amurgpz.ru", "svb-mail.corp.amurgpz.ru") == 3
+    assert _shared_domain_labels("calendar.vkm.corp.amurgpz.ru", "imap.gmail.com") == 0
+
+
+def test_calendar_uses_mail_account_of_its_own_server() -> None:
+    """Календарь VK берёт пароль почты VK, даже если последней открывали
+    папку Exchange с входом по Kerberos."""
+    from types import SimpleNamespace
+
+    vk = SimpleNamespace(host="imap.vkm.corp.amurgpz.ru", auth_type="password", username="vk")
+    gmail = SimpleNamespace(host="imap.gmail.com", auth_type="password", username="gmail")
+    url = "https://calendar.vkm.corp.amurgpz.ru/principals/amurgpz.ru/rsponomarev/calendars/1/"
+
+    assert _pick_calendar_account(url, [gmail, vk]) is vk
+    assert _pick_calendar_account("https://caldav.yandex.ru/", [gmail, vk]) is None

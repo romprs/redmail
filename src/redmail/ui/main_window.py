@@ -213,6 +213,7 @@ from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail import (
     address_rules,
     autoarchive,
+    calendar_sync,
     ews_calendar,
     html_cleanup,
     profile,
@@ -3879,6 +3880,16 @@ class _CalendarPickerDialog(QDialog):
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
 
 
+def _caldav_account_for(dialog, url: str):
+    """Учётные данные для адреса календаря: подобранные по домену сервера,
+    а если подобрать не из чего — переданные в окно при открытии."""
+    credentials = dialog._credentials_for(url) if getattr(dialog, "_credentials_for", None) else None
+    if credentials is None:
+        credentials = (dialog._my_email, dialog._my_password, dialog._my_auth_type)
+    username, password, auth_type = credentials
+    return caldav_sync.CalDavAccount(url=url, username=username, password=password, auth_type=auth_type)
+
+
 class _EditCalendarUrlDialog(QDialog):
     """Смена адреса CalDAV-календаря — жалоба: узкое QInputDialog.getText
     показывало длинный URL с UUID обрезанным (виден только хвост). Тот же
@@ -3886,13 +3897,17 @@ class _EditCalendarUrlDialog(QDialog):
     переподключить на другой (например, другой расшаренный) календарь, не
     придётся вручную набирать точный URL."""
 
-    def __init__(self, parent, current_url: str, my_email: str, my_password: str, my_auth_type: str = "password"):
+    def __init__(
+        self, parent, current_url: str, my_email: str, my_password: str, my_auth_type: str = "password",
+        credentials_for=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Подключение CalDAV")
         self.resize(560, 160)
         self._my_email = my_email
         self._my_password = my_password
         self._my_auth_type = my_auth_type
+        self._credentials_for = credentials_for
         self._test_workers: list[QThread] = []
 
         self.url_edit = QLineEdit(current_url, self)
@@ -3920,9 +3935,7 @@ class _EditCalendarUrlDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
             return
-        account = caldav_sync.CalDavAccount(
-            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
-        )
+        account = _caldav_account_for(self, url)
         self.status_label.setText("Ищу календари на сервере…")
 
         def discover() -> list[caldav_sync.CalDavCalendarInfo]:
@@ -3979,12 +3992,14 @@ class AddCalendarDialog(QDialog):
         my_password: str = "",
         my_auth_type: str = "password",
         used_colors: set[str] | None = None,
+        credentials_for=None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Новый календарь")
         self._my_email = my_email
         self._my_password = my_password
         self._my_auth_type = my_auth_type
+        self._credentials_for = credentials_for
         self._test_workers: list[QThread] = []
 
         self.name_edit = QLineEdit(self)
@@ -4083,9 +4098,7 @@ class AddCalendarDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для проверки.")
             return
-        account = caldav_sync.CalDavAccount(
-            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
-        )
+        account = _caldav_account_for(self, url)
         self.caldav_test_button.setEnabled(False)
         self.caldav_test_status.setText("Проверка подключения…")
 
@@ -4157,9 +4170,7 @@ class AddCalendarDialog(QDialog):
         if not url:
             QMessageBox.warning(self, "Укажите адрес", "Адрес сервера CalDAV обязателен для поиска календарей.")
             return
-        account = caldav_sync.CalDavAccount(
-            url=url, username=self._my_email, password=self._my_password, auth_type=self._my_auth_type
-        )
+        account = _caldav_account_for(self, url)
         self.caldav_discover_button.setEnabled(False)
         self.caldav_test_status.setText("Ищу календари на сервере…")
 
@@ -4971,6 +4982,92 @@ class ContactDialog(QDialog):
         )
 
 
+def _shared_domain_labels(first: str, second: str) -> int:
+    """Сколько последних частей доменного имени совпадает:
+    calendar.vkm.corp.amurgpz.ru и imap.vkm.corp.amurgpz.ru — четыре."""
+    left = [part for part in (first or "").lower().split(".") if part]
+    right = [part for part in (second or "").lower().split(".") if part]
+    shared = 0
+    while shared < min(len(left), len(right)) and left[-1 - shared] == right[-1 - shared]:
+        shared += 1
+    return shared
+
+
+def _pick_calendar_account(url: str, accounts: list) -> object | None:
+    """Учётная запись для сервера календаря: чей почтовый сервер ближе всего
+    по домену к адресу календаря. Раньше бралась «текущая» запись — та, в
+    папке которой последний раз щёлкнули. После просмотра папок Exchange
+    календарь VK шёл на сервер с входом Exchange и получал отказ
+    (журнал: "Unauthorized, сервер предлагает только Basic")."""
+    from urllib.parse import urlparse
+
+    host = urlparse(url if "://" in url else f"https://{url}").hostname or ""
+    best = None
+    best_score = (-1, False)
+    for account in accounts:
+        server = getattr(account, "host", "") or ""
+        score = (_shared_domain_labels(host, server), getattr(account, "auth_type", "password") == "password")
+        if score > best_score:
+            best, best_score = account, score
+    if best is None or best_score[0] < 2:
+        return None
+    return best
+
+
+class _CalDavCalendarServer:
+    """Календарь CalDAV для calendar_sync: встречи и удаления по UID."""
+
+    def __init__(self, session, username: str) -> None:
+        self._session = session
+        self._username = username
+
+    def push_event(self, event) -> None:
+        self._session.push_event(event, self._username, self._username)
+
+    def delete_event(self, uid: str) -> None:
+        self._session.delete_event(uid)
+
+    def fetch_events(self, start, end):
+        return self._session.fetch_events(start, end, self._username)
+
+
+class _ExchangeCalendarServer:
+    """Календарь Exchange по тому же подключению, что и почта."""
+
+    def __init__(self, session, email: str) -> None:
+        self._session = session
+        self._email = email
+
+    def push_event(self, event) -> None:
+        ews_calendar.push_event(self._session, event)
+
+    def delete_event(self, uid: str) -> None:
+        ews_calendar.delete_event(self._session, uid)
+
+    def fetch_events(self, start, end):
+        return ews_calendar.fetch_events(self._session, start, end, self._email)
+
+
+class _IcsCalendarServer:
+    """Подписка по ссылке: только чтение."""
+
+    def __init__(self, url: str, username: str) -> None:
+        self._url = url
+        self._username = username
+
+    def push_event(self, event) -> None:
+        raise RuntimeError("подписка по ссылке только для чтения")
+
+    def delete_event(self, uid: str) -> None:
+        raise RuntimeError("подписка по ссылке только для чтения")
+
+    def fetch_events(self, start, end):
+        return [
+            event for event in ics_subscription.fetch_events(self._url, self._username)
+            if not (event.dtend < start or event.dtstart > end)
+        ]
+
+
 def account_key(account, protocol: str) -> str:
     """Ключ подключённой учётной записи в дереве и во внутренних словарях.
     Протокол и сервер — часть ключа: на время перехода с Exchange на VK
@@ -5680,12 +5777,19 @@ class MainWindow(QMainWindow):
         calendar_refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
-        caldav_sync_action = QAction(_toolbar_icon("sync"), "Синхронизировать с CalDAV", self)
+        caldav_sync_action = QAction(_toolbar_icon("sync"), "Синхронизировать календари", self)
         caldav_sync_action.setToolTip(
-            "Синхронизировать с CalDAV — адрес сервера в Параметрах, логин/пароль от почты"
+            "Синхронизировать календари — Exchange, CalDAV (VK и др.) и подписки по ссылке. "
+            "Идёт и сама: после подключения почты и затем каждые три опроса."
         )
-        caldav_sync_action.triggered.connect(self.on_caldav_sync)
+        caldav_sync_action.triggered.connect(lambda: self.on_caldav_sync())
         calendar_toolbar.addAction(caldav_sync_action)
+        # Подпись рядом со значком: одной иконки было мало, кнопку не находили
+        # (жалоба: "нет кнопки синхронизации календаря exchange").
+        sync_button = calendar_toolbar.widgetForAction(caldav_sync_action)
+        if isinstance(sync_button, QToolButton):
+            sync_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            sync_button.setText("Синхронизировать")
         calendar_toolbar.addWidget(self.calendar_view_combo)
 
         # Левая панель: мини-календарь для быстрого перехода к неделе +
@@ -6045,6 +6149,7 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.font_scale_slider)
         self._apply_font_scale(initial_font_scale)
 
+        self._calendar_sync_running = False
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._on_periodic_refresh)
         self._restart_poll_timer()
@@ -6308,6 +6413,9 @@ class MainWindow(QMainWindow):
                     self.statusBar().showMessage(f"Восстановлено подключений: {', '.join(restored)}", 5000)
                     self._refresh_folder_async(silent=True)
                     QTimer.singleShot(1500, self._start_full_sync)
+                    # Календари — вскоре после подключения почты: Exchange
+                    # берёт её соединение, CalDAV — её учётные данные.
+                    self._schedule_calendar_sync(20_000)
                 return
             protocol, account, smtp_account = queue.pop(0)
             name = account.email if protocol == "ews" else account.username
@@ -8202,6 +8310,12 @@ class MainWindow(QMainWindow):
         # Тихая фоновая проверка по таймеру — без модальных окон об ошибках,
         # чтобы не перебивать пользователя, если тот занят (например, пишет письмо).
         # Архивы локальны и статичны — опрашивать их по таймеру незачем.
+        self._calendar_ticks = getattr(self, "_calendar_ticks", 0) + 1
+        if self._calendar_ticks % 3 == 0:
+            # Календари — раз в три опроса и независимо от того, какая папка
+            # открыта (жалоба: "нет синхронизации с календарём" — раньше
+            # только по кнопке).
+            self.on_caldav_sync(silent=True)
         if self.active_source is not self.mailbox or not self.mailbox or not self.current_folder:
             return
         self._refresh_folder_async(silent=True)
@@ -9554,139 +9668,158 @@ class MainWindow(QMainWindow):
         self.refresh_calendar_view()
         self.statusBar().showMessage(f"Импортировано событий: {count} (календарь «{name}»)", 5000)
 
-    def on_caldav_sync(self) -> None:
-        """Ручная синхронизация по кнопке — не по таймеру. Сервер ни разу
-        не проверялся вживую (закрытая корпоративная сеть, доступа отсюда
-        нет), поэтому автоматический фоновый опрос пока не включаем —
-        только явный запуск, чтобы первые реальные проблемы были видны
-        сразу пользователю, а не тихо повторялись каждые несколько минут.
+    def _calendar_by_id(self, calendar_id: str):
+        try:
+            return next((cal for cal in calendar_store.list_calendars(self.calendar_path) if cal.id == calendar_id), None)
+        except Exception:
+            return None
 
-        Раньше вся синхронизация (создание CalDAV-соединения, отправка
-        каждой встречи по одной, затем получение всех с сервера) шла
-        синхронно прямо здесь — в основном потоке интерфейса. На реальном
-        сервере это могло занять заметное время, а без таймаута на HTTP
-        (см. caldav_sync.CalDavSession) — зависнуть надолго при сетевых
-        проблемах: жалоба "после настройки CalDav сломалась отправка,
-        просмотр, переход между папками и получение почты" — окно было не
-        сломано, а всё это время ждало одного зависшего запроса к CalDAV,
-        полностью замёрзшее. Теперь вся сетевая часть уходит в фоновый
-        поток, как и импорт/отправка почты."""
-        if not self.account:
-            QMessageBox.warning(self, "Нет учётной записи", "Сначала подключитесь к почте в настройках.")
-            return
-        caldav_calendars = [
-            cal for cal in calendar_store.list_calendars(self.calendar_path)
-            if cal.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_ICS, calendar_store.SOURCE_EWS)
+    def _is_server_calendar(self, calendar_id: str) -> bool:
+        calendar = self._calendar_by_id(calendar_id)
+        return calendar is not None and calendar.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_EWS)
+
+    def _is_exchange_calendar(self, calendar_id: str) -> bool:
+        calendar = self._calendar_by_id(calendar_id)
+        return calendar is not None and calendar.source_type == calendar_store.SOURCE_EWS
+
+    def _calendar_credentials(self, url: str) -> tuple[str, str, str] | None:
+        """(логин, пароль, способ входа) для сервера календаря — от учётной
+        записи, чей почтовый сервер ближе всего по домену (см.
+        _pick_calendar_account). Годятся и выключенные галочкой записи:
+        календарь VK нужен, даже когда почта VK сейчас не открыта."""
+        accounts = [
+            account for key, account in self.mailbox_accounts.items() if self.mailbox_protocols.get(key) == "imap"
         ]
-        if not caldav_calendars:
-            QMessageBox.information(
-                self, "Синхронизация не настроена",
-                "Добавьте календарь с источником CalDAV или подписку по ссылке (.ics) через «+ Добавить календарь».",
-            )
+        try:
+            accounts += [account for account, _smtp in load_accounts()]
+        except Exception as exc:
+            _log.debug("Календарь: сохранённые учётные записи не прочитаны: %s", exc)
+        chosen = _pick_calendar_account(url, accounts)
+        if chosen is None:
+            return None
+        return chosen.username, getattr(chosen, "password", ""), getattr(chosen, "auth_type", "password")
+
+    def _schedule_calendar_sync(self, delay_ms: int = 1500) -> None:
+        """Тихая синхронизация календарей чуть позже — после сохранения,
+        переноса или удаления встречи, чтобы изменение сразу ушло на сервер."""
+        QTimer.singleShot(delay_ms, lambda: self.on_caldav_sync(silent=True))
+
+    def on_caldav_sync(self, *, silent: bool = False) -> None:
+        """Синхронизация всех календарей с серверами — CalDAV (VK и др.),
+        Exchange и подписок по ссылке — в фоне (сетевые запросы раньше
+        шли в потоке окна, и оно замерзало целиком).
+
+        Каждый календарь идёт со своей учётной записью: для CalDAV — той, чей
+        почтовый сервер ближе по домену, для Exchange — подключённой почтой
+        Exchange. Ошибка одного календаря не останавливает остальные.
+        silent — запуск по таймеру или после правки встречи: без окон,
+        итог только в строке состояния и журнале."""
+        if self._calendar_sync_running:
+            return
+        try:
+            calendars = [
+                cal for cal in calendar_store.list_calendars(self.calendar_path)
+                if cal.source_type in (calendar_store.SOURCE_CALDAV, calendar_store.SOURCE_ICS, calendar_store.SOURCE_EWS)
+            ]
+        except Exception as exc:
+            _log.error("Календари: список не прочитан: %s", exc)
+            return
+        if not calendars:
+            if not silent:
+                QMessageBox.information(
+                    self, "Синхронизация не настроена",
+                    "Добавьте календарь с источником Exchange, CalDAV или подписку по ссылке (.ics) "
+                    "через «+ Добавить календарь».",
+                )
             return
 
-        username = self.account.username
-        password = getattr(self.account, "password", "")
-        # Тот же способ входа, что у почты: при Kerberos (SSO) CalDAV идёт
-        # по доменному билету через SPNEGO, app-пароль не нужен.
-        auth_type = getattr(self.account, "auth_type", "password")
+        plans = []
+        problems: list[str] = []
+        for cal in calendars:
+            if cal.source_type == calendar_store.SOURCE_EWS:
+                session = self._ews_session_for_calendar()
+                if session is None:
+                    problems.append(f"«{cal.name}»: не подключена учётная запись Exchange")
+                    continue
+                email = getattr(getattr(session, "account", None), "email", "") or ""
+                plans.append((cal, lambda session=session, email=email: (_ExchangeCalendarServer(session, email), None), False))
+            elif cal.source_type == calendar_store.SOURCE_ICS:
+                username = getattr(self.account, "username", "") if self.account else ""
+                plans.append((cal, lambda cal=cal, username=username: (_IcsCalendarServer(cal.caldav_url, username), None), True))
+            else:
+                credentials = self._calendar_credentials(cal.caldav_url)
+                if credentials is None and self.account is not None and not isinstance(self.account, EwsAccount):
+                    credentials = (
+                        self.account.username, getattr(self.account, "password", ""),
+                        getattr(self.account, "auth_type", "password"),
+                    )
+                if credentials is None:
+                    problems.append(f"«{cal.name}»: нет учётной записи почты для сервера календаря")
+                    continue
+                username, password, auth_type = credentials
+
+                def open_caldav(cal=cal, username=username, password=password, auth_type=auth_type):
+                    session = caldav_sync.CalDavSession(
+                        caldav_sync.CalDavAccount(url=cal.caldav_url, username=username, password=password, auth_type=auth_type)
+                    )
+                    return _CalDavCalendarServer(session, username), session
+
+                plans.append((cal, open_caldav, False))
+
         calendar_path = self.calendar_path
         window_start = datetime.now(timezone.utc) - timedelta(days=30)
         window_end = datetime.now(timezone.utc) + timedelta(days=180)
 
-        def do_sync() -> tuple[int, int]:
-            # Раньше был ровно один CalDAV-адрес на весь аккаунт — теперь
-            # календарей с источником CalDAV может быть несколько, каждый
-            # синхронизируется отдельно со своим сервером, а полученные
-            # события помечаются ИМЕННО тем calendar_id, к которому
-            # относится синхронизация (раньше calendar_id для них вообще
-            # не проставлялся, событие с сервера всегда попадало в default).
-            total_pushed = 0
-            total_pulled = 0
-            _log.info("CalDAV: синхронизация, календарей %d", len(caldav_calendars))
-            local_events = calendar_store.list_events(calendar_path, start=window_start, end=window_end)
-            for cal in caldav_calendars:
-                if cal.source_type == calendar_store.SOURCE_EWS:
-                    # Календарь Exchange: то же подключение, что и у почты
-                    # Exchange — отдельный адрес и пароль не нужны.
-                    session = self._ews_session_for_calendar()
-                    if session is None:
-                        _log.warning("Календарь Exchange: нет подключённой учётной записи Exchange")
-                        continue
-                    for event in local_events:
-                        if event.calendar_id == cal.id and event.is_organizer and event.status != "cancelled":
-                            ews_calendar.push_event(session, event)
-                            total_pushed += 1
-                    for event in ews_calendar.fetch_events(session, window_start, window_end, self.account.email if hasattr(self.account, "email") else username):
-                        event = replace(event, calendar_id=cal.id)
-                        existing_local = calendar_store.get_event(calendar_path, event.uid)
-                        if existing_local and not event.color and existing_local.color:
-                            event.color = existing_local.color
-                        calendar_store.save_event(calendar_path, event)
-                        total_pulled += 1
-                    continue
-                if cal.source_type == calendar_store.SOURCE_ICS:
-                    # Подписка по ссылке (Google и др.): только чтение —
-                    # локальные правки на сервер не уходят.
-                    for event in ics_subscription.fetch_events(cal.caldav_url, username):
-                        if event.dtend < window_start or event.dtstart > window_end:
-                            continue
-                        event = replace(event, calendar_id=cal.id)
-                        existing_local = calendar_store.get_event(calendar_path, event.uid)
-                        if existing_local and not event.color and existing_local.color:
-                            event.color = existing_local.color
-                        calendar_store.save_event(calendar_path, event)
-                        total_pulled += 1
-                    continue
-                account = caldav_sync.CalDavAccount(
-                    url=cal.caldav_url, username=username, password=password, auth_type=auth_type
-                )
-                session = caldav_sync.CalDavSession(account)
+        def do_sync() -> list:
+            reports = []
+            for cal, open_server, read_only in plans:
                 try:
-                    # Сначала отправляем локальные изменения (свои встречи
-                    # ЭТОГО календаря), потом забираем с сервера — если
-                    # сделать наоборот, свежая локальная правка, ещё не
-                    # отправленная, могла бы затереться устаревшей версией
-                    # с сервера при получении.
-                    for event in local_events:
-                        if event.calendar_id == cal.id and event.is_organizer and event.status != "cancelled":
-                            session.push_event(event, username, username)
-                            total_pushed += 1
-
-                    server_events = session.fetch_events(window_start, window_end, username)
-                    for event in server_events:
-                        event = replace(event, calendar_id=cal.id)
-                        # CalDAV-сервер ничего не знает о наших полях,
-                        # которых нет в стандартном iCalendar (ручной цвет
-                        # события) и может не хранить произвольные
-                        # вложения — не даём синхронизации тихо стереть то,
-                        # что есть только локально.
-                        existing_local = calendar_store.get_event(calendar_path, event.uid)
-                        if existing_local:
-                            if not event.attachments and existing_local.attachments:
-                                event.attachments = existing_local.attachments
-                            if not event.color and existing_local.color:
-                                event.color = existing_local.color
-                        calendar_store.save_event(calendar_path, event)
-                        total_pulled += 1
+                    server, closable = open_server()
+                except Exception as exc:
+                    report = calendar_sync.CalendarSyncReport(name=cal.name, errors=[f"подключение: {exc}"])
+                    _log.warning("Календарь «%s»: подключение не удалось: %s", cal.name, exc)
+                    reports.append(report)
+                    continue
+                try:
+                    reports.append(calendar_sync.sync_calendar(
+                        calendar_path, cal, server, window_start, window_end, read_only=read_only,
+                    ))
                 finally:
-                    session.close()
-            return total_pushed, total_pulled
+                    if closable is not None:
+                        closable.close()
+            return reports
 
-        self.statusBar().showMessage("Синхронизация с CalDAV…")
+        self._calendar_sync_running = True
+        if not silent:
+            self.statusBar().showMessage("Синхронизация календарей…")
         worker = _CallableWorker(do_sync, parent=self)
 
+        def finish() -> None:
+            self._calendar_sync_running = False
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+
         def on_success(result: object) -> None:
-            pushed, pulled = result
-            _log.info("CalDAV: синхронизация завершена, отправлено %d, получено %d", pushed, pulled)
+            finish()
+            reports = list(result or [])
             self.refresh_calendar_view()
-            self.statusBar().showMessage(f"CalDAV: отправлено {pushed}, получено {pulled}", 7000)
-            self._background_workers.remove(worker)
+            pushed = sum(r.pushed for r in reports)
+            pulled = sum(r.pulled for r in reports)
+            errors = problems + [f"«{r.name}»: {error}" for r in reports for error in r.errors]
+            summary = f"Календари: отправлено {pushed}, получено {pulled}"
+            if errors:
+                summary += f", ошибок {len(errors)}"
+            self.statusBar().showMessage(summary, 7000)
+            if errors and not silent:
+                QMessageBox.warning(self, "Синхронизация календарей", "\n".join(errors[:10]))
 
         def on_failure(error_text: str) -> None:
-            _log.error("CalDAV: синхронизация не удалась: %s", error_text)
-            QMessageBox.critical(self, "Ошибка CalDAV", error_text)
-            self._background_workers.remove(worker)
+            finish()
+            _log.error("Календари: синхронизация не удалась: %s", error_text)
+            if silent:
+                self.statusBar().showMessage(f"Календари: {error_text}", 7000)
+            else:
+                QMessageBox.critical(self, "Синхронизация календарей", error_text)
 
         worker.succeeded.connect(on_success)
         worker.failed.connect(on_failure)
@@ -9839,6 +9972,7 @@ class MainWindow(QMainWindow):
             my_password=getattr(self.account, "password", "") if self.account else "",
             my_auth_type=getattr(self.account, "auth_type", "password") if self.account else "password",
             used_colors=used_colors,
+            credentials_for=self._calendar_credentials,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -9893,6 +10027,7 @@ class MainWindow(QMainWindow):
             self.account.username,
             getattr(self.account, "password", ""),
             getattr(self.account, "auth_type", "password"),
+            credentials_for=self._calendar_credentials,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -10355,8 +10490,15 @@ class MainWindow(QMainWindow):
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
             attachments=list(dialog.attachments),
         )
-        calendar_store.save_event(self.calendar_path, event)
-        self._send_request_to_attendees(event, subject_prefix="Приглашение", body_prefix="Вас приглашают на встречу")
+        calendar_store.save_event(self.calendar_path, event, needs_push=True)
+        if self._is_exchange_calendar(event.calendar_id):
+            # Приглашения Exchange рассылает сам, когда встреча уходит на
+            # сервер — своё письмо сверху дало бы участникам дубль.
+            self._schedule_calendar_sync()
+        else:
+            self._send_request_to_attendees(event, subject_prefix="Приглашение", body_prefix="Вас приглашают на встречу")
+            if self._is_server_calendar(event.calendar_id):
+                self._schedule_calendar_sync()
         self.refresh_calendar_view()
 
     def _send_request_to_attendees(self, event: calendar_store.Event, *, subject_prefix: str, body_prefix: str) -> None:
@@ -10472,7 +10614,12 @@ class MainWindow(QMainWindow):
         if updated is None:
             self.refresh_calendar_view()
             return
-        self._send_request_to_attendees(updated, subject_prefix="Перенесено", body_prefix="Встреча перенесена:")
+        if self._is_exchange_calendar(updated.calendar_id):
+            self._schedule_calendar_sync()  # обновление участникам разошлёт Exchange
+        else:
+            self._send_request_to_attendees(updated, subject_prefix="Перенесено", body_prefix="Встреча перенесена:")
+            if self._is_server_calendar(updated.calendar_id):
+                self._schedule_calendar_sync()
         self.refresh_calendar_view()
         self.statusBar().showMessage(f"Перенесено: «{updated.summary}» → {when_text}", 5000)
 
@@ -10496,7 +10643,8 @@ class MainWindow(QMainWindow):
             return
 
         attendee_emails = [a.email for a in event.attendees]
-        if attendee_emails and self.smtp_account:
+        exchange_calendar = self._is_exchange_calendar(event.calendar_id)
+        if attendee_emails and self.smtp_account and not exchange_calendar:
             ics = itip.build_cancel_ics(event, self.account.username, self.account.username)
             message = OutgoingMessage(
                 sender=self.account.username,
@@ -10520,6 +10668,11 @@ class MainWindow(QMainWindow):
             )
 
         calendar_store.delete_event(self.calendar_path, event.uid)
+        if self._is_server_calendar(event.calendar_id):
+            # Удаление должно дойти до сервера, иначе синхронизация вернёт
+            # встречу (для Exchange отмену участникам разошлёт сам Exchange).
+            calendar_store.remember_server_delete(self.calendar_path, event.uid, event.calendar_id)
+            self._schedule_calendar_sync()
         self.selected_calendar_event = None
         self.refresh_calendar_view()
 
