@@ -171,3 +171,15 @@ def test_cli_exports_mail(home: Path, capsys) -> None:
     assert cli.wants_cli(["redmail", "--export-mail", "x"]) and not cli.wants_cli(["redmail", "-style", "fusion"])
     assert cli.run(["redmail", "--export-mail", str(home / "cli"), "--format", "eml"]) == 0
     assert "3 писем" in capsys.readouterr().out
+
+
+def test_build_message_survives_exchange_style_addresses() -> None:
+    # Реальные адреса Exchange, на которых разборщик Python падает с AttributeError.
+    raw = mail_export.build_message(
+        subject="Тема", sender="", sender_email="", date="2026-09-01 10:00", message_id="",
+        body="Текст", content_from="Иванов И.И.<ivanov@example.com>",
+        content_to='"me@example.com" <me@example.com>,Петров П.П.<petrov@example.com>',
+    )
+    message = message_from_bytes(raw, policy=default_policy)
+    assert "ivanov@example.com" in str(message["From"])
+    assert "me@example.com" in str(message["To"]) and "petrov@example.com" in str(message["To"])

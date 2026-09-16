@@ -25,7 +25,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from email.message import EmailMessage
-from email.utils import format_datetime, formataddr
+from email.utils import format_datetime, formataddr, getaddresses
 from pathlib import Path
 from typing import Callable
 
@@ -54,6 +54,7 @@ class ExportResult:
     target: Path
     messages: int = 0
     headers_only: int = 0
+    failed: int = 0
     archives: int = 0
     folders: int = 0
 
@@ -84,6 +85,46 @@ def _rfc_date(value: str) -> str:
     return ""
 
 
+def _set_address(message: EmailMessage, name: str, value: str) -> None:
+    """Адресный заголовок. Адреса Exchange вида «Иванов И.И.<ivanov@…>»
+    разборщик Python 3.11 роняет (AttributeError в display_name), а более
+    новый записывает с ошибкой переноса строки — второй адресат теряется.
+    Поэтому адреса сначала разбираются терпимым getaddresses и собираются
+    заново с именами в кодировке RFC 2047: такой ASCII-заголовок безопасен.
+    Не вышло — только адреса, затем исходный текст."""
+    if not value:
+        return
+    if "@" not in value:
+        # Одно имя без адреса («Пономарев Р.С.»): getaddresses порезал бы его.
+        pairs = [(value, "")]
+    else:
+        pairs = [(display, address) for display, address in getaddresses([value]) if address]
+    formatted = []
+    for display, address in pairs:
+        try:
+            if not address:
+                raise UnicodeError
+            formatted.append(formataddr((display.strip(), address), charset="utf-8"))
+        except UnicodeError:
+            # Кириллица в самом адресе или адреса нет: оставляем читаемым
+            # текстом в кодировке RFC 2047.
+            text = f"{display.strip()} <{address}>" if display.strip() and address else (display.strip() or address)
+            formatted.append(formataddr((text, ""), charset="utf-8").rstrip(" <>"))
+    for variant in (
+        ", ".join(item for item in formatted if item),
+        ", ".join(address for _display, address in pairs),
+        value,
+    ):
+        if not variant:
+            continue
+        try:
+            message[name] = variant
+            return
+        except Exception:
+            continue
+    _log.warning("Заголовок %s не разобран и пропущен: %r", name, value[:200])
+
+
 def build_message(
     *,
     subject: str,
@@ -103,12 +144,12 @@ def build_message(
 ) -> bytes:
     """Письмо из локальной копии обратно в MIME."""
     message = EmailMessage()
-    message["From"] = _header(content_from) or formataddr((_header(sender), _header(sender_email)))
+    _set_address(message, "From", _header(content_from) or formataddr((_header(sender), _header(sender_email))))
     recipients = _header(content_to) or _header(to)
     if recipients:
-        message["To"] = recipients
+        _set_address(message, "To", recipients)
     if _header(content_cc):
-        message["Cc"] = _header(content_cc)
+        _set_address(message, "Cc", _header(content_cc))
     message["Subject"] = _header(subject)
     rfc_date = _rfc_date(date)
     if rfc_date:
@@ -277,12 +318,18 @@ def export_mail(
                         ).fetchall()
                     else:
                         result.headers_only += 1
-                    raw = build_message(
-                        subject=subject, sender=sender, sender_email=sender_email, date=date,
-                        message_id=message_id, importance=importance, to=to, body=body, html=html or "",
-                        content_from=content_from or "", content_to=content_to or "", content_cc=content_cc or "",
-                        attachments=attachments, inline_images=inline,
-                    )
+                    try:
+                        raw = build_message(
+                            subject=subject, sender=sender, sender_email=sender_email, date=date,
+                            message_id=message_id, importance=importance, to=to, body=body, html=html or "",
+                            content_from=content_from or "", content_to=content_to or "",
+                            content_cc=content_cc or "", attachments=attachments, inline_images=inline,
+                        )
+                    except Exception as exc:
+                        # Одно неразборчивое письмо не должно обрывать всю выгрузку.
+                        result.failed += 1
+                        _log.error("Письмо %s/%s/%s не выгружено: %s", account, folder, uid, exc)
+                        continue
                     writer.add(raw, subject)
                     tick()
         used_names: set[str] = set()
@@ -309,7 +356,7 @@ def export_mail(
     if progress is not None:
         progress(result.messages)
     _log.info(
-        "Выгрузка переписки (%s) в %s: писем %d, без тела %d, архивов %d",
-        fmt, target, result.messages, result.headers_only, result.archives,
+        "Выгрузка переписки (%s) в %s: писем %d, без тела %d, не выгружено %d, архивов %d",
+        fmt, target, result.messages, result.headers_only, result.failed, result.archives,
     )
     return result

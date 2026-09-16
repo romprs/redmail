@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        121%{?dist}
+Release:        122%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -124,6 +124,9 @@ fi
 %dir %{_sysconfdir}/redmail/brands
 
 %changelog
+* Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-122
+- Выгрузка переписки не обрывается на адресах вида «Иванов И.И.<ivanov@…>» (Exchange) и адресах с кириллицей; неразобранное письмо пропускается и попадает в итог
+- Выгрузка администратором от root не трогает файл журнала сотрудника
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-121
 - Исправлен запуск программы: сборка 120 не открывалась из-за ошибки в сообщении о переносе профиля
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-120

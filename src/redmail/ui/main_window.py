@@ -3224,7 +3224,7 @@ class SettingsDialog(QDialog):
         def done(result) -> None:
             profile_transfer.audit(
                 "Выгрузка переписки", формат=fmt, каталог=result.target, писем=result.messages,
-                без_тела=result.headers_only, архивов=result.archives,
+                без_тела=result.headers_only, не_выгружено=result.failed, архивов=result.archives,
             )
             text = f"Выгружено писем: {result.messages}, архивов: {result.archives}.\n{result.target}"
             if result.headers_only:
@@ -3232,6 +3232,8 @@ class SettingsDialog(QDialog):
                     f"\n\nПисем без тела: {result.headers_only} — оно ещё не было скачано с сервера, "
                     "выгружены только реквизиты."
                 )
+            if result.failed:
+                text += f"\n\nНе выгружено из-за ошибок разбора: {result.failed} — подробности в журнале программы."
             QMessageBox.information(self, "Выгрузка переписки", text)
 
         self._run_transfer("Выгрузка переписки", mail_export.export_mail, target, fmt, on_success=done, cancellable=True)
