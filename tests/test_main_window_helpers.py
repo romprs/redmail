@@ -8,6 +8,7 @@ from redmail.ui.main_window import (
     _recipients_tooltip,
     _format_recipient_candidate,
     _html_to_preview_text,
+    _inline_images_to_data_uris,
     _needs_another_bodies_round,
     _pick_calendar_account,
     _shared_domain_labels,
@@ -217,3 +218,29 @@ def test_calendar_uses_mail_account_of_its_own_server() -> None:
 
     assert _pick_calendar_account(url, [gmail, vk]) is vk
     assert _pick_calendar_account("https://caldav.yandex.ru/", [gmail, vk]) is None
+
+
+def test_cid_image_found_by_encoded_or_differently_cased_reference() -> None:
+    html = '<img src="cid:IMAGE001.png%4001DB1234.5678ABCD">'
+    images = {"image001.png@01DB1234.5678abcd": ("image/png", b"PNGDATA")}
+
+    result = _inline_images_to_data_uris(html, images)
+
+    assert "data:image/png;base64," in result
+
+
+def test_cid_image_found_among_attachments_by_file_name() -> None:
+    """Outlook: картинка подписи без Content-Id, тип application/octet-stream."""
+    from redmail.imap_client import Attachment
+
+    html = '<p>С уважением</p><img src="cid:image001.png@01DB1234.5678ABCD">'
+    attachments = [Attachment("image001.png", "application/octet-stream", b"PNGDATA")]
+
+    result = _inline_images_to_data_uris(html, {}, attachments)
+
+    assert 'src="data:image/png;base64,' in result
+
+
+def test_unknown_cid_reference_is_left_untouched() -> None:
+    html = '<img src="cid:missing@x">'
+    assert _inline_images_to_data_uris(html, {"other@x": ("image/png", b"1")}) == html

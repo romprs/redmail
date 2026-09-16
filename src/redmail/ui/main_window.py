@@ -714,20 +714,59 @@ def _create_mail_browser(parent: QWidget) -> QWebEngineView:
     return view
 
 
-def _inline_images_to_data_uris(html_content: str, inline_images: dict[str, tuple[str, bytes]]) -> str:
+_IMAGE_EXTENSIONS = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
+    ".bmp": "image/bmp", ".webp": "image/webp",
+}
+
+
+def _inline_images_to_data_uris(
+    html_content: str, inline_images: dict[str, tuple[str, bytes]], attachments=None,
+) -> str:
     """Заменяет <img src="cid:xxx"> на data:-URI прямо в разметке.
 
     QWebEngineView не понимает QTextDocument.addResource() (это API
     рич-текстового движка, у веб-движка нет такого понятия "ресурс
     документа") — вместо реестра ресурсов картинку нужно встроить прямо в
     HTML как data:-URI, единственный способ показать её без реального
-    HTTP-сервера, отдающего cid:-ссылки."""
-    if not inline_images:
+    HTTP-сервера, отдающего cid:-ссылки.
+
+    Ссылка ищется не только точным совпадением: в письмах из Outlook и
+    Exchange адрес бывает закодирован (%40 вместо @), в другом регистре, а
+    картинка — без Content-Id и с типом application/octet-stream, только с
+    именем «image001.png». Раньше такие подписи и логотипы показывались
+    пустой рамкой (жалоба: "часть содержимого писем не отображается")."""
+    by_key: dict[str, tuple[str, bytes]] = {}
+
+    def remember(key: str, entry: tuple[str, bytes]) -> None:
+        key = (key or "").strip().strip("<>").casefold()
+        if key and key not in by_key:
+            by_key[key] = entry
+
+    for content_id, entry in (inline_images or {}).items():
+        remember(content_id, entry)
+        remember(content_id.split("@", 1)[0], entry)
+    for attachment in attachments or []:
+        filename = getattr(attachment, "filename", "") or ""
+        content_type = (getattr(attachment, "content_type", "") or "").lower()
+        extension = os.path.splitext(filename)[1].lower()
+        if not content_type.startswith("image/") and extension not in _IMAGE_EXTENSIONS:
+            continue
+        if not content_type.startswith("image/"):
+            content_type = _IMAGE_EXTENSIONS[extension]
+        remember(filename, (content_type, getattr(attachment, "payload", b"") or b""))
+    if not by_key:
         return html_content
+
+    def lookup(content_id: str):
+        from urllib.parse import unquote
+
+        raw = unquote(content_id).strip().strip("<>").casefold()
+        return by_key.get(raw) or by_key.get(raw.split("@", 1)[0])
 
     def replace(match: re.Match[str]) -> str:
         prefix, content_id, suffix = match.group(1), match.group(2), match.group(3)
-        entry = inline_images.get(content_id)
+        entry = lookup(content_id)
         if entry is None:
             return match.group(0)
         content_type, payload = entry
@@ -792,7 +831,7 @@ def _populate_body_browser(view: QWebEngineView, content: MessageContent, *, anc
     MainWindow.reading_pane и MessageWindow — открытие письма в отдельном
     окне должно выглядеть так же, как в основной панели чтения."""
     if content.html:
-        html_content = _inline_images_to_data_uris(content.html, content.inline_images)
+        html_content = _inline_images_to_data_uris(content.html, content.inline_images, content.attachments)
     else:
         html_content = _BODY_WRAP_TEMPLATE.format(content=_linkify(content.text))
     _render_mail_html(view, html_content, anchor=anchor)
@@ -879,7 +918,12 @@ class MessageWindow(QWidget):
 
 def _linkify(text: str) -> str:
     """HTML-экранирует текст и оборачивает http(s)-ссылки в <a href>, чтобы
-    их можно было открыть кликом в QTextBrowser."""
+    их можно было открыть кликом в QTextBrowser.
+
+    Метки картинок «[cid:image001.png@…]», которые Outlook вставляет в
+    текстовую версию письма вместо изображений, убираются — в ленте цепочки
+    они выглядели обрывками служебного текста."""
+    text = re.sub(r"\[cid:[^\]\s]+\]", "", text or "")
     escaped = html.escape(text)
     linked = _URL_PATTERN.sub(lambda m: f'<a href="{m.group(0)}">{m.group(0)}</a>', escaped)
     return linked.replace("\n", "<br>")
@@ -9405,7 +9449,7 @@ class MainWindow(QMainWindow):
             if other.uid == summary.uid:
                 body_html = content.html or _linkify(content.text)
                 if content.html:
-                    body_html = _inline_images_to_data_uris(body_html, content.inline_images)
+                    body_html = _inline_images_to_data_uris(body_html, content.inline_images, content.attachments)
                 entries.append((other, body_html))
                 continue
             other_content = self._thread_content_cache.get(other.uid)
