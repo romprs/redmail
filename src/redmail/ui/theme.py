@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QPalette
 
 # Раньше приложение вообще не задавало собственный стиль — его вид
 # полностью зависел от темы рабочего стола/GTK хоста (жалоба: "сделай фон
@@ -315,6 +315,8 @@ def _build_palette(colors: dict[str, str]) -> QPalette:
 
 
 _is_dark = False
+_system_font: QFont | None = None
+_current_brand = None
 
 
 def is_dark() -> bool:
@@ -325,9 +327,37 @@ def is_dark() -> bool:
     return _is_dark
 
 
+def current_brand():
+    """Фирменное оформление, применённое сейчас (None — обычная тема)."""
+    return _current_brand
+
+
 def apply_theme(app, theme: str) -> None:
-    global _is_dark
-    _is_dark = theme == "dark"
-    colors = _DARK if _is_dark else _LIGHT
+    """theme — "light", "dark" или "brand:<id>" (фирменное оформление
+    организации, см. redmail.branding): его цвета поверх светлой или тёмной
+    основы и его шрифт."""
+    global _is_dark, _system_font, _current_brand
+    from redmail import branding
+
+    if _system_font is None:
+        _system_font = QFont(app.font())
+    brand = branding.find_brand(theme) if theme.startswith(branding.THEME_PREFIX) else None
+    _current_brand = brand
+    base = brand.base if brand is not None else theme
+    _is_dark = base == "dark"
+    colors = dict(_DARK if _is_dark else _LIGHT)
+    if brand is not None:
+        colors.update(brand.colors)
     app.setPalette(_build_palette(colors))
     app.setStyleSheet(_qss(colors))
+    font = QFont(_system_font)
+    if brand is not None and brand.font_family:
+        if brand.font_family in QFontDatabase.families():
+            font.setFamily(brand.font_family)
+        else:
+            from redmail.applog import get_logger
+
+            get_logger("branding").warning("Шрифт «%s» не установлен — остаётся системный", brand.font_family)
+    if brand is not None and brand.font_size:
+        font.setPointSizeF(brand.font_size)
+    app.setFont(font)

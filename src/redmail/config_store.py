@@ -134,7 +134,15 @@ def load_theme() -> str:
     вообще не задавало стиль, и его вид определялся тем, что было настроено
     в системе, вплоть до нечитаемых сочетаний (тёмная система + не
     предусмотренные под неё жёстко белые фоны в календаре и т.п.)."""
-    value = _load_settings_dict().get("theme", _DEFAULT_THEME)
+    settings = _load_settings_dict()
+    if "theme" not in settings:
+        # Тему ещё не выбирали — оформление по умолчанию от администратора.
+        from redmail import branding
+
+        return branding.default_theme() or _DEFAULT_THEME
+    value = settings.get("theme", _DEFAULT_THEME)
+    if isinstance(value, str) and value.startswith("brand:"):
+        return value
     return value if value in ("light", "dark") else _DEFAULT_THEME
 
 

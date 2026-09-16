@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from contextlib import contextmanager
 import html
 import math
@@ -97,6 +98,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSpinBox,
+    QDoubleSpinBox,
     QSplitter,
     QStackedWidget,
     QStatusBar,
@@ -127,7 +129,7 @@ from PySide6.QtWebEngineCore import (
 )
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-from redmail import archive_store, calendar_store, caldav_sync, contact_store, ews_client, itip
+from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
     MailRule,
@@ -2331,6 +2333,298 @@ class CategoriesDialog(QDialog):
         QMessageBox.information(self, "Разметка", "Автоматическая разметка сброшена — письма получат категории заново при открытии папок.")
 
 
+class BrandEditDialog(QDialog):
+    """Оформление одной организации: цвета программы, шрифт, оформление
+    письма и шаблон стандартной подписи. Содержимое задаёт заказчик."""
+
+    _COLOR_LABELS = (
+        ("accent", "Основной цвет (выделение, кнопки)"),
+        ("accent_text", "Текст на основном цвете"),
+        ("window", "Фон окна"),
+        ("base", "Фон полей и списков"),
+        ("alt_base", "Фон панелей"),
+        ("text", "Текст"),
+        ("border", "Рамки"),
+        ("disabled_text", "Второстепенный текст"),
+    )
+
+    def __init__(self, parent, brand: branding.Brand | None = None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Оформление «{brand.name}»" if brand else "Новое оформление")
+        self._brand = brand
+        self.id_edit = QLineEdit(brand.id if brand else "", self)
+        self.id_edit.setPlaceholderText("gpp-blagoveshchensk")
+        self.id_edit.setEnabled(brand is None)
+        self.name_edit = QLineEdit(brand.name if brand else "", self)
+        self.organization_edit = QLineEdit(brand.organization if brand else "", self)
+        self.base_combo = QComboBox(self)
+        self.base_combo.addItem("Светлая основа", "light")
+        self.base_combo.addItem("Тёмная основа", "dark")
+        self.base_combo.setCurrentIndex(max(0, self.base_combo.findData(brand.base if brand else "light")))
+        self.default_check = QCheckBox("Оформление по умолчанию для тех, кто тему ещё не выбирал", self)
+        self.default_check.setChecked(bool(brand and brand.default))
+
+        self._colors: dict[str, str] = dict(brand.colors) if brand else {}
+        self._color_buttons: dict[str, QPushButton] = {}
+        colors_form = QFormLayout()
+        for key, label in self._COLOR_LABELS:
+            button = QPushButton(self)
+            button.clicked.connect(lambda _checked=False, k=key: self._pick_color(k))
+            self._color_buttons[key] = button
+            self._paint_color(key)
+            colors_form.addRow(label, button)
+        colors_group = QGroupBox("Цвета программы", self)
+        colors_group.setLayout(colors_form)
+
+        self.font_combo = QFontComboBox(self)
+        self.font_check = QCheckBox("Свой шрифт программы", self)
+        self.font_check.setChecked(bool(brand and brand.font_family))
+        if brand and brand.font_family:
+            self.font_combo.setCurrentFont(QFont(brand.font_family))
+        self.font_size_spin = QDoubleSpinBox(self)
+        self.font_size_spin.setRange(0, 30)
+        self.font_size_spin.setSpecialValueText("как в системе")
+        self.font_size_spin.setValue(brand.font_size if brand else 0)
+        font_form = QFormLayout()
+        font_form.addRow(self.font_check)
+        font_form.addRow("Гарнитура", self.font_combo)
+        font_form.addRow("Размер", self.font_size_spin)
+        font_group = QGroupBox("Шрифт программы", self)
+        font_group.setLayout(font_form)
+
+        self.letter_font_check = QCheckBox("Свой шрифт письма", self)
+        self.letter_font_check.setChecked(bool(brand and brand.letter_font_family))
+        self.letter_font_combo = QFontComboBox(self)
+        if brand and brand.letter_font_family:
+            self.letter_font_combo.setCurrentFont(QFont(brand.letter_font_family))
+        self.letter_size_spin = QDoubleSpinBox(self)
+        self.letter_size_spin.setRange(0, 40)
+        self.letter_size_spin.setSpecialValueText("как в программе")
+        self.letter_size_spin.setValue(brand.letter_font_size if brand else 0)
+        self._letter_color = brand.letter_text_color if brand else ""
+        self.letter_color_button = QPushButton(self)
+        self.letter_color_button.clicked.connect(self._pick_letter_color)
+        self._paint_letter_color()
+        self.footer_edit = QPlainTextEdit(brand.letter_footer_html if brand else "", self)
+        self.footer_edit.setPlaceholderText("<p style=\"color:#777\">Сообщение и вложения конфиденциальны…</p>")
+        self.footer_edit.setFixedHeight(70)
+        letter_form = QFormLayout()
+        letter_form.addRow(self.letter_font_check)
+        letter_form.addRow("Гарнитура", self.letter_font_combo)
+        letter_form.addRow("Размер", self.letter_size_spin)
+        letter_form.addRow("Цвет текста", self.letter_color_button)
+        letter_form.addRow("Колонтитул (HTML)", self.footer_edit)
+        letter_group = QGroupBox("Оформление письма", self)
+        letter_group.setLayout(letter_form)
+
+        self.signature_edit = QPlainTextEdit(brand.signature_html if brand else "", self)
+        self.signature_edit.setPlaceholderText(
+            "<p>С уважением,<br>{name}<br>{title}<br>{department}<br>{organization}<br>Тел.: {phone}<br>{email}</p>"
+        )
+        signature_hint = QLabel(
+            "Шаблон стандартной подписи (HTML). Подстановки: {name}, {title}, {department}, {organization}, "
+            "{phone}, {email} — из карточки сотрудника в адресной книге. Строка с пустой подстановкой в подпись "
+            "не попадает.", self,
+        )
+        signature_hint.setWordWrap(True)
+        signature_layout = QVBoxLayout()
+        signature_layout.addWidget(self.signature_edit)
+        signature_layout.addWidget(signature_hint)
+        signature_group = QGroupBox("Стандартная подпись", self)
+        signature_group.setLayout(signature_layout)
+
+        main_form = QFormLayout()
+        main_form.addRow("Код (латиницей)", self.id_edit)
+        main_form.addRow("Название", self.name_edit)
+        main_form.addRow("Организация", self.organization_edit)
+        main_form.addRow("Основа", self.base_combo)
+        main_form.addRow(self.default_check)
+
+        left = QVBoxLayout()
+        left.addLayout(main_form)
+        left.addWidget(colors_group)
+        left.addStretch(1)
+        right = QVBoxLayout()
+        right.addWidget(font_group)
+        right.addWidget(letter_group)
+        right.addWidget(signature_group, 1)
+        columns = QHBoxLayout()
+        columns.addLayout(left, 1)
+        columns.addLayout(right, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(columns)
+        layout.addWidget(buttons)
+        self.resize(980, 720)
+
+    def _paint_color(self, key: str) -> None:
+        value = self._colors.get(key, "")
+        button = self._color_buttons[key]
+        button.setText(value or "как в основе")
+        button.setIcon(_dot_icon(value) if value else QIcon())
+
+    def _pick_color(self, key: str) -> None:
+        color = QColorDialog.getColor(QColor(self._colors.get(key, "#ffffff")), self, "Цвет")
+        if color.isValid():
+            self._colors[key] = color.name()
+            self._paint_color(key)
+
+    def _paint_letter_color(self) -> None:
+        self.letter_color_button.setText(self._letter_color or "как в программе")
+        self.letter_color_button.setIcon(_dot_icon(self._letter_color) if self._letter_color else QIcon())
+
+    def _pick_letter_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._letter_color or "#202124"), self, "Цвет текста письма")
+        if color.isValid():
+            self._letter_color = color.name()
+            self._paint_letter_color()
+
+    def to_brand(self) -> branding.Brand:
+        return branding.parse_brand({
+            "id": self.id_edit.text().strip(),
+            "name": self.name_edit.text().strip(),
+            "organization": self.organization_edit.text().strip(),
+            "base": self.base_combo.currentData(),
+            "colors": dict(self._colors),
+            "font": {
+                "family": self.font_combo.currentFont().family() if self.font_check.isChecked() else "",
+                "size": self.font_size_spin.value(),
+            },
+            "letter": {
+                "font_family": self.letter_font_combo.currentFont().family() if self.letter_font_check.isChecked() else "",
+                "font_size": self.letter_size_spin.value(),
+                "text_color": self._letter_color,
+                "footer_html": self.footer_edit.toPlainText().strip(),
+            },
+            "signature_html": self.signature_edit.toPlainText().strip(),
+            "default": self.default_check.isChecked(),
+        })
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        try:
+            self.to_brand()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Оформление", f"Проверьте поля: {exc}")
+            return
+        super().accept()
+
+
+class BrandsDialog(QDialog):
+    """Оформления организаций: список, правка, выгрузка файла для
+    администратора. Системные оформления (/etc/redmail/brands) только
+    показываются — их меняет администратор."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Оформления организаций")
+        self.list_widget = QListWidget(self)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._on_edit())
+        add_button = QPushButton("Добавить…", self)
+        add_button.clicked.connect(self._on_add)
+        self.edit_button = QPushButton("Изменить…", self)
+        self.edit_button.clicked.connect(self._on_edit)
+        self.delete_button = QPushButton("Удалить", self)
+        self.delete_button.clicked.connect(self._on_delete)
+        self.export_button = QPushButton("Выгрузить файл…", self)
+        self.export_button.setToolTip(
+            f"Сохранить оформление файлом, чтобы администратор разложил его по машинам в {branding.SYSTEM_BRANDS_DIR}"
+        )
+        self.export_button.clicked.connect(self._on_export)
+        import_button = QPushButton("Загрузить файл…", self)
+        import_button.clicked.connect(self._on_import)
+        side = QVBoxLayout()
+        for button in (add_button, self.edit_button, self.delete_button, self.export_button, import_button):
+            side.addWidget(button)
+        side.addStretch(1)
+        body = QHBoxLayout()
+        body.addWidget(self.list_widget, 1)
+        body.addLayout(side)
+        hint = QLabel(
+            f"Оформления из {branding.SYSTEM_BRANDS_DIR} разложены администратором и здесь не меняются. "
+            "Выбрать оформление — в списке «Тема оформления».", self,
+        )
+        hint.setWordWrap(True)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(body)
+        layout.addWidget(hint)
+        layout.addWidget(close)
+        self.list_widget.currentRowChanged.connect(self._update_buttons)
+        self._reload()
+        self.resize(620, 360)
+
+    def _reload(self) -> None:
+        self.list_widget.clear()
+        for brand in branding.load_brands():
+            system = brand.source.startswith(str(branding.SYSTEM_BRANDS_DIR))
+            item = QListWidgetItem(_dot_icon(brand.colors.get("accent", "#1a73e8")), brand.name + (" — от администратора" if system else ""))
+            item.setData(Qt.ItemDataRole.UserRole, brand.id)
+            item.setData(Qt.ItemDataRole.UserRole + 1, system)
+            self.list_widget.addItem(item)
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+        self._update_buttons()
+
+    def _current(self) -> tuple[branding.Brand | None, bool]:
+        item = self.list_widget.currentItem()
+        if item is None:
+            return None, False
+        brand = next((b for b in branding.load_brands() if b.id == item.data(Qt.ItemDataRole.UserRole)), None)
+        return brand, bool(item.data(Qt.ItemDataRole.UserRole + 1))
+
+    def _update_buttons(self, *_args) -> None:
+        brand, system = self._current()
+        self.edit_button.setEnabled(brand is not None and not system)
+        self.delete_button.setEnabled(brand is not None and not system)
+        self.export_button.setEnabled(brand is not None)
+
+    def _on_add(self) -> None:
+        dialog = BrandEditDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            branding.save_user_brand(dialog.to_brand())
+            self._reload()
+
+    def _on_edit(self) -> None:
+        brand, system = self._current()
+        if brand is None or system:
+            return
+        dialog = BrandEditDialog(self, brand)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            branding.save_user_brand(dialog.to_brand())
+            self._reload()
+
+    def _on_delete(self) -> None:
+        brand, system = self._current()
+        if brand is None or system:
+            return
+        if QMessageBox.question(self, "Удалить оформление", f"Удалить оформление «{brand.name}»?") == QMessageBox.StandardButton.Yes:
+            branding.delete_user_brand(brand.id)
+            self._reload()
+
+    def _on_export(self) -> None:
+        brand, _system = self._current()
+        if brand is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Выгрузить оформление", f"{brand.id}.json", "Оформление (*.json)")
+        if path:
+            Path(path).write_text(json.dumps(branding.brand_to_dict(brand), ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _on_import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Загрузить оформление", "", "Оформление (*.json)")
+        if not path:
+            return
+        try:
+            brand = branding.parse_brand(json.loads(Path(path).read_text(encoding="utf-8")), path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Оформление", f"Файл не подходит: {exc}")
+            return
+        branding.save_user_brand(brand)
+        self._reload()
+
+
 class SettingsDialog(QDialog):
     """Один диалог на всё: учётная запись (было отдельным «Подключиться…»),
     интервал проверки почты и расположение панели чтения."""
@@ -2374,9 +2668,16 @@ class SettingsDialog(QDialog):
             self.orientation_vertical.setChecked(True)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("Светлая", "light")
-        self.theme_combo.addItem("Тёмная", "dark")
-        self.theme_combo.setCurrentIndex(self.theme_combo.findData(theme))
+        self._fill_theme_combo(theme)
+        brands_button = QPushButton("Оформления организаций…", self)
+        brands_button.setToolTip(
+            "Цвета, шрифты, оформление письма и стандартная подпись для каждой организации — "
+            "их задаёт заказчик; файл оформления можно выгрузить и разослать администратору"
+        )
+        brands_button.clicked.connect(self._on_manage_brands)
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(self.theme_combo, 1)
+        theme_row.addWidget(brands_button)
 
         # Корневой сертификат организации: браузер берёт его из системного
         # хранилища Windows, а программа на RED OS — из своего набора, где
@@ -2414,7 +2715,7 @@ class SettingsDialog(QDialog):
         general_form.addRow("Масштаб шрифта", self.font_scale_spin)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
-        general_form.addRow("Тема оформления", self.theme_combo)
+        general_form.addRow("Тема оформления", theme_row)
         general_form.addRow("Корневой сертификат (PEM)", tls_ca_row)
         general_group = QGroupBox("Общие")
         general_group.setLayout(general_form)
@@ -2804,6 +3105,20 @@ class SettingsDialog(QDialog):
     def pane_orientation(self) -> str:
         return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
 
+    def _fill_theme_combo(self, selected: str) -> None:
+        self.theme_combo.clear()
+        self.theme_combo.addItem("Светлая", "light")
+        self.theme_combo.addItem("Тёмная", "dark")
+        for brand in branding.load_brands():
+            self.theme_combo.addItem(f"Оформление: {brand.name}", brand.theme_value)
+        index = self.theme_combo.findData(selected)
+        self.theme_combo.setCurrentIndex(index if index >= 0 else 0)
+
+    def _on_manage_brands(self) -> None:
+        current = self.theme_combo.currentData()
+        BrandsDialog(self).exec()
+        self._fill_theme_combo(current)
+
     def theme(self) -> str:
         return self.theme_combo.currentData()
 
@@ -3192,6 +3507,18 @@ class _ComposeBodyEdit(QTextEdit):
 
 
 class ComposeDialog(QDialog):
+    def _apply_letter_branding(self, brand) -> None:
+        document = self.body_edit.document()
+        font = QFont(document.defaultFont())
+        if brand.letter_font_family:
+            font.setFamily(brand.letter_font_family)
+        if brand.letter_font_size:
+            font.setPointSizeF(brand.letter_font_size)
+        document.setDefaultFont(font)
+        self.body_edit.setCurrentFont(font)
+        if brand.letter_text_color:
+            self.body_edit.setTextColor(QColor(brand.letter_text_color))
+
     def _insert_greeting(self, greeting: str) -> None:
         """Приветствие первой строкой и пустая строка после него; курсор —
         сразу под приветствием, чтобы писать текст. Если письмо уже
@@ -3290,6 +3617,11 @@ class ComposeDialog(QDialog):
             self.body_edit.setHtml(body_html)
         else:
             self.body_edit.setPlainText(body)
+        # Оформление организации: шрифт, размер и цвет текста письма.
+        # Черновик и пересылка приходят со своей разметкой — её не трогаем.
+        brand = app_theme.current_brand()
+        if brand is not None and body_html is None:
+            self._apply_letter_branding(brand)
         self._greeting = greeting
         if greeting:
             self._insert_greeting(greeting)
@@ -3580,7 +3912,9 @@ class ComposeDialog(QDialog):
         return self.body_edit.toPlainText()
 
     def body_html(self) -> str:
-        return self.body_edit.toHtml()
+        # Цвет текста из оформления организации — в разметку письма, чтобы
+        # его увидел получатель.
+        return branding.letter_html(app_theme.current_brand(), self.body_edit.toHtml())
 
     def inline_images(self) -> dict[str, tuple[str, bytes]]:
         return dict(self._inline_images)
@@ -8050,7 +8384,20 @@ class MainWindow(QMainWindow):
         self._restart_poll_timer()
         self._apply_pane_orientation()
         if theme_changed:
-            app_theme.apply_theme(QApplication.instance(), self.theme)
+            app = QApplication.instance()
+            previous_family = app.font().family()
+            app_theme.apply_theme(app, self.theme)
+            # Гарнитура оформления — и уже открытым виджетам с шрифтом
+            # приложения; размер пересчитывается от нового базового.
+            new_family = app.font().family()
+            if new_family != previous_family:
+                for widget in app.allWidgets():
+                    widget_font = widget.font()
+                    if widget_font.family() == previous_family:
+                        widget_font.setFamily(new_family)
+                        widget.setFont(widget_font)
+            self._base_font_point_size = app.font().pointSizeF() or self._base_font_point_size
+            self._apply_font_scale(load_font_scale())
             # Ячейки месячного вида красят себя сами через inline
             # setStyleSheet() (см. MonthCellWidget._apply_style) — общий
             # QSS приложения их не перекрашивает, нужно попросить явно.
@@ -9699,7 +10046,7 @@ class MainWindow(QMainWindow):
                     OutgoingAttachment(filename=a.filename, content_type=a.content_type, payload=a.payload)
                     for a in content.attachments
                 ],
-                signatures=self.signatures,
+                signatures=self._compose_signatures(),
                 default_signature_id=self.default_signature_id,
             )
             self._exec_compose(dialog, source_draft=(self.current_folder, summary.uid))
@@ -11703,6 +12050,53 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Сохранено: {path}", 5000)
 
+    def _my_person_data(self) -> dict[str, str]:
+        """Данные сотрудника для фирменной подписи — из его карточки в
+        адресной книге (по адресу текущей учётной записи)."""
+        account = self.account
+        email = (getattr(account, "email", "") or getattr(account, "username", "")) if account is not None else ""
+        person = {"email": email if "@" in email else ""}
+        if not email:
+            return person
+        try:
+            contact = contact_store.find_by_email(self.contacts_path, email)
+        except Exception as exc:
+            _log.debug("Карточка сотрудника для подписи не найдена: %s", exc)
+            contact = None
+        if contact is not None:
+            person.update(
+                name=contact.display_name, title=contact.title, department=contact.department,
+                phone=contact.phone, organization=contact.organization,
+            )
+        return person
+
+    def _compose_signatures(self) -> list[Signature]:
+        """Подписи для окна письма; фирменная подпись оформления организации
+        обновляется по шаблону и данным сотрудника перед каждым письмом.
+        Если своей подписи по умолчанию нет — фирменная становится ей."""
+        brand = app_theme.current_brand()
+        if brand is None or not brand.signature_html.strip():
+            return self.signatures
+        signature_id = f"brand-{brand.id}"
+        body = branding.render_signature(brand, self._my_person_data())
+        existing = next((sig for sig in self.signatures if sig.id == signature_id), None)
+        changed = False
+        if existing is None:
+            self.signatures.append(Signature(id=signature_id, name=f"Фирменная: {brand.name}", body_html=body))
+            changed = True
+        elif existing.body_html != body:
+            existing.body_html = body
+            changed = True
+        try:
+            if changed:
+                save_signatures(self.signatures)
+            if not self.default_signature_id:
+                self.default_signature_id = signature_id
+                save_default_signature_id(signature_id)
+        except Exception as exc:
+            _log.warning("Фирменная подпись не сохранена: %s", exc)
+        return self.signatures
+
     def on_compose(self) -> None:
         if not self.smtp_account:
             QMessageBox.warning(
@@ -11715,7 +12109,7 @@ class MainWindow(QMainWindow):
             self,
             title="Новое письмо",
             contacts=self._load_contacts(),
-            signatures=self.signatures,
+            signatures=self._compose_signatures(),
             default_signature_id=self.default_signature_id,
             greeting=greeting_text(load_greeting_mode()),
         )
@@ -11779,7 +12173,7 @@ class MainWindow(QMainWindow):
             subject=subject,
             body=body,
             contacts=self._load_contacts(),
-            signatures=self.signatures,
+            signatures=self._compose_signatures(),
             default_signature_id=self.default_signature_id,
             greeting=greeting_text(load_greeting_mode()),
         )
@@ -11905,7 +12299,7 @@ class MainWindow(QMainWindow):
                     )
                     for a in content.attachments
                 ],
-                signatures=self.signatures,
+                signatures=self._compose_signatures(),
                 default_signature_id=self.default_signature_id,
                 greeting=greeting_text(load_greeting_mode()),
                 **kwargs,
@@ -12005,14 +12399,18 @@ class MainWindow(QMainWindow):
             self._apply_domain_rewrites(dialog.bcc_recipients()),
         )
 
+        # Колонтитул организации (например, о конфиденциальности) — только в
+        # отправляемое письмо, не в черновик: иначе он копился бы при каждом
+        # сохранении.
+        branded_html, branded_text = branding.with_footer(app_theme.current_brand(), dialog.body_html(), dialog.body())
         message = OutgoingMessage(
             sender=self.account.username,
             to=recipients,
             cc=cc_recipients,
             bcc=bcc_recipients,
             subject=dialog.subject(),
-            body=dialog.body(),
-            html_body=dialog.body_html(),
+            body=branded_text,
+            html_body=branded_html,
             inline_images=dialog.inline_images(),
             in_reply_to=in_reply_to,
             attachments=dialog.attachments,
@@ -12189,7 +12587,7 @@ class MainWindow(QMainWindow):
             subject=subject,
             body=body,
             contacts=self._load_contacts(),
-            signatures=self.signatures,
+            signatures=self._compose_signatures(),
             default_signature_id=self.default_signature_id,
             greeting=greeting_text(load_greeting_mode()),
         )

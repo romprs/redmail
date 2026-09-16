@@ -946,6 +946,7 @@ def _window_stub(**overrides):
         account=SimpleNamespace(username="me@example.com"),
         smtp_account=object(),
         signatures=[],
+        _compose_signatures=lambda: [],
         default_signature_id=None,
         mail_rules=[],
         mailbox=None,

@@ -1,0 +1,21 @@
+{
+  "id": "primer-organizacii",
+  "name": "Пример организации",
+  "organization": "ООО «Пример»",
+  "base": "light",
+  "colors": {
+    "accent": "#0079C2",
+    "accent_text": "#FFFFFF",
+    "window": "#F4F7FA",
+    "border": "#C9D6E2"
+  },
+  "font": {"family": "PT Sans", "size": 10},
+  "letter": {
+    "font_family": "PT Sans",
+    "font_size": 11,
+    "text_color": "#1B1B1B",
+    "footer_html": "<p style=\"color:#777777;font-size:9pt\">Сообщение и вложения предназначены только для адресатов.</p>"
+  },
+  "signature_html": "<p>С уважением,<br>{name}<br>{title}<br>{department}<br>{organization}<br>Тел.: {phone}<br>{email}</p>",
+  "default": false
+}
