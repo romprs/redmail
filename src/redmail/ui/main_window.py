@@ -213,6 +213,7 @@ from redmail.mailbox import ArchiveSource, CachedMailbox
 from redmail import (
     address_rules,
     autoarchive,
+    calendar_mail,
     calendar_sync,
     ews_calendar,
     html_cleanup,
@@ -5499,11 +5500,11 @@ class MainWindow(QMainWindow):
 
         mail_actions_toolbar = QToolBar("Письмо", self)
         mail_actions_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        # Ответить / Ответить всем / Переслать живут в шапке открытого
+        # письма, рядом с тем, на что отвечают (пожелание пользователя), —
+        # в верхней панели остались действия над списком писем.
         for action in (
             compose_action,
-            self.reply_action,
-            self.reply_all_action,
-            self.forward_action,
             self.delete_action,
             self.archive_selected_action,
         ):
@@ -5515,9 +5516,6 @@ class MainWindow(QMainWindow):
         # способом экономии места, что и раньше.
         for labelled_action in (
             compose_action,
-            self.reply_action,
-            self.reply_all_action,
-            self.forward_action,
             self.delete_action,
         ):
             button = mail_actions_toolbar.widgetForAction(labelled_action)
@@ -5666,10 +5664,25 @@ class MainWindow(QMainWindow):
         self._header_to = ""
         self._header_cc = ""
         header_layout.addWidget(self.message_header_label, 1)
+        header_buttons = QVBoxLayout()
+        header_buttons.setSpacing(6)
+        reply_row = QHBoxLayout()
+        reply_row.setSpacing(6)
+        self.header_reply_buttons: list[QToolButton] = []
+        for action in (self.reply_action, self.reply_all_action, self.forward_action):
+            button = QToolButton(self.message_header_widget)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setAutoRaise(False)
+            reply_row.addWidget(button)
+            self.header_reply_buttons.append(button)
+        header_buttons.addLayout(reply_row)
         self.open_message_window_button = QPushButton("Открыть в окне", self.message_header_widget)
         self.open_message_window_button.setToolTip("Открыть письмо в отдельном окне")
         self.open_message_window_button.clicked.connect(self.on_open_message_window)
-        header_layout.addWidget(self.open_message_window_button)
+        header_buttons.addWidget(self.open_message_window_button, 0, Qt.AlignmentFlag.AlignRight)
+        header_buttons.addStretch(1)
+        header_layout.addLayout(header_buttons)
         # Жалоба: "заголовок письма... занимает от 50% до 100%, должен
         # занимать 4 строки" — без явной политики размера QVBoxLayout ниже
         # (reading_layout) мог отдавать этому виджету всё "лишнее" место
@@ -6173,6 +6186,7 @@ class MainWindow(QMainWindow):
         self._apply_font_scale(initial_font_scale)
 
         self._calendar_sync_running = False
+        self._calendar_changed_in_background = False
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._on_periodic_refresh)
         self._restart_poll_timer()
@@ -6556,6 +6570,7 @@ class MainWindow(QMainWindow):
         self.mailbox_trash_folders[key] = session.trash_folder()
         self.mailbox_sent_folders[key] = session.sent_folder()
         self.mailbox_drafts_folders[key] = session.drafts_folder()
+        self.mailboxes[key].content_hook = self._calendar_hook_for(account, self.mailbox_drafts_folders[key])
 
         default_item = self._populate_account_folder_tree(key, folders)
 
@@ -8144,6 +8159,9 @@ class MainWindow(QMainWindow):
         def on_done(stats: object) -> None:
             finish()
             _log.info("Полная синхронизация %s: новых %d, удалено %d, тел скачано %d", key, stats.added, stats.deleted, stats.bodies_downloaded)
+            if self._calendar_changed_in_background:
+                self._calendar_changed_in_background = False
+                self.refresh_calendar_view()
             if self.active_source is mailbox and self.current_folder:
                 try:
                     self._render_folder(mailbox.folder_summaries(self.current_folder))
@@ -9473,27 +9491,54 @@ class MainWindow(QMainWindow):
                 item.setText(_thread_subject_text(summary, info, info is not None and info.key in self._expanded_threads))
             self._refresh_cards()
 
-    def _update_invite_bar(self, content: MessageContent) -> None:
-        calendar_part = next((a for a in content.attachments if a.content_type == "text/calendar"), None)
-        if calendar_part is None or not self.account:
-            return
-        try:
-            invite = itip.parse_invite(calendar_part.payload, my_email=self.account.username)
-        except Exception:
-            return  # повреждённый или непонятный .ics — просто не показываем панель
+    def _calendar_hook_for(self, account, drafts_folder: str | None):
+        """Разбор календарных вложений в письмах, скачанных фоном: приглашения
+        и .ics попадают в календарь, даже если письмо не открывали. Работает
+        в потоке докачки — окна не трогает, только отмечает, что календарь
+        нужно перерисовать."""
+        my_email = getattr(account, "email", "") or getattr(account, "username", "")
+        calendar_path = self.calendar_path
 
+        def hook(folder: str, _uid: int, content) -> None:
+            if drafts_folder and folder == drafts_folder:
+                return
+            if not calendar_mail.has_calendar_data(content):
+                return
+            if calendar_mail.apply_calendar_parts(calendar_path, content, my_email):
+                self._calendar_changed_in_background = True
+
+        return hook
+
+    def _update_invite_bar(self, content: MessageContent) -> None:
+        if not self.account or not calendar_mail.has_calendar_data(content):
+            return
+        my_email = getattr(self.account, "email", "") or self.account.username
         try:
-            self._apply_invite_to_calendar(invite)
+            results = calendar_mail.apply_calendar_parts(self.calendar_path, content, my_email)
         except Exception as exc:
             # Не проглатывать молча — иначе панель приглашения просто не
-            # появляется без единого следа, почему (так уже терялось видимое
-            # состояние календаря один раз — см. миграцию схемы в
-            # calendar_store.py).
+            # появляется без единого следа, почему.
             QMessageBox.critical(self, "Не удалось обработать приглашение", str(exc))
+            return
+        if not results:
+            return
+        result = results[0]
+        if result.method == "PUBLISH":
+            names = ", ".join(f"«{event.summary}»" for event in result.imported[:3])
+            more = f" и ещё {len(result.imported) - 3}" if len(result.imported) > 3 else ""
+            self.current_invite = None
+            self.invite_label.setText(f"Добавлено в календарь из вложения: {names}{more} — {_format_event_time(result.event)}")
+            for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+                button.setEnabled(False)
+            self.invite_bar.show()
+        else:
+            self._show_invite_result(result)
+        self.refresh_calendar_view()
 
-    def _apply_invite_to_calendar(self, invite: itip.IncomingInvite) -> None:
-        if invite.method == "REQUEST":
-            event = calendar_store.apply_invite(self.calendar_path, "REQUEST", invite.event)
+    def _show_invite_result(self, result) -> None:
+        invite = result.invite
+        event = result.event
+        if result.method == "REQUEST":
             self.current_invite = invite
             when = _format_event_time(event)
             text = f"Приглашение: «{event.summary}» — {when}"
@@ -9506,28 +9551,18 @@ class MainWindow(QMainWindow):
             can_respond = bool(self.smtp_account) and event.my_participation == "needs-action"
             for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
                 button.setEnabled(can_respond)
-            self.invite_bar.show()
-        elif invite.method == "CANCEL":
-            calendar_store.apply_invite(self.calendar_path, "CANCEL", invite.event)
+        elif result.method == "CANCEL":
             self.current_invite = None
             self.invite_label.setText(f"Встреча отменена: «{invite.event.summary}»")
             for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
                 button.setEnabled(False)
-            self.invite_bar.show()
-        elif invite.method == "REPLY" and invite.replying_attendee_email:
-            participation = next(
-                (a.participation for a in invite.event.attendees if a.email == invite.replying_attendee_email),
-                "needs-action",
-            )
-            calendar_store.apply_reply(
-                self.calendar_path, invite.event.uid, invite.replying_attendee_email, participation
-            )
+        else:
             self.current_invite = None
-            label = _PARTICIPATION_LABELS.get(participation, participation)
-            self.invite_label.setText(f"{invite.replying_attendee_email}: {label} — «{invite.event.summary}»")
+            label = _PARTICIPATION_LABELS.get(result.participation, result.participation)
+            self.invite_label.setText(f"{result.replying_attendee}: {label} — «{invite.event.summary}»")
             for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
                 button.setEnabled(False)
-            self.invite_bar.show()
+        self.invite_bar.show()
 
     def on_invite_response(self, participation: str) -> None:
         if self.current_invite is None or not self.account:

@@ -462,6 +462,11 @@ def apply_invite(path: Path, method: str, event: Event) -> Event:
         # Повторная присылка того же приглашения не должна затирать уже
         # отправленный организатору ответ на него.
         event.my_participation = existing.my_participation
+        # И не должна перекладывать встречу в другой календарь: Exchange
+        # сам кладёт приглашение в свой календарь, а письмо с ним приходит
+        # следом — без этого встреча прыгала между календарями.
+        event.calendar_id = existing.calendar_id
+        event.color = event.color or existing.color
     if method == "CANCEL":
         if existing is not None:
             existing.status = "cancelled"

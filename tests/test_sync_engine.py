@@ -195,3 +195,27 @@ def test_initial_sync_does_not_fetch_headers_twice(tmp_path: Path) -> None:
         sync_engine.sync_folder_headers(server, "acc", "Sent")
 
     assert len(server.summary_calls) == 1
+
+
+def test_downloaded_bodies_are_passed_to_content_hook(tmp_path: Path) -> None:
+    """По скачанным телам окно разбирает приглашения — даже если письмо не открывали."""
+    server = Server(2)
+    seen: list[tuple[str, int]] = []
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+        sync_engine.download_bodies(server, "acc", on_content=lambda folder, uid, content: seen.append((folder, uid)))
+
+    assert sorted(seen) == [("INBOX", 1), ("INBOX", 2)]
+
+
+def test_failing_content_hook_does_not_stop_download(tmp_path: Path) -> None:
+    server = Server(2)
+
+    def broken(folder, uid, content):
+        raise RuntimeError("календарь занят")
+
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+        downloaded = sync_engine.download_bodies(server, "acc", on_content=broken)
+
+    assert downloaded == 2

@@ -246,8 +246,11 @@ def download_bodies(
     stop: threading.Event | None = None,
     limit: int | None = None,
     skip_folders: tuple[str, ...] = (),
+    on_content: Callable[[str, int, object], None] | None = None,
 ) -> int:
     """Докачивает тела писем, которых ещё нет локально, от новых к старым.
+    on_content(folder, uid, content) вызывается для каждого скачанного тела —
+    так в календарь попадают приглашения из писем, которые не открывали.
     Письма больше max_bytes помечаются как отложенные (скачаются при
     открытии). Возвращает число скачанных."""
     downloaded = 0
@@ -276,6 +279,11 @@ def download_bodies(
                 cache_store.set_body_state(account_key, folder, uid, "deferred")
                 continue
             cache_store.save_message_content(account_key, folder, uid, content)
+            if on_content is not None:
+                try:
+                    on_content(folder, uid, content)
+                except Exception as exc:
+                    _log.warning("Письмо %s/%d: разбор после скачивания не удался: %s", folder, uid, exc)
             downloaded += 1
             # Пауза между письмами: разбор MIME и запись больших вложений
             # держат GIL, без передышки окно становилось вялым.

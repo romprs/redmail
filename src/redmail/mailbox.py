@@ -35,6 +35,9 @@ class CachedMailbox:
         self._account = account
         self._account_key = f"{account.host}:{account.username}"
         self.body_max_bytes = body_max_bytes
+        # Вызывается для каждого тела, скачанного фоновой докачкой
+        # (folder, uid, content) — окно разбирает в нём приглашения.
+        self.content_hook = None
         # Второе соединение для действий пользователя (открыть письмо,
         # переслать): основное занято фоновой синхронизацией и автоархивом
         # по одной команде за раз, и открытие письма ждало их очередь
@@ -99,7 +102,7 @@ class CachedMailbox:
         with self._bodies_lock:
             return sync_engine.download_bodies(
                 self.session, self._account_key, max_bytes=self.body_max_bytes, progress=progress, stop=stop, limit=limit,
-                skip_folders=self.skip_body_folders,
+                skip_folders=self.skip_body_folders, on_content=self.content_hook,
             )
 
     def interactive_session(self):
