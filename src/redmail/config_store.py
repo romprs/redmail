@@ -91,16 +91,28 @@ def save_disabled_accounts(keys: list[str]) -> None:
     _save_settings_dict(data)
 
 
-def load_domain_rewrites() -> str:
-    """Правила замены домена у получателей при отправке (текстом, по одному
-    в строке: «старый = новый»). Нужны на время переезда между почтовыми
-    системами, когда у людей два адреса."""
-    return str(_load_settings_dict().get("domain_rewrites", "") or "")
+def load_domain_rewrites(account_key: str) -> str:
+    """Правила замены домена у получателей при отправке с этой учётной
+    записи (текстом, по одному в строке: «старый = новый»). Нужны на время
+    переезда между почтовыми системами, когда у людей два адреса.
 
-
-def save_domain_rewrites(text: str) -> None:
+    У каждой записи свои правила: письмо через VK надо слать на новый
+    адрес, а через Exchange — на прежний (замечание: «поле сопоставления
+    доменов влияет на все учётки»). До сборки 117 правила были общими — пока
+    их не разнесли по записям, общие действуют для каждой."""
     data = _load_settings_dict()
-    data["domain_rewrites"] = str(text or "")
+    by_account = data.get("domain_rewrites_by_account")
+    if isinstance(by_account, dict):
+        return str(by_account.get(account_key, "") or "")
+    return str(data.get("domain_rewrites", "") or "")
+
+
+def save_domain_rewrites_by_account(rules: dict[str, str]) -> None:
+    data = _load_settings_dict()
+    data["domain_rewrites_by_account"] = {
+        str(key): str(text).strip() for key, text in rules.items() if str(text or "").strip()
+    }
+    data.pop("domain_rewrites", None)
     _save_settings_dict(data)
 
 
@@ -212,15 +224,24 @@ def in_maintenance_window(now: datetime | None = None) -> bool:
     return hour >= start or hour < end
 
 
-def load_auto_archive_delete_on_server() -> bool:
-    """Удалять ли письма с сервера после переноса в архив. По умолчанию
-    НЕТ: автоархив только освобождает локальную базу."""
-    return bool(_load_settings_dict().get("auto_archive_delete_on_server", False))
+def delete_on_server_for(account_key: str) -> bool:
+    """Удалять ли письма с сервера после переноса в архив для этой учётной
+    записи. По умолчанию НЕТ: автоархив только освобождает локальную базу.
 
-
-def save_auto_archive_delete_on_server(enabled: bool) -> None:
+    Настройка у каждой записи своя: на время переезда старый ящик можно
+    чистить, а новый — нет. До сборки 117 галочка была одна на все записи —
+    пока её не разнесли, она действует для каждой."""
     data = _load_settings_dict()
-    data["auto_archive_delete_on_server"] = bool(enabled)
+    keys = data.get("auto_archive_delete_on_server_accounts")
+    if isinstance(keys, list):
+        return account_key in keys
+    return bool(data.get("auto_archive_delete_on_server", False))
+
+
+def save_delete_on_server_accounts(keys: list[str]) -> None:
+    data = _load_settings_dict()
+    data["auto_archive_delete_on_server_accounts"] = sorted({str(key) for key in keys})
+    data.pop("auto_archive_delete_on_server", None)
     _save_settings_dict(data)
 
 

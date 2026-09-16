@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import html
 import math
 import os
@@ -137,7 +138,7 @@ from redmail.config_store import (
     load_default_signature_id,
     load_ews_accounts,
     load_auto_archive_confirmed,
-    load_auto_archive_delete_on_server,
+    delete_on_server_for,
     load_auto_archive_enabled,
     load_maintenance_window,
     load_disabled_accounts,
@@ -169,11 +170,11 @@ from redmail.config_store import (
     save_caldav_url,
     save_default_signature_id,
     save_auto_archive_confirmed,
-    save_auto_archive_delete_on_server,
+    save_delete_on_server_accounts,
     save_auto_archive_enabled,
     save_maintenance_window,
     save_disabled_accounts,
-    save_domain_rewrites,
+    save_domain_rewrites_by_account,
     save_tls_ca_file,
     save_auto_archive_size_mb,
     save_body_max_size_mb,
@@ -2131,13 +2132,13 @@ class SettingsDialog(QDialog):
         auto_archive_size_mb: int = 500,
         storage_stats: dict | None = None,
         auto_archive_enabled: bool = True,
-        auto_archive_delete_on_server: bool = False,
         maintenance_window: tuple[bool, int, int] = (False, 22, 7),
         tls_ca_file: str = "",
-        domain_rewrites: str = "",
         font_scale: float = 1.0,
         accounts: list[tuple[str, str]] | None = None,
         disabled_accounts: tuple[str, ...] = (),
+        delete_on_server_accounts: tuple[str, ...] = (),
+        domain_rewrites_by_account: dict[str, str] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
@@ -2210,23 +2211,6 @@ class SettingsDialog(QDialog):
         smtp_form.addRow(self.smtp_ssl_check)
         smtp_form.addRow(self.smtp_test_button)
         smtp_form.addRow(self.smtp_test_status)
-        # Переезд между почтовыми системами: у человека два адреса, письма
-        # надо слать на адрес нового сервера, а в книге и в переписке
-        # остаются старые (жалоба: "почта по старым адресам не уходит").
-        self.domain_rewrites_edit = QPlainTextEdit(domain_rewrites, self)
-        self.domain_rewrites_edit.setPlaceholderText("amurgpz.ru = vk.corp.amurgpz.ru")
-        self.domain_rewrites_edit.setFixedHeight(70)
-        rewrite_hint = QLabel(
-            "По одному правилу в строке: старый домен = новый. Заменяется только при отправке, "
-            "в адресной книге и письмах адреса остаются прежними.", self,
-        )
-        rewrite_hint.setWordWrap(True)
-        rewrite_form = QFormLayout()
-        rewrite_form.addRow("Замена домена получателей", self.domain_rewrites_edit)
-        rewrite_form.addRow(rewrite_hint)
-        rewrite_group = QGroupBox("Переезд на другой сервер")
-        rewrite_group.setLayout(rewrite_form)
-
         smtp_group = QGroupBox("Исходящая почта (SMTP) — тот же логин и пароль")
         smtp_group.setLayout(smtp_form)
 
@@ -2322,15 +2306,45 @@ class SettingsDialog(QDialog):
             self.accounts_list.addItem(item)
         accounts_hint = QLabel(
             "Снятая галочка — запись выключена: она не подключается, её письма не загружаются, "
-            "но настройки и уже скачанная почта сохраняются. Включение действует после перезапуска программы.",
+            "но настройки и уже скачанная почта сохраняются. Вернули галочку — запись подключается сразу.",
             self,
         )
         accounts_hint.setWordWrap(True)
+
+        # Настройки выбранной в списке записи. Раньше удаление с сервера и
+        # замена доменов были общими на все записи (замечание: «для каждой
+        # своя настройка», «поле сопоставления доменов влияет на все учётки»).
+        self._options_account_key: str | None = None
+        self._delete_on_server: dict[str, bool] = {key: key in (delete_on_server_accounts or ()) for key, _t in (accounts or [])}
+        self._domain_rewrites: dict[str, str] = {
+            key: (domain_rewrites_by_account or {}).get(key, "") for key, _t in (accounts or [])
+        }
+        self.account_delete_check = QCheckBox("Удалять письма с сервера после переноса в архив (необратимо)", self)
+        self.account_rewrites_edit = QPlainTextEdit(self)
+        self.account_rewrites_edit.setPlaceholderText("amurgpz.ru = vk.corp.amurgpz.ru")
+        self.account_rewrites_edit.setFixedHeight(70)
+        rewrite_hint = QLabel(
+            "Переезд на другой сервер: по одному правилу в строке, старый домен = новый. Действует только "
+            "для писем, отправленных с этой учётной записи; в адресной книге и письмах адреса остаются прежними.",
+            self,
+        )
+        rewrite_hint.setWordWrap(True)
+        account_options_form = QFormLayout()
+        account_options_form.addRow(self.account_delete_check)
+        account_options_form.addRow("Замена домена получателей", self.account_rewrites_edit)
+        account_options_form.addRow(rewrite_hint)
+        self.account_options_group = QGroupBox("Настройки учётной записи", self)
+        self.account_options_group.setLayout(account_options_form)
+        self.accounts_list.currentRowChanged.connect(self._on_account_row_changed)
 
         accounts_rules_layout = QVBoxLayout()
         if accounts:
             accounts_rules_layout.addWidget(self.accounts_list)
             accounts_rules_layout.addWidget(accounts_hint)
+            accounts_rules_layout.addWidget(self.account_options_group)
+            self.accounts_list.setCurrentRow(0)
+        else:
+            self.account_options_group.hide()
         accounts_rules_layout.addWidget(add_account_button)
         accounts_rules_layout.addWidget(add_ews_account_button)
         accounts_rules_layout.addWidget(mail_rules_button)
@@ -2349,7 +2363,7 @@ class SettingsDialog(QDialog):
         # экран (жалоба: "окно параметров не входит на экран — сделай
         # вкладки, разнеси функционал").
         tabs = QTabWidget(self)
-        tabs.addTab(_settings_tab(imap_group, smtp_group, rewrite_group), "Почта")
+        tabs.addTab(_settings_tab(imap_group, smtp_group), "Почта")
         tabs.addTab(_settings_tab(general_group, archive_dir_group), "Общие")
         layout = QVBoxLayout(self)
 
@@ -2368,8 +2382,6 @@ class SettingsDialog(QDialog):
         self.body_max_size_edit.setValue(int(body_max_size_mb))
         self.auto_archive_check = QCheckBox("Автоархив по размеру базы: самые старые письма — в файл архива", self)
         self.auto_archive_check.setChecked(bool(auto_archive_enabled))
-        self.auto_archive_delete_check = QCheckBox("Удалять письма с сервера после переноса в архив (необратимо)", self)
-        self.auto_archive_delete_check.setChecked(bool(auto_archive_delete_on_server))
         self.auto_archive_size_edit = QSpinBox(self)
         self.auto_archive_size_edit.setRange(50, 100000)
         self.auto_archive_size_edit.setSuffix(" МБ")
@@ -2406,7 +2418,12 @@ class SettingsDialog(QDialog):
         storage_form.addRow("Не скачивать фоном письма больше", self.body_max_size_edit)
         storage_form.addRow(self.auto_archive_check)
         storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
-        storage_form.addRow(self.auto_archive_delete_check)
+        delete_hint = QLabel(
+            "Удалять ли письма с сервера после переноса в архив, задаётся для каждой учётной записи "
+            "на вкладке «Учётные записи».", self,
+        )
+        delete_hint.setWordWrap(True)
+        storage_form.addRow(delete_hint)
         storage_form.addRow(self.maintenance_check)
         storage_form.addRow("Часы обслуживания", maintenance_row)
         storage_form.addRow(storage_stats_label)
@@ -2594,14 +2611,35 @@ class SettingsDialog(QDialog):
     def auto_archive_enabled(self) -> bool:
         return self.auto_archive_check.isChecked()
 
-    def auto_archive_delete_on_server(self) -> bool:
-        return self.auto_archive_delete_check.isChecked()
 
     def tls_ca_file(self) -> str:
         return self.tls_ca_edit.text().strip()
 
-    def domain_rewrites(self) -> str:
-        return self.domain_rewrites_edit.toPlainText().strip()
+    def delete_on_server_accounts(self) -> list[str]:
+        self._store_account_options()
+        return sorted(key for key, enabled in self._delete_on_server.items() if enabled)
+
+    def domain_rewrites_by_account(self) -> dict[str, str]:
+        self._store_account_options()
+        return {key: text for key, text in self._domain_rewrites.items() if text.strip()}
+
+    def _store_account_options(self) -> None:
+        """Запоминает правки полей выбранной записи перед переходом к другой."""
+        key = self._options_account_key
+        if key is None:
+            return
+        self._delete_on_server[key] = self.account_delete_check.isChecked()
+        self._domain_rewrites[key] = self.account_rewrites_edit.toPlainText().strip()
+
+    def _on_account_row_changed(self, row: int) -> None:
+        self._store_account_options()
+        item = self.accounts_list.item(row) if row >= 0 else None
+        key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+        self._options_account_key = key
+        self.account_options_group.setEnabled(key is not None)
+        self.account_options_group.setTitle(f"Настройки: {item.text()}" if item is not None else "Настройки учётной записи")
+        self.account_delete_check.setChecked(bool(self._delete_on_server.get(key, False)))
+        self.account_rewrites_edit.setPlainText(self._domain_rewrites.get(key, ""))
 
     def font_scale(self) -> float:
         return self.font_scale_spin.value() / 100
@@ -5586,7 +5624,6 @@ class MainWindow(QMainWindow):
         self.sort_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.sort_button.setMenu(self._build_sort_menu())
         self.thread_grouping = load_thread_grouping()
-        self.domain_rewrites = address_rules.parse_rules(load_domain_rewrites())
         self.thread_grouping_action.setChecked(self.thread_grouping)
         view_group = QActionGroup(self)
         view_group.setExclusive(True)
@@ -6770,6 +6807,35 @@ class MainWindow(QMainWindow):
 
         walk(root)
 
+    @contextmanager
+    def _account_context(self, key: str | None):
+        """На время блока делает запись key «текущей» (self.account,
+        self.mailbox, SMTP, папки) и затем возвращает прежнюю — если за это
+        время пользователь сам не переключился на другую запись."""
+        if key is None or key not in self.mailboxes:
+            yield
+            return
+        names = (
+            "account", "mailbox", "smtp_account", "account_protocol", "account_root",
+            "trash_folder_name", "sent_folder_name", "drafts_folder_name",
+        )
+        saved = {name: getattr(self, name, None) for name in names}
+        chosen = self.mailboxes[key]
+        self.account = self.mailbox_accounts[key]
+        self.mailbox = chosen
+        self.smtp_account = self.mailbox_smtp_accounts.get(key)
+        self.account_protocol = self.mailbox_protocols.get(key, "imap")
+        self.account_root = self.mailbox_tree_roots.get(key)
+        self.trash_folder_name = self.mailbox_trash_folders.get(key)
+        self.sent_folder_name = self.mailbox_sent_folders.get(key)
+        self.drafts_folder_name = self.mailbox_drafts_folders.get(key)
+        try:
+            yield
+        finally:
+            if self.mailbox is chosen and saved["mailbox"] in self.mailboxes.values():
+                for name, value in saved.items():
+                    setattr(self, name, value)
+
     def _mailbox_key(self, mailbox=None) -> str | None:
         target = self.mailbox if mailbox is None else mailbox
         return next((k for k, m in self.mailboxes.items() if m is target), None)
@@ -7498,6 +7564,7 @@ class MainWindow(QMainWindow):
         # смысла: там своё подключение (кнопка «Подключить Exchange»).
         imap_account = self.account if self.account_protocol == "imap" else None
         smtp_account = self.smtp_account if self.account_protocol == "imap" else None
+        known_accounts = self._known_accounts()
         dialog = SettingsDialog(
             self,
             account=imap_account,
@@ -7511,12 +7578,12 @@ class MainWindow(QMainWindow):
             auto_archive_size_mb=load_auto_archive_size_mb(),
             storage_stats=self._storage_stats(),
             auto_archive_enabled=load_auto_archive_enabled(),
-            auto_archive_delete_on_server=load_auto_archive_delete_on_server(),
             maintenance_window=load_maintenance_window(),
             tls_ca_file=load_tls_ca_file(),
-            domain_rewrites=load_domain_rewrites(),
-            accounts=self._known_accounts(),
+            accounts=known_accounts,
             disabled_accounts=tuple(load_disabled_accounts()),
+            delete_on_server_accounts=tuple(key for key, _title in known_accounts if delete_on_server_for(key)),
+            domain_rewrites_by_account={key: load_domain_rewrites(key) for key, _title in known_accounts},
             font_scale=load_font_scale(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
@@ -7537,12 +7604,11 @@ class MainWindow(QMainWindow):
             save_body_max_size_mb(dialog.body_max_size_mb())
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
             save_auto_archive_enabled(dialog.auto_archive_enabled())
-            save_auto_archive_delete_on_server(dialog.auto_archive_delete_on_server())
+            save_delete_on_server_accounts(dialog.delete_on_server_accounts())
             save_maintenance_window(*dialog.maintenance_window())
             save_tls_ca_file(dialog.tls_ca_file())
             tls_trust.apply_trust(dialog.tls_ca_file())
-            save_domain_rewrites(dialog.domain_rewrites())
-            self.domain_rewrites = address_rules.parse_rules(dialog.domain_rewrites())
+            save_domain_rewrites_by_account(dialog.domain_rewrites_by_account())
             self._apply_disabled_accounts(dialog.disabled_accounts())
             if abs(dialog.font_scale() - load_font_scale()) > 0.001:
                 # Тот же путь, что у ползунка в строке состояния.
@@ -8294,7 +8360,7 @@ class MainWindow(QMainWindow):
             return
         self._autoarchive_exhausted.discard(key)
         confirmed = load_auto_archive_confirmed()
-        delete_on_server = load_auto_archive_delete_on_server()
+        delete_on_server = delete_on_server_for(key)
         if delete_on_server and key not in confirmed:
             # Вопрос только когда включено удаление с сервера: это
             # необратимо. В режиме по умолчанию (сервер не трогаем)
@@ -11122,15 +11188,22 @@ class MainWindow(QMainWindow):
         писем независимы, их может быть несколько, почту можно читать,
         пока пишешь. Результат обрабатывается по сигналу finished."""
         self._compose_windows.append(dialog)
+        # Учётная запись, в которой начали письмо. Окно немодальное: пока
+        # пишешь, можно щёлкнуть папку другой записи, и раньше письмо уходило
+        # через ту, что открыта в момент «Отправить» — с чужим отправителем и
+        # чужими правилами замены доменов.
+        compose_account_key = self._mailbox_key()
 
         def on_finished(result: int) -> None:
             if dialog in self._compose_windows:
                 self._compose_windows.remove(dialog)
             try:
                 if result == QDialog.DialogCode.Accepted:
-                    self._on_compose_accepted(
-                        dialog, in_reply_to=in_reply_to, source_draft=source_draft, reply_source=reply_source
-                    )
+                    with self._account_context(compose_account_key):
+                        self._on_compose_accepted(
+                            dialog, in_reply_to=in_reply_to, source_draft=source_draft, reply_source=reply_source,
+                            account_key=compose_account_key,
+                        )
             finally:
                 dialog.deleteLater()
 
@@ -11147,6 +11220,7 @@ class MainWindow(QMainWindow):
         in_reply_to: str | None,
         source_draft: tuple[str, int] | None,
         reply_source: tuple[object, str, int] | None,
+        account_key: str | None = None,
     ) -> None:
         if dialog.save_as_draft_requested():
             self._save_draft(dialog, source_draft=source_draft)
@@ -11176,24 +11250,8 @@ class MainWindow(QMainWindow):
         )
 
         def after_send() -> None:
-            self._append_sent_copy(message)
-            if source_draft is not None:
-                self._delete_draft(source_draft)
-            if reply_source is not None:
-                self._mark_summary_answered(*reply_source)
-            # "Отправленные" раньше обновлялись только по кнопке "Обновить"
-            # (жалоба: "папка отправленные обновляется только принудительно,
-            # должна сразу после отправки") — folder_summaries() при обычном
-            # переключении на папку безусловно доверяет кэшу, не проверяя
-            # exists_count на сервере, поэтому только что добавленное копией
-            # письмо не появлялось само по себе. Мы только что сами
-            # добавили его в "Отправленные" (см. _append_sent_copy) —
-            # обновляем кэш этой папки сразу, не дожидаясь следующего
-            # ручного "Обновить" или счастливого совпадения exists_count.
-            if self.account_protocol == "imap" and self.sent_folder_name and self.mailbox is not None:
-                # В фоне: сетевой запрос в потоке интерфейса подвешивал окно
-                # сразу после отправки.
-                self._sync_folders_async([self.sent_folder_name])
+            with self._account_context(account_key):
+                self._after_send(message, source_draft, reply_source)
 
         # Раньше отправка шла синхронно прямо здесь — окно подвисало на
         # время SMTP-разговора с сервером, как и у календарных приглашений
@@ -11206,11 +11264,41 @@ class MainWindow(QMainWindow):
             on_success_extra=after_send,
         )
 
+    def _after_send(self, message, source_draft, reply_source) -> None:
+        """Копия в «Отправленные», удаление черновика, отметка «отвечено» —
+        в учётной записи, из которой письмо отправлено."""
+        self._append_sent_copy(message)
+        if source_draft is not None:
+            self._delete_draft(source_draft)
+        if reply_source is not None:
+            self._mark_summary_answered(*reply_source)
+        # "Отправленные" раньше обновлялись только по кнопке "Обновить"
+        # (жалоба: "папка отправленные обновляется только принудительно,
+        # должна сразу после отправки") — folder_summaries() при обычном
+        # переключении на папку безусловно доверяет кэшу, не проверяя
+        # exists_count на сервере, поэтому только что добавленное копией
+        # письмо не появлялось само по себе. Мы только что сами
+        # добавили его в "Отправленные" (см. _append_sent_copy) —
+        # обновляем кэш этой папки сразу, не дожидаясь следующего
+        # ручного "Обновить" или счастливого совпадения exists_count.
+        if self.account_protocol == "imap" and self.sent_folder_name and self.mailbox is not None:
+            # В фоне: сетевой запрос в потоке интерфейса подвешивал окно
+            # сразу после отправки.
+            self._sync_folders_async([self.sent_folder_name])
+
     def _apply_domain_rewrites(self, addresses: list[str]) -> list[str]:
-        """Замена домена получателей по правилам из настроек (переезд между
-        почтовыми системами). Что заменилось — в журнал и в строку состояния."""
-        rules = getattr(self, "domain_rewrites", None) or []
-        if not rules or not addresses:
+        """Замена домена получателей по правилам отправляющей учётной записи
+        (переезд между почтовыми системами). Что заменилось — в журнал и в
+        строку состояния."""
+        if not addresses:
+            return addresses
+        key = self._mailbox_key()
+        try:
+            rules = address_rules.parse_rules(load_domain_rewrites(key)) if key else []
+        except Exception as exc:
+            _log.warning("Правила замены домена не прочитаны: %s", exc)
+            rules = []
+        if not rules:
             return addresses
         rewritten = address_rules.rewrite_recipients(addresses, rules)
         changes = address_rules.describe_changes(addresses, rewritten)

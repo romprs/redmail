@@ -664,3 +664,44 @@ def test_legacy_recovery_without_file_does_nothing(tmp_path: Path) -> None:
     with patch("redmail.config_store._accounts_path", return_value=tmp_path / "accounts.json"), \
          patch("redmail.config_store._config_path", return_value=tmp_path / "account.json"):
         assert config_store.recover_legacy_account() is None
+
+
+def test_domain_rewrites_are_kept_per_account(tmp_path: Path) -> None:
+    """Замена доменов нужна для отправки через VK, но не через Exchange."""
+    settings_file = tmp_path / "settings.json"
+    vk, exchange = "imap:imap.vkm.corp.amurgpz.ru:ivan", "ews:svb-mail.corp.amurgpz.ru:ivan"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        config_store.save_domain_rewrites_by_account({vk: "amurgpz.ru = vk.corp.amurgpz.ru", exchange: ""})
+
+        assert config_store.load_domain_rewrites(vk) == "amurgpz.ru = vk.corp.amurgpz.ru"
+        assert config_store.load_domain_rewrites(exchange) == ""
+
+
+def test_legacy_shared_domain_rewrites_apply_to_every_account_until_split(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"domain_rewrites": "a.ru = b.ru"}), encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert config_store.load_domain_rewrites("imap:x:y") == "a.ru = b.ru"
+        config_store.save_domain_rewrites_by_account({"imap:x:y": "a.ru = b.ru"})
+        assert config_store.load_domain_rewrites("ews:z:y") == ""
+        assert "domain_rewrites" not in json.loads(settings_file.read_text(encoding="utf-8"))
+
+
+def test_delete_on_server_is_set_per_account(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    old, new = "ews:svb-mail.corp.amurgpz.ru:ivan", "imap:imap.vkm.corp.amurgpz.ru:ivan"
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert config_store.delete_on_server_for(old) is False  # по умолчанию сервер не трогаем
+        config_store.save_delete_on_server_accounts([old])
+
+        assert config_store.delete_on_server_for(old) is True
+        assert config_store.delete_on_server_for(new) is False
+
+
+def test_legacy_shared_delete_flag_applies_to_every_account_until_split(tmp_path: Path) -> None:
+    settings_file = tmp_path / "settings.json"
+    settings_file.write_text(json.dumps({"auto_archive_delete_on_server": True}), encoding="utf-8")
+    with patch("redmail.config_store._settings_path", return_value=settings_file):
+        assert config_store.delete_on_server_for("imap:x:y") is True
+        config_store.save_delete_on_server_accounts([])
+        assert config_store.delete_on_server_for("imap:x:y") is False
