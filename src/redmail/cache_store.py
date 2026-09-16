@@ -275,6 +275,32 @@ def get_folder_uids(account_key: str, folder: str, *, include_archived: bool = F
     return {r[0] for r in rows}
 
 
+def uids_without_recipients(account_key: str, folder: str) -> set[int]:
+    """Письма папки без сохранённых получателей — у Exchange до сборки 116
+    колонка «Кому» не заполнялась вовсе."""
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT uid FROM messages WHERE account = ? AND folder = ? AND position >= 0 "
+            "AND archive_path IS NULL AND (recipients_to IS NULL OR recipients_to = '')",
+            (account_key, folder),
+        ).fetchall()
+    return {r[0] for r in rows}
+
+
+def update_recipients(account_key: str, folder: str, rows: list[tuple[int, str, int]]) -> None:
+    """Дописывает получателей (и размер, если он известен) уже сохранённым
+    письмам, не трогая остальное: маркеры, прочитанность, тела."""
+    if not rows:
+        return
+    with closing(_connect()) as conn:
+        conn.executemany(
+            "UPDATE messages SET recipients_to = ?, size = CASE WHEN ? > 0 THEN ? ELSE size END "
+            "WHERE account = ? AND folder = ? AND uid = ?",
+            [(to, size, size, account_key, folder, uid) for uid, to, size in rows],
+        )
+        conn.commit()
+
+
 def get_folder_flags(account_key: str, folder: str) -> dict[int, tuple[bool, bool, str | None]]:
     with closing(_connect()) as conn:
         rows = conn.execute(

@@ -161,3 +161,37 @@ def test_body_download_drops_messages_gone_from_server(tmp_path: Path) -> None:
 
     assert downloaded == 2
     assert remaining == [1, 3]
+
+
+class ServerWithBackfill(Server):
+    """Сессия, которая раньше не отдавала получателей (как Exchange)."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.recipients_backfilled: set[str] = set()
+
+
+def test_recipients_are_backfilled_once_per_folder(tmp_path: Path) -> None:
+    server = ServerWithBackfill(3)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "Sent")  # сохранились без «Кому»
+        server.recipients_backfilled.clear()  # как после обновления программы
+        for uid, summary in server.messages.items():
+            server.messages[uid] = _summary(uid, to=f"user{uid}@x.ru", size=100)
+        server.summary_calls.clear()
+
+        sync_engine.sync_folder_headers(server, "acc", "Sent")
+        sync_engine.sync_folder_headers(server, "acc", "Sent")  # второй раз не дописывает
+
+        stored = {s.uid: s.to for s in cache_store.get_folder_summaries("acc", "Sent", None)}
+
+    assert stored == {1: "user1@x.ru", 2: "user2@x.ru", 3: "user3@x.ru"}
+    assert len(server.summary_calls) == 1
+
+
+def test_initial_sync_does_not_fetch_headers_twice(tmp_path: Path) -> None:
+    server = ServerWithBackfill(3)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "Sent")
+
+    assert len(server.summary_calls) == 1

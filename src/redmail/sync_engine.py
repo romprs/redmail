@@ -126,6 +126,9 @@ def sync_folder_headers(
         result.added += len(summaries)
         _report(progress, f"{folder}: заголовки {done}/{len(new_uids)}", done, len(new_uids))
 
+    # Только что скачанные заголовки уже с получателями — их не трогаем.
+    _backfill_recipients(session, account_key, folder, server_uids - set(new_uids), chunk, stop)
+
     existing = sorted(server_uids & local_uids)
     if existing:
         # Exchange цвет маркера дёшево не отдаёт (см. EwsSession) — у такой
@@ -163,6 +166,27 @@ def sync_folder_headers(
         folder, result.total, result.added, result.deleted, result.flags_updated,
     )
     return result
+
+
+def _backfill_recipients(session, account_key: str, folder: str, server_uids: set[int], chunk: int, stop) -> None:
+    """Один раз за сеанс на папку дописывает получателей письмам, у которых
+    их нет. Нужно сессиям, которые раньше не отдавали получателей
+    (Exchange: колонка «Кому» в «Отправленных» была пустой)."""
+    done = getattr(session, "recipients_backfilled", None)
+    if done is None or folder in done:
+        return
+    done.add(folder)
+    missing = sorted(cache_store.uids_without_recipients(account_key, folder) & server_uids, reverse=True)
+    for part in _chunks(missing, chunk):
+        if _stopped(stop):
+            return
+        summaries = session.fetch_summaries_by_uids(folder, part)
+        cache_store.update_recipients(
+            account_key, folder,
+            [(s.uid, s.to, int(getattr(s, "size", 0) or 0)) for s in summaries if s.to],
+        )
+    if missing:
+        _log.info("Папка %s: получатели дописаны у %d писем", folder, len(missing))
 
 
 #: Признаки того, что сервер попросил притормозить (Exchange/EWS).

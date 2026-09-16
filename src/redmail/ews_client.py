@@ -214,6 +214,9 @@ class EwsSession:
         # лежали сами письма всех папок сразу — на настоящем ящике это
         # съедало и память, и время.
         self._flags: dict[str, dict[int, bool]] = {}
+        # Папки, где получатели уже дописаны старым письмам (см.
+        # sync_engine._backfill_recipients).
+        self.recipients_backfilled: set[str] = set()
 
     def close(self) -> None:
         pass  # exchangelib сам управляет пулом HTTP-соединений, отдельно закрывать нечего
