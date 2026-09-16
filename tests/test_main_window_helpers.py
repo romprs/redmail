@@ -244,3 +244,19 @@ def test_cid_image_found_among_attachments_by_file_name() -> None:
 def test_unknown_cid_reference_is_left_untouched() -> None:
     html = '<img src="cid:missing@x">'
     assert _inline_images_to_data_uris(html, {"other@x": ("image/png", b"1")}) == html
+
+
+def test_thread_members_are_listed_newest_first() -> None:
+    """Внутри группы — от нового к старому, как в списке писем."""
+    from types import SimpleNamespace
+
+    from redmail.ui.main_window import MainWindow
+
+    older = _summary(1, "2026-07-07 10:00", "Проект")
+    newer = _summary(2, "2026-07-07 12:00", "Re: Проект")
+    newest = _summary(3, "2026-07-07 23:51", "Re: Проект")
+    window = SimpleNamespace(current_summaries=[older, newest, newer])
+
+    members = MainWindow._thread_summaries_for(window, older)
+
+    assert [m.uid for m in members] == [3, 2]

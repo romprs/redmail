@@ -9404,12 +9404,13 @@ class MainWindow(QMainWindow):
 
     def _thread_summaries_for(self, summary: MessageSummary) -> list[MessageSummary]:
         """Остальные письма текущей папки с той же темой (без Re:/Fwd:/
-        Ответ:/Пересыл:), отсортированные от старых к новым — не включает
-        само summary."""
+        Ответ:/Пересыл:), от новых к старым, как в списке писем (пожелание:
+        «внутри группы — от нового к старому») — не включает само summary."""
         normalized = _normalize_subject(summary.subject)
         return sorted(
             (s for s in self.current_summaries if s.uid != summary.uid and _normalize_subject(s.subject) == normalized),
-            key=lambda s: s.date,
+            key=lambda s: (s.date, s.uid),
+            reverse=True,
         )
 
     def _render_thread_list(self, summary: MessageSummary) -> None:
@@ -9449,7 +9450,9 @@ class MainWindow(QMainWindow):
             self._render_body(content)
             return
 
-        all_in_thread = sorted([summary, *thread], key=lambda s: s.date)[-_THREAD_DEPTH_LIMIT:]
+        # Самые свежие письма цепочки, сверху новые — тот же порядок, что в
+        # списке писем (раньше лента шла от старых к новым).
+        all_in_thread = sorted([summary, *thread], key=lambda s: (s.date, s.uid), reverse=True)[:_THREAD_DEPTH_LIMIT]
         self._remember_thread_content(summary.uid, content)
         self._thread_render_token += 1
         token = self._thread_render_token
