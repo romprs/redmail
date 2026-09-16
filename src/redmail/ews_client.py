@@ -344,6 +344,17 @@ class EwsSession:
             self._flags = {folder: flags}
         return list(flags)
 
+    def folder_unseen_count(self, folder: str) -> int:
+        """Непрочитанные в папке для счётчика в дереве. Раньше у Exchange
+        этого не было вовсе, и число после удаления или прочтения не
+        менялось до перезапуска."""
+        folder_obj = self._folder(folder)
+        try:
+            folder_obj.refresh()
+        except Exception as exc:
+            _log.debug("EWS: счётчик папки %s не обновлён: %s", folder, exc)
+        return int(getattr(folder_obj, "unread_count", 0) or 0)
+
     def folder_status(self, folder: str) -> tuple[int, int]:
         """(UIDVALIDITY, число писем): у EWS нет UIDVALIDITY — наши uid
         детерминированы (crc32 от id письма), возвращаем 0."""

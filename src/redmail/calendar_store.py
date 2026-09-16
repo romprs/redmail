@@ -54,6 +54,11 @@ _MIGRATIONS = (
     f"ALTER TABLE events ADD COLUMN calendar_id TEXT NOT NULL DEFAULT '{DEFAULT_CALENDAR_ID}'",
     f"ALTER TABLE calendars ADD COLUMN source_type TEXT NOT NULL DEFAULT '{SOURCE_LOCAL}'",
     "ALTER TABLE calendars ADD COLUMN caldav_url TEXT NOT NULL DEFAULT ''",
+    # Встреча изменена здесь и ещё не отправлена на сервер своего календаря.
+    # Раньше при каждой синхронизации на сервер уходили ВСЕ свои встречи —
+    # Exchange при этом рассылал участникам обновления, а VK отвечал 412 на
+    # встречи, изменённые с тех пор в другом месте.
+    "ALTER TABLE events ADD COLUMN needs_push INTEGER NOT NULL DEFAULT 0",
 )
 
 _SCHEMA = """
@@ -82,6 +87,13 @@ CREATE TABLE IF NOT EXISTS events (
     color TEXT,
     calendar_id TEXT NOT NULL DEFAULT 'default',
     raw_ics BLOB
+);
+
+-- Встречи, удалённые здесь из календаря с сервером: удаление ещё нужно
+-- передать на сервер, иначе следующая синхронизация вернёт их обратно.
+CREATE TABLE IF NOT EXISTS pending_deletes (
+    uid TEXT PRIMARY KEY,
+    calendar_id TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS event_attachments (
@@ -312,23 +324,29 @@ def get_event(path: Path, uid: str) -> Event | None:
         return _row_to_event(conn, row) if row else None
 
 
-def save_event(path: Path, event: Event) -> None:
+def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
     """Вставляет или обновляет по UID (UID устойчив между переносами — это
-    один и тот же iCalendar-объект с растущим SEQUENCE, не новое событие)."""
+    один и тот же iCalendar-объект с растущим SEQUENCE, не новое событие).
+
+    needs_push=True — изменение сделано здесь (окно встречи, перенос мышью)
+    и должно уйти на сервер календаря при следующей синхронизации. Копии,
+    полученные с сервера, сохраняются без него и уже поставленную отметку
+    не снимают."""
     create_calendar(path)
     with closing(_connect(path)) as conn:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-            "recurrence_rule, color, calendar_id, raw_ics) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recurrence_rule, color, calendar_id, raw_ics, needs_push) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
             "organizer_email=excluded.organizer_email, organizer_name=excluded.organizer_name, "
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
             "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
-            "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics",
+            "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics, "
+            "needs_push=MAX(events.needs_push, excluded.needs_push)",
             (
                 event.uid,
                 event.sequence,
@@ -348,10 +366,67 @@ def save_event(path: Path, event: Event) -> None:
                 event.color,
                 event.calendar_id,
                 event.raw_ics,
+                int(needs_push),
             ),
         )
+        if needs_push:
+            # Встречу снова завели здесь — прежнее удаление на сервер не нужно.
+            conn.execute("DELETE FROM pending_deletes WHERE uid = ?", (event.uid,))
         _save_attachments(conn, event.uid, event.attachments)
         conn.commit()
+
+
+def events_to_push(path: Path, calendar_id: str) -> list[Event]:
+    """Свои встречи календаря, изменённые здесь и ещё не отправленные."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            f"SELECT {_COLUMNS} FROM events WHERE calendar_id = ? AND needs_push = 1", (calendar_id,)
+        ).fetchall()
+        return [_row_to_event(conn, row) for row in rows]
+
+
+def mark_pushed(path: Path, uid: str) -> None:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE events SET needs_push = 0 WHERE uid = ?", (uid,))
+        conn.commit()
+
+
+def remember_server_delete(path: Path, uid: str, calendar_id: str) -> None:
+    """Запоминает удаление встречи, которое нужно передать на сервер."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_deletes (uid, calendar_id) VALUES (?, ?)", (uid, calendar_id)
+        )
+        conn.commit()
+
+
+def pending_server_deletes(path: Path, calendar_id: str) -> list[str]:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute("SELECT uid FROM pending_deletes WHERE calendar_id = ?", (calendar_id,)).fetchall()
+    return [row[0] for row in rows]
+
+
+def forget_server_delete(path: Path, uid: str) -> None:
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("DELETE FROM pending_deletes WHERE uid = ?", (uid,))
+        conn.commit()
+
+
+def stored_events_in_window(path: Path, calendar_id: str, start: datetime, end: datetime) -> list[tuple[str, bool]]:
+    """(uid, ждёт ли отправки) встреч календаря, начинающихся в окне —
+    без раскрытия повторов: нужно для зеркала удалений с сервера."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            "SELECT uid, needs_push FROM events WHERE calendar_id = ? AND dtstart >= ? AND dtstart < ?",
+            (calendar_id, start.isoformat(), end.isoformat()),
+        ).fetchall()
+    return [(row[0], bool(row[1])) for row in rows]
 
 
 def delete_event(path: Path, uid: str) -> None:
@@ -372,7 +447,7 @@ def reschedule_event(path: Path, uid: str, dtstart: datetime, dtend: datetime) -
     event.dtstart = dtstart
     event.dtend = dtend
     event.sequence += 1
-    save_event(path, event)
+    save_event(path, event, needs_push=True)
     return event
 
 

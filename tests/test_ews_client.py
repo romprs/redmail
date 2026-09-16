@@ -395,3 +395,18 @@ def test_sent_folder_summary_carries_recipients() -> None:
 
     assert summary.to == "Комарова Светлана <svkomarova@example.com>, petr@example.com"
     assert summary.size == 2048
+
+
+def test_unread_counter_is_read_fresh_from_server() -> None:
+    inbox = _fake_folder("Входящие", total_count=3)
+    inbox.unread_count = 1
+
+    def refresh():
+        inbox.unread_count = 2  # на сервере прочитали/пришло новое
+
+    inbox.refresh = MagicMock(side_effect=refresh)
+    exchange_account = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[inbox]))
+    session = _session(exchange_account)
+    session.list_folders()
+
+    assert session.folder_unseen_count("Входящие") == 2

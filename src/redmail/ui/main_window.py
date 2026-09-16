@@ -48,11 +48,13 @@ from PySide6.QtGui import (
     QFontMetrics,
     QIcon,
     QImage,
+    QKeySequence,
     QPainter,
     QPainterPath,
     QPalette,
     QPen,
     QPixmap,
+    QShortcut,
     QTextCharFormat,
     QTextCursor,
     QTextDocument,
@@ -5368,8 +5370,8 @@ class MainWindow(QMainWindow):
         self.forward_action.triggered.connect(self.on_forward)
 
         self.delete_action = QAction(_toolbar_icon("delete"), "Удалить", self)
-        self.delete_action.setToolTip("Удалить — в корзину. Shift+Удалить — безвозвратно.")
-        self.delete_action.triggered.connect(self.on_delete_selected)
+        self.delete_action.setToolTip("Удалить — в корзину (Del). Безвозвратно — Ctrl+Del или Shift+Удалить.")
+        self.delete_action.triggered.connect(lambda: self.on_delete_selected())
 
         self.archive_selected_action = QAction(_toolbar_icon("archive"), "В архив…", self)
         self.archive_selected_action.setToolTip("В архив — выгрузить отмеченные письма в архив (копия или перемещение)")
@@ -5456,6 +5458,16 @@ class MainWindow(QMainWindow):
         # таблице письма выделены").
         self.card_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.card_list.setMouseTracking(True)
+        # Del — в корзину, Ctrl+Del — безвозвратно (с подтверждением). Только
+        # в списке писем: в строке фильтра и в окне письма Del по-прежнему
+        # стирает текст.
+        for widget in (self.table, self.card_list):
+            to_trash = QShortcut(QKeySequence(Qt.Key.Key_Delete), widget)
+            to_trash.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            to_trash.activated.connect(lambda: self.on_delete_selected())
+            permanent = QShortcut(QKeySequence(Qt.KeyboardModifier.ControlModifier | Qt.Key.Key_Delete), widget)
+            permanent.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            permanent.activated.connect(lambda: self.on_delete_selected(force_permanent=True))
         self.card_list.setUniformItemSizes(True)
         self.card_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.card_list.customContextMenuRequested.connect(self._on_card_context_menu)
@@ -6439,7 +6451,13 @@ class MainWindow(QMainWindow):
             if index != -1:
                 self.folder_tree.takeTopLevelItem(index)
 
-        root = QTreeWidgetItem([key])
+        # Раньше в дереве показывался внутренний ключ записи
+        # («ews:svb-mail…:rsponomarev@…») — теперь та же подпись, что в
+        # списке учётных записей; ключ остаётся во всплывающей подсказке.
+        account = self.mailbox_accounts.get(key)
+        title = self._account_title(account, self.mailbox_protocols.get(key, "imap")) if account is not None else key
+        root = QTreeWidgetItem([title])
+        root.setToolTip(0, title)
         root.setFlags(root.flags() & ~Qt.ItemFlag.ItemIsSelectable)
         self.folder_tree.insertTopLevelItem(0, root)
         self.mailbox_tree_roots[key] = root
@@ -6562,17 +6580,23 @@ class MainWindow(QMainWindow):
 
         walk(root)
 
-    def _mailbox_key(self) -> str | None:
-        return next((k for k, m in self.mailboxes.items() if m is self.mailbox), None)
+    def _mailbox_key(self, mailbox=None) -> str | None:
+        target = self.mailbox if mailbox is None else mailbox
+        return next((k for k, m in self.mailboxes.items() if m is target), None)
 
-    def _sync_folders_async(self, folders: list[str]) -> None:
+    def _sync_folders_async(self, folders: list[str], *, mailbox=None) -> None:
         """Досинхронизировать локальные копии указанных папок в фоне.
         Нужно после переноса писем: письмо уже лежит в корзине на сервере,
         но в кэше «Корзины» его нет до следующего полного прохода — и
         папка выглядела пустой (жалоба: "удалились полностью, без
-        помещения в корзину"). Счётчики в дереве обновляются здесь же."""
-        mailbox = self.mailbox
-        key = self._mailbox_key()
+        помещения в корзину"). Счётчики в дереве обновляются здесь же.
+
+        mailbox — ящик, в котором было действие. Без него берётся текущий,
+        а текущий меняется, стоит щёлкнуть папку другой учётной записи,
+        пока действие идёт в фоне (жалоба: "сбивается синхронизация и
+        удаление, если переключаться между папками")."""
+        mailbox = self.mailbox if mailbox is None else mailbox
+        key = self._mailbox_key(mailbox)
         folders = [f for f in dict.fromkeys(folders) if f]
         if not isinstance(mailbox, CachedMailbox) or key is None or not folders:
             return
@@ -6610,12 +6634,12 @@ class MainWindow(QMainWindow):
         self._background_workers.append(worker)
         worker.start()
 
-    def _refresh_counts_async(self, folders: list[str]) -> None:
+    def _refresh_counts_async(self, folders: list[str], *, mailbox=None) -> None:
         """Счётчики непрочитанных в дереве для указанных папок — после
         удаления, переноса, отметки «прочитано» (жалоба: "после удаления
         число остаётся"). STATUS по интерактивному соединению, в фоне."""
-        mailbox = self.mailbox
-        key = self._mailbox_key()
+        mailbox = self.mailbox if mailbox is None else mailbox
+        key = self._mailbox_key(mailbox)
         folders = [f for f in dict.fromkeys(folders) if f]
         if not isinstance(mailbox, CachedMailbox) or key is None or not folders:
             return
@@ -8926,7 +8950,7 @@ class MainWindow(QMainWindow):
         self._render_folder(summaries)
         self.statusBar().showMessage(f"Восстановлено во «Входящие»: {len(checked_uids)}", 5000)
 
-    def on_delete_selected(self) -> None:
+    def on_delete_selected(self, *, force_permanent: bool = False) -> None:
         if not self.active_source or not self.current_folder:
             return
         checked_uids = self._checked_uids()
@@ -8936,11 +8960,16 @@ class MainWindow(QMainWindow):
 
         source = self.active_source
         folder = self.current_folder
+        # Ящик и его корзина запоминаются в момент нажатия: фоновая часть
+        # раньше брала «текущий» ящик в момент выполнения, и щелчок по папке
+        # другой учётной записи в это время уводил удаление не туда.
+        live_mailbox = self.mailbox if source is self.mailbox else None
+        trash_name = self.trash_folder_name
         moved_to_folder: str | None = None  # куда переехали письма (для досинхронизации папки)
-        if source is self.mailbox:
+        if live_mailbox is not None:
             shift_held = bool(QApplication.keyboardModifiers() & Qt.KeyboardModifier.ShiftModifier)
-            already_in_trash = self.trash_folder_name is not None and folder == self.trash_folder_name
-            permanent = shift_held or already_in_trash or not self.trash_folder_name
+            already_in_trash = trash_name is not None and folder == trash_name
+            permanent = force_permanent or shift_held or already_in_trash or not trash_name
 
             if permanent:
                 confirm = QMessageBox.question(
@@ -8951,11 +8980,11 @@ class MainWindow(QMainWindow):
                 )
                 if confirm != QMessageBox.StandardButton.Yes:
                     return
-                operation = lambda: self.mailbox.delete_messages(folder, checked_uids)  # noqa: E731
+                operation = lambda: live_mailbox.delete_messages(folder, checked_uids)  # noqa: E731
                 status_text = f"Удалено безвозвратно: {len(checked_uids)}"
             else:
-                trash = self.trash_folder_name
-                operation = lambda: self.mailbox.move_to_trash(folder, checked_uids, trash)  # noqa: E731
+                trash = trash_name
+                operation = lambda: live_mailbox.move_to_trash(folder, checked_uids, trash)  # noqa: E731
                 status_text = f"Перемещено в корзину: {len(checked_uids)}"
                 moved_to_folder = trash
         else:
@@ -8996,10 +9025,10 @@ class MainWindow(QMainWindow):
             if source is self.active_source and folder == self.current_folder:
                 self._render_folder(summaries)
             self.statusBar().showMessage(status_text, 5000)
-            if source is self.mailbox:
+            if live_mailbox is not None:
                 if moved_to_folder:
-                    self._sync_folders_async([moved_to_folder])
-                self._refresh_counts_async([folder, self.trash_folder_name or ""])
+                    self._sync_folders_async([moved_to_folder], mailbox=live_mailbox)
+                self._refresh_counts_async([folder, trash_name or ""], mailbox=live_mailbox)
 
         def on_failure(error_text: str) -> None:
             finish()
