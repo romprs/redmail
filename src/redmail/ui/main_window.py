@@ -148,6 +148,12 @@ from redmail.config_store import (
     load_auto_archive_size_mb,
     load_body_max_size_mb,
     load_font_scale,
+    load_greeting_mode,
+    greeting_text,
+    save_greeting_mode,
+    GREETING_HELLO,
+    GREETING_NONE,
+    GREETING_TIME_OF_DAY,
     load_profile_dir,
     load_contacts_view_mode,
     load_mail_view_mode,
@@ -2136,6 +2142,7 @@ class SettingsDialog(QDialog):
         maintenance_window: tuple[bool, int, int] = (False, 22, 7),
         tls_ca_file: str = "",
         font_scale: float = 1.0,
+        greeting_mode: str = GREETING_NONE,
         accounts: list[tuple[str, str]] | None = None,
         disabled_accounts: tuple[str, ...] = (),
         delete_on_server_accounts: tuple[str, ...] = (),
@@ -2254,8 +2261,17 @@ class SettingsDialog(QDialog):
         self.font_scale_spin.setSuffix(" %")
         self.font_scale_spin.setValue(int(round(font_scale * 100)))
 
+        # Приветствие первой строкой нового письма, ответа и пересылки.
+        self.greeting_combo = QComboBox(self)
+        self.greeting_combo.addItem("Не добавлять", GREETING_NONE)
+        self.greeting_combo.addItem("«Здравствуйте!»", GREETING_HELLO)
+        self.greeting_combo.addItem("По времени суток: «Доброе утро!», «Добрый день!», «Добрый вечер!»", GREETING_TIME_OF_DAY)
+        greeting_index = self.greeting_combo.findData(greeting_mode)
+        self.greeting_combo.setCurrentIndex(greeting_index if greeting_index >= 0 else 0)
+
         general_form = QFormLayout()
         general_form.addRow("Проверять почту каждые", self.interval_edit)
+        general_form.addRow("Приветствие в начале письма", self.greeting_combo)
         general_form.addRow("Масштаб шрифта", self.font_scale_spin)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
@@ -2645,6 +2661,9 @@ class SettingsDialog(QDialog):
     def font_scale(self) -> float:
         return self.font_scale_spin.value() / 100
 
+    def greeting_mode(self) -> str:
+        return self.greeting_combo.currentData() or GREETING_NONE
+
     def disabled_accounts(self) -> list[str]:
         return [
             self.accounts_list.item(row).data(Qt.ItemDataRole.UserRole)
@@ -2856,6 +2875,20 @@ class _ComposeBodyEdit(QTextEdit):
 
 
 class ComposeDialog(QDialog):
+    def _insert_greeting(self, greeting: str) -> None:
+        """Приветствие первой строкой и пустая строка после него; курсор —
+        сразу под приветствием, чтобы писать текст. Если письмо уже
+        начинается с приветствия (помощник продиктовал), второе не ставим."""
+        existing = self.body_edit.toPlainText().lstrip().casefold()
+        if existing.startswith(("здравствуй", "добр", "привет")):
+            return
+        cursor = QTextCursor(self.body_edit.document())
+        cursor.movePosition(QTextCursor.MoveOperation.Start)
+        cursor.insertText(greeting)
+        cursor.insertBlock()
+        cursor.insertBlock()
+        self.body_edit.setTextCursor(cursor)
+
     def __init__(
         self,
         parent=None,
@@ -2872,6 +2905,7 @@ class ComposeDialog(QDialog):
         attachments: list[OutgoingAttachment] | None = None,
         signatures: list[Signature] | None = None,
         default_signature_id: str | None = None,
+        greeting: str = "",
     ):
         super().__init__(parent)
         self.setWindowTitle(title)
@@ -2939,6 +2973,14 @@ class ComposeDialog(QDialog):
             self.body_edit.setHtml(body_html)
         else:
             self.body_edit.setPlainText(body)
+        self._greeting = greeting
+        if greeting:
+            self._insert_greeting(greeting)
+            # Приветствие — не правка человека: иначе докачанные позже
+            # картинки пересылаемого письма не подставились бы (см.
+            # apply_embedded_images), а закрытие пустого письма спрашивало бы
+            # о сохранении.
+            self.body_edit.document().setModified(False)
 
         # Подпись (жалоба: "нет возможности задать подпись или несколько
         # подписей и выбрать нужную") — подставляется автоматически только
@@ -3165,6 +3207,8 @@ class ComposeDialog(QDialog):
                 self.body_edit.document().addResource(QTextDocument.ResourceType.ImageResource, QUrl(f"cid:{cid}"), image)
         cursor_position = self.body_edit.textCursor().position()
         self.body_edit.setHtml(html_with_cids)
+        if getattr(self, "_greeting", ""):
+            self._insert_greeting(self._greeting)  # разметка заменена целиком — приветствие возвращаем
         cursor = self.body_edit.textCursor()
         cursor.setPosition(min(cursor_position, self.body_edit.document().characterCount() - 1))
         self.body_edit.setTextCursor(cursor)
@@ -7623,6 +7667,7 @@ class MainWindow(QMainWindow):
             delete_on_server_accounts=tuple(key for key, _title in known_accounts if delete_on_server_for(key)),
             domain_rewrites_by_account={key: load_domain_rewrites(key) for key, _title in known_accounts},
             font_scale=load_font_scale(),
+            greeting_mode=load_greeting_mode(),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -7648,6 +7693,7 @@ class MainWindow(QMainWindow):
             tls_trust.apply_trust(dialog.tls_ca_file())
             save_domain_rewrites_by_account(dialog.domain_rewrites_by_account())
             self._apply_disabled_accounts(dialog.disabled_accounts())
+            save_greeting_mode(dialog.greeting_mode())
             if abs(dialog.font_scale() - load_font_scale()) > 0.001:
                 # Тот же путь, что у ползунка в строке состояния.
                 self.font_scale_slider.setValue(int(round(dialog.font_scale() * 100)))
@@ -10992,6 +11038,7 @@ class MainWindow(QMainWindow):
             contacts=self._load_contacts(),
             signatures=self.signatures,
             default_signature_id=self.default_signature_id,
+            greeting=greeting_text(load_greeting_mode()),
         )
         self._exec_compose(dialog)
 
@@ -11055,6 +11102,7 @@ class MainWindow(QMainWindow):
             contacts=self._load_contacts(),
             signatures=self.signatures,
             default_signature_id=self.default_signature_id,
+            greeting=greeting_text(load_greeting_mode()),
         )
         reply_source = (
             (self.active_source, self.current_folder, summary.uid)
@@ -11180,6 +11228,7 @@ class MainWindow(QMainWindow):
                 ],
                 signatures=self.signatures,
                 default_signature_id=self.default_signature_id,
+                greeting=greeting_text(load_greeting_mode()),
                 **kwargs,
             )
 
@@ -11463,6 +11512,7 @@ class MainWindow(QMainWindow):
             contacts=self._load_contacts(),
             signatures=self.signatures,
             default_signature_id=self.default_signature_id,
+            greeting=greeting_text(load_greeting_mode()),
         )
         self.ipc_focus()
         self._ipc_later(lambda: self._exec_compose(dialog))

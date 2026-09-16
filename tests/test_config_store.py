@@ -705,3 +705,23 @@ def test_legacy_shared_delete_flag_applies_to_every_account_until_split(tmp_path
         assert config_store.delete_on_server_for("imap:x:y") is True
         config_store.save_delete_on_server_accounts([])
         assert config_store.delete_on_server_for("imap:x:y") is False
+
+
+def test_greeting_text_by_mode_and_time_of_day() -> None:
+    from datetime import datetime
+
+    assert config_store.greeting_text("none") == ""
+    assert config_store.greeting_text("hello") == "Здравствуйте!"
+    assert config_store.greeting_text("time_of_day", datetime(2026, 9, 16, 8, 0)) == "Доброе утро!"
+    assert config_store.greeting_text("time_of_day", datetime(2026, 9, 16, 13, 0)) == "Добрый день!"
+    assert config_store.greeting_text("time_of_day", datetime(2026, 9, 16, 19, 30)) == "Добрый вечер!"
+    assert config_store.greeting_text("time_of_day", datetime(2026, 9, 16, 2, 0)) == "Здравствуйте!"
+
+
+def test_greeting_mode_is_saved(tmp_path: Path) -> None:
+    with patch("redmail.config_store._settings_path", return_value=tmp_path / "settings.json"):
+        assert config_store.load_greeting_mode() == "none"
+        config_store.save_greeting_mode("time_of_day")
+        assert config_store.load_greeting_mode() == "time_of_day"
+        config_store.save_greeting_mode("что-то")
+        assert config_store.load_greeting_mode() == "none"

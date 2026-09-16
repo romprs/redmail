@@ -441,6 +441,44 @@ def save_mail_rules(rules: list[MailRule]) -> None:
     _save_settings_dict(data)
 
 
+#: Приветствие первой строкой нового письма, ответа и пересылки.
+GREETING_NONE = "none"
+GREETING_HELLO = "hello"
+GREETING_TIME_OF_DAY = "time_of_day"
+_GREETING_MODES = (GREETING_NONE, GREETING_HELLO, GREETING_TIME_OF_DAY)
+
+
+def load_greeting_mode() -> str:
+    value = str(_load_settings_dict().get("greeting_mode", GREETING_NONE))
+    return value if value in _GREETING_MODES else GREETING_NONE
+
+
+def save_greeting_mode(mode: str) -> None:
+    data = _load_settings_dict()
+    data["greeting_mode"] = mode if mode in _GREETING_MODES else GREETING_NONE
+    _save_settings_dict(data)
+
+
+def greeting_text(mode: str, now=None) -> str:
+    """Первая строка письма по настройке: «Здравствуйте!» или приветствие по
+    времени суток. Ночью по времени суток — тоже «Здравствуйте!»: «доброй
+    ночи» в деловой переписке звучит как прощание."""
+    if mode == GREETING_HELLO:
+        return "Здравствуйте!"
+    if mode != GREETING_TIME_OF_DAY:
+        return ""
+    from datetime import datetime
+
+    hour = (now or datetime.now()).hour
+    if 4 <= hour < 12:
+        return "Доброе утро!"
+    if 12 <= hour < 18:
+        return "Добрый день!"
+    if 18 <= hour < 24:
+        return "Добрый вечер!"
+    return "Здравствуйте!"
+
+
 def load_font_scale() -> float:
     try:
         value = float(_load_settings_dict().get("font_scale", _DEFAULT_FONT_SCALE))
