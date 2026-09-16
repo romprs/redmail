@@ -2571,7 +2571,7 @@ class SettingsDialog(QDialog):
         # журнал, проверка связи по локальному каналу.
         self.voice_status_label = QLabel("", self)
         self.voice_status_label.setWordWrap(True)
-        self.voice_enable_check = QCheckBox("Голосовое управление включено (сервис помощника запускается при входе)", self)
+        self.voice_enable_check = QCheckBox("Включён — служба помощника запускается при входе в систему", self)
         self.voice_enable_check.toggled.connect(self._on_voice_toggle)
         self.voice_settings_button = QPushButton("Настройки помощника…", self)
         self.voice_settings_button.clicked.connect(self._on_voice_settings)
@@ -2584,39 +2584,42 @@ class SettingsDialog(QDialog):
         voice_buttons.addWidget(self.voice_log_button)
         voice_buttons.addWidget(self.voice_check_button)
         voice_buttons.addStretch(1)
-        voice_form = QFormLayout()
-        voice_form.addRow(self.voice_status_label)
-        voice_form.addRow(self.voice_enable_check)
-        voice_form.addRow(voice_buttons)
-        voice_group = QGroupBox("Голосовой помощник")
-        voice_group.setLayout(voice_form)
-        tabs.addTab(_settings_tab(voice_group), "Помощник")
         self._voice_updating = False
         self._refresh_voice_state()
         tabs.addTab(_settings_tab(accounts_rules_group), "Учётные записи")
 
         # Подключаемые модули: включаются и выключаются без перезапуска.
         self._category_store = category_store
+        # Голосовой помощник — тоже модуль (пожелание: «голосовой помощник тоже
+        # модуль, в закладку модули»), отдельной вкладки у него больше нет.
         self.plugin_checks: dict[str, QCheckBox] = {}
-        modules_layout = QVBoxLayout()
+        module_groups: list[QGroupBox] = []
         for plugin in mail_plugins.available_plugins():
-            check = QCheckBox(plugin.title, self)
-            check.setChecked((plugins_enabled or {}).get(plugin.id, plugin.enabled_by_default))
             description = QLabel(plugin.description, self)
             description.setWordWrap(True)
-            modules_layout.addWidget(check)
-            modules_layout.addWidget(description)
-            self.plugin_checks[plugin.id] = check
-            if plugin.id == mail_plugins.CATEGORIES.id:
-                categories_button = QPushButton("Категории…", self)
-                categories_button.setToolTip("Список категорий, их цвета и описание: адресаты и слова в теме")
-                categories_button.clicked.connect(self._on_manage_categories)
-                categories_button.setEnabled(category_store is not None)
-                check.toggled.connect(lambda on, button=categories_button: button.setEnabled(on and self._category_store is not None))
-                modules_layout.addWidget(categories_button, 0, Qt.AlignmentFlag.AlignLeft)
-        modules_group = QGroupBox("Подключаемые модули", self)
-        modules_group.setLayout(modules_layout)
-        tabs.addTab(_settings_tab(modules_group), "Модули")
+            module_layout = QVBoxLayout()
+            module_layout.addWidget(description)
+            if plugin.id == mail_plugins.VOICE_ASSISTANT.id:
+                # Включение помощника — это его служба, а не флаг в настройках почты.
+                module_layout.addWidget(self.voice_status_label)
+                module_layout.addWidget(self.voice_enable_check)
+                module_layout.addLayout(voice_buttons)
+            else:
+                check = QCheckBox("Включён", self)
+                check.setChecked((plugins_enabled or {}).get(plugin.id, plugin.enabled_by_default))
+                self.plugin_checks[plugin.id] = check
+                module_layout.addWidget(check)
+                if plugin.id == mail_plugins.CATEGORIES.id:
+                    categories_button = QPushButton("Категории…", self)
+                    categories_button.setToolTip("Список категорий, их цвета и описание: адресаты и слова в теме")
+                    categories_button.clicked.connect(self._on_manage_categories)
+                    categories_button.setEnabled(category_store is not None)
+                    check.toggled.connect(lambda on, button=categories_button: button.setEnabled(on and self._category_store is not None))
+                    module_layout.addWidget(categories_button, 0, Qt.AlignmentFlag.AlignLeft)
+            group = QGroupBox(plugin.title, self)
+            group.setLayout(module_layout)
+            module_groups.append(group)
+        tabs.addTab(_settings_tab(*module_groups), "Модули")
         layout.addWidget(tabs)
         layout.addWidget(buttons)
         self.resize(760, 560)

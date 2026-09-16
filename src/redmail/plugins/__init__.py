@@ -36,7 +36,18 @@ CATEGORIES = PluginInfo(
     enabled_by_default=True,
 )
 
-BUILTIN: tuple[PluginInfo, ...] = (CATEGORIES,)
+VOICE_ASSISTANT = PluginInfo(
+    id="voice_assistant",
+    title="Голосовой помощник",
+    description=(
+        "Управление почтой и календарём голосом: открыть почту, создать встречу разговором, перенести "
+        "или отменить встречу, выбрать участников и календарь. Распознавание речи — на этом компьютере, "
+        "без сети. Ставится отдельным пакетом audioreferent; включается службой пользователя."
+    ),
+    enabled_by_default=False,
+)
+
+BUILTIN: tuple[PluginInfo, ...] = (CATEGORIES, VOICE_ASSISTANT)
 
 
 def available_plugins() -> list[PluginInfo]:
