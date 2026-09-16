@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        120%{?dist}
+Release:        121%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -124,6 +124,8 @@ fi
 %dir %{_sysconfdir}/redmail/brands
 
 %changelog
+* Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-121
+- Исправлен запуск программы: сборка 120 не открывалась из-за ошибки в сообщении о переносе профиля
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-120
 - Ответить, Ответить всем, Переслать и Открыть в окне — кнопками, как над списком писем, строкой над реквизитами письма
 - Окно учётной записи не сжимается ниже содержимого, подписи полей выровнены во всех группах

@@ -191,8 +191,7 @@ def main() -> int:
     if pending_error:
         from PySide6.QtWidgets import QMessageBox
 
-        QMessageBox.warning(window, "Перенос профиля", f"Профиль не загружен, данные остались прежними:
-{pending_error}")
+        QMessageBox.warning(window, "Перенос профиля", f"Профиль не загружен, данные остались прежними:\n{pending_error}")
     return app.exec()
 
 
