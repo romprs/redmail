@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parseaddr
 from pathlib import Path
 
 import icalendar
@@ -39,6 +40,9 @@ class CalendarPartResult:
     imported: list[calendar_store.Event] = field(default_factory=list)
     replying_attendee: str = ""
     participation: str = ""
+    # Письмо пришло не от того, кто вправе менять встречу (отмену прислал не
+    # организатор, ответ — не сам участник): в календарь не внесено.
+    rejected_sender: str = ""
 
 
 def calendar_payloads(content) -> list[bytes]:
@@ -67,8 +71,14 @@ def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | 
     данный ответ; отмена (CANCEL) помечает встречу отменённой; ответ
     участника (REPLY) обновляет его статус в своей встрече; файл встречи без
     METHOD или с PUBLISH добавляется как есть. Ничего не отправляет.
-    Повторный разбор того же письма ничего не меняет."""
+    Повторный разбор того же письма ничего не меняет.
+
+    Менять уже известную встречу может только её организатор, ответ
+    участника — только сам участник. Письма теперь разбираются и без
+    открытия, поэтому отмену «от имени» организатора, присланную кем-то
+    другим (UID встречи знает любой приглашённый), в календарь не вносим."""
     cutoff = (now or datetime.now(timezone.utc)) - PAST_HORIZON
+    sender = parseaddr(getattr(content, "from_", "") or "")[1].strip().lower()
     results: list[CalendarPartResult] = []
     for payload in calendar_payloads(content):
         try:
@@ -79,7 +89,7 @@ def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | 
         method = str(calendar.get("method", "") or "").upper()
         try:
             if method in _ITIP_METHODS:
-                result = _apply_itip(path, payload, method, my_email, cutoff)
+                result = _apply_itip(path, payload, method, my_email, cutoff, sender)
             else:
                 result = _apply_publish(path, payload, my_email, cutoff)
         except Exception as exc:
@@ -90,19 +100,38 @@ def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | 
     return results
 
 
-def _apply_itip(path: Path, payload: bytes, method: str, my_email: str, cutoff: datetime) -> CalendarPartResult | None:
+def _same_address(first: str, second: str) -> bool:
+    return bool(first) and bool(second) and first.strip().lower() == second.strip().lower()
+
+
+def _apply_itip(
+    path: Path, payload: bytes, method: str, my_email: str, cutoff: datetime, sender: str,
+) -> CalendarPartResult | None:
     invite = itip.parse_invite(payload, my_email=my_email)
     event = invite.event
+    existing = calendar_store.get_event(path, event.uid)
+    organizer = (existing.organizer_email if existing is not None and existing.organizer_email else event.organizer_email)
     if method == "REQUEST":
         if event.dtend < cutoff and event.recurrence_rule is None:
             return None  # давно прошедшая встреча
+        if existing is not None and not _same_address(sender, organizer) and not _same_address(sender, my_email):
+            # Уже известную встречу меняет только организатор; переслать
+            # приглашение коллеге можно, но изменить им нашу встречу — нет.
+            return CalendarPartResult(method=method, event=existing, invite=invite, rejected_sender=sender or "?")
         stored = calendar_store.apply_invite(path, "REQUEST", event)
         return CalendarPartResult(method=method, event=stored, invite=invite)
     if method == "CANCEL":
+        if not _same_address(sender, organizer) and not _same_address(sender, my_email):
+            return CalendarPartResult(method=method, event=existing or event, invite=invite, rejected_sender=sender or "?")
         stored = calendar_store.apply_invite(path, "CANCEL", event)
         return CalendarPartResult(method=method, event=stored, invite=invite)
     if not invite.replying_attendee_email:
         return None
+    if not _same_address(sender, invite.replying_attendee_email):
+        return CalendarPartResult(
+            method=method, event=existing or event, invite=invite,
+            replying_attendee=invite.replying_attendee_email, rejected_sender=sender or "?",
+        )
     participation = next(
         (a.participation for a in event.attendees if a.email == invite.replying_attendee_email), "needs-action"
     )
@@ -118,11 +147,10 @@ def _apply_publish(path: Path, payload: bytes, my_email: str, cutoff: datetime) 
     for event in itip.parse_ics_events(payload, my_email):
         if event.dtend < cutoff and event.recurrence_rule is None:
             continue
-        existing = calendar_store.get_event(path, event.uid)
-        if existing is not None:
-            event.calendar_id = existing.calendar_id
-            event.color = event.color or existing.color
-            event.my_participation = existing.my_participation
+        if calendar_store.get_event(path, event.uid) is not None:
+            # Файл встречи без METHOD ничего не говорит о том, кто вправе её
+            # менять, — уже известную встречу им не перезаписываем.
+            continue
         calendar_store.save_event(path, event)
         imported.append(event)
     if not imported:

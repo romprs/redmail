@@ -9582,6 +9582,19 @@ class MainWindow(QMainWindow):
     def _show_invite_result(self, result) -> None:
         invite = result.invite
         event = result.event
+        if result.rejected_sender:
+            # Изменение встречи пришло не от организатора (или ответ — не от
+            # самого участника): в календарь не внесено, объясняем почему.
+            self.current_invite = None
+            kinds = {"REQUEST": "Изменение встречи", "CANCEL": "Отмена встречи", "REPLY": "Ответ участника"}
+            self.invite_label.setText(
+                f"{kinds.get(result.method, 'Изменение')} «{invite.event.summary}» прислал {result.rejected_sender}, "
+                "а не организатор — в календарь не внесено."
+            )
+            for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+                button.setEnabled(False)
+            self.invite_bar.show()
+            return
         if result.method == "REQUEST":
             self.current_invite = invite
             when = _format_event_time(event)

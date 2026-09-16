@@ -31,8 +31,8 @@ def _ics(method: str | None, *, uid: str = "meet-1@example.com", start: datetime
     return ("\r\n".join(lines) + "\r\n").encode("utf-8")
 
 
-def _content(*attachments: Attachment) -> MessageContent:
-    return MessageContent(text="письмо", attachments=list(attachments))
+def _content(*attachments: Attachment, sender: str = "Организатор <boss@example.com>") -> MessageContent:
+    return MessageContent(text="письмо", attachments=list(attachments), from_=sender)
 
 
 def test_invitation_in_plain_ics_attachment_reaches_calendar(tmp_path: Path) -> None:
@@ -105,3 +105,63 @@ def test_broken_or_foreign_attachments_are_ignored(tmp_path: Path) -> None:
 
     assert calendar_mail.apply_calendar_parts(path, content, "me@example.com", now=NOW) == []
     assert calendar_mail.has_calendar_data(_content(Attachment("report.pdf", "application/pdf", b"%PDF"))) is False
+
+
+def test_cancellation_from_someone_else_is_not_applied(tmp_path: Path) -> None:
+    """Отмену может прислать только организатор: UID встречи знает любой
+    приглашённый, а письма теперь разбираются и без открытия."""
+    path = tmp_path / "calendar.rmcal"
+    calendar_mail.apply_calendar_parts(path, _content(Attachment("i.ics", "text/calendar", _ics("REQUEST"))), "me@example.com", now=NOW)
+
+    results = calendar_mail.apply_calendar_parts(
+        path, _content(Attachment("c.ics", "text/calendar", _ics("CANCEL")), sender="Шутник <joker@example.com>"),
+        "me@example.com", now=NOW,
+    )
+
+    assert results[0].rejected_sender == "joker@example.com"
+    assert calendar_store.get_event(path, "meet-1@example.com").status != "cancelled"
+
+
+def test_changed_invitation_from_someone_else_does_not_overwrite_meeting(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.rmcal"
+    calendar_mail.apply_calendar_parts(path, _content(Attachment("i.ics", "text/calendar", _ics("REQUEST"))), "me@example.com", now=NOW)
+
+    calendar_mail.apply_calendar_parts(
+        path,
+        _content(Attachment("i.ics", "text/calendar", _ics("REQUEST", summary="Подменённая")), sender="joker@example.com"),
+        "me@example.com", now=NOW,
+    )
+
+    assert calendar_store.get_event(path, "meet-1@example.com").summary == "Планёрка"
+
+
+def test_reply_is_accepted_only_from_the_attendee_himself(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.rmcal"
+    start = NOW + timedelta(days=2)
+    mine = calendar_store.Event(
+        uid="meet-1@example.com", summary="Моя встреча", dtstart=start, dtend=start + timedelta(hours=1),
+        organizer_email="boss@example.com", is_organizer=True,
+        attendees=[calendar_store.Attendee(email="me@example.com")],
+    )
+    calendar_store.save_event(path, mine)
+    reply = _ics("REPLY", attendee_status="DECLINED")
+
+    calendar_mail.apply_calendar_parts(path, _content(Attachment("r.ics", "text/calendar", reply), sender="joker@example.com"), "boss@example.com", now=NOW)
+    before = calendar_store.get_event(path, "meet-1@example.com").attendees[0].participation
+    calendar_mail.apply_calendar_parts(path, _content(Attachment("r.ics", "text/calendar", reply), sender="me@example.com"), "boss@example.com", now=NOW)
+    after = calendar_store.get_event(path, "meet-1@example.com").attendees[0].participation
+
+    assert before == "needs-action"
+    assert after == "declined"
+
+
+def test_ics_file_does_not_overwrite_known_meeting(tmp_path: Path) -> None:
+    path = tmp_path / "calendar.rmcal"
+    calendar_mail.apply_calendar_parts(path, _content(Attachment("i.ics", "text/calendar", _ics("REQUEST"))), "me@example.com", now=NOW)
+
+    results = calendar_mail.apply_calendar_parts(
+        path, _content(Attachment("x.ics", "text/calendar", _ics(None, summary="Подменённая"))), "me@example.com", now=NOW
+    )
+
+    assert results == []
+    assert calendar_store.get_event(path, "meet-1@example.com").summary == "Планёрка"
