@@ -81,6 +81,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
@@ -2824,11 +2825,37 @@ class _AccountOptionsMixin:
         hint.setWordWrap(True)
         form = QFormLayout()
         form.addRow(self.delete_on_server_check)
-        form.addRow("Замена домена получателей", self.domain_rewrites_edit)
+        form.addRow("Замена доменов", self.domain_rewrites_edit)
         form.addRow(hint)
+        self._options_form = form
         group = QGroupBox("Архив и переезд", self)
         group.setLayout(form)
         return group
+
+    def _fit_account_window(self, layout: QVBoxLayout, forms: list) -> None:
+        """Окно не меньше содержимого и подписи полей одной ширины во всех
+        группах. Раньше окно открывалось низким, и поля в группах сжимались
+        друг на друга (замечание: «криво, расширь окно вниз»)."""
+        labels = []
+        for form in forms + [self._options_form]:
+            form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            form.setVerticalSpacing(8)
+            for row in range(form.rowCount()):
+                item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                if item is not None and item.widget() is not None:
+                    labels.append(item.widget())
+        width = max((label.sizeHint().width() for label in labels), default=0)
+        for label in labels:
+            label.setMinimumWidth(width)
+        # Минимальный размер окна берётся из разметки — сжать поля нельзя.
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        self.adjustSize()
+        hint = self.sizeHint()
+        screen = self.screen().availableGeometry() if self.screen() is not None else None
+        height = hint.height() + 40
+        if screen is not None:
+            height = min(height, screen.height() - 40)
+        self.resize(max(hint.width(), 600), height)
 
     def delete_on_server(self) -> bool:
         return self.delete_on_server_check.isChecked()
@@ -2926,12 +2953,13 @@ class ImapAccountDialog(_AccountOptionsMixin, QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         layout = QVBoxLayout(self)
+        layout.setSpacing(10)
         layout.addWidget(imap_group)
         layout.addWidget(smtp_group)
         layout.addWidget(self._build_account_options(delete_on_server, domain_rewrites))
         layout.addWidget(buttons)
         self._update_password_enabled()
-        self.resize(560, 640)
+        self._fit_account_window(layout, [imap_form, smtp_form])
 
     def _update_password_enabled(self) -> None:
         is_kerberos = self.auth_combo.currentData() == "kerberos"
@@ -3085,6 +3113,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
         layout.addWidget(buttons)
 
         self._update_fields_enabled()
+        self._fit_account_window(layout, [form])
 
     def _update_fields_enabled(self) -> None:
         is_kerberos = self.auth_combo.currentData() == "kerberos"
