@@ -91,7 +91,8 @@ python -m venv .venv
 `find_events`, `cancel_event`, `event_form_open`, `event_form_set`,
 `event_form_state`, `event_form_save`, `event_form_cancel`, `find_contacts`,
 `contact_picker_open`, `contact_picker_select`, `contact_picker_state`,
-`contact_picker_accept`, `contact_picker_cancel`, `apply_mail_rules`,
+`contact_picker_accept`, `contact_picker_cancel`, `event_form_focus`,
+`list_calendars`, `apply_mail_rules`,
 `list_mail_rules`.
 
 Пошаговая форма встречи (`event_form_*`) — для голосового заполнения «на
@@ -99,7 +100,9 @@ python -m venv .venv
 либо своей по `uid`) и держит его открытым, `event_form_set` меняет поля
 прямо в нём по одному (`subject`, `date`, `time`, `start`,
 `duration_minutes`, `recurrence` = none/daily/weekly/monthly/yearly,
-`participants`/`add_participants`, `location`, `description`, `all_day`) —
+`participants`/`add_participants`, `location`, `description`, `all_day`,
+`calendar` — название, как его произносят: «эксчейндж», «вк», «мои встречи»,
+номер из `list_calendars` или id) —
 человек видит каждое изменение, `event_form_save`/`event_form_cancel`
 нажимают «Сохранить»/«Отмена». `find_contacts` ищет в адресной книге по
 фамилии/имени так, как их слышно в речи (с падежным окончанием: «Шилкина»
