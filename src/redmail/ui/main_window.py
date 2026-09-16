@@ -2014,6 +2014,7 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
 # референсах, отрисованный через QSvgRenderer и перекрашенный в цвет
 # _icon_color().
 _MATERIAL_ICON_PATHS: dict[str, str] = {
+    "open_in_new": "M200-120q-33 0-56.5-23.5T120-200v-560q0-33 23.5-56.5T200-840h280v80H200v560h560v-280h80v280q0 33-23.5 56.5T760-120H200Zm188-212-56-56 372-372H560v-80h280v280h-80v-144L388-332Z",
     "edit": "M180-180h44l472-471-44-44-472 471v44Zm-60 60v-128l575-574q8-8 19-12.5t23-4.5q11 0 22 4.5t20 12.5l44 44q9 9 13 20t4 22q0 11-4.5 22.5T823-694L248-120H120Zm659-617-41-41 41 41Zm-105 64-22-22 44 44-22-22Z",
     "reply": "M780-200v-156q0-60-39-99t-99-39H236l163 163-43 43-236-236 236-236 43 43-163 163h406q85 0 141.5 56.5T840-356v156h-60Z",
     "forward": "m644-288-43-43 193-193-193-193 43-43 236 236-236 236ZM81-200v-156q0-85 56.5-141.5T279-554h305L421-717l43-43 236 236-236 236-43-43 163-163H279q-60 0-99 39t-39 99v156H81Z",
@@ -2071,6 +2072,7 @@ _TOOLBAR_ICON_MATERIAL: dict[str, str] = {
     "sync": "sync",
     "search": "search",
     "more": "more_vert",
+    "open_window": "open_in_new",
 }
 
 _FOLDER_ICON_MATERIAL: dict[str, str] = {
@@ -6118,25 +6120,30 @@ class MainWindow(QMainWindow):
         self._header_to = ""
         self._header_cc = ""
         header_layout.addWidget(self.message_header_label, 1)
-        header_buttons = QVBoxLayout()
-        header_buttons.setSpacing(6)
-        reply_row = QHBoxLayout()
-        reply_row.setSpacing(6)
-        self.header_reply_buttons: list[QToolButton] = []
-        for action in (self.reply_action, self.reply_all_action, self.forward_action):
-            button = QToolButton(self.message_header_widget)
+        # Действия с письмом — одной строкой, плоскими пунктами без рамок, как
+        # разделы в верхнем меню (пожелание: «сделай кнопки в верхней строке
+        # как меню — не красиво же так»).
+        self.open_message_window_action = QAction(_toolbar_icon("open_window"), "Открыть в окне", self)
+        self.open_message_window_action.setToolTip("Открыть письмо в отдельном окне")
+        self.open_message_window_action.triggered.connect(self.on_open_message_window)
+        # Обычный ряд кнопок, а не QToolBar: панель инструментов при узкой
+        # области чтения прятала часть действий за стрелку «»».
+        self.message_actions_bar = QWidget(self.message_header_widget)
+        self.message_actions_bar.setObjectName("messageActions")
+        actions_row = QHBoxLayout(self.message_actions_bar)
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(2)
+        for action in (self.reply_action, self.reply_all_action, self.forward_action, self.open_message_window_action):
+            button = QToolButton(self.message_actions_bar)
             button.setDefaultAction(action)
             button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            button.setAutoRaise(False)
-            reply_row.addWidget(button)
-            self.header_reply_buttons.append(button)
-        header_buttons.addLayout(reply_row)
-        self.open_message_window_button = QPushButton("Открыть в окне", self.message_header_widget)
-        self.open_message_window_button.setToolTip("Открыть письмо в отдельном окне")
-        self.open_message_window_button.clicked.connect(self.on_open_message_window)
-        header_buttons.addWidget(self.open_message_window_button, 0, Qt.AlignmentFlag.AlignRight)
-        header_buttons.addStretch(1)
-        header_layout.addLayout(header_buttons)
+            button.setIconSize(QSize(18, 18))
+            button.setAutoRaise(True)
+            actions_row.addWidget(button)
+        header_actions = QVBoxLayout()
+        header_actions.addWidget(self.message_actions_bar, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+        header_actions.addStretch(1)
+        header_layout.addLayout(header_actions)
         # Жалоба: "заголовок письма... занимает от 50% до 100%, должен
         # занимать 4 строки" — без явной политики размера QVBoxLayout ниже
         # (reading_layout) мог отдавать этому виджету всё "лишнее" место
