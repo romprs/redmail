@@ -130,6 +130,7 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
+from redmail import mail_export, profile_transfer
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
     MailRule,
@@ -2363,6 +2364,14 @@ class BrandEditDialog(QDialog):
         self.base_combo.setCurrentIndex(max(0, self.base_combo.findData(brand.base if brand else "light")))
         self.default_check = QCheckBox("Оформление по умолчанию для тех, кто тему ещё не выбирал", self)
         self.default_check.setChecked(bool(brand and brand.default))
+        self.export_combo = QComboBox(self)
+        self.export_combo.addItem("Сотрудник сам", "user")
+        self.export_combo.addItem("Только администратор", "admin")
+        self.export_combo.setCurrentIndex(max(0, self.export_combo.findData(brand.data_export if brand else "user")))
+        self.export_combo.setToolTip(
+            "Кто выгружает переписку и переносит профиль. Действует, когда оформление разложено "
+            "администратором в /etc/redmail/brands"
+        )
 
         self._colors: dict[str, str] = dict(brand.colors) if brand else {}
         self._color_buttons: dict[str, QPushButton] = {}
@@ -2439,6 +2448,7 @@ class BrandEditDialog(QDialog):
         main_form.addRow("Организация", self.organization_edit)
         main_form.addRow("Основа", self.base_combo)
         main_form.addRow(self.default_check)
+        main_form.addRow("Выгрузка переписки", self.export_combo)
 
         left = QVBoxLayout()
         left.addLayout(main_form)
@@ -2500,6 +2510,7 @@ class BrandEditDialog(QDialog):
             },
             "signature_html": self.signature_edit.toPlainText().strip(),
             "default": self.default_check.isChecked(),
+            "data_export": self.export_combo.currentData(),
         })
 
     def accept(self) -> None:  # noqa: N802 - Qt override
@@ -2865,7 +2876,8 @@ class SettingsDialog(QDialog):
         storage_form.addRow(storage_hint)
         storage_group = QGroupBox("Хранилище")
         storage_group.setLayout(storage_form)
-        tabs.addTab(_settings_tab(storage_group), "Хранилище")
+        self._transfer_workers: list[_CallableWorker] = []
+        tabs.addTab(_settings_tab(storage_group, self._build_transfer_group()), "Хранилище")
 
         # Голосовой помощник (audioreferent) — отдельный продукт, здесь только
         # управление им: включить/выключить сервис, состояние, его настройки,
@@ -3104,6 +3116,178 @@ class SettingsDialog(QDialog):
 
     def pane_orientation(self) -> str:
         return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
+
+    def _build_transfer_group(self) -> QGroupBox:
+        """Перенос профиля на другой компьютер и выгрузка всей переписки.
+        Кто это делает — сотрудник сам или администратор — задаёт оформление
+        организации; без оформлений решает пользователь."""
+        mode, brand = profile_transfer.export_policy()
+        allowed = profile_transfer.allowed_here()
+        self.export_mail_button = QPushButton("Выгрузить переписку…", self)
+        self.export_mail_button.setToolTip("Вся переписка и архивы — в mbox или файлы EML, для другой почтовой программы")
+        self.export_mail_button.clicked.connect(self._on_export_mail)
+        self.export_profile_button = QPushButton("Выгрузить профиль…", self)
+        self.export_profile_button.setToolTip("Настройки, почта, календарь, контакты и архивы одним файлом .rmprofile")
+        self.export_profile_button.clicked.connect(self._on_export_profile)
+        self.import_profile_button = QPushButton("Загрузить профиль…", self)
+        self.import_profile_button.setToolTip("Профиль с другого компьютера; прежние данные сохраняются в резервную копию")
+        self.import_profile_button.clicked.connect(self._on_import_profile)
+        buttons = QHBoxLayout()
+        for button in (self.export_mail_button, self.export_profile_button, self.import_profile_button):
+            button.setEnabled(allowed)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        if not allowed:
+            text = (
+                f"Выгрузку переписки и перенос профиля выполняет администратор — так задано в оформлении "
+                f"организации «{brand.name}». Обратитесь к администратору."
+            )
+        elif mode == profile_transfer.EXPORT_BY_USER and brand is not None:
+            text = f"Разрешено сотруднику (оформление «{brand.name}»). Выгрузки записываются в системный журнал."
+        else:
+            text = "Пароли не переносятся — на новом компьютере их вводят заново. Выгрузки записываются в журнал."
+        policy_label = QLabel(text, self)
+        policy_label.setWordWrap(True)
+        layout = QVBoxLayout()
+        layout.addLayout(buttons)
+        layout.addWidget(policy_label)
+        pending = profile_transfer.pending_import()
+        if pending is not None:
+            pending_label = QLabel(f"Профиль из {pending} загрузится при следующем запуске программы.", self)
+            pending_label.setWordWrap(True)
+            cancel_button = QPushButton("Отменить загрузку", self)
+
+            def cancel_pending() -> None:
+                profile_transfer.cancel_pending_import()
+                pending_label.setText("Загрузка профиля отменена.")
+                cancel_button.setEnabled(False)
+
+            cancel_button.clicked.connect(cancel_pending)
+            layout.addWidget(pending_label)
+            layout.addWidget(cancel_button, 0, Qt.AlignmentFlag.AlignLeft)
+        group = QGroupBox("Перенос на другой компьютер и выгрузка переписки", self)
+        group.setLayout(layout)
+        return group
+
+    def _run_transfer(self, title: str, fn, *args, on_success, cancellable: bool = False, **kwargs) -> None:
+        progress = QProgressDialog(title, "Остановить" if cancellable else "", 0, 0, self)
+        progress.setWindowTitle(title)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        if not cancellable:
+            progress.setCancelButton(None)
+        state = {"count": 0, "stop": False}
+        if cancellable:
+            progress.canceled.connect(lambda: state.__setitem__("stop", True))
+            kwargs["stop"] = lambda: state["stop"]
+            kwargs["progress"] = lambda count: state.__setitem__("count", count)
+            timer = QTimer(progress)
+            timer.timeout.connect(lambda: progress.setLabelText(f"{title}: писем {state['count']}"))
+            timer.start(500)
+        progress.show()
+        worker = _CallableWorker(fn, *args, parent=self, **kwargs)
+
+        def finish() -> None:
+            progress.close()
+            if worker in self._transfer_workers:
+                self._transfer_workers.remove(worker)
+
+        def succeeded(result: object) -> None:
+            finish()
+            on_success(result)
+
+        def failed(message: str) -> None:
+            finish()
+            if state["stop"]:
+                QMessageBox.information(self, title, "Выгрузка остановлена, выгруженная часть осталась в каталоге.")
+            else:
+                QMessageBox.warning(self, title, message)
+
+        worker.succeeded.connect(succeeded)
+        worker.failed.connect(failed)
+        self._transfer_workers.append(worker)
+        worker.start()
+
+    def _on_export_mail(self) -> None:
+        if not profile_transfer.allowed_here():
+            return
+        labels = list(mail_export.FORMATS.values())
+        label, ok = QInputDialog.getItem(self, "Выгрузить переписку", "Формат:", labels, 0, False)
+        if not ok:
+            return
+        fmt = next(key for key, value in mail_export.FORMATS.items() if value == label)
+        base = QFileDialog.getExistingDirectory(self, "Куда выгрузить переписку")
+        if not base:
+            return
+        target = Path(base) / f"Переписка {datetime.now():%Y-%m-%d %H-%M}"
+
+        def done(result) -> None:
+            profile_transfer.audit(
+                "Выгрузка переписки", формат=fmt, каталог=result.target, писем=result.messages,
+                без_тела=result.headers_only, архивов=result.archives,
+            )
+            text = f"Выгружено писем: {result.messages}, архивов: {result.archives}.\n{result.target}"
+            if result.headers_only:
+                text += (
+                    f"\n\nПисем без тела: {result.headers_only} — оно ещё не было скачано с сервера, "
+                    "выгружены только реквизиты."
+                )
+            QMessageBox.information(self, "Выгрузка переписки", text)
+
+        self._run_transfer("Выгрузка переписки", mail_export.export_mail, target, fmt, on_success=done, cancellable=True)
+
+    def _on_export_profile(self) -> None:
+        if not profile_transfer.allowed_here():
+            return
+        default_name = f"профиль-{datetime.now():%Y-%m-%d}{profile_transfer.EXTENSION}"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Выгрузить профиль", default_name, f"Профиль redmail (*{profile_transfer.EXTENSION})"
+        )
+        if not path:
+            return
+
+        def done(manifest) -> None:
+            QMessageBox.information(
+                self, "Выгрузка профиля",
+                f"Профиль выгружен: файлов {len(manifest['files'])}.\n\nНа новом компьютере: «Параметры» → "
+                "«Хранилище» → «Загрузить профиль…». Пароли учётных записей нужно будет ввести заново.",
+            )
+
+        self._run_transfer("Выгрузка профиля", profile_transfer.export_profile, Path(path), on_success=done)
+
+    def _on_import_profile(self) -> None:
+        if not profile_transfer.allowed_here():
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Загрузить профиль", "", f"Профиль redmail (*{profile_transfer.EXTENSION})"
+        )
+        if not path:
+            return
+        try:
+            manifest = profile_transfer.read_manifest(Path(path))
+        except profile_transfer.TransferError as exc:
+            QMessageBox.warning(self, "Загрузка профиля", str(exc))
+            return
+        size_mb = manifest.get("total_size", 0) / (1024 * 1024)
+        answer = QMessageBox.question(
+            self, "Загрузка профиля",
+            f"Профиль {manifest.get('user', '?')} с компьютера {manifest.get('host', '?')} от "
+            f"{manifest.get('created', '?')}, {size_mb:.0f} МБ.\n\nОн заменит почту, календарь, контакты и настройки "
+            "на этом компьютере; прежние данные сохранятся в резервную копию. Загрузка выполнится при следующем "
+            "запуске программы. Пароли нужно будет ввести заново.\n\nПродолжить?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            profile_transfer.schedule_import(Path(path))
+        except (profile_transfer.TransferError, OSError) as exc:
+            QMessageBox.warning(self, "Загрузка профиля", str(exc))
+            return
+        if QMessageBox.question(
+            self, "Загрузка профиля", "Закрыть программу сейчас? Профиль загрузится при следующем запуске."
+        ) == QMessageBox.StandardButton.Yes:
+            self.reject()
+            QApplication.instance().quit()
 
     def _fill_theme_combo(self, selected: str) -> None:
         self.theme_combo.clear()

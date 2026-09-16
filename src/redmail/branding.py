@@ -24,6 +24,9 @@
                       добавляется в конец письма при отправке
     default         — true: оформление по умолчанию для тех, кто тему ещё
                       не выбирал
+    data_export     — кто выгружает переписку и переносит профиль: "user"
+                      (сам сотрудник, по умолчанию) или "admin" (только
+                      администратор); действует из оформлений в /etc/redmail/brands
 """
 from __future__ import annotations
 
@@ -64,6 +67,7 @@ class Brand:
     letter_font_size: float = 0.0
     letter_text_color: str = ""
     letter_footer_html: str = ""
+    data_export: str = "user"
 
     @property
     def theme_value(self) -> str:
@@ -119,7 +123,11 @@ def parse_brand(data: dict, source: str = "") -> Brand:
         raise ValueError("letter.font_size — число") from None
     if letter_size and not 6 <= letter_size <= 40:
         raise ValueError("letter.font_size — от 6 до 40")
+    data_export = str(data.get("data_export", "user") or "user")
+    if data_export not in ("user", "admin"):
+        raise ValueError("data_export — user или admin")
     return Brand(
+        data_export=data_export,
         id=brand_id, name=name, base=base, colors=colors, font_family=family, font_size=size,
         organization=str(data.get("organization", "")).strip(),
         signature_html=str(data.get("signature_html", "")),
@@ -148,6 +156,8 @@ def brand_to_dict(brand: Brand) -> dict:
         data["signature_html"] = brand.signature_html
     if brand.default:
         data["default"] = True
+    if brand.data_export != "user":
+        data["data_export"] = brand.data_export
     return data
 
 

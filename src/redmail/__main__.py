@@ -100,6 +100,10 @@ def _ensure_session_bus_address() -> None:
 
 
 def main() -> int:
+    from redmail import cli
+
+    if cli.wants_cli(sys.argv):
+        return cli.run(sys.argv)
     log_file = applog.setup_logging()
     _ensure_session_bus_address()
     # HTTPS (CalDAV, Exchange, подписка на календарь) — доверенные корни из
@@ -154,6 +158,17 @@ def main() -> int:
         splash.close()
         return 0
 
+    pending_error = None
+    try:
+        from redmail import profile_transfer
+
+        if profile_transfer.pending_import() is not None:
+            report("Загружаю перенесённый профиль…")
+            backup = profile_transfer.apply_pending_import(progress=lambda name: report(f"Загружаю профиль: {name}"))
+            applog.get_logger("app").info("Перенесённый профиль загружен, прежние данные: %s", backup)
+    except Exception as exc:
+        applog.get_logger("app").error("Перенесённый профиль не загружен: %s", exc)
+        pending_error = str(exc)
     profile_path = profile.ensure_profile()
     applog.get_logger("app").info("Профиль: %s", profile_path)
     try:
@@ -173,6 +188,11 @@ def main() -> int:
     report("Готово")
     window.show()
     splash.finish(window)
+    if pending_error:
+        from PySide6.QtWidgets import QMessageBox
+
+        QMessageBox.warning(window, "Перенос профиля", f"Профиль не загружен, данные остались прежними:
+{pending_error}")
     return app.exec()
 
 
