@@ -6107,9 +6107,29 @@ class MainWindow(QMainWindow):
         # письма — тело часто само содержит полный <html>...</html>, и
         # примешивать туда наш текст means риск сломать вёрстку письма.
         self.message_header_widget = QWidget(self)
-        header_layout = QHBoxLayout(self.message_header_widget)
+        header_layout = QVBoxLayout(self.message_header_widget)
         # Отступы сверху и снизу — пожелание "сделай отступ от верхнего края и снизу".
         header_layout.setContentsMargins(12, 12, 12, 12)
+        header_layout.setSpacing(8)
+        # Действия с письмом — строкой кнопок над реквизитами, такими же, как
+        # «Написать» и «Удалить» над списком писем (пожелание: «сделай
+        # кнопками и над заголовком»).
+        self.open_message_window_action = QAction(_toolbar_icon("open_window"), "Открыть в окне", self)
+        self.open_message_window_action.setToolTip("Открыть письмо в отдельном окне")
+        self.open_message_window_action.triggered.connect(self.on_open_message_window)
+        self.message_actions_bar = QWidget(self.message_header_widget)
+        actions_row = QHBoxLayout(self.message_actions_bar)
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(6)
+        for action in (self.reply_action, self.reply_all_action, self.forward_action, self.open_message_window_action):
+            button = QToolButton(self.message_actions_bar)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+            button.setIconSize(QSize(18, 18))
+            actions_row.addWidget(button)
+        actions_row.addStretch(1)
+        header_layout.addWidget(self.message_actions_bar)
+
         self.message_header_label = QLabel(self.message_header_widget)
         self.message_header_label.setWordWrap(True)
         self.message_header_label.setTextInteractionFlags(
@@ -6119,31 +6139,7 @@ class MainWindow(QMainWindow):
         self.message_header_label.linkHovered.connect(self._on_header_link_hovered)
         self._header_to = ""
         self._header_cc = ""
-        header_layout.addWidget(self.message_header_label, 1)
-        # Действия с письмом — одной строкой, плоскими пунктами без рамок, как
-        # разделы в верхнем меню (пожелание: «сделай кнопки в верхней строке
-        # как меню — не красиво же так»).
-        self.open_message_window_action = QAction(_toolbar_icon("open_window"), "Открыть в окне", self)
-        self.open_message_window_action.setToolTip("Открыть письмо в отдельном окне")
-        self.open_message_window_action.triggered.connect(self.on_open_message_window)
-        # Обычный ряд кнопок, а не QToolBar: панель инструментов при узкой
-        # области чтения прятала часть действий за стрелку «»».
-        self.message_actions_bar = QWidget(self.message_header_widget)
-        self.message_actions_bar.setObjectName("messageActions")
-        actions_row = QHBoxLayout(self.message_actions_bar)
-        actions_row.setContentsMargins(0, 0, 0, 0)
-        actions_row.setSpacing(2)
-        for action in (self.reply_action, self.reply_all_action, self.forward_action, self.open_message_window_action):
-            button = QToolButton(self.message_actions_bar)
-            button.setDefaultAction(action)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-            button.setIconSize(QSize(18, 18))
-            button.setAutoRaise(True)
-            actions_row.addWidget(button)
-        header_actions = QVBoxLayout()
-        header_actions.addWidget(self.message_actions_bar, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
-        header_actions.addStretch(1)
-        header_layout.addLayout(header_actions)
+        header_layout.addWidget(self.message_header_label)
         # Жалоба: "заголовок письма... занимает от 50% до 100%, должен
         # занимать 4 строки" — без явной политики размера QVBoxLayout ниже
         # (reading_layout) мог отдавать этому виджету всё "лишнее" место

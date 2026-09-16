@@ -180,21 +180,6 @@ QScrollBar::add-page, QScrollBar::sub-page {{
 /* Кнопки разделов (Почта/Календарь/Контакты/Параметры/Справка) — без
    рамок, выделяется только активный раздел (пожелание: "убери рамку у
    кнопок меню"). */
-/* Действия в шапке открытого письма (Ответить, Переслать, Открыть в окне) —
-   такие же плоские пункты, как разделы в верхнем меню. */
-QWidget#messageActions {{
-    background-color: transparent;
-    border: none;
-    spacing: 2px;
-}}
-QWidget#messageActions QToolButton {{
-    border: none;
-    background-color: transparent;
-    padding: 4px 10px;
-}}
-QWidget#messageActions QToolButton:hover {{
-    background-color: {border};
-}}
 QToolBar#modeBar {{
     padding: 6px 4px;  /* отступы сверху и снизу у панели разделов (пожелание пользователя) */
 }}
