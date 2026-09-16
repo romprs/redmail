@@ -450,6 +450,17 @@ def delete_messages(account_key: str, folder: str, uids: list[int]) -> None:
 # ---- Тела писем --------------------------------------------------------------
 
 
+def get_message_text(account_key: str, folder: str, uid: int) -> str | None:
+    """Только текст сохранённого письма — без вложений и картинок (для
+    разметки категорий: грузить ради неё вложения незачем)."""
+    with closing(_connect()) as conn:
+        row = conn.execute(
+            "SELECT body FROM messages WHERE account = ? AND folder = ? AND uid = ?",
+            (account_key, folder, uid),
+        ).fetchone()
+    return row[0] if row else None
+
+
 def get_message_content(account_key: str, folder: str, uid: int) -> MessageContent | None:
     with closing(_connect()) as conn:
         row = conn.execute(

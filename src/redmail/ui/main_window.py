@@ -148,6 +148,8 @@ from redmail.config_store import (
     load_auto_archive_size_mb,
     load_body_max_size_mb,
     load_font_scale,
+    plugin_enabled,
+    save_plugin_enabled,
     load_greeting_mode,
     greeting_text,
     save_greeting_mode,
@@ -232,6 +234,8 @@ from redmail import (
     voice_assistant,
 )
 from redmail.paths import app_dir
+from redmail import plugins as mail_plugins
+from redmail.plugins import categories as mail_categories
 from redmail.smtp_client import (
     OutgoingAttachment,
     OutgoingMessage,
@@ -263,8 +267,10 @@ COL_FLAG = 1
 COL_IMPORTANCE = 2
 COL_ATTACHMENT = 3
 COL_SENDER = 4
-COL_SUBJECT = 5
-COL_DATE = 6
+COL_CATEGORY = 5
+COL_SUBJECT = 6
+COL_DATE = 7
+MAIL_COLUMN_COUNT = 8
 
 # Колонки, по которым имеет смысл искать текстом — по ним же переключается
 # фильтр, когда пользователь встаёт в соответствующую колонку/заголовок.
@@ -1502,6 +1508,23 @@ def _importance_mark(importance: str) -> str:
     return ""
 
 
+def _facts_from_summary(summary: MessageSummary, text: str = "") -> mail_categories.MessageFacts:
+    return mail_categories.MessageFacts(
+        sender_email=summary.sender_email or "", sender_name=summary.sender or "",
+        subject=summary.subject or "", text=text or "", to=summary.to or "",
+    )
+
+
+def _facts_from_content(content: MessageContent) -> mail_categories.MessageFacts:
+    from email.utils import parseaddr
+
+    name, email = parseaddr(content.from_ or "")
+    return mail_categories.MessageFacts(
+        sender_email=email, sender_name=name, subject=content.subject or "", text=content.text or "",
+        headers=dict(getattr(content, "mail_headers", {}) or {}), to=content.to or "",
+    )
+
+
 def _dot_icon(hex_color: str, diameter: int = _MARKER_ICON_SIZE) -> QIcon:
     pixmap = QPixmap(diameter, diameter)
     pixmap.fill(Qt.GlobalColor.transparent)
@@ -1736,9 +1759,10 @@ class _MessageCardDelegate(QStyledItemDelegate):
     AVATAR = 36
     PAD = 8
 
-    def __init__(self, summaries_by_uid, parent=None, *, thread_info=None, on_thread_toggle=None) -> None:
+    def __init__(self, summaries_by_uid, parent=None, *, thread_info=None, on_thread_toggle=None, category_for=None) -> None:
         super().__init__(parent)
         self._summaries_by_uid = summaries_by_uid
+        self._category_for = category_for or (lambda uid: None)
         self._thread_info = thread_info or (lambda uid: None)
         self._on_thread_toggle = on_thread_toggle
         self.expanded_keys: set[str] = set()
@@ -1822,6 +1846,22 @@ class _MessageCardDelegate(QStyledItemDelegate):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(_MARKER_HEX[color]))
             painter.drawEllipse(indicator_x, y2 + (line_h - dot) // 2, dot, dot)
+        chip = self._category_for(summary.uid)
+        if chip is not None:
+            chip_name, chip_color = chip
+            small = QFont(option.font)
+            small.setPointSizeF(max(6.0, option.font.pointSizeF() * 0.85))
+            painter.setFont(small)
+            chip_w = painter.fontMetrics().horizontalAdvance(chip_name) + 10
+            indicator_x -= chip_w + 6
+            chip_rect = QRect(indicator_x, y2 + 1, chip_w, line_h - 2)
+            painter.setPen(Qt.PenStyle.NoPen)
+            fill = QColor(chip_color)
+            fill.setAlpha(40)
+            painter.setBrush(fill)
+            painter.drawRoundedRect(chip_rect, 6, 6)
+            painter.setPen(palette.highlightedText().color() if selected else QColor(chip_color))
+            painter.drawText(chip_rect, Qt.AlignmentFlag.AlignCenter, chip_name)
         marks = []
         if summary.importance == "high":
             marks.append("!")
@@ -2120,6 +2160,170 @@ def _settings_tab(*groups: QWidget) -> QWidget:
     return page
 
 
+class CategoryEditDialog(QDialog):
+    """Одна категория: название, цвет, описание и правила — адресаты и слова в теме."""
+
+    def __init__(self, parent, category: mail_categories.Category | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("Категория" if category is None else f"Категория «{category.name}»")
+        self._category = category
+        self._color = category.color if category is not None else "#5C6BC0"
+        self.name_edit = QLineEdit(category.name if category is not None else "", self)
+        self.color_button = QPushButton(self)
+        self.color_button.clicked.connect(self._on_color)
+        self._paint_color_button()
+        self.description_edit = QPlainTextEdit(category.description if category is not None else "", self)
+        self.description_edit.setPlaceholderText("Что попадает в категорию — для себя и коллег")
+        self.description_edit.setFixedHeight(60)
+        self.senders_edit = QPlainTextEdit("\n".join(category.senders) if category is not None else "", self)
+        self.senders_edit.setPlaceholderText("nalog.ru\n*@gosuslugi.ru\nnoreply@*\nИванов")
+        self.keywords_edit = QPlainTextEdit("\n".join(category.keywords) if category is not None else "", self)
+        self.keywords_edit.setPlaceholderText("счёт на оплату\nакт сверки")
+        hint = QLabel(
+            "Адресаты — по одному в строке: домен («nalog.ru»), адрес или маска со звёздочкой "
+            "(«*@gosuslugi.ru», «noreply@*») или часть имени отправителя («Иванов»). Слова — ищутся "
+            "в теме письма. Остальное модуль узнаёт сам, когда вы выбираете категорию письмам вручную.",
+            self,
+        )
+        hint.setWordWrap(True)
+        form = QFormLayout()
+        form.addRow("Название", self.name_edit)
+        form.addRow("Цвет", self.color_button)
+        form.addRow("Описание", self.description_edit)
+        form.addRow("Адресаты", self.senders_edit)
+        form.addRow("Слова в теме", self.keywords_edit)
+        form.addRow(hint)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+        self.resize(520, 460)
+
+    def _paint_color_button(self) -> None:
+        self.color_button.setIcon(_dot_icon(self._color))
+        self.color_button.setText(self._color)
+
+    def _on_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self._color), self, "Цвет категории")
+        if color.isValid():
+            self._color = color.name()
+            self._paint_color_button()
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        if not self.name_edit.text().strip():
+            QMessageBox.warning(self, "Нет названия", "Укажите название категории.")
+            return
+        super().accept()
+
+    def to_category(self) -> mail_categories.Category:
+        lines = lambda edit: [line.strip() for line in edit.toPlainText().splitlines() if line.strip()]  # noqa: E731
+        base = self._category
+        return mail_categories.Category(
+            id=base.id if base is not None else "",
+            name=self.name_edit.text().strip(),
+            color=self._color,
+            description=self.description_edit.toPlainText().strip(),
+            senders=lines(self.senders_edit),
+            keywords=lines(self.keywords_edit),
+            builtin=base.builtin if base is not None else False,
+            position=base.position if base is not None else 0,
+        )
+
+
+class CategoriesDialog(QDialog):
+    """Список категорий модуля: добавить, изменить, удалить, разметить заново."""
+
+    def __init__(self, parent, store: mail_categories.CategoryStore):
+        super().__init__(parent)
+        self.setWindowTitle("Категории писем")
+        self._store = store
+        self.list_widget = QListWidget(self)
+        self.list_widget.itemDoubleClicked.connect(lambda _item: self._on_edit())
+        add_button = QPushButton("Добавить…", self)
+        add_button.clicked.connect(self._on_add)
+        edit_button = QPushButton("Изменить…", self)
+        edit_button.clicked.connect(self._on_edit)
+        self.delete_button = QPushButton("Удалить", self)
+        self.delete_button.clicked.connect(self._on_delete)
+        relabel_button = QPushButton("Разметить письма заново", self)
+        relabel_button.setToolTip(
+            "Сбросить автоматическую разметку — письма получат категории заново по текущим правилам. "
+            "Выбранное вручную сохраняется."
+        )
+        relabel_button.clicked.connect(self._on_relabel)
+        side = QVBoxLayout()
+        for button in (add_button, edit_button, self.delete_button):
+            side.addWidget(button)
+        side.addStretch(1)
+        side.addWidget(relabel_button)
+        body = QHBoxLayout()
+        body.addWidget(self.list_widget, 1)
+        body.addLayout(side)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(body)
+        layout.addWidget(close)
+        self.list_widget.currentRowChanged.connect(self._update_buttons)
+        self._reload()
+        self.resize(560, 360)
+
+    def _reload(self) -> None:
+        self.list_widget.clear()
+        for category in self._store.categories():
+            item = QListWidgetItem(_dot_icon(category.color), category.name)
+            item.setData(Qt.ItemDataRole.UserRole, category.id)
+            item.setToolTip(category.description)
+            self.list_widget.addItem(item)
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+        self._update_buttons()
+
+    def _current(self) -> mail_categories.Category | None:
+        item = self.list_widget.currentItem()
+        if item is None:
+            return None
+        return next((c for c in self._store.categories() if c.id == item.data(Qt.ItemDataRole.UserRole)), None)
+
+    def _update_buttons(self, *_args) -> None:
+        current = self._current()
+        # Стандартные категории правятся, но не удаляются.
+        self.delete_button.setEnabled(current is not None and not current.builtin)
+
+    def _on_add(self) -> None:
+        dialog = CategoryEditDialog(self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._store.save_category(dialog.to_category())
+            self._reload()
+
+    def _on_edit(self) -> None:
+        current = self._current()
+        if current is None:
+            return
+        dialog = CategoryEditDialog(self, current)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._store.save_category(dialog.to_category())
+            self._reload()
+
+    def _on_delete(self) -> None:
+        current = self._current()
+        if current is None or current.builtin:
+            return
+        answer = QMessageBox.question(
+            self, "Удалить категорию",
+            f"Удалить категорию «{current.name}»? Письма останутся на месте, пропадут только их метки этой категории и обучение.",
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            self._store.delete_category(current.id)
+            self._reload()
+
+    def _on_relabel(self) -> None:
+        self._store.forget_automatic()
+        QMessageBox.information(self, "Разметка", "Автоматическая разметка сброшена — письма получат категории заново при открытии папок.")
+
+
 class SettingsDialog(QDialog):
     """Один диалог на всё: учётная запись (было отдельным «Подключиться…»),
     интервал проверки почты и расположение панели чтения."""
@@ -2145,6 +2349,8 @@ class SettingsDialog(QDialog):
         greeting_mode: str = GREETING_NONE,
         accounts: list[tuple[str, str]] | None = None,
         disabled_accounts: tuple[str, ...] = (),
+        plugins_enabled: dict[str, bool] | None = None,
+        category_store=None,
         delete_on_server_accounts: tuple[str, ...] = (),
         domain_rewrites_by_account: dict[str, str] | None = None,
     ):
@@ -2477,6 +2683,29 @@ class SettingsDialog(QDialog):
         self._voice_updating = False
         self._refresh_voice_state()
         tabs.addTab(_settings_tab(accounts_rules_group), "Учётные записи")
+
+        # Подключаемые модули: включаются и выключаются без перезапуска.
+        self._category_store = category_store
+        self.plugin_checks: dict[str, QCheckBox] = {}
+        modules_layout = QVBoxLayout()
+        for plugin in mail_plugins.available_plugins():
+            check = QCheckBox(plugin.title, self)
+            check.setChecked((plugins_enabled or {}).get(plugin.id, plugin.enabled_by_default))
+            description = QLabel(plugin.description, self)
+            description.setWordWrap(True)
+            modules_layout.addWidget(check)
+            modules_layout.addWidget(description)
+            self.plugin_checks[plugin.id] = check
+            if plugin.id == mail_plugins.CATEGORIES.id:
+                categories_button = QPushButton("Категории…", self)
+                categories_button.setToolTip("Список категорий, их цвета и описание: адресаты и слова в теме")
+                categories_button.clicked.connect(self._on_manage_categories)
+                categories_button.setEnabled(category_store is not None)
+                check.toggled.connect(lambda on, button=categories_button: button.setEnabled(on and self._category_store is not None))
+                modules_layout.addWidget(categories_button, 0, Qt.AlignmentFlag.AlignLeft)
+        modules_group = QGroupBox("Подключаемые модули", self)
+        modules_group.setLayout(modules_layout)
+        tabs.addTab(_settings_tab(modules_group), "Модули")
         layout.addWidget(tabs)
         layout.addWidget(buttons)
         self.resize(760, 560)
@@ -2660,6 +2889,13 @@ class SettingsDialog(QDialog):
 
     def font_scale(self) -> float:
         return self.font_scale_spin.value() / 100
+
+    def plugins_enabled(self) -> dict[str, bool]:
+        return {plugin_id: check.isChecked() for plugin_id, check in self.plugin_checks.items()}
+
+    def _on_manage_categories(self) -> None:
+        if self._category_store is not None:
+            CategoriesDialog(self, self._category_store).exec()
 
     def greeting_mode(self) -> str:
         return self.greeting_combo.currentData() or GREETING_NONE
@@ -5563,6 +5799,12 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
         self.contacts_path = profile.contacts_db_path()
+        # Модуль «Категории писем» (Параметры → «Модули»).
+        self.category_store: mail_categories.CategoryStore | None = None
+        self._categories_cache: dict[str, mail_categories.Category] = {}
+        self._category_labels: dict[int, mail_categories.Label] = {}
+        self.category_filter: str | None = None  # None — любая, "" — без категории
+        self._category_token = 0
         self._contacts_view_signature: tuple[int, int] | None = None
         self.current_invite: itip.IncomingInvite | None = None
         self.selected_contact: contact_store.Contact | None = None
@@ -5582,8 +5824,8 @@ class MainWindow(QMainWindow):
         self.filter_edit.setObjectName("searchField")
         self.filter_edit.addAction(_toolbar_icon("search", 14), QLineEdit.ActionPosition.LeadingPosition)
 
-        self.table = QTableWidget(0, 7, self)
-        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Тема", "Дата"])
+        self.table = QTableWidget(0, MAIL_COLUMN_COUNT, self)
+        self.table.setHorizontalHeaderLabels(["", _FLAG_MARK, "!", _ATTACHMENT_MARK, "От кого", "Категория", "Тема", "Дата"])
         self.table.setItemDelegateForColumn(COL_CHECK, _ThinCheckboxDelegate(self.table))
         self._update_marker_filter_indicator()
         self.table.verticalHeader().setVisible(False)
@@ -5604,6 +5846,8 @@ class MainWindow(QMainWindow):
         # естественно забирает освободившееся место.
         header.setSectionResizeMode(COL_SUBJECT, QHeaderView.ResizeMode.Interactive)
         self.table.setColumnWidth(COL_SUBJECT, 320)
+        header.setSectionResizeMode(COL_CATEGORY, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(COL_CATEGORY, 150)
         header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeMode.Interactive)
         for col in (COL_CHECK, COL_FLAG, COL_IMPORTANCE, COL_ATTACHMENT):
             header.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
@@ -5719,6 +5963,7 @@ class MainWindow(QMainWindow):
         self.card_delegate = _MessageCardDelegate(
             lambda: self.summaries_by_uid, self.card_list,
             thread_info=lambda uid: self._thread_info.get(uid), on_thread_toggle=self._toggle_thread,
+            category_for=self._category_chip,
         )
         self.card_list.setItemDelegate(self.card_delegate)
         # Выделение в плитках — то же, что в таблице (Ctrl/Shift-клик,
@@ -6339,6 +6584,7 @@ class MainWindow(QMainWindow):
 
         self._calendar_sync_running = False
         self._calendar_changed_in_background = False
+        self._apply_categories_module(plugin_enabled("categories", mail_plugins.CATEGORIES.enabled_by_default))
         self.poll_timer = QTimer(self)
         self.poll_timer.timeout.connect(self._on_periodic_refresh)
         self._restart_poll_timer()
@@ -6390,7 +6636,7 @@ class MainWindow(QMainWindow):
                     self.main_splitter.restoreState(QByteArray(splitters_state["main"]))
                 if "right" in splitters_state:
                     self.right_splitter.restoreState(QByteArray(splitters_state["right"]))
-            columns_state = load_mail_columns_state()
+            columns_state = load_mail_columns_state(MAIL_COLUMN_COUNT)
             if columns_state:
                 self.table.horizontalHeader().restoreState(QByteArray(columns_state))
                 # Ширины колонок восстановлены как есть — геометрия окна
@@ -6733,7 +6979,9 @@ class MainWindow(QMainWindow):
         self.mailbox_trash_folders[key] = session.trash_folder()
         self.mailbox_sent_folders[key] = session.sent_folder()
         self.mailbox_drafts_folders[key] = session.drafts_folder()
-        self.mailboxes[key].content_hook = self._calendar_hook_for(account, self.mailbox_drafts_folders[key])
+        self.mailboxes[key].content_hook = self._calendar_hook_for(
+            account, self.mailbox_drafts_folders[key], self.mailboxes[key].account_key,
+        )
 
         default_item = self._populate_account_folder_tree(key, folders)
 
@@ -7668,6 +7916,8 @@ class MainWindow(QMainWindow):
             domain_rewrites_by_account={key: load_domain_rewrites(key) for key, _title in known_accounts},
             font_scale=load_font_scale(),
             greeting_mode=load_greeting_mode(),
+            plugins_enabled={p.id: plugin_enabled(p.id, p.enabled_by_default) for p in mail_plugins.available_plugins()},
+            category_store=self.category_store,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -7694,6 +7944,9 @@ class MainWindow(QMainWindow):
             save_domain_rewrites_by_account(dialog.domain_rewrites_by_account())
             self._apply_disabled_accounts(dialog.disabled_accounts())
             save_greeting_mode(dialog.greeting_mode())
+            for plugin_id, enabled in dialog.plugins_enabled().items():
+                save_plugin_enabled(plugin_id, enabled)
+            self._apply_categories_module(dialog.plugins_enabled().get(mail_plugins.CATEGORIES.id, False))
             if abs(dialog.font_scale() - load_font_scale()) > 0.001:
                 # Тот же путь, что у ползунка в строке состояния.
                 self.font_scale_slider.setValue(int(round(dialog.font_scale() * 100)))
@@ -8603,6 +8856,11 @@ class MainWindow(QMainWindow):
             return False
         if self.filter_attachments and not summary.has_attachments:
             return False
+        if self.category_filter is not None:
+            label = self._category_labels.get(summary.uid)
+            category_id = label.category_id if label is not None else None
+            if (category_id or "") != self.category_filter:
+                return False
         if self.marker_filter is not None:
             markers = split_markers(summary.marker_color)
             if self.marker_filter == _ANY_MARKER_FILTER:
@@ -8686,6 +8944,7 @@ class MainWindow(QMainWindow):
             row = self._row_for_uid(previously_selected_uid)
             if row is not None:
                 self.table.selectRow(row)
+        self._categorize_folder_async(summaries)
 
     def _fill_message_rows(self, summaries: list[MessageSummary], is_sent_folder: bool) -> None:
         for row, summary in enumerate(summaries):
@@ -8746,6 +9005,10 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_SENDER, sender_item)
             self.table.setItem(row, COL_SUBJECT, subject_item)
             self.table.setItem(row, COL_DATE, thread_item(summary.date, head.date))
+            category_name, head_category = self._category_name(summary.uid), self._category_name(head.uid)
+            category_item = thread_item(category_name, head_category.casefold(), category_name.casefold())
+            self._paint_category_item(category_item, summary.uid)
+            self.table.setItem(row, COL_CATEGORY, category_item)
 
     @staticmethod
     def _readonly_item(text: str | QTableWidgetItem) -> QTableWidgetItem:
@@ -9035,8 +9298,35 @@ class MainWindow(QMainWindow):
             marker_group.addAction(action)
             self._marker_filter_actions[action] = color
         marker_group.triggered.connect(self._on_marker_filter_action)
+        menu.addSeparator()
+        # Категории — отдельным подменю, пересобирается при каждом открытии:
+        # список категорий правится в «Параметрах».
+        self.category_filter_menu = menu.addMenu("Категория")
+        self.category_filter_menu.aboutToShow.connect(self._rebuild_category_filter_menu)
         menu.aboutToShow.connect(self._sync_filter_menu)
         return menu
+
+    def _rebuild_category_filter_menu(self) -> None:
+        menu = self.category_filter_menu
+        menu.clear()
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        options = [(None, "Любая", None)]
+        if self.category_store is not None:
+            options += [(c.id, c.name, c.color) for c in self._categories_cache.values()]
+            options.append(("", "Без категории", None))
+        for value, label, color in options:
+            action = menu.addAction(_dot_icon(color) if color else QIcon(), label)
+            action.setCheckable(True)
+            action.setChecked(value == self.category_filter)
+            action.setData(value)
+            group.addAction(action)
+        group.triggered.connect(self._on_category_filter_action)
+
+    def _on_category_filter_action(self, action: QAction) -> None:
+        self.category_filter = action.data()
+        self._update_filter_button_indicator()
+        self.on_filter_changed(self.filter_edit.text())
 
     def _sync_filter_menu(self) -> None:
         self.filter_important_action.setChecked(self.filter_important)
@@ -9057,7 +9347,10 @@ class MainWindow(QMainWindow):
         self.on_filter_changed(self.filter_edit.text())
 
     def _update_filter_button_indicator(self) -> None:
-        active = self.filter_important or self.filter_attachments or self.marker_filter is not None
+        active = (
+            self.filter_important or self.filter_attachments or self.marker_filter is not None
+            or self.category_filter is not None
+        )
         self.filter_button.setText("Фильтр •" if active else "Фильтр")
 
     def on_mail_table_context_menu(self, pos) -> None:
@@ -9085,9 +9378,24 @@ class MainWindow(QMainWindow):
         )
         if in_trash:
             restore_action = menu.addAction("Восстановить из корзины")
+        category_actions: dict[QAction, str | None] = {}
+        if self.category_store is not None and getattr(self.active_source, "account_key", None):
+            category_menu = menu.addMenu("Категория")
+            current = self._category_labels.get(summary.uid)
+            for category in self._categories_cache.values():
+                action = category_menu.addAction(_dot_icon(category.color), category.name)
+                action.setCheckable(True)
+                action.setChecked(current is not None and current.category_id == category.id)
+                category_actions[action] = category.id
+            category_menu.addSeparator()
+            category_actions[category_menu.addAction("Без категории")] = None
         menu.addSeparator()
         add_contact_action = menu.addAction("Добавить отправителя в контакты…")
         chosen = menu.exec(global_pos)
+
+        if chosen in category_actions:
+            self._set_category_manually(summary, category_actions[chosen])
+            return
 
         if chosen is toggle_read_action:
             self._set_message_read(row, summary, not summary.is_read)
@@ -9688,23 +9996,168 @@ class MainWindow(QMainWindow):
                 item.setText(_thread_subject_text(summary, info, info is not None and info.key in self._expanded_threads))
             self._refresh_cards()
 
-    def _calendar_hook_for(self, account, drafts_folder: str | None):
-        """Разбор календарных вложений в письмах, скачанных фоном: приглашения
-        и .ics попадают в календарь, даже если письмо не открывали. Работает
-        в потоке докачки — окна не трогает, только отмечает, что календарь
-        нужно перерисовать."""
+    def _calendar_hook_for(self, account, drafts_folder: str | None, cache_key: str | None = None):
+        """Разбор писем, скачанных фоном: приглашения и .ics попадают в
+        календарь, а письмо получает категорию — даже если его не открывали.
+        Работает в потоке докачки — окна не трогает."""
         my_email = getattr(account, "email", "") or getattr(account, "username", "")
         calendar_path = self.calendar_path
 
-        def hook(folder: str, _uid: int, content) -> None:
+        def hook(folder: str, uid: int, content) -> None:
             if drafts_folder and folder == drafts_folder:
                 return
+            store = self.category_store
+            if store is not None and cache_key:
+                try:
+                    store.classify_and_store(cache_key, folder, uid, _facts_from_content(content))
+                except Exception as exc:
+                    _log.debug("Категория письма %s/%d не определена: %s", folder, uid, exc)
             if not calendar_mail.has_calendar_data(content):
                 return
             if calendar_mail.apply_calendar_parts(calendar_path, content, my_email):
                 self._calendar_changed_in_background = True
 
         return hook
+
+    # ---- Категории писем (подключаемый модуль) ------------------------------
+
+    def _apply_categories_module(self, enabled: bool) -> None:
+        """Включить или выключить модуль категорий без перезапуска."""
+        if enabled and self.category_store is None:
+            try:
+                self.category_store = mail_categories.CategoryStore(profile.profile_dir() / "categories.sqlite3")
+            except Exception as exc:
+                _log.error("Модуль категорий не запущен: %s", exc)
+                self.category_store = None
+        elif not enabled:
+            self.category_store = None
+            self._category_labels = {}
+            self.category_filter = None
+        self._reload_categories()
+        self.table.setColumnHidden(COL_CATEGORY, self.category_store is None)
+        if self.current_summaries:
+            self._render_folder(self.current_summaries)
+
+    def _reload_categories(self) -> None:
+        store = self.category_store
+        try:
+            self._categories_cache = {c.id: c for c in store.categories()} if store is not None else {}
+        except Exception as exc:
+            _log.warning("Категории не прочитаны: %s", exc)
+            self._categories_cache = {}
+
+    def _category_chip(self, uid: int) -> tuple[str, str] | None:
+        label = self._category_labels.get(uid)
+        category = self._categories_cache.get(label.category_id) if label is not None and label.category_id else None
+        return (category.name, category.color) if category is not None else None
+
+    def _category_name(self, uid: int) -> str:
+        label = self._category_labels.get(uid)
+        category = self._categories_cache.get(label.category_id) if label is not None and label.category_id else None
+        return category.name if category is not None else ""
+
+    def _paint_category_item(self, item: QTableWidgetItem, uid: int) -> None:
+        label = self._category_labels.get(uid)
+        category = self._categories_cache.get(label.category_id) if label is not None and label.category_id else None
+        item.setText(category.name if category is not None else "")
+        if category is not None:
+            item.setForeground(QColor(category.color))
+            how = {
+                mail_categories.SOURCE_USER: "выбрана вручную",
+                mail_categories.SOURCE_RULE: "по описанию категории",
+                mail_categories.SOURCE_HEADERS: "по признакам рассылки",
+                mail_categories.SOURCE_MODEL: f"по обучению, уверенность {label.score:.0%}",
+            }.get(label.source, "")
+            item.setToolTip(f"{category.name} — {how}" if how else category.name)
+        else:
+            item.setToolTip("")
+
+    def _apply_category_labels(self, labels: dict) -> None:
+        self._category_labels = labels
+        self.table.setSortingEnabled(False)
+        try:
+            for row in range(self.table.rowCount()):
+                check = self.table.item(row, COL_CHECK)
+                item = self.table.item(row, COL_CATEGORY)
+                if check is None or item is None:
+                    continue
+                self._paint_category_item(item, check.data(Qt.ItemDataRole.UserRole))
+        finally:
+            self.table.setSortingEnabled(True)
+        self._refresh_cards()
+        self.on_filter_changed(self.filter_edit.text())
+
+    def _categorize_folder_async(self, summaries: list[MessageSummary]) -> None:
+        """Категории писем открытой папки: известные — сразу из базы модуля,
+        недостающие — в фоне, по теме, отправителю и сохранённому тексту."""
+        store = self.category_store
+        source = self.active_source
+        folder = self.current_folder
+        account = getattr(source, "account_key", None)
+        if store is None or not account or not folder:
+            self._category_labels = {}
+            return
+        self._category_token += 1
+        token = self._category_token
+        try:
+            known = store.labels_for(account, folder)
+        except Exception as exc:
+            _log.warning("Категории папки %s не прочитаны: %s", folder, exc)
+            return
+        self._apply_category_labels(known)
+        missing = [s for s in summaries if s.uid not in known][:1000]
+        if not missing:
+            return
+
+        def work() -> dict:
+            model = store.model()
+            for summary in missing:
+                text = ""
+                try:
+                    from redmail import cache_store
+
+                    text = cache_store.get_message_text(account, folder, summary.uid) or ""
+                except Exception:
+                    text = ""
+                store.classify_and_store(account, folder, summary.uid, _facts_from_summary(summary, text), model=model)
+            return store.labels_for(account, folder)
+
+        worker = _CallableWorker(work, parent=self)
+
+        def done(result: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if result is not None and token == self._category_token and source is self.active_source and folder == self.current_folder:
+                self._apply_category_labels(result)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(lambda error: (_log.warning("Разметка категорий не удалась: %s", error), done()))
+        self._background_workers.append(worker)
+        worker.start()
+
+    def _set_category_manually(self, summary: MessageSummary, category_id: str | None) -> None:
+        """Человек выбрал категорию: для этого письма и отмеченных галочкой.
+        Выбор сохраняется и учит модуль на будущее."""
+        store = self.category_store
+        account = getattr(self.active_source, "account_key", None)
+        folder = self.current_folder
+        if store is None or not account or not folder:
+            return
+        uids = [uid for uid in self._checked_uids() if uid in self.summaries_by_uid] or [summary.uid]
+        if summary.uid not in uids:
+            uids = [summary.uid]
+        from redmail import cache_store
+
+        for uid in uids:
+            target = self.summaries_by_uid[uid]
+            try:
+                text = cache_store.get_message_text(account, folder, uid) or ""
+            except Exception:
+                text = ""
+            store.set_user_label(account, folder, uid, category_id, _facts_from_summary(target, text))
+        self._apply_category_labels(store.labels_for(account, folder))
+        name = self._categories_cache[category_id].name if category_id in self._categories_cache else "без категории"
+        self.statusBar().showMessage(f"Категория «{name}»: писем {len(uids)}", 5000)
 
     def _update_invite_bar(self, content: MessageContent) -> None:
         if not self.account or not calendar_mail.has_calendar_data(content):
@@ -11918,7 +12371,7 @@ class MainWindow(QMainWindow):
             shutil.rmtree(temp_dir, ignore_errors=True)
         try:
             save_window_geometry(bytes(self.saveGeometry()))
-            save_mail_columns_state(bytes(self.table.horizontalHeader().saveState()))
+            save_mail_columns_state(bytes(self.table.horizontalHeader().saveState()), MAIL_COLUMN_COUNT)
             # Раньше положение сплиттеров (ширина списка папок, доля
             # списка писем/панели чтения) нигде не сохранялось вовсе —
             # всегда сбрасывалось на жёстко заданные умолчания при

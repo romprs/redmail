@@ -197,6 +197,13 @@ class FolderInfo:
     delimiter: str
 
 
+#: Заголовки, которые сохраняются в MessageContent.mail_headers.
+_CLASSIFICATION_HEADERS = (
+    "List-Unsubscribe", "List-Id", "Precedence", "Auto-Submitted", "X-Auto-Response-Suppress",
+    "X-Campaign", "X-MC-User", "Feedback-ID", "X-SG-EID", "X-Mailgun-Tag",
+)
+
+
 class MessageGoneError(LookupError):
     """Письма на сервере больше нет: его удалили или перенесли в другую
     папку (в том числе из другой программы или с телефона), а локальная
@@ -258,6 +265,10 @@ class MessageContent:
     to: str = ""
     cc: str = ""
     bcc: str = ""
+    # Служебные заголовки, по которым модуль категорий узнаёт рассылки
+    # (List-Unsubscribe, Precedence, Auto-Submitted и т.п.). В локальной
+    # копии не хранятся — нужны только в момент разбора скачанного письма.
+    mail_headers: dict[str, str] = field(default_factory=dict)
 
 
 class ImapSession:
@@ -693,6 +704,11 @@ def extract_content(message: Message) -> MessageContent:
     # передаём во все ветки через один хелпер, а не повторяя 5 kwargs в
     # каждом return.
     header_kwargs = dict(
+        mail_headers={
+            name: str(message.get(name))
+            for name in _CLASSIFICATION_HEADERS
+            if message.get(name) is not None
+        },
         subject=_decode_header_text(message.get("Subject")),
         from_=_decode_header_text(message.get("From")),
         to=_decode_header_text(message.get("To")),

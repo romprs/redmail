@@ -518,14 +518,40 @@ def save_compose_geometry(data: bytes) -> None:
     _save_settings_dict(settings)
 
 
-def load_mail_columns_state() -> bytes | None:
-    value = _load_settings_dict().get("mail_columns_state")
-    return base64.b64decode(value) if value else None
+def load_mail_columns_state(expected_columns: int | None = None) -> bytes | None:
+    """Сохранённые ширины и порядок колонок. Если с тех пор число колонок
+    поменялось (добавилась «Категория»), старое состояние не подходит —
+    колонки встанут по умолчанию один раз."""
+    settings = _load_settings_dict()
+    value = settings.get("mail_columns_state")
+    if not value:
+        return None
+    if expected_columns is not None and settings.get("mail_columns_count", 7) != expected_columns:
+        return None
+    return base64.b64decode(value)
 
 
-def save_mail_columns_state(data: bytes) -> None:
+def save_mail_columns_state(data: bytes, columns: int | None = None) -> None:
     settings = _load_settings_dict()
     settings["mail_columns_state"] = base64.b64encode(data).decode("ascii")
+    if columns is not None:
+        settings["mail_columns_count"] = columns
+    _save_settings_dict(settings)
+
+
+def plugin_enabled(plugin_id: str, default: bool = False) -> bool:
+    """Включён ли подключаемый модуль (Параметры → «Модули»)."""
+    value = _load_settings_dict().get("plugins", {})
+    if isinstance(value, dict) and plugin_id in value:
+        return bool(value[plugin_id])
+    return default
+
+
+def save_plugin_enabled(plugin_id: str, enabled: bool) -> None:
+    settings = _load_settings_dict()
+    plugins = settings.get("plugins") if isinstance(settings.get("plugins"), dict) else {}
+    plugins[plugin_id] = bool(enabled)
+    settings["plugins"] = plugins
     _save_settings_dict(settings)
 
 
