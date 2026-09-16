@@ -725,3 +725,11 @@ def test_greeting_mode_is_saved(tmp_path: Path) -> None:
         assert config_store.load_greeting_mode() == "time_of_day"
         config_store.save_greeting_mode("что-то")
         assert config_store.load_greeting_mode() == "none"
+
+
+def test_list_view_states_are_kept_per_account(tmp_path: Path) -> None:
+    with patch("redmail.config_store._settings_path", return_value=tmp_path / "settings.json"):
+        assert config_store.load_list_view_states() == {}
+        config_store.save_list_view_states({"imap:vk:me": {"sort": "sender", "order": "asc"}, "ews:ex:me": {"sort": "date"}})
+        states = config_store.load_list_view_states()
+    assert states["imap:vk:me"]["sort"] == "sender" and states["ews:ex:me"]["sort"] == "date"

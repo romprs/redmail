@@ -539,6 +539,19 @@ def save_mail_columns_state(data: bytes, columns: int | None = None) -> None:
     _save_settings_dict(settings)
 
 
+def load_list_view_states() -> dict[str, dict]:
+    """Сортировка и фильтры списка писем — у каждой учётной записи (и
+    архива) свои: {ключ записи: {sort, order, filter_column, ...}}."""
+    value = _load_settings_dict().get("list_view_by_account", {})
+    return {str(k): dict(v) for k, v in value.items() if isinstance(v, dict)} if isinstance(value, dict) else {}
+
+
+def save_list_view_states(states: dict[str, dict]) -> None:
+    settings = _load_settings_dict()
+    settings["list_view_by_account"] = states
+    _save_settings_dict(settings)
+
+
 def plugin_enabled(plugin_id: str, default: bool = False) -> bool:
     """Включён ли подключаемый модуль (Параметры → «Модули»)."""
     value = _load_settings_dict().get("plugins", {})

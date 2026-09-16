@@ -148,6 +148,8 @@ from redmail.config_store import (
     load_auto_archive_size_mb,
     load_body_max_size_mb,
     load_font_scale,
+    load_list_view_states,
+    save_list_view_states,
     plugin_enabled,
     save_plugin_enabled,
     load_greeting_mode,
@@ -5764,6 +5766,16 @@ class MainWindow(QMainWindow):
         # он реально завершится, даже если у него есть родитель-QObject.
         self._background_workers: list[QThread] = []
         self.filter_column = COL_SUBJECT
+        # Сортировка и фильтры — свои у каждой учётной записи и архива
+        # (пожелание: «фильтры и сортировки должны быть привязаны к учёткам,
+        # сейчас они на таблицу»). Ключ — тот же, что у записи в дереве.
+        self._view_states: dict[str, dict] = {}
+        try:
+            self._view_states = load_list_view_states()
+        except Exception as exc:
+            _log.warning("Настройки списка писем по учётным записям не прочитаны: %s", exc)
+        self._view_key: str | None = None
+        self._applying_view_state = False
         self.marker_filter: str | None = None
         # Фильтры списка писем (пожелание: "нужна фильтрация по важности,
         # наличию вложений, маркеру") — маркер выше, остальные два тут.
@@ -8220,6 +8232,7 @@ class MainWindow(QMainWindow):
         self.filter_column = column
         self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[column]}")
         self.on_filter_changed(self.filter_edit.text())
+        self._remember_view_state()
 
     def _open_marker_filter_menu(self) -> None:
         menu = QMenu(self)
@@ -8242,6 +8255,7 @@ class MainWindow(QMainWindow):
             self.marker_filter = color_actions[chosen]
         self._update_marker_filter_indicator()
         self.on_filter_changed(self.filter_edit.text())
+        self._remember_view_state()
 
     def _update_marker_filter_indicator(self) -> None:
         header_item = self.table.horizontalHeaderItem(COL_FLAG)
@@ -8281,6 +8295,7 @@ class MainWindow(QMainWindow):
         source = self.mailboxes.get(source_key) or self.archives.get(source_key)
         if source is None:
             return
+        self._switch_view_state(source_key)
         self.active_source = source
         self.current_folder = folder_name
         if source_key in self.mailboxes:
@@ -9073,6 +9088,85 @@ class MainWindow(QMainWindow):
     def _on_sort_indicator_changed(self, _column: int, _order: Qt.SortOrder) -> None:
         if self._card_items_by_uid:
             self._reorder_cards_from_table()
+        self._remember_view_state()
+
+    # ---- Сортировка и фильтры по учётным записям -----------------------------
+
+    _VIEW_COLUMNS = {"sender": COL_SENDER, "subject": COL_SUBJECT, "date": COL_DATE, "category": COL_CATEGORY}
+
+    def _capture_view_state(self) -> dict:
+        header = self.table.horizontalHeader()
+        names = {column: name for name, column in self._VIEW_COLUMNS.items()}
+        return {
+            "sort": names.get(header.sortIndicatorSection(), "date"),
+            "order": "asc" if header.sortIndicatorOrder() == Qt.SortOrder.AscendingOrder else "desc",
+            "filter_column": names.get(self.filter_column, "subject"),
+            "filter_text": self.filter_edit.text(),
+            "important": bool(self.filter_important),
+            "attachments": bool(self.filter_attachments),
+            "marker": self.marker_filter,
+            "category": self.category_filter,
+            "grouping": bool(self.thread_grouping),
+        }
+
+    def _apply_view_state(self, state: dict) -> None:
+        self._applying_view_state = True
+        try:
+            self.filter_important = bool(state.get("important", False))
+            self.filter_attachments = bool(state.get("attachments", False))
+            self.marker_filter = state.get("marker")
+            category = state.get("category")
+            self.category_filter = category if category is None or category == "" or category in self._categories_cache else None
+            self.filter_column = self._VIEW_COLUMNS.get(state.get("filter_column", "subject"), COL_SUBJECT)
+            if self.filter_column not in _FILTER_COLUMNS:
+                self.filter_column = COL_SUBJECT
+            self.filter_edit.setPlaceholderText(f"Фильтр: {_FILTER_COLUMNS[self.filter_column]}")
+            self.filter_edit.blockSignals(True)
+            self.filter_edit.setText(str(state.get("filter_text", "") or ""))
+            self.filter_edit.blockSignals(False)
+            grouping = bool(state.get("grouping", self.thread_grouping))
+            if grouping != self.thread_grouping:
+                self.thread_grouping = grouping
+                self.thread_grouping_action.blockSignals(True)
+                self.thread_grouping_action.setChecked(grouping)
+                self.thread_grouping_action.blockSignals(False)
+            column = self._VIEW_COLUMNS.get(state.get("sort", "date"), COL_DATE)
+            order = Qt.SortOrder.AscendingOrder if state.get("order") == "asc" else Qt.SortOrder.DescendingOrder
+            self.table.horizontalHeader().setSortIndicator(column, order)
+            self._update_marker_filter_indicator()
+            self._update_filter_button_indicator()
+        finally:
+            self._applying_view_state = False
+
+    def _switch_view_state(self, key: str) -> None:
+        """Выбрана папка другой учётной записи или архива — вернуть её
+        сортировку и фильтры, а свои у прежней запомнить."""
+        if key == self._view_key:
+            return
+        if self._view_key is not None:
+            self._view_states[self._view_key] = self._capture_view_state()
+        self._view_key = key
+        state = self._view_states.get(key)
+        if state is None:
+            # Впервые: сортировка по дате, новые сверху, фильтров нет;
+            # группировка — как была задана до разделения по учётным записям.
+            state = {"sort": "date", "order": "desc", "grouping": load_thread_grouping()}
+        self._apply_view_state(state)
+        self._save_view_states()
+
+    def _remember_view_state(self) -> None:
+        if self._applying_view_state or self._view_key is None:
+            return
+        self._view_states[self._view_key] = self._capture_view_state()
+        self._save_view_states()
+
+    def _save_view_states(self) -> None:
+        # Текст в строке фильтра между запусками не храним — только в сеансе.
+        stored = {key: {k: v for k, v in state.items() if k != "filter_text"} for key, state in self._view_states.items()}
+        try:
+            save_list_view_states(stored)
+        except Exception as exc:
+            _log.warning("Настройки списка писем не сохранены: %s", exc)
 
     _SORT_CHOICES: tuple[tuple[str, int, Qt.SortOrder], ...] = (
         ("Дата: новые сверху", COL_DATE, Qt.SortOrder.DescendingOrder),
@@ -9106,9 +9200,10 @@ class MainWindow(QMainWindow):
             return
         self.thread_grouping = enabled
         try:
-            save_thread_grouping(enabled)
+            save_thread_grouping(enabled)  # умолчание для записей, у которых своего выбора ещё нет
         except Exception:
             pass
+        self._remember_view_state()
         if self.current_folder is not None:
             self._render_folder(list(self.current_summaries))
 
@@ -9327,6 +9422,7 @@ class MainWindow(QMainWindow):
         self.category_filter = action.data()
         self._update_filter_button_indicator()
         self.on_filter_changed(self.filter_edit.text())
+        self._remember_view_state()
 
     def _sync_filter_menu(self) -> None:
         self.filter_important_action.setChecked(self.filter_important)
@@ -9339,12 +9435,14 @@ class MainWindow(QMainWindow):
         self.filter_attachments = self.filter_attachments_action.isChecked()
         self._update_filter_button_indicator()
         self.on_filter_changed(self.filter_edit.text())
+        self._remember_view_state()
 
     def _on_marker_filter_action(self, action: QAction) -> None:
         self.marker_filter = self._marker_filter_actions.get(action)
         self._update_marker_filter_indicator()
         self._update_filter_button_indicator()
         self.on_filter_changed(self.filter_edit.text())
+        self._remember_view_state()
 
     def _update_filter_button_indicator(self) -> None:
         active = (
