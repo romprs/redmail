@@ -181,6 +181,8 @@ from redmail.config_store import (
     save_default_signature_id,
     save_auto_archive_confirmed,
     save_delete_on_server_accounts,
+    set_delete_on_server,
+    set_domain_rewrites,
     save_auto_archive_enabled,
     save_maintenance_window,
     save_disabled_accounts,
@@ -2334,8 +2336,6 @@ class SettingsDialog(QDialog):
         self,
         parent=None,
         *,
-        account: Account | None = None,
-        smtp: SmtpAccount | None = None,
         poll_interval_minutes: int = 5,
         pane_orientation: str = "vertical",
         archive_storage_dir: Path | None = None,
@@ -2353,82 +2353,10 @@ class SettingsDialog(QDialog):
         disabled_accounts: tuple[str, ...] = (),
         plugins_enabled: dict[str, bool] | None = None,
         category_store=None,
-        delete_on_server_accounts: tuple[str, ...] = (),
-        domain_rewrites_by_account: dict[str, str] | None = None,
     ):
         super().__init__(parent)
         self.setWindowTitle("Параметры")
 
-        # Учётная запись Exchange не описывает IMAP-подключение: её поля
-        # (host/port/use_ssl) в этом окне пустые, правится она отдельной
-        # кнопкой «Подключить Exchange (EWS)».
-        self.host_edit = QLineEdit(getattr(account, "host", "") if account else "")
-        self.port_edit = QSpinBox()
-        self.port_edit.setRange(1, 65535)
-        # account может быть учётной записью Exchange (у неё нет ни порта,
-        # ни отдельного IMAP-хоста) — окно параметров из-за этого вообще не
-        # открывалось (жалоба: "кнопка Параметры недоступна").
-        self.port_edit.setValue(getattr(account, "port", 993) if account else 993)
-        self.user_edit = QLineEdit(getattr(account, "username", "") if account else "")
-        self.password_edit = QLineEdit(account.password if account else "")
-        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.ssl_check = QCheckBox("Использовать SSL")
-        self.ssl_check.setChecked(getattr(account, "use_ssl", True) if account else True)
-
-        self.auth_combo = QComboBox()
-        self.auth_combo.addItem("Логин и пароль", "password")
-        self.auth_combo.addItem("SSO (Kerberos, без пароля)", "kerberos")
-        self.auth_combo.setToolTip(
-            "SSO — почтовый сервер в домене; вход идёт по Kerberos-билету, "
-            "который RED OS уже выдала при входе пользователя в домен "
-            "(SSSD). Пароль в приложении не хранится и не используется — "
-            "его смену на стороне домена обрабатывает сама SSO-инфраструктура."
-        )
-        self.auth_combo.setCurrentIndex(
-            self.auth_combo.findData(getattr(account, "auth_type", "password") if account else "password")
-        )
-        self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
-
-
-        self.imap_test_button = QPushButton("Проверить подключение")
-        self.imap_test_button.clicked.connect(self._on_test_imap)
-        self.imap_test_status = QLabel("")
-        self.imap_test_status.setWordWrap(True)
-        self._imap_test_worker: object | None = None
-
-        imap_form = QFormLayout()
-        imap_form.addRow("Сервер", self.host_edit)
-        imap_form.addRow("Порт", self.port_edit)
-        imap_form.addRow("Способ входа", self.auth_combo)
-        imap_form.addRow("Логин", self.user_edit)
-        imap_form.addRow("Пароль", self.password_edit)
-        imap_form.addRow(self.ssl_check)
-        imap_form.addRow(self.imap_test_button)
-        imap_form.addRow(self.imap_test_status)
-        imap_group = QGroupBox("Входящая почта (IMAP)")
-        imap_group.setLayout(imap_form)
-
-        self.smtp_host_edit = QLineEdit(smtp.host if smtp else "")
-        self.smtp_port_edit = QSpinBox()
-        self.smtp_port_edit.setRange(1, 65535)
-        self.smtp_port_edit.setValue(smtp.port if smtp else 587)
-        self.smtp_ssl_check = QCheckBox("SSL напрямую (порт 465) вместо STARTTLS")
-        self.smtp_ssl_check.setChecked(smtp.use_ssl if smtp else False)
-
-        self.smtp_test_button = QPushButton("Проверить подключение")
-        self.smtp_test_button.clicked.connect(self._on_test_smtp)
-        self.smtp_test_status = QLabel("")
-        self.smtp_test_status.setWordWrap(True)
-        self._smtp_test_worker: object | None = None
-
-        smtp_form = QFormLayout()
-        smtp_form.addRow("Сервер", self.smtp_host_edit)
-        smtp_form.addRow("Порт", self.smtp_port_edit)
-        smtp_form.addRow(self.smtp_ssl_check)
-        smtp_form.addRow(self.smtp_test_button)
-        smtp_form.addRow(self.smtp_test_status)
-        smtp_group = QGroupBox("Исходящая почта (SMTP) — тот же логин и пароль")
-        smtp_group.setLayout(smtp_form)
 
         self.interval_edit = QSpinBox()
         self.interval_edit.setRange(1, 180)
@@ -2535,41 +2463,26 @@ class SettingsDialog(QDialog):
             self,
         )
         accounts_hint.setWordWrap(True)
-
-        # Настройки выбранной в списке записи. Раньше удаление с сервера и
-        # замена доменов были общими на все записи (замечание: «для каждой
-        # своя настройка», «поле сопоставления доменов влияет на все учётки»).
-        self._options_account_key: str | None = None
-        self._delete_on_server: dict[str, bool] = {key: key in (delete_on_server_accounts or ()) for key, _t in (accounts or [])}
-        self._domain_rewrites: dict[str, str] = {
-            key: (domain_rewrites_by_account or {}).get(key, "") for key, _t in (accounts or [])
-        }
-        self.account_delete_check = QCheckBox("Удалять письма с сервера после переноса в архив (необратимо)", self)
-        self.account_rewrites_edit = QPlainTextEdit(self)
-        self.account_rewrites_edit.setPlaceholderText("amurgpz.ru = vk.corp.amurgpz.ru")
-        self.account_rewrites_edit.setFixedHeight(70)
-        rewrite_hint = QLabel(
-            "Переезд на другой сервер: по одному правилу в строке, старый домен = новый. Действует только "
-            "для писем, отправленных с этой учётной записи; в адресной книге и письмах адреса остаются прежними.",
-            self,
+        # Всё, что относится к одной записи — подключение, удаление писем с
+        # сервера, замена доменов, — в её собственном окне (пожелание: «лучше
+        # открывать отдельное окно для выбранной учётки по кнопке»).
+        self.edit_account_button = QPushButton("Настроить…", self)
+        self.edit_account_button.setToolTip(
+            "Подключение, удаление писем с сервера и замена доменов получателей — для выбранной учётной записи"
         )
-        rewrite_hint.setWordWrap(True)
-        account_options_form = QFormLayout()
-        account_options_form.addRow(self.account_delete_check)
-        account_options_form.addRow("Замена домена получателей", self.account_rewrites_edit)
-        account_options_form.addRow(rewrite_hint)
-        self.account_options_group = QGroupBox("Настройки учётной записи", self)
-        self.account_options_group.setLayout(account_options_form)
-        self.accounts_list.currentRowChanged.connect(self._on_account_row_changed)
+        self.edit_account_button.clicked.connect(self._on_edit_account)
+        self.accounts_list.itemDoubleClicked.connect(lambda _item: self._on_edit_account())
+        self.accounts_list.currentRowChanged.connect(lambda row: self.edit_account_button.setEnabled(row >= 0))
+
 
         accounts_rules_layout = QVBoxLayout()
-        if accounts:
-            accounts_rules_layout.addWidget(self.accounts_list)
-            accounts_rules_layout.addWidget(accounts_hint)
-            accounts_rules_layout.addWidget(self.account_options_group)
+        accounts_rules_layout.addWidget(self.accounts_list)
+        accounts_rules_layout.addWidget(accounts_hint)
+        accounts_rules_layout.addWidget(self.edit_account_button, 0, Qt.AlignmentFlag.AlignLeft)
+        if self.accounts_list.count():
             self.accounts_list.setCurrentRow(0)
         else:
-            self.account_options_group.hide()
+            self.edit_account_button.setEnabled(False)
         accounts_rules_layout.addWidget(add_account_button)
         accounts_rules_layout.addWidget(add_ews_account_button)
         accounts_rules_layout.addWidget(mail_rules_button)
@@ -2588,7 +2501,6 @@ class SettingsDialog(QDialog):
         # экран (жалоба: "окно параметров не входит на экран — сделай
         # вкладки, разнеси функционал").
         tabs = QTabWidget(self)
-        tabs.addTab(_settings_tab(imap_group, smtp_group), "Почта")
         tabs.addTab(_settings_tab(general_group, archive_dir_group), "Общие")
         layout = QVBoxLayout(self)
 
@@ -2643,12 +2555,6 @@ class SettingsDialog(QDialog):
         storage_form.addRow("Не скачивать фоном письма больше", self.body_max_size_edit)
         storage_form.addRow(self.auto_archive_check)
         storage_form.addRow("Автоархив при размере базы", self.auto_archive_size_edit)
-        delete_hint = QLabel(
-            "Удалять ли письма с сервера после переноса в архив, задаётся для каждой учётной записи "
-            "на вкладке «Учётные записи».", self,
-        )
-        delete_hint.setWordWrap(True)
-        storage_form.addRow(delete_hint)
         storage_form.addRow(self.maintenance_check)
         storage_form.addRow("Часы обслуживания", maintenance_row)
         storage_form.addRow(storage_stats_label)
@@ -2711,68 +2617,6 @@ class SettingsDialog(QDialog):
         layout.addWidget(tabs)
         layout.addWidget(buttons)
         self.resize(760, 560)
-
-        self._update_password_enabled()
-
-    def _update_password_enabled(self) -> None:
-        is_kerberos = self.auth_combo.currentData() == "kerberos"
-        self.password_edit.setEnabled(not is_kerberos)
-
-    def _on_test_imap(self) -> None:
-        account = self.account()
-        if not account.host or not account.username:
-            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
-            return
-        self.imap_test_button.setEnabled(False)
-        self.imap_test_status.setText("Проверка подключения…")
-
-        def connect_and_list_folders() -> int:
-            with ImapSession(account) as session:
-                return len(session.list_folders())
-
-        worker = _CallableWorker(connect_and_list_folders, parent=self)
-
-        def on_success(folder_count: object) -> None:
-            self.imap_test_status.setText(f"Подключение успешно, папок найдено: {folder_count}")
-            self.imap_test_button.setEnabled(True)
-            self._imap_test_worker = None
-
-        def on_failure(error_text: str) -> None:
-            self.imap_test_status.setText("")
-            QMessageBox.critical(self, "Не удалось подключиться (IMAP)", error_text)
-            self.imap_test_button.setEnabled(True)
-            self._imap_test_worker = None
-
-        worker.succeeded.connect(on_success)
-        worker.failed.connect(on_failure)
-        self._imap_test_worker = worker
-        worker.start()
-
-    def _on_test_smtp(self) -> None:
-        smtp = self.smtp_account()
-        if not smtp.host or not smtp.username:
-            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
-            return
-        self.smtp_test_button.setEnabled(False)
-        self.smtp_test_status.setText("Проверка подключения…")
-
-        worker = _CallableWorker(smtp_test_connection, smtp, parent=self)
-
-        def on_success(_result: object) -> None:
-            self.smtp_test_status.setText("Подключение и вход успешны")
-            self.smtp_test_button.setEnabled(True)
-            self._smtp_test_worker = None
-
-        def on_failure(error_text: str) -> None:
-            self.smtp_test_status.setText("")
-            QMessageBox.critical(self, "Не удалось подключиться (SMTP)", error_text)
-            self.smtp_test_button.setEnabled(True)
-            self._smtp_test_worker = None
-
-        worker.succeeded.connect(on_success)
-        worker.failed.connect(on_failure)
-        self._smtp_test_worker = worker
-        worker.start()
 
     # ---- Голосовой помощник ---------------------------------------------------
 
@@ -2863,32 +2707,6 @@ class SettingsDialog(QDialog):
     def tls_ca_file(self) -> str:
         return self.tls_ca_edit.text().strip()
 
-    def delete_on_server_accounts(self) -> list[str]:
-        self._store_account_options()
-        return sorted(key for key, enabled in self._delete_on_server.items() if enabled)
-
-    def domain_rewrites_by_account(self) -> dict[str, str]:
-        self._store_account_options()
-        return {key: text for key, text in self._domain_rewrites.items() if text.strip()}
-
-    def _store_account_options(self) -> None:
-        """Запоминает правки полей выбранной записи перед переходом к другой."""
-        key = self._options_account_key
-        if key is None:
-            return
-        self._delete_on_server[key] = self.account_delete_check.isChecked()
-        self._domain_rewrites[key] = self.account_rewrites_edit.toPlainText().strip()
-
-    def _on_account_row_changed(self, row: int) -> None:
-        self._store_account_options()
-        item = self.accounts_list.item(row) if row >= 0 else None
-        key = item.data(Qt.ItemDataRole.UserRole) if item is not None else None
-        self._options_account_key = key
-        self.account_options_group.setEnabled(key is not None)
-        self.account_options_group.setTitle(f"Настройки: {item.text()}" if item is not None else "Настройки учётной записи")
-        self.account_delete_check.setChecked(bool(self._delete_on_server.get(key, False)))
-        self.account_rewrites_edit.setPlainText(self._domain_rewrites.get(key, ""))
-
     def font_scale(self) -> float:
         return self.font_scale_spin.value() / 100
 
@@ -2935,11 +2753,32 @@ class SettingsDialog(QDialog):
 
     def _on_add_account(self) -> None:
         if self.parent() is not None:
-            self.parent().on_add_account()
+            self._add_account_item(self.parent().on_add_account())
 
     def _on_add_ews_account(self) -> None:
         if self.parent() is not None:
-            self.parent().on_add_ews_account()
+            self._add_account_item(self.parent().on_add_ews_account())
+
+    def _add_account_item(self, added) -> None:
+        if not added:
+            return
+        key, title = added
+        item = QListWidgetItem(title)
+        item.setData(Qt.ItemDataRole.UserRole, key)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        self.accounts_list.addItem(item)
+        self.accounts_list.setCurrentItem(item)
+
+    def _on_edit_account(self) -> None:
+        item = self.accounts_list.currentItem()
+        if item is None or self.parent() is None:
+            return
+        result = self.parent().on_edit_account(item.data(Qt.ItemDataRole.UserRole))
+        if result:
+            key, title = result
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setText(title)
 
     def _on_mail_rules(self) -> None:
         if self.parent() is not None:
@@ -2952,6 +2791,206 @@ class SettingsDialog(QDialog):
     def _on_manage_signatures(self) -> None:
         if self.parent() is not None:
             self.parent().on_manage_signatures()
+
+    def poll_interval_minutes(self) -> int:
+        return self.interval_edit.value()
+
+    def pane_orientation(self) -> str:
+        return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
+
+    def theme(self) -> str:
+        return self.theme_combo.currentData()
+
+
+class _AccountOptionsMixin:
+    """Настройки одной учётной записи помимо подключения: удаление писем с
+    сервера после архивации и замена доменов получателей при отправке.
+    Раньше были на общей вкладке «Параметров» (замечание: «туда же перенеси
+    и настройки удаления и сопоставление доменов»)."""
+
+    def _build_account_options(self, delete_on_server: bool, domain_rewrites: str) -> QGroupBox:
+        self.delete_on_server_check = QCheckBox("Удалять письма с сервера после переноса в архив (необратимо)", self)
+        self.delete_on_server_check.setChecked(bool(delete_on_server))
+        self.domain_rewrites_edit = QPlainTextEdit(domain_rewrites or "", self)
+        self.domain_rewrites_edit.setPlaceholderText("amurgpz.ru = vk.corp.amurgpz.ru")
+        self.domain_rewrites_edit.setFixedHeight(70)
+        hint = QLabel(
+            "Переезд на другой сервер: по одному правилу в строке, старый домен = новый. Действует только "
+            "для писем, отправленных с этой учётной записи; в адресной книге и письмах адреса остаются прежними.",
+            self,
+        )
+        hint.setWordWrap(True)
+        form = QFormLayout()
+        form.addRow(self.delete_on_server_check)
+        form.addRow("Замена домена получателей", self.domain_rewrites_edit)
+        form.addRow(hint)
+        group = QGroupBox("Архив и переезд", self)
+        group.setLayout(form)
+        return group
+
+    def delete_on_server(self) -> bool:
+        return self.delete_on_server_check.isChecked()
+
+    def domain_rewrites(self) -> str:
+        return self.domain_rewrites_edit.toPlainText().strip()
+
+
+class ImapAccountDialog(_AccountOptionsMixin, QDialog):
+    """Учётная запись IMAP/SMTP: подключение и её собственные настройки.
+    Открывается кнопкой «Настроить…» или «Добавить учётную запись…» на
+    вкладке «Учётные записи» вместо прежней общей вкладки «Почта», которая
+    правила только ту запись, чья папка была открыта."""
+
+    def __init__(
+        self,
+        parent=None,
+        *,
+        account: Account | None = None,
+        smtp: SmtpAccount | None = None,
+        delete_on_server: bool = False,
+        domain_rewrites: str = "",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle(f"Учётная запись {account.username}" if account else "Новая учётная запись")
+        self.host_edit = QLineEdit(getattr(account, "host", "") if account else "")
+        self.port_edit = QSpinBox()
+        self.port_edit.setRange(1, 65535)
+        # account может быть учётной записью Exchange (у неё нет ни порта,
+        # ни отдельного IMAP-хоста) — окно параметров из-за этого вообще не
+        # открывалось (жалоба: "кнопка Параметры недоступна").
+        self.port_edit.setValue(getattr(account, "port", 993) if account else 993)
+        self.user_edit = QLineEdit(getattr(account, "username", "") if account else "")
+        self.password_edit = QLineEdit(account.password if account else "")
+        self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ssl_check = QCheckBox("Использовать SSL")
+        self.ssl_check.setChecked(getattr(account, "use_ssl", True) if account else True)
+
+        self.auth_combo = QComboBox()
+        self.auth_combo.addItem("Логин и пароль", "password")
+        self.auth_combo.addItem("SSO (Kerberos, без пароля)", "kerberos")
+        self.auth_combo.setToolTip(
+            "SSO — почтовый сервер в домене; вход идёт по Kerberos-билету, "
+            "который RED OS уже выдала при входе пользователя в домен "
+            "(SSSD). Пароль в приложении не хранится и не используется — "
+            "его смену на стороне домена обрабатывает сама SSO-инфраструктура."
+        )
+        self.auth_combo.setCurrentIndex(
+            self.auth_combo.findData(getattr(account, "auth_type", "password") if account else "password")
+        )
+        self.auth_combo.currentIndexChanged.connect(self._update_password_enabled)
+
+
+        self.imap_test_button = QPushButton("Проверить подключение")
+        self.imap_test_button.clicked.connect(self._on_test_imap)
+        self.imap_test_status = QLabel("")
+        self.imap_test_status.setWordWrap(True)
+        self._imap_test_worker: object | None = None
+
+        imap_form = QFormLayout()
+        imap_form.addRow("Сервер", self.host_edit)
+        imap_form.addRow("Порт", self.port_edit)
+        imap_form.addRow("Способ входа", self.auth_combo)
+        imap_form.addRow("Логин", self.user_edit)
+        imap_form.addRow("Пароль", self.password_edit)
+        imap_form.addRow(self.ssl_check)
+        imap_form.addRow(self.imap_test_button)
+        imap_form.addRow(self.imap_test_status)
+        imap_group = QGroupBox("Входящая почта (IMAP)")
+        imap_group.setLayout(imap_form)
+
+        self.smtp_host_edit = QLineEdit(smtp.host if smtp else "")
+        self.smtp_port_edit = QSpinBox()
+        self.smtp_port_edit.setRange(1, 65535)
+        self.smtp_port_edit.setValue(smtp.port if smtp else 587)
+        self.smtp_ssl_check = QCheckBox("SSL напрямую (порт 465) вместо STARTTLS")
+        self.smtp_ssl_check.setChecked(smtp.use_ssl if smtp else False)
+
+        self.smtp_test_button = QPushButton("Проверить подключение")
+        self.smtp_test_button.clicked.connect(self._on_test_smtp)
+        self.smtp_test_status = QLabel("")
+        self.smtp_test_status.setWordWrap(True)
+        self._smtp_test_worker: object | None = None
+
+        smtp_form = QFormLayout()
+        smtp_form.addRow("Сервер", self.smtp_host_edit)
+        smtp_form.addRow("Порт", self.smtp_port_edit)
+        smtp_form.addRow(self.smtp_ssl_check)
+        smtp_form.addRow(self.smtp_test_button)
+        smtp_form.addRow(self.smtp_test_status)
+        smtp_group = QGroupBox("Исходящая почта (SMTP) — тот же логин и пароль")
+        smtp_group.setLayout(smtp_form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(imap_group)
+        layout.addWidget(smtp_group)
+        layout.addWidget(self._build_account_options(delete_on_server, domain_rewrites))
+        layout.addWidget(buttons)
+        self._update_password_enabled()
+        self.resize(560, 640)
+
+    def _update_password_enabled(self) -> None:
+        is_kerberos = self.auth_combo.currentData() == "kerberos"
+        self.password_edit.setEnabled(not is_kerberos)
+
+    def _on_test_imap(self) -> None:
+        account = self.account()
+        if not account.host or not account.username:
+            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
+            return
+        self.imap_test_button.setEnabled(False)
+        self.imap_test_status.setText("Проверка подключения…")
+
+        def connect_and_list_folders() -> int:
+            with ImapSession(account) as session:
+                return len(session.list_folders())
+
+        worker = _CallableWorker(connect_and_list_folders, parent=self)
+
+        def on_success(folder_count: object) -> None:
+            self.imap_test_status.setText(f"Подключение успешно, папок найдено: {folder_count}")
+            self.imap_test_button.setEnabled(True)
+            self._imap_test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.imap_test_status.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться (IMAP)", error_text)
+            self.imap_test_button.setEnabled(True)
+            self._imap_test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._imap_test_worker = worker
+        worker.start()
+
+    def _on_test_smtp(self) -> None:
+        smtp = self.smtp_account()
+        if not smtp.host or not smtp.username:
+            QMessageBox.warning(self, "Укажите параметры", "Сервер и логин обязательны для проверки.")
+            return
+        self.smtp_test_button.setEnabled(False)
+        self.smtp_test_status.setText("Проверка подключения…")
+
+        worker = _CallableWorker(smtp_test_connection, smtp, parent=self)
+
+        def on_success(_result: object) -> None:
+            self.smtp_test_status.setText("Подключение и вход успешны")
+            self.smtp_test_button.setEnabled(True)
+            self._smtp_test_worker = None
+
+        def on_failure(error_text: str) -> None:
+            self.smtp_test_status.setText("")
+            QMessageBox.critical(self, "Не удалось подключиться (SMTP)", error_text)
+            self.smtp_test_button.setEnabled(True)
+            self._smtp_test_worker = None
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._smtp_test_worker = worker
+        worker.start()
+
 
     def account(self) -> Account:
         auth_type = self.auth_combo.currentData()
@@ -2975,26 +3014,24 @@ class SettingsDialog(QDialog):
             auth_type=auth_type,
         )
 
-    def poll_interval_minutes(self) -> int:
-        return self.interval_edit.value()
 
-    def pane_orientation(self) -> str:
-        return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
-
-    def theme(self) -> str:
-        return self.theme_combo.currentData()
-
-
-class EwsAccountDialog(QDialog):
+class EwsAccountDialog(_AccountOptionsMixin, QDialog):
     """Подключение к Exchange напрямую по EWS — отдельный диалог от
     обычного "Параметры" (IMAP/SMTP): модель входа принципиально другая —
     адрес сервера обычно не нужен вводить (автообнаружение по email), а
     для Kerberos/SSO вообще не нужен пароль в самом приложении (билет
     берётся из окружения ОС, см. ews_client.EwsSession)."""
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        account: EwsAccount | None = None,
+        delete_on_server: bool = False,
+        domain_rewrites: str = "",
+    ):
         super().__init__(parent)
-        self.setWindowTitle("Подключить Exchange (EWS)")
+        self.setWindowTitle(f"Exchange {account.email}" if account else "Подключить Exchange (EWS)")
 
         self.email_edit = QLineEdit()
         self.email_edit.setPlaceholderText("ivan.ivanov@corp.example")
@@ -3031,10 +3068,18 @@ class EwsAccountDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
 
+        if account is not None:
+            self.email_edit.setText(account.email)
+            self.auth_combo.setCurrentIndex(max(0, self.auth_combo.findData(account.auth_type)))
+            self.username_edit.setText(account.username if account.username != account.email else "")
+            self.password_edit.setText(account.password)
+            self.server_edit.setText(account.server)
+
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.test_button)
         layout.addWidget(self.status_label)
+        layout.addWidget(self._build_account_options(delete_on_server, domain_rewrites))
         layout.addWidget(buttons)
 
         self._update_fields_enabled()
@@ -7902,15 +7947,9 @@ class MainWindow(QMainWindow):
         dialog.exec()
 
     def on_settings(self) -> None:
-        # Для учётной записи Exchange поля IMAP/SMTP в этом окне не имеют
-        # смысла: там своё подключение (кнопка «Подключить Exchange»).
-        imap_account = self.account if self.account_protocol == "imap" else None
-        smtp_account = self.smtp_account if self.account_protocol == "imap" else None
         known_accounts = self._known_accounts()
         dialog = SettingsDialog(
             self,
-            account=imap_account,
-            smtp=smtp_account,
             poll_interval_minutes=self.poll_interval_minutes,
             pane_orientation=self.pane_orientation,
             archive_storage_dir=self.archive_storage_dir,
@@ -7924,8 +7963,6 @@ class MainWindow(QMainWindow):
             tls_ca_file=load_tls_ca_file(),
             accounts=known_accounts,
             disabled_accounts=tuple(load_disabled_accounts()),
-            delete_on_server_accounts=tuple(key for key, _title in known_accounts if delete_on_server_for(key)),
-            domain_rewrites_by_account={key: load_domain_rewrites(key) for key, _title in known_accounts},
             font_scale=load_font_scale(),
             greeting_mode=load_greeting_mode(),
             plugins_enabled={p.id: plugin_enabled(p.id, p.enabled_by_default) for p in mail_plugins.available_plugins()},
@@ -7949,11 +7986,9 @@ class MainWindow(QMainWindow):
             save_body_max_size_mb(dialog.body_max_size_mb())
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
             save_auto_archive_enabled(dialog.auto_archive_enabled())
-            save_delete_on_server_accounts(dialog.delete_on_server_accounts())
             save_maintenance_window(*dialog.maintenance_window())
             save_tls_ca_file(dialog.tls_ca_file())
             tls_trust.apply_trust(dialog.tls_ca_file())
-            save_domain_rewrites_by_account(dialog.domain_rewrites_by_account())
             self._apply_disabled_accounts(dialog.disabled_accounts())
             save_greeting_mode(dialog.greeting_mode())
             for plugin_id, enabled in dialog.plugins_enabled().items():
@@ -7986,64 +8021,37 @@ class MainWindow(QMainWindow):
             # QSS приложения их не перекрашивает, нужно попросить явно.
             self.calendar_month_grid.refresh_theme()
 
-        new_account = dialog.account()
-        if not new_account.host or not new_account.username:
-            return
-        new_smtp = dialog.smtp_account()
-        new_smtp = new_smtp if new_smtp.host else None
-        if new_account == self.account and new_smtp == self.smtp_account:
-            return  # данные подключения не менялись — незачем переподключаться
-
-        previous_key = (
-            account_key(self.account, "imap")
-            if self.account is not None and self.account_protocol == "imap"
-            else None
-        )
-        try:
-            session = ImapSession(new_account)
-            folders = session.list_folders()
-        except Exception as exc:  # показываем пользователю любую ошибку подключения как есть
-            QMessageBox.critical(self, "Ошибка подключения", str(exc))
-            return
-        self._add_or_replace_account(new_account, new_smtp, session, folders)
-        if previous_key is not None and previous_key != account_key(new_account, "imap"):
-            # Здесь правят СВОЮ запись, а не добавляют вторую (для второй
-            # есть "Добавить учётную запись"). Раз сервер или логин стали
-            # другими, прежнее подключение закрываем и убираем из
-            # сохранённых, иначе в списке учётных записей остаётся призрак.
-            self._disconnect_account(previous_key)
-            self._save_all_accounts(forget=previous_key)
-        else:
-            self._save_all_accounts()
-
     def on_add_account(self) -> None:
         """Добавить ЕЩЁ одну учётную запись, не закрывая уже открытые
         (жалоба: "несколько учётных записей одновременно — сейчас клиент
         держит только одно подключение") — в отличие от "Параметры…",
         который правит текущую."""
-        dialog = SettingsDialog(self)
+        dialog = ImapAccountDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return None
         new_account = dialog.account()
         if not new_account.host or not new_account.username:
-            return
+            return None
         new_smtp = dialog.smtp_account()
         new_smtp = new_smtp if new_smtp.host else None
-        if account_key(new_account, "imap") in self.mailboxes:
+        key = account_key(new_account, "imap")
+        if key in self.mailboxes:
             QMessageBox.information(
                 self, "Уже подключено", f"Учётная запись {new_account.username} на {new_account.host} уже открыта."
             )
-            return
+            return None
 
         try:
             session = ImapSession(new_account)
             folders = session.list_folders()
         except Exception as exc:
             QMessageBox.critical(self, "Ошибка подключения", str(exc))
-            return
+            return None
         self._add_or_replace_account(new_account, new_smtp, session, folders)
         self._save_all_accounts()
+        self._save_account_options(key, dialog)
         self.statusBar().showMessage(f"Добавлена учётная запись: {new_account.username}", 5000)
+        return key, self._account_title(new_account, "imap")
 
     def on_add_ews_account(self) -> None:  # noqa: D102 - см. тело
         """Подключение к Exchange напрямую по EWS — отдельный путь от
@@ -8052,24 +8060,109 @@ class MainWindow(QMainWindow):
         (SSO) без ввода пароля в самом приложении."""
         dialog = EwsAccountDialog(self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
+            return None
         new_account = dialog.account()
         if not new_account.email:
-            return
-        if account_key(new_account, "ews") in self.mailboxes:
+            return None
+        key = account_key(new_account, "ews")
+        if key in self.mailboxes:
             QMessageBox.information(
                 self, "Уже подключено", f"Учётная запись Exchange {new_account.email} уже открыта."
             )
-            return
+            return None
         try:
             session = EwsSession(new_account)
             folders = session.list_folders()
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось подключиться к Exchange", str(exc))
-            return
+            return None
         self._add_or_replace_ews_account(new_account, session, folders)
         self._save_all_accounts()
+        self._save_account_options(key, dialog)
         self.statusBar().showMessage(f"Exchange подключён: {new_account.email}", 5000)
+        return key, self._account_title(new_account, "ews")
+
+    def _saved_account(self, key: str):
+        """(протокол, учётная запись, SMTP) по ключу — из открытых или
+        сохранённых (выключенная галочкой запись не открыта)."""
+        if key in self.mailbox_accounts:
+            return self.mailbox_protocols.get(key, "imap"), self.mailbox_accounts[key], self.mailbox_smtp_accounts.get(key)
+        try:
+            for account, smtp in load_accounts():
+                if account_key(account, "imap") == key:
+                    return "imap", account, smtp
+            for account in load_ews_accounts():
+                if account_key(account, "ews") == key:
+                    return "ews", account, None
+        except Exception as exc:
+            _log.warning("Сохранённые учётные записи не прочитаны: %s", exc)
+        return None
+
+    def _save_account_options(self, key: str, dialog, *, previous_key: str | None = None) -> None:
+        known = [known_key for known_key, _title in self._known_accounts()]
+        try:
+            set_delete_on_server(key, dialog.delete_on_server(), known)
+            set_domain_rewrites(key, dialog.domain_rewrites(), known, forget=previous_key if previous_key != key else None)
+        except Exception as exc:
+            QMessageBox.warning(self, "Настройки учётной записи", f"Не удалось сохранить: {exc}")
+
+    def on_edit_account(self, key: str):
+        """Окно одной учётной записи: подключение, удаление с сервера, замена
+        доменов. Возвращает (ключ, подпись) — ключ меняется, если сменили
+        сервер или логин — или None, если ничего не сохранено."""
+        found = self._saved_account(key)
+        if found is None:
+            QMessageBox.information(self, "Учётная запись", "Настройки этой записи не найдены — добавьте её заново.")
+            return None
+        protocol, account, smtp = found
+        options = {"delete_on_server": delete_on_server_for(key), "domain_rewrites": load_domain_rewrites(key)}
+        if protocol == "ews":
+            dialog = EwsAccountDialog(self, account=account, **options)
+        else:
+            dialog = ImapAccountDialog(self, account=account, smtp=smtp if smtp is not account else None, **options)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        new_account = dialog.account()
+        new_smtp = None
+        if protocol == "ews":
+            if not new_account.email:
+                return None
+            changed = new_account != account
+        else:
+            if not new_account.host or not new_account.username:
+                return None
+            new_smtp = dialog.smtp_account()
+            new_smtp = new_smtp if new_smtp.host else None
+            changed = new_account != account or new_smtp != smtp
+        new_key = account_key(new_account, protocol)
+        if changed:
+            if key in self.mailboxes:
+                try:
+                    session = EwsSession(new_account) if protocol == "ews" else ImapSession(new_account)
+                    folders = session.list_folders()
+                except Exception as exc:
+                    QMessageBox.critical(self, "Ошибка подключения", str(exc))
+                    return None
+                if new_key != key:
+                    self._disconnect_account(key)
+                if protocol == "ews":
+                    self._add_or_replace_ews_account(new_account, session, folders)
+                else:
+                    self._add_or_replace_account(new_account, new_smtp, session, folders)
+                self._save_all_accounts(forget=key if new_key != key else None)
+            else:
+                # Запись выключена — только сохраняем, подключится при включении.
+                try:
+                    if protocol == "ews":
+                        merge_ews_accounts([new_account], forget=key if new_key != key else None)
+                    else:
+                        merge_accounts([(new_account, new_smtp)], forget=key if new_key != key else None)
+                except Exception as exc:
+                    QMessageBox.warning(self, "Учётная запись", f"Не удалось сохранить: {exc}")
+                    return None
+        self._save_account_options(new_key, dialog, previous_key=key)
+        self.statusBar().showMessage("Настройки учётной записи сохранены", 5000)
+        return new_key, self._account_title(new_account, protocol)
 
     def _known_accounts(self) -> list[tuple[str, str]]:
         """(ключ, подпись) для списка в настройках: и подключённые сейчас,

@@ -238,6 +238,29 @@ def delete_on_server_for(account_key: str) -> bool:
     return bool(data.get("auto_archive_delete_on_server", False))
 
 
+def set_delete_on_server(account_key: str, enabled: bool, known_keys: list[str]) -> None:
+    """Галочка удаления с сервера одной учётной записи. known_keys — все
+    записи: если выбор ещё хранится общей галочкой прежних версий, он
+    переносится на каждую из них, прежде чем меняется одна."""
+    keys = {key for key in known_keys if delete_on_server_for(key)}
+    if enabled:
+        keys.add(account_key)
+    else:
+        keys.discard(account_key)
+    save_delete_on_server_accounts(sorted(keys))
+
+
+def set_domain_rewrites(account_key: str, text: str, known_keys: list[str], *, forget: str | None = None) -> None:
+    """Правила замены доменов одной учётной записи (см. set_delete_on_server
+    про перенос общих правил прежних версий). forget — прежний ключ записи,
+    если у неё сменились сервер или логин."""
+    rules = {key: load_domain_rewrites(key) for key in known_keys}
+    if forget:
+        rules.pop(forget, None)
+    rules[account_key] = text
+    save_domain_rewrites_by_account(rules)
+
+
 def save_delete_on_server_accounts(keys: list[str]) -> None:
     data = _load_settings_dict()
     data["auto_archive_delete_on_server_accounts"] = sorted({str(key) for key in keys})
