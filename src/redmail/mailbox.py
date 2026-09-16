@@ -7,7 +7,7 @@ from pathlib import Path as _Path
 
 from redmail import archive_store, cache_store, sync_engine
 from redmail.applog import get_logger
-from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageSummary
+from redmail.imap_client import UNKNOWN_MARKER, Account, ImapSession, MessageContent, MessageGoneError, MessageSummary
 
 _log = get_logger("mailbox")
 
@@ -133,7 +133,13 @@ class CachedMailbox:
             # Единый индекс: письмо перенесено автоархивом — тело из файла архива.
             return archive_store.get_message_content(_Path(ref[0]), ref[1])
         session = self.session if background else self._reader_session()
-        content = session.fetch_message_content(folder, uid)
+        try:
+            content = session.fetch_message_content(folder, uid)
+        except MessageGoneError:
+            # Письмо уже удалили или перенесли в другом месте — убираем
+            # строку, чтобы оно не висело в списке «призраком».
+            cache_store.delete_messages(self._account_key, folder, [uid])
+            raise
         cache_store.save_message_content(self._account_key, folder, uid, content)
         return content
 
@@ -195,8 +201,14 @@ class CachedMailbox:
         удаляются из архива и индекса."""
         live, archived = self._split_archived(folder, uids)
         if live:
-            self._reader_session().move_messages(folder, live, target_folder)
-            cache_store.delete_messages(self._account_key, folder, live)
+            # Под замком папки: фоновая синхронизация этой же папки иначе
+            # успевала прочитать список с сервера до переноса, а записать
+            # после — и перенесённые письма возвращались в список как новые
+            # (жалоба: "сбивается синхронизация и удаление, если
+            # переключаться между папками"; "не удаляются письма").
+            with self._folder_lock(folder):
+                self._reader_session().move_messages(folder, live, target_folder)
+                cache_store.delete_messages(self._account_key, folder, live)
         if archived:
             # Архивные письма при выключенном «удалять с сервера» всё ещё
             # лежат на сервере — иначе после переноса синхронизация вернёт
@@ -230,8 +242,9 @@ class CachedMailbox:
         # хранилищу): сначала сервер, затем локальная копия.
         live, archived = self._split_archived(folder, uids)
         if live:
-            self._reader_session().delete_messages(folder, live)
-            cache_store.delete_messages(self._account_key, folder, live)
+            with self._folder_lock(folder):  # см. move_to_folder
+                self._reader_session().delete_messages(folder, live)
+                cache_store.delete_messages(self._account_key, folder, live)
         if archived:
             self._server_op_for_archived(folder, [uid for uid, _p, _a in archived], lambda s, ids: s.delete_messages(folder, ids))
             self._delete_archived(folder, archived)

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from redmail.ews_client import EwsAccount, EwsSession, send_message
+from redmail.imap_client import MessageGoneError
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage
 
 
@@ -150,10 +151,10 @@ def test_get_item_for_unknown_uid_raises() -> None:
     session = _session(exchange_account)
     try:
         session.fetch_message_raw("Входящие", 999)
-    except ValueError:
+    except MessageGoneError:
         pass
     else:
-        raise AssertionError("expected ValueError for unknown uid")
+        raise AssertionError("expected MessageGoneError for unknown uid")
 
 
 def test_move_and_delete_messages() -> None:
@@ -170,11 +171,15 @@ def test_move_and_delete_messages() -> None:
     session.folder_message_count("Входящие")
     [summary] = session.fetch_summaries()
 
+    exchange_account.bulk_move = MagicMock(return_value=[True])
+    exchange_account.bulk_delete = MagicMock(return_value=[True])
+
     session.move_messages("Входящие", [summary.uid], "Корзина")
-    item.move.assert_called_once_with(trash)
+    moved = exchange_account.bulk_move.call_args.kwargs
+    assert moved["ids"] == [("item-1", None)] and moved["to_folder"] is trash
 
     session.delete_messages("Входящие", [summary.uid])
-    item.delete.assert_called_once()
+    assert exchange_account.bulk_delete.call_args.kwargs["ids"] == [("item-1", None)]
 
 
 def test_kerberos_auth_does_not_use_password_credentials() -> None:
@@ -285,3 +290,108 @@ def test_connection_waits_when_server_asks_to_throttle() -> None:
 
     policy = config.call_args.kwargs["retry_policy"]
     assert policy.max_wait == 60
+
+
+class ErrorItemNotFound(Exception):
+    """Так exchangelib сообщает, что письма на сервере нет."""
+
+
+class ErrorMimeContentConversionFailed(Exception):
+    """Так exchangelib сообщает, что письмо не переводится в MIME."""
+
+
+def _session_with_listed_item(item, *, fetch):
+    inbox = _fake_folder("Входящие", total_count=1)
+    inbox.all.return_value.only.return_value = [item]
+    trash = _fake_folder("Удаленные")
+    exchange_account = SimpleNamespace(
+        msg_folder_root=_fake_folder("root", children=[inbox, trash]), fetch=fetch,
+        bulk_move=MagicMock(), bulk_delete=MagicMock(),
+    )
+    session = _session(exchange_account)
+    session.list_folders()
+    [uid] = session.search_uids("Входящие")
+    return session, exchange_account, uid
+
+
+def test_moving_messages_already_gone_from_server_is_not_an_error() -> None:
+    """Письмо уже удалили в другом месте: цель «убрать из папки» достигнута."""
+    session, exchange_account, uid = _session_with_listed_item(_fake_item(), fetch=MagicMock())
+    exchange_account.bulk_move.return_value = [ErrorItemNotFound("нет")]
+
+    session.move_messages("Входящие", [uid], "Удаленные")  # не поднимает ошибку
+
+
+def test_other_bulk_failures_are_reported() -> None:
+    session, exchange_account, uid = _session_with_listed_item(_fake_item(), fetch=MagicMock())
+    exchange_account.bulk_delete.return_value = [RuntimeError("доступ запрещён")]
+
+    try:
+        session.delete_messages("Входящие", [uid])
+    except RuntimeError as exc:
+        assert "доступ запрещён" in str(exc)
+    else:
+        raise AssertionError("ожидалась ошибка удаления")
+
+
+def test_opening_message_gone_from_server_raises_gone_error() -> None:
+    session, _account, uid = _session_with_listed_item(
+        _fake_item(), fetch=MagicMock(return_value=[ErrorItemNotFound("нет")])
+    )
+
+    try:
+        session.fetch_message_raw("Входящие", uid)
+    except MessageGoneError:
+        pass
+    else:
+        raise AssertionError("ожидалась MessageGoneError")
+
+
+def test_message_is_rebuilt_when_server_cannot_convert_to_mime() -> None:
+    """Exchange иногда не отдаёт MIME — собираем письмо из тела и вложений."""
+    rebuilt = _fake_item(subject="Приглашение")
+    rebuilt.body = "Текст письма"
+    rebuilt.attachments = []
+    rebuilt.to_recipients = [SimpleNamespace(name="Пётр", email_address="petr@example.com")]
+    rebuilt.cc_recipients = []
+    rebuilt.datetime_sent = datetime(2026, 9, 16, 9, 0)
+    fetch = MagicMock(side_effect=[[ErrorMimeContentConversionFailed("нет MIME")], [rebuilt]])
+    session, _account, uid = _session_with_listed_item(_fake_item(), fetch=fetch)
+
+    content = session.fetch_message_content("Входящие", uid)
+
+    assert "Текст письма" in (content.text or "")
+
+
+def test_message_can_be_opened_before_folder_was_listed_in_this_session() -> None:
+    """После перезапуска номера писем из локальной базы ещё не сопоставлены
+    с идентификаторами Exchange — папку перечитываем сами."""
+    item = _fake_item(mime_content=b"From: a@example.com\r\n\r\nhi")
+    inbox = _fake_folder("Входящие", total_count=1)
+    inbox.all.return_value.only.return_value = [item]
+    exchange_account = SimpleNamespace(
+        msg_folder_root=_fake_folder("root", children=[inbox]), fetch=MagicMock(return_value=[item])
+    )
+    first = _session(exchange_account)
+    first.list_folders()
+    [uid] = first.search_uids("Входящие")
+
+    restarted = _session(exchange_account)
+    restarted.list_folders()
+
+    assert restarted.fetch_message_raw("Входящие", uid).endswith(b"hi")
+
+
+def test_sent_folder_summary_carries_recipients() -> None:
+    item = _fake_item()
+    item.to_recipients = [
+        SimpleNamespace(name="Комарова Светлана", email_address="svkomarova@example.com"),
+        SimpleNamespace(name="", email_address="petr@example.com"),
+    ]
+    item.size = 2048
+    session, exchange_account, uid = _session_with_listed_item(item, fetch=MagicMock(return_value=[item]))
+
+    [summary] = session.fetch_summaries_by_uids("Входящие", [uid])
+
+    assert summary.to == "Комарова Светлана <svkomarova@example.com>, petr@example.com"
+    assert summary.size == 2048

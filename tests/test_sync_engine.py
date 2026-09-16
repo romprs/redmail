@@ -139,3 +139,25 @@ def test_marker_cleared_by_server_when_session_reports_markers(tmp_path: Path) -
 
         flags = cache_store.get_folder_flags("acc", "INBOX")
     assert flags[2][2] is None
+
+
+def test_body_download_drops_messages_gone_from_server(tmp_path: Path) -> None:
+    """Письмо удалили, пока оно ждало докачки: его убираем, а не откладываем
+    навсегда (в журнале пользователя такие письма повторялись десятками)."""
+    from redmail.imap_client import MessageGoneError
+
+    server = Server(3)
+
+    def fetch(folder, uid):
+        if uid == 2:
+            raise MessageGoneError("нет")
+        return MessageContent(text=f"body {uid}")
+
+    server.fetch_message_content = fetch
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "INBOX")
+        downloaded = sync_engine.download_bodies(server, "acc")
+        remaining = sorted(cache_store.get_folder_uids("acc", "INBOX"))
+
+    assert downloaded == 2
+    assert remaining == [1, 3]

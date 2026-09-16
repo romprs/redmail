@@ -25,6 +25,7 @@ from pathlib import Path
 
 from redmail import archive_store, cache_store
 from redmail.applog import get_logger
+from redmail.imap_client import MessageGoneError
 
 _log = get_logger("autoarchive")
 
@@ -215,6 +216,12 @@ def run(
                     cache_store.vacuum(stop)
                 except Exception as exc:
                     _log.warning("Ужатие базы по ходу автоархива не удалось: %s", exc)
+        except MessageGoneError:
+            # Письмо удалили на сервере раньше, чем до него дошёл архив:
+            # архивировать нечего, строку из индекса убираем. Это не сбой
+            # и не повод останавливать архив.
+            _log.info("Автоархив %s/%d: письма на сервере уже нет, убрано из индекса", folder, uid)
+            cache_store.delete_messages(plan.account_key, folder, [uid])
         except Exception as exc:
             result.failed += 1
             consecutive_failures += 1

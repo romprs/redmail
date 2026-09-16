@@ -266,3 +266,47 @@ def test_archive_source_set_marker_and_delete(tmp_path: Path) -> None:
 def test_archive_source_close_and_set_read_are_noops(tmp_path: Path) -> None:
     ArchiveSource(tmp_path / "test.rmarchive").close()
     ArchiveSource(tmp_path / "test.rmarchive").set_read("F", 1, False)
+
+
+
+def test_move_waits_for_running_sync_of_the_same_folder(tmp_path: Path) -> None:
+    """Перенос и удаление ждут, пока синхронизация этой папки закончит:
+    иначе она записывала в базу уже перенесённые письма как новые."""
+    import threading
+
+    session = FakeSession({1: _summary(1), 2: _summary(2)})
+    db_patch, mailbox = _mailbox(tmp_path, session)
+    with db_patch:
+        mailbox.refresh_folder("INBOX")
+        lock = mailbox._folder_lock("INBOX")
+        lock.acquire()  # «идёт синхронизация папки»
+        worker = threading.Thread(target=mailbox.move_to_trash, args=("INBOX", [1], "Trash"))
+        worker.start()
+        worker.join(timeout=0.3)
+        moved_while_syncing = session.move_messages.called
+        lock.release()
+        worker.join(timeout=5)
+        remaining = [summary.uid for summary in mailbox.folder_summaries("INBOX")]
+
+    assert moved_while_syncing is False
+    session.move_messages.assert_called_once_with("INBOX", [1], "Trash")
+    assert remaining == [2]
+
+
+def test_opening_message_gone_from_server_removes_its_row(tmp_path: Path) -> None:
+    from redmail.imap_client import MessageGoneError
+
+    session = FakeSession({1: _summary(1), 2: _summary(2)})
+    session.fetch_message_content.side_effect = MessageGoneError("нет")
+    db_patch, mailbox = _mailbox(tmp_path, session)
+    with db_patch:
+        mailbox.refresh_folder("INBOX")
+        try:
+            mailbox.message_content("INBOX", 1)
+        except MessageGoneError:
+            pass
+        else:
+            raise AssertionError("ожидалась MessageGoneError")
+        remaining = [summary.uid for summary in mailbox.folder_summaries("INBOX")]
+
+    assert remaining == [2]

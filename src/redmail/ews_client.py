@@ -14,6 +14,7 @@ from redmail.imap_client import (
     UNKNOWN_MARKER,
     FolderInfo,
     MessageContent,
+    MessageGoneError,
     MessageSummary,
     extract_content,
 )
@@ -111,7 +112,25 @@ _SERVICE_FOLDER_NAMES = {
 _SUMMARY_FIELDS = (
     "subject", "sender", "datetime_received", "message_id",
     "has_attachments", "categories", "importance", "is_read",
+    "to_recipients", "size",
 )
+
+#: Коды ответа сервера, означающие «такого письма здесь уже нет».
+_GONE_ERRORS = ("ErrorItemNotFound", "ErrorInvalidIdMalformed", "ErrorInvalidIdNotAnItemAttachmentId")
+
+
+def _is_gone(result) -> bool:
+    return isinstance(result, Exception) and type(result).__name__ in _GONE_ERRORS
+
+
+def _format_mailboxes(mailboxes) -> str:
+    """Получатели для колонки «Кому» — в том же виде, что у IMAP."""
+    parts = []
+    for mailbox in mailboxes or []:
+        name = getattr(mailbox, "name", "") or ""
+        email = getattr(mailbox, "email_address", "") or ""
+        parts.append(f"{name} <{email}>" if name and email else (email or name))
+    return ", ".join(parts)
 #: Сколько ждать, если сервер просит притормозить (секунды).
 _MAX_THROTTLE_WAIT = 60
 
@@ -357,18 +376,62 @@ class EwsSession:
         return extract_content(message_from_bytes(self.fetch_message_raw(folder, uid)))
 
     def fetch_message_raw(self, folder: str, uid: int) -> bytes:
-        item = self._get_item(uid)
-        return item.mime_content
+        item = self._get_item(uid, folder)
+        mime = getattr(item, "mime_content", None)
+        if mime:
+            return mime
+        # Exchange не всегда умеет отдать письмо в MIME
+        # (ErrorMimeContentConversionFailed — чаще всего приглашения и
+        # письма, созданные не почтовым клиентом). Тогда собираем письмо
+        # сами из тела и вложений, иначе в области просмотра пусто
+        # (жалоба: "часть содержимого писем не отображается").
+        return self._build_mime(item)
+
+    def _build_mime(self, item) -> bytes:
+        from email.message import EmailMessage
+        from email.utils import format_datetime
+
+        message = EmailMessage()
+        message["Subject"] = item.subject or ""
+        sender = getattr(item, "sender", None)
+        if sender is not None:
+            message["From"] = _format_mailboxes([sender])
+        for header, field in (("To", "to_recipients"), ("Cc", "cc_recipients")):
+            value = _format_mailboxes(getattr(item, field, None))
+            if value:
+                message[header] = value
+        sent = getattr(item, "datetime_sent", None) or getattr(item, "datetime_received", None)
+        if sent is not None:
+            try:
+                message["Date"] = format_datetime(sent)
+            except (TypeError, ValueError):
+                pass
+        body = getattr(item, "body", None) or ""
+        if type(body).__name__ == "HTMLBody":
+            message.set_content(str(body), subtype="html")
+        else:
+            message.set_content(str(body))
+        for attachment in getattr(item, "attachments", None) or []:
+            content = getattr(attachment, "content", None)
+            if content is None:
+                continue  # вложенное письмо (ItemAttachment) — пропускаем
+            maintype, _, subtype = (attachment.content_type or "application/octet-stream").partition("/")
+            message.add_attachment(
+                content, maintype=maintype, subtype=subtype or "octet-stream",
+                filename=attachment.name or "вложение",
+                cid=f"<{attachment.content_id}>" if getattr(attachment, "content_id", None) else None,
+            )
+        return message.as_bytes()
 
     def set_read(self, folder: str, uid: int, read: bool) -> None:
-        item = self._get_item(uid)
+        item = self._get_item(uid, folder)
         item.is_read = read
         item.save(update_fields=["is_read"])
 
     def set_marker(self, folder: str, uid: int, color: str | None, *, previous_color=UNKNOWN_MARKER) -> None:
         if previous_color is not UNKNOWN_MARKER and previous_color == color:
             return
-        item = self._get_item(uid)
+        item = self._get_item(uid, folder)
         categories = [c for c in (item.categories or []) if c not in MARKER_CATEGORIES.values()]
         if color is not None:
             categories.append(MARKER_CATEGORIES[color])
@@ -376,17 +439,45 @@ class EwsSession:
         item.save(update_fields=["categories"])
 
     def move_messages(self, folder: str, uids: list[int], target_folder: str) -> None:
+        """Одним пакетным запросом на порцию писем. Раньше на каждое письмо
+        шло два запроса (прочитать целиком, затем перенести) — удаление
+        сотни писем тянулось минутами, а синхронизация тем временем
+        возвращала их в список (жалоба: "не удаляются письма")."""
         if not uids:
             return
         target = self._folder(target_folder)
-        for uid in uids:
-            self._get_item(uid).move(target)
+        ids = self._ids_for(folder, uids)
+        self._check_bulk("перенос", self._account.bulk_move(ids=ids, to_folder=target, chunk_size=_FETCH_CHUNK))
 
     def delete_messages(self, folder: str, uids: list[int]) -> None:
         if not uids:
             return
-        for uid in uids:
-            self._get_item(uid).delete()
+        ids = self._ids_for(folder, uids)
+        self._check_bulk("удаление", self._account.bulk_delete(ids=ids, chunk_size=_FETCH_CHUNK))
+
+    def _ids_for(self, folder: str, uids: list[int]) -> list[tuple[str, None]]:
+        """Идентификаторы писем без ключа изменения: для переноса и
+        удаления он не нужен, а устаревший ключ сервер отвергает."""
+        missing = [uid for uid in uids if uid not in self._id_map]
+        if missing:
+            self.search_uids(folder)  # после перезапуска сопоставление ещё не заполнено
+        return [(self._id_map[uid][0], None) for uid in uids if uid in self._id_map]
+
+    @staticmethod
+    def _check_bulk(action: str, results) -> None:
+        """Письма, которых на сервере уже нет, считаются обработанными —
+        цель (убрать их из папки) и так достигнута. Остальные ошибки
+        поднимаются одной понятной ошибкой."""
+        failures = []
+        for result in results:
+            if result is True or not isinstance(result, Exception):
+                continue
+            if _is_gone(result):
+                _log.info("EWS: %s — письма на сервере уже нет (%s)", action, type(result).__name__)
+                continue
+            failures.append(result)
+        if failures:
+            raise RuntimeError(f"Exchange: {action} не удалось для {len(failures)} писем: {failures[0]}")
 
     def _register(self, item) -> int:
         # & 0x7FFFFFFF — держим uid в диапазоне обычного 32-битного
@@ -396,12 +487,33 @@ class EwsSession:
         self._id_map[uid] = (item.id, item.changekey)
         return uid
 
-    def _get_item(self, uid: int):
+    def _get_item(self, uid: int, folder: str | None = None):
         entry = self._id_map.get(uid)
+        if entry is None and folder is not None and folder in self._folders_by_path:
+            # После перезапуска программы сопоставление номеров писем с
+            # идентификаторами Exchange пусто, пока папку не обойдут —
+            # открыть письмо до этого было нельзя.
+            self.search_uids(folder)
+            entry = self._id_map.get(uid)
         if entry is None:
-            raise ValueError("Письмо не найдено в этой сессии — обновите папку и повторите")
-        ews_id, changekey = entry
-        (item,) = self._account.fetch(ids=[(ews_id, changekey)])
+            raise MessageGoneError("Письма нет в папке на сервере — его удалили или перенесли")
+        ews_id, _changekey = entry
+        # Без ключа изменения: он устаревает при каждом изменении письма
+        # (прочитано, маркер), и сервер отвечает, будто письма нет.
+        (item,) = self._account.fetch(ids=[(ews_id, None)])
+        if _is_gone(item):
+            self._id_map.pop(uid, None)
+            raise MessageGoneError("Письма нет на сервере — его удалили или перенесли")
+        if isinstance(item, Exception):
+            if type(item).__name__ == "ErrorMimeContentConversionFailed":
+                (item,) = self._account.fetch(
+                    ids=[(ews_id, None)],
+                    only_fields=_SUMMARY_FIELDS + ("body", "attachments", "cc_recipients", "datetime_sent"),
+                )
+                if not isinstance(item, Exception):
+                    item.mime_content = None
+                    return item
+            raise RuntimeError(f"Exchange: письмо не прочитано: {item}")
         return item
 
     def _to_summary(self, item) -> MessageSummary:
@@ -427,6 +539,8 @@ class EwsSession:
             marker_color=marker_color,
             importance=_IMPORTANCE_MAP.get(item.importance, "normal"),
             is_read=bool(item.is_read),
+            to=_format_mailboxes(getattr(item, "to_recipients", None)),
+            size=int(getattr(item, "size", 0) or 0),
         )
 
 

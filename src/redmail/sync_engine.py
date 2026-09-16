@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 
 from redmail import cache_store
 from redmail.applog import get_logger
+from redmail.imap_client import MessageGoneError
 
 _log = get_logger("sync")
 
@@ -239,6 +240,13 @@ def download_bodies(
                 break
             try:
                 content = session.fetch_message_content(folder, uid)
+            except MessageGoneError:
+                # Письмо удалили или перенесли, пока оно ждало докачки:
+                # строку убираем, а не откладываем — иначе к нему
+                # возвращались бы снова и снова.
+                _log.info("Письмо %s/%d: на сервере его уже нет, убрано из локальной копии", folder, uid)
+                cache_store.delete_messages(account_key, folder, [uid])
+                continue
             except Exception as exc:
                 _log.warning("Письмо %s/%d: тело не скачано (%s), отложено", folder, uid, exc)
                 cache_store.set_body_state(account_key, folder, uid, "deferred")
