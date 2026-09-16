@@ -211,6 +211,7 @@ def _handle_create_event(controller, args) -> dict:
         participants=_email_list(args.get("participants"), "participants"),
         description=_text(args.get("description"), "description"),
         location=_text(args.get("location"), "location"),
+        calendar=_text(args.get("calendar"), "calendar") or None,
     )
     return {"opened": "create_event"}
 
@@ -354,6 +355,10 @@ def _form_changes(args: dict) -> dict:
         changes["description"] = _text(args.get("description"), "description")
     if "all_day" in args:
         changes["all_day"] = bool(args.get("all_day"))
+    if "calendar" in args:
+        # Название, как его сказали голосом («эксчейндж», «вк»), номер в
+        # списке list_calendars или id календаря — сопоставляет окно.
+        changes["calendar"] = _text(args.get("calendar"), "calendar")
     return changes
 
 
@@ -372,6 +377,23 @@ def _handle_event_form_set(controller, args) -> dict:
 
 def _handle_event_form_state(controller, _args) -> dict:
     return {"form": controller.ipc_event_form_state()}
+
+
+_FORM_FIELDS = ("subject", "date", "time", "duration", "recurrence", "participants", "calendar", "location", "description")
+
+
+def _handle_event_form_focus(controller, args) -> dict:
+    """Подсветить поле формы, о котором помощник сейчас спрашивает, — видно,
+    что заполняется, даже когда голосовой ответ выключен."""
+    field = _text(args.get("field"), "field")
+    if field not in _FORM_FIELDS:
+        raise ValueError(f"field: одно из {', '.join(_FORM_FIELDS)}")
+    return {"form": controller.ipc_event_form_focus(field)}
+
+
+def _handle_list_calendars(controller, _args) -> dict:
+    """Календари в том порядке, в каком их называют номером: «календарь два»."""
+    return {"calendars": controller.ipc_list_calendars()}
 
 
 def _handle_event_form_save(controller, _args) -> dict:
@@ -545,6 +567,8 @@ _HANDLERS = {
     "event_form_open": _handle_event_form_open,
     "event_form_set": _handle_event_form_set,
     "event_form_state": _handle_event_form_state,
+    "event_form_focus": _handle_event_form_focus,
+    "list_calendars": _handle_list_calendars,
     "event_form_save": _handle_event_form_save,
     "event_form_cancel": _handle_event_form_cancel,
     "contact_picker_open": _handle_contact_picker_open,

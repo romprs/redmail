@@ -215,6 +215,7 @@ from redmail import (
     address_rules,
     autoarchive,
     calendar_mail,
+    calendar_names,
     calendar_sync,
     ews_calendar,
     html_cleanup,
@@ -4391,6 +4392,10 @@ class EventDialog(QDialog):
         self.calendar_combo = QComboBox(self)
         for cal in calendars:
             self.calendar_combo.addItem(_dot_icon(cal.color), cal.name, cal.id)
+        # Для выбора голосом: «календарь эксчейндж» ищется и по источнику.
+        self._calendar_choices = [
+            calendar_names.CalendarChoice(id=cal.id, name=cal.name, source=cal.source_type) for cal in calendars
+        ]
         # Для НОВОГО события (event is None) — календарь, выбранный в списке
         # "Мои календари" слева, а не всегда default: иначе, создав новый
         # календарь и (например, скрыв старый чекбоксом) ожидая, что события
@@ -4782,6 +4787,9 @@ def _apply_event_form_changes(dialog: EventDialog, changes: dict) -> None:
         dialog.description_edit.setPlainText(changes["description"])
     if "all_day" in changes:
         dialog.all_day_check.setChecked(bool(changes["all_day"]))
+    if "calendar" in changes:
+        choice = calendar_names.match_calendar(changes["calendar"], getattr(dialog, "_calendar_choices", []))
+        dialog.calendar_combo.setCurrentIndex(dialog.calendar_combo.findData(choice.id))
 
 
 def _event_form_state(dialog: EventDialog, existing: calendar_store.Event | None) -> dict:
@@ -4799,7 +4807,26 @@ def _event_form_state(dialog: EventDialog, existing: calendar_store.Event | None
         "location": dialog.location(),
         "description": dialog.description(),
         "all_day": dialog.all_day(),
+        "calendar": dialog.calendar_combo.currentText(),
+        "calendar_id": dialog.calendar_id(),
     }
+
+
+def _focus_event_form_field(dialog: EventDialog, field: str) -> None:
+    widgets = {
+        "subject": dialog.summary_edit,
+        "date": dialog.start_edit,
+        "time": dialog.start_edit,
+        "duration": dialog.end_edit,
+        "recurrence": dialog.recurrence_combo,
+        "participants": dialog.attendees_edit,
+        "calendar": dialog.calendar_combo,
+        "location": dialog.location_edit,
+        "description": dialog.description_edit,
+    }
+    widget = widgets[field]
+    dialog.activateWindow()
+    widget.setFocus(Qt.FocusReason.OtherFocusReason)
 
 
 def _validate_event_form(dialog: EventDialog, existing: calendar_store.Event | None) -> None:
@@ -11467,9 +11494,17 @@ class MainWindow(QMainWindow):
         participants: list[str] | None = None,
         description: str = "",
         location: str = "",
+        calendar: str | None = None,
     ) -> None:
         if not self.account:
             raise RuntimeError("Нет учётной записи: сначала подключитесь к почте в настройках.")
+        calendar_id = self._ipc_default_calendar_id()
+        if calendar:
+            choices = [
+                calendar_names.CalendarChoice(id=cal.id, name=cal.name, source=cal.source_type)
+                for cal in self._load_calendars()
+            ]
+            calendar_id = calendar_names.match_calendar(calendar, choices).id
         draft = calendar_store.Event(
             uid=calendar_store.new_uid(),
             summary=summary,
@@ -11481,7 +11516,7 @@ class MainWindow(QMainWindow):
             organizer_name=self.account.username,
             is_organizer=True,
             my_participation="accepted",
-            calendar_id=self._ipc_default_calendar_id(),
+            calendar_id=calendar_id,
             attendees=[calendar_store.Attendee(email=email) for email in (participants or [])],
         )
         dialog = self._ipc_event_dialog(draft, title="Новая встреча")
@@ -11704,6 +11739,20 @@ class MainWindow(QMainWindow):
     def ipc_event_form_state(self) -> dict:
         dialog, existing = self._ipc_open_event_form()
         return _event_form_state(dialog, existing)
+
+    def ipc_event_form_focus(self, field: str) -> dict:
+        dialog, existing = self._ipc_open_event_form()
+        _focus_event_form_field(dialog, field)
+        return _event_form_state(dialog, existing)
+
+    def ipc_list_calendars(self) -> list[dict]:
+        """Календари в порядке списка «Мои календари» — номер в этом списке
+        и есть номер, которым календарь называют голосом."""
+        current = self._ipc_default_calendar_id()
+        return [
+            {"number": index, "id": cal.id, "name": cal.name, "source": cal.source_type, "current": cal.id == current}
+            for index, cal in enumerate(self._load_calendars(), 1)
+        ]
 
     def ipc_event_form_save(self) -> dict:
         dialog, existing = self._ipc_open_event_form()

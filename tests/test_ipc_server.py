@@ -79,6 +79,13 @@ class FakeController:
     def ipc_event_form_cancel(self):
         self.calls.append(("event_form_cancel", {}))
 
+    def ipc_event_form_focus(self, field):
+        self.calls.append(("event_form_focus", {"field": field}))
+        return dict(getattr(self, "form", {}))
+
+    def ipc_list_calendars(self):
+        return [{"number": 1, "id": "default", "name": "Мои встречи", "source": "local", "current": True}]
+
     def ipc_contacts(self):
         return getattr(self, "contacts", [])
 
@@ -1234,3 +1241,41 @@ def test_focus_running_instance_talks_to_live_server_and_is_false_without_one(qa
         assert controller.ipc_focus.called
     finally:
         server.stop()
+
+
+def test_event_form_calendar_and_focus_and_list() -> None:
+    controller = FakeController()
+    handle_request(controller, {"action": "event_form_open", "args": {}})
+
+    set_response = handle_request(controller, {"action": "event_form_set", "args": {"calendar": "эксчейндж"}})
+    focus_response = handle_request(controller, {"action": "event_form_focus", "args": {"field": "calendar"}})
+    bad_focus = handle_request(controller, {"action": "event_form_focus", "args": {"field": "цвет"}})
+    listed = handle_request(controller, {"action": "list_calendars"})
+
+    assert set_response["ok"] and controller.calls[1] == ("event_form_set", {"calendar": "эксчейндж"})
+    assert focus_response["ok"] and controller.calls[2] == ("event_form_focus", {"field": "calendar"})
+    assert bad_focus["ok"] is False
+    assert listed == {"ok": True, "calendars": [{"number": 1, "id": "default", "name": "Мои встречи", "source": "local", "current": True}]}
+
+
+def test_calendar_chosen_by_voice_on_real_dialog(qapp) -> None:
+    from redmail.ui.main_window import EventDialog, _apply_event_form_changes, _event_form_state
+
+    start = datetime(2026, 9, 10, 15, 0, tzinfo=timezone.utc)
+    draft = calendar_store.Event(uid="draft", summary="", dtstart=start, dtend=start + timedelta(hours=1))
+    calendars = [
+        calendar_store.Calendar(id="default", name="Мои встречи", color="#3B6FB6"),
+        calendar_store.Calendar(id="vk", name="CalDAV", color="#00897B", source_type=calendar_store.SOURCE_CALDAV),
+        calendar_store.Calendar(id="ex", name="Exchange: me@example.com", color="#6A5ACD", source_type=calendar_store.SOURCE_EWS),
+    ]
+    dialog = EventDialog(None, event=draft, my_email="me@example.com", calendars=calendars)
+
+    _apply_event_form_changes(dialog, {"calendar": "эксчейндж"})
+    assert _event_form_state(dialog, None)["calendar_id"] == "ex"
+
+    _apply_event_form_changes(dialog, {"calendar": "вк"})
+    assert _event_form_state(dialog, None)["calendar"] == "CalDAV"
+
+    with pytest.raises(LookupError):
+        _apply_event_form_changes(dialog, {"calendar": "гугл"})
+    assert _event_form_state(dialog, None)["calendar_id"] == "vk"  # выбор не сбит ошибкой
