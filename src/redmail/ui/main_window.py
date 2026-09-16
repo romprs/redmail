@@ -1501,9 +1501,31 @@ def _attendee_avatar_letter(name: str, email: str) -> str:
     return source[0] if source else "?"
 
 
+#: Готовые аватары контактов. Раньше фотография заново раскодировалась и
+#: скруглялась при каждой отрисовке плитки и при каждом открытии раздела —
+#: на корпоративной книге с фотографиями переход в «Контакты» заметно тормозил.
+_AVATAR_CACHE: dict[tuple, QIcon] = {}
+_AVATAR_CACHE_LIMIT = 8000
+
+
 def _contact_avatar(contact, size: int = 32) -> QIcon:
     """Аватар контакта: фотография из адресной книги (в корпоративной
     выгрузке она есть у части сотрудников), иначе кружок с инициалами."""
+    photo = getattr(contact, "photo", b"") or b""
+    name = getattr(contact, "display_name", "") or ""
+    emails = getattr(contact, "emails", None) or []
+    cache_key = (size, name, emails[0] if emails else "", len(photo), photo[:32], photo[-32:])
+    cached = _AVATAR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    if len(_AVATAR_CACHE) >= _AVATAR_CACHE_LIMIT:
+        _AVATAR_CACHE.clear()
+    icon = _render_contact_avatar(contact, size)
+    _AVATAR_CACHE[cache_key] = icon
+    return icon
+
+
+def _render_contact_avatar(contact, size: int) -> QIcon:
     photo = getattr(contact, "photo", b"")
     if photo:
         image = QImage.fromData(photo)
@@ -5387,6 +5409,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
         self.contacts_path = profile.contacts_db_path()
+        self._contacts_view_signature: tuple[int, int] | None = None
         self.current_invite: itip.IncomingInvite | None = None
         self.selected_contact: contact_store.Contact | None = None
         self._contacts_by_row: list[contact_store.Contact] = []
@@ -10204,20 +10227,43 @@ class MainWindow(QMainWindow):
             return
         self._save_event_from_dialog(dialog, existing=None)
 
-    def _load_contacts(self) -> list[contact_store.Contact]:
+    def _contacts_signature(self) -> tuple[int, int] | None:
+        """Отпечаток файла адресной книги: меняется при любой записи в неё,
+        откуда бы та ни пришла (окно контакта, импорт, письмо, помощник)."""
         try:
-            return contact_store.list_contacts(self.contacts_path)
+            stat = Path(self.contacts_path).stat()
+        except OSError:
+            return None
+        return stat.st_mtime_ns, stat.st_size
+
+    def _load_contacts(self) -> list[contact_store.Contact]:
+        signature = self._contacts_signature()
+        cached = getattr(self, "_contacts_cache", None)
+        if cached is not None and signature is not None and cached[0] == signature:
+            return cached[1]
+        try:
+            contacts = contact_store.list_contacts(self.contacts_path)
         except Exception:
             return []
+        self._contacts_cache = (signature, contacts)
+        return contacts
 
     def _show_contacts_page(self) -> None:
         self.pages.setCurrentIndex(2)
         self._update_mail_actions_enabled()
+        # Раздел перестраивался заново при каждом переходе — вся книга из
+        # базы и все фотографии (жалоба: "медленно переключается в раздел
+        # контакты"). Теперь — только если книга менялась с прошлого раза.
+        if self._contacts_view_signature is not None and self._contacts_view_signature == self._contacts_signature():
+            return
         self.refresh_contacts_view()
 
     def refresh_contacts_view(self) -> None:
+        self._contacts_view_signature = None
         try:
-            contacts = contact_store.list_contacts(self.contacts_path)
+            contacts = self._load_contacts()
+            if not contacts and self._contacts_signature() is not None:
+                contacts = contact_store.list_contacts(self.contacts_path)  # пустая книга или сбой — перепроверяем
         except Exception as exc:
             QMessageBox.critical(self, "Не удалось загрузить контакты", str(exc))
             return
@@ -10254,6 +10300,7 @@ class MainWindow(QMainWindow):
         finally:
             self.contacts_card_list.blockSignals(False)
         self._apply_contacts_filter()
+        self._contacts_view_signature = self._contacts_signature()
 
     def _apply_contacts_filter(self, *_args) -> None:
         needle = self.contacts_search_edit.text().strip().casefold()
