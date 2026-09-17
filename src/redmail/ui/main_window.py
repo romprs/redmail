@@ -13263,10 +13263,21 @@ class MainWindow(QMainWindow):
         выполнится сразу после того, как ответ уже отправлен."""
         QTimer.singleShot(0, action)
 
-    def ipc_focus(self) -> None:
+    def ipc_focus(self, section: str | None = None) -> None:
+        """Окно на передний план; section — раздел: mail, calendar, contacts
+        («открой календарь» голосом)."""
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        pages = {
+            "mail": (self.mail_mode_action, self._show_mail_page),
+            "calendar": (self.calendar_mode_action, self._show_calendar_page),
+            "contacts": (self.contacts_mode_action, self._show_contacts_page),
+        }
+        if section in pages:
+            action, show = pages[section]
+            action.setChecked(True)
+            show()
 
     def ipc_compose_email(
         self, *, to: str, subject: str = "", body: str = "", cc: str = "", bcc: str = ""

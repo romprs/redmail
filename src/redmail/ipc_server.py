@@ -179,9 +179,18 @@ def _handle_ping(_controller, _args) -> dict:
     return {"pong": True, "version": _app_version(), "protocol": PROTOCOL}
 
 
-def _handle_focus(controller, _args) -> dict:
-    controller.ipc_focus()
-    return {"focused": True}
+_SECTIONS = ("mail", "calendar", "contacts")
+
+
+def _handle_focus(controller, args) -> dict:
+    section = args.get("section")
+    if section in (None, ""):
+        controller.ipc_focus()
+        return {"focused": True}
+    if section not in _SECTIONS:
+        raise ValueError("section: mail, calendar или contacts")
+    controller.ipc_focus(section=section)
+    return {"focused": True, "section": section}
 
 
 def _handle_compose_email(controller, args) -> dict:

@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        130%{?dist}
+Release:        131%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -124,6 +124,8 @@ fi
 %dir %{_sysconfdir}/redmail/brands
 
 %changelog
+* Fri Sep 18 2026 redmail <redmail@example.com> - 0.0.1-131
+- Канал помощника: переход к разделу почты, календаря или контактов («открой календарь» голосом)
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-130
 - Свой список приветствий: текст и время, когда оно подходит («Параметры» → «Общие» → «Список приветствий…»)
 - В окне письма приветствие меняется на другое из списка или убирается

@@ -1281,3 +1281,29 @@ def test_calendar_chosen_by_voice_on_real_dialog(qapp) -> None:
     with pytest.raises(LookupError):
         _apply_event_form_changes(dialog, {"calendar": "гугл"})
     assert _event_form_state(dialog, None)["calendar_id"] == "vk"  # выбор не сбит ошибкой
+
+
+def test_focus_switches_section_and_rejects_unknown(qapp, tmp_path) -> None:
+    from redmail import ipc_server
+
+    calls = []
+    controller = SimpleNamespace(ipc_focus=lambda section=None: calls.append(section))
+    assert ipc_server._handle_focus(controller, {"section": "calendar"}) == {"focused": True, "section": "calendar"}
+    assert ipc_server._handle_focus(controller, {}) == {"focused": True}
+    assert calls == ["calendar", None]
+    with pytest.raises(ValueError):
+        ipc_server._handle_focus(controller, {"section": "почта"})
+
+    shown = []
+    from PySide6.QtGui import QAction
+    from PySide6.QtWidgets import QMainWindow
+
+    host = QMainWindow()
+    for name in ("mail", "calendar", "contacts"):
+        action = QAction(name, host)
+        action.setCheckable(True)
+        setattr(host, f"{name}_mode_action", action)
+        setattr(host, f"_show_{name}_page", lambda name=name: shown.append(name))
+    MainWindow.ipc_focus(host, section="contacts")
+    assert shown == ["contacts"] and host.contacts_mode_action.isChecked()
+
