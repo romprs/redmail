@@ -124,3 +124,28 @@ def test_classification_headers_are_read_from_message() -> None:
 
 def test_categories_module_is_listed() -> None:
     assert "categories" in {plugin.id for plugin in available_plugins()}
+
+
+def test_category_column_sorts_names_uncategorized_last_newest_first() -> None:
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QTableWidget
+
+    from redmail.ui import main_window as mw
+
+    QApplication.instance() or QApplication([])
+    table = QTableWidget(0, mw.MAIL_COLUMN_COUNT)
+    rows = [("", "2026-09-17 10:00"), ("Реклама", "2026-09-15 10:00"), ("Обращения", "2026-09-16 10:00"),
+            ("Реклама", "2026-09-17 09:00"), ("Обращения", "2026-09-10 10:00")]
+    for row, (name, date) in enumerate(rows):
+        table.insertRow(row)
+        key = mw._category_sort_key(name)
+        table.setItem(row, mw.COL_CATEGORY, mw._ThreadSortItem(name, group_value=key, group_key="", rank=0, own=key, date=date))
+    table.horizontalHeader().setSortIndicator(mw.COL_CATEGORY, Qt.SortOrder.AscendingOrder)
+    table.sortItems(mw.COL_CATEGORY, Qt.SortOrder.AscendingOrder)
+    order = [(table.item(r, mw.COL_CATEGORY).text(), table.item(r, mw.COL_CATEGORY).date[:10]) for r in range(len(rows))]
+    assert order == [("Обращения", "2026-09-16"), ("Обращения", "2026-09-10"), ("Реклама", "2026-09-17"),
+                     ("Реклама", "2026-09-15"), ("", "2026-09-17")]
+    assert ("Категория", mw.COL_CATEGORY, Qt.SortOrder.AscendingOrder) in mw.MainWindow._SORT_CHOICES

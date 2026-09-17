@@ -462,10 +462,18 @@ class _ThreadSortItem(QTableWidgetItem):
         if self.rank == 1 and self.group_key:
             # Дочерние письма одной цепочки: новые выше при любом направлении.
             return self.date < other.date if self._descending() else self.date > other.date
+        if self.own == other.own and self.date != other.date:
+            # Одинаковые категория, отправитель или тема: новые выше.
+            return self.date < other.date if self._descending() else self.date > other.date
         return self.own < other.own
 
 
-_SORTABLE_COLUMNS = (COL_SENDER, COL_SUBJECT, COL_DATE)
+_SORTABLE_COLUMNS = (COL_SENDER, COL_SUBJECT, COL_DATE, COL_CATEGORY)
+
+
+def _category_sort_key(name: str) -> str:
+    """Письма без категории — в конце списка при сортировке по возрастанию."""
+    return name.casefold() if name else "\uffff"
 
 # Gmail заворачивает Отправленные/Корзину и т.п. в служебный контейнер
 # "[Gmail]" — сам по себе не открывается (см. \Noselect в list_folders),
@@ -10017,7 +10025,7 @@ class MainWindow(QMainWindow):
             self.table.setItem(row, COL_SUBJECT, subject_item)
             self.table.setItem(row, COL_DATE, thread_item(summary.date, head.date))
             category_name, head_category = self._category_name(summary.uid), self._category_name(head.uid)
-            category_item = thread_item(category_name, head_category.casefold(), category_name.casefold())
+            category_item = thread_item(category_name, _category_sort_key(head_category), _category_sort_key(category_name))
             self._paint_category_item(category_item, summary.uid)
             self.table.setItem(row, COL_CATEGORY, category_item)
 
@@ -10169,6 +10177,7 @@ class MainWindow(QMainWindow):
         ("Дата: старые сверху", COL_DATE, Qt.SortOrder.AscendingOrder),
         ("От кого", COL_SENDER, Qt.SortOrder.AscendingOrder),
         ("Тема", COL_SUBJECT, Qt.SortOrder.AscendingOrder),
+        ("Категория", COL_CATEGORY, Qt.SortOrder.AscendingOrder),
     )
 
     def _build_sort_menu(self) -> QMenu:
@@ -11236,9 +11245,22 @@ class MainWindow(QMainWindow):
                 item = self.table.item(row, COL_CATEGORY)
                 if check is None or item is None:
                     continue
-                self._paint_category_item(item, check.data(Qt.ItemDataRole.UserRole))
+                uid = check.data(Qt.ItemDataRole.UserRole)
+                self._paint_category_item(item, uid)
+                if isinstance(item, _ThreadSortItem):
+                    # Категории приходят в фоне уже после построения списка —
+                    # обновляем и значения для сортировки.
+                    info = self._thread_info.get(uid)
+                    head_uid = info.head_uid if info is not None else uid
+                    item.own = _category_sort_key(self._category_name(uid))
+                    item.group_value = _category_sort_key(self._category_name(head_uid))
         finally:
             self.table.setSortingEnabled(True)
+        header = self.table.horizontalHeader()
+        if header.sortIndicatorSection() == COL_CATEGORY:
+            self.table.sortItems(COL_CATEGORY, header.sortIndicatorOrder())
+            if self._card_items_by_uid:
+                self._reorder_cards_from_table()
         self._refresh_cards()
         self.on_filter_changed(self.filter_edit.text())
 
