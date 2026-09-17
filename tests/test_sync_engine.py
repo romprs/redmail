@@ -219,3 +219,59 @@ def test_failing_content_hook_does_not_stop_download(tmp_path: Path) -> None:
         downloaded = sync_engine.download_bodies(server, "acc", on_content=broken)
 
     assert downloaded == 2
+
+
+class FlakyListingServer(Server):
+    """Перечисление папки один раз обрывается на середине (Exchange под нагрузкой)."""
+
+    def __init__(self, n: int) -> None:
+        super().__init__(n)
+        self.short_listings = 1
+
+    def search_uids(self, folder, *, before=None):
+        uids = sorted(self.messages)
+        if self.short_listings:
+            self.short_listings -= 1
+            return uids[: len(uids) // 2]
+        return uids
+
+
+def test_partial_folder_listing_does_not_delete_local_messages(tmp_path: Path) -> None:
+    server = Server(400)
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        sync_engine.sync_folder_headers(server, "acc", "Sent")
+        flaky = FlakyListingServer(400)
+        result = sync_engine.sync_folder_headers(flaky, "acc", "Sent")
+        assert result.deleted == 0 and cache_store.count_folder_summaries("acc", "Sent") == 400
+
+        # А настоящее массовое удаление (второй список тоже короткий) проходит.
+        for uid in range(1, 201):
+            flaky.messages.pop(uid)
+        result = sync_engine.sync_folder_headers(flaky, "acc", "Sent")
+        assert result.deleted == 200 and cache_store.count_folder_summaries("acc", "Sent") == 200
+
+
+def test_recipients_filled_from_downloaded_letter(tmp_path: Path) -> None:
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        cache_store.upsert_summaries("acc", "Sent", [_summary(1, to=""), _summary(2, to="")])
+        # Уже скачанное раньше письмо без получателей в списке.
+        cache_store.save_message_content("acc", "Sent", 1, MessageContent(text="x", to="Иванов <iv@x.ru>"))
+        stored = {s.uid: s.to for s in cache_store.get_folder_summaries("acc", "Sent", None)}
+        assert stored[1] == "Иванов <iv@x.ru>"  # заполнено сразу при сохранении письма
+        with cache_store._connect() as conn:  # как в базе до обновления
+            conn.execute("UPDATE messages SET recipients_to = '' WHERE uid = 1")
+        assert cache_store.recipients_from_content("acc", "Sent") == 1
+        stored = {s.uid: s.to for s in cache_store.get_folder_summaries("acc", "Sent", None)}
+        assert stored == {1: "Иванов <iv@x.ru>", 2: ""}
+
+
+def test_recipients_from_body_text_when_header_is_empty(tmp_path: Path) -> None:
+    text = "Добрый день.\n\nОт: Пономарев Р.С.\nКому: Свечников Николай <NASvechnikov@x.ru>\nТема: заявка\n"
+    assert cache_store.recipients_from_text(text) == "Свечников Николай <NASvechnikov@x.ru>"
+    assert cache_store.recipients_from_text("> To: a@x.ru\n") == "a@x.ru"
+    assert cache_store.pick_recipients("b@x.ru", text) == "b@x.ru"  # заголовок главнее текста
+    assert cache_store.recipients_from_text("Никому: нет\n") == ""
+    with patch("redmail.cache_store._db_path", return_value=tmp_path / "mail.sqlite3"):
+        cache_store.upsert_summaries("acc", "Sent", [_summary(1, to="")])
+        cache_store.save_message_content("acc", "Sent", 1, MessageContent(text=text, to=""))
+        assert cache_store.get_folder_summaries("acc", "Sent", None)[0].to == "Свечников Николай <NASvechnikov@x.ru>"

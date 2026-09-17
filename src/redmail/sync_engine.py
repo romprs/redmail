@@ -107,6 +107,20 @@ def sync_folder_headers(
     result.total = len(server_uids)
 
     missing_on_server = sorted(local_uids - server_uids)
+    if len(missing_on_server) > max(_MASS_DELETE_MIN, len(local_uids) * _MASS_DELETE_SHARE):
+        # Сервер разом «потерял» много писем. Так бывает, когда перечисление
+        # папки оборвалось на середине (Exchange под нагрузкой): в журнале
+        # «Отправленные» за семь минут «похудели» с 3366 до 2798 писем, и
+        # локальная копия их удалила. Перечитываем папку и удаляем только то,
+        # чего нет в обоих списках.
+        _log.warning(
+            "Папка %s: на сервере нет %d из %d писем — перечитываю список перед удалением",
+            folder, len(missing_on_server), len(local_uids),
+        )
+        second = set(session.search_uids(folder))
+        missing_on_server = sorted(set(missing_on_server) - second)
+        server_uids |= second
+        result.total = len(server_uids)
     if missing_on_server:
         cache_store.delete_messages(account_key, folder, missing_on_server)
         result.deleted = len(missing_on_server)
@@ -168,6 +182,11 @@ def sync_folder_headers(
     return result
 
 
+#: Порог «подозрительно много удалений за один проход».
+_MASS_DELETE_MIN = 50
+_MASS_DELETE_SHARE = 0.05
+
+
 def _backfill_recipients(session, account_key: str, folder: str, server_uids: set[int], chunk: int, stop) -> None:
     """Один раз за сеанс на папку дописывает получателей письмам, у которых
     их нет. Нужно сессиям, которые раньше не отдавали получателей
@@ -176,6 +195,9 @@ def _backfill_recipients(session, account_key: str, folder: str, server_uids: se
     if done is None or folder in done:
         return
     done.add(folder)
+    from_content = cache_store.recipients_from_content(account_key, folder)
+    if from_content:
+        _log.info("Папка %s: получатели взяты из скачанных писем у %d писем", folder, from_content)
     missing = sorted(cache_store.uids_without_recipients(account_key, folder) & server_uids, reverse=True)
     for part in _chunks(missing, chunk):
         if _stopped(stop):

@@ -423,3 +423,18 @@ def test_message_date_is_shown_in_local_time() -> None:
 
     expected = datetime(2026, 9, 16, 5, 30, tzinfo=timezone.utc).astimezone().strftime("%Y-%m-%d %H:%M")
     assert summary.date == expected
+
+
+def test_summary_recipients_fall_back_to_display_to() -> None:
+    from types import SimpleNamespace
+
+    from redmail import ews_client
+
+    session = ews_client.EwsSession.__new__(ews_client.EwsSession)
+    session._id_map = {}
+    item = SimpleNamespace(
+        id="AAMk1", changekey="ck", subject="Fwd: Обновление УХ", sender=None, datetime_received=None,
+        message_id="<m@x>", has_attachments=False, categories=None, importance="Normal", is_read=True,
+        to_recipients=None, display_to="Иванов Иван; Петров Пётр", size=100,
+    )
+    assert session._to_summary(item).to == "Иванов Иван; Петров Пётр"

@@ -113,7 +113,7 @@ _SERVICE_FOLDER_NAMES = {
 _SUMMARY_FIELDS = (
     "subject", "sender", "datetime_received", "message_id",
     "has_attachments", "categories", "importance", "is_read",
-    "to_recipients", "size",
+    "to_recipients", "display_to", "size",
 )
 
 #: Коды ответа сервера, означающие «такого письма здесь уже нет».
@@ -565,7 +565,10 @@ class EwsSession:
             marker_color=marker_color,
             importance=_IMPORTANCE_MAP.get(item.importance, "normal"),
             is_read=bool(item.is_read),
-            to=_format_mailboxes(getattr(item, "to_recipients", None)),
+            # Копии писем, отправленных через SMTP и положенных в «Отправленные»
+            # сервером, приходят без списка получателей — остаётся строка
+            # display_to с именами.
+            to=_format_mailboxes(getattr(item, "to_recipients", None)) or (getattr(item, "display_to", "") or "").strip(),
             size=int(getattr(item, "size", 0) or 0),
         )
 

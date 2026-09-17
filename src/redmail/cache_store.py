@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 from datetime import datetime, timezone
 from contextlib import closing
@@ -313,6 +314,41 @@ def uids_without_recipients(account_key: str, folder: str) -> set[int]:
     return {r[0] for r in rows}
 
 
+_TO_LINE = re.compile(r"(?im)^[ \t>]*(?:Кому|To)[ \t]*:[ \t]*(\S.*?)[ \t]*$")
+
+
+def recipients_from_text(text: str | None) -> str:
+    """Строка «Кому:» / «To:» в тексте письма — если в заголовке письма
+    получателей нет (пожелание: «сначала заголовок — нет — текст»).
+    Смотрим только начало письма: дальше обычно цитаты."""
+    if not text:
+        return ""
+    match = _TO_LINE.search("\n".join(text.splitlines()[:80]))
+    return match.group(1)[:500] if match else ""
+
+
+def pick_recipients(content_to: str | None, text: str | None) -> str:
+    return (content_to or "").strip() or recipients_from_text(text)
+
+
+def recipients_from_content(account_key: str, folder: str) -> int:
+    """Пустые получатели в списке — из уже скачанного письма, без обращения
+    к серверу: сначала заголовок «Кому», если его нет — строка «Кому:» в
+    тексте. Возвращает число заполненных строк."""
+    with closing(_connect()) as conn:
+        rows = conn.execute(
+            "SELECT uid, content_to, body FROM messages WHERE account = ? AND folder = ? "
+            "AND recipients_to = '' AND body IS NOT NULL",
+            (account_key, folder),
+        ).fetchall()
+        updates = [(value, account_key, folder, uid) for uid, to, body in rows if (value := pick_recipients(to, body))]
+        conn.executemany(
+            "UPDATE messages SET recipients_to = ? WHERE account = ? AND folder = ? AND uid = ?", updates
+        )
+        conn.commit()
+        return len(updates)
+
+
 def update_recipients(account_key: str, folder: str, rows: list[tuple[int, str, int]]) -> None:
     """Дописывает получателей (и размер, если он известен) уже сохранённым
     письмам, не трогая остальное: маркеры, прочитанность, тела."""
@@ -517,6 +553,16 @@ def save_message_content(account_key: str, folder: str, uid: int, content: Messa
                 content.bcc,
             ),
         )
+        recipients = pick_recipients(content.to, content.text)
+        if recipients:
+            # Получатели из самого письма — если сервер не отдал их в сводке
+            # (Exchange: копии писем, отправленных через SMTP): сначала
+            # заголовок «Кому», затем строка «Кому:» в тексте.
+            conn.execute(
+                "UPDATE messages SET recipients_to = ? WHERE account = ? AND folder = ? AND uid = ? "
+                "AND recipients_to = ''",
+                (recipients, account_key, folder, uid),
+            )
         conn.execute(
             "DELETE FROM attachments WHERE account = ? AND folder = ? AND uid = ?", (account_key, folder, uid)
         )
