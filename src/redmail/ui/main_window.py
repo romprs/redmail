@@ -44,6 +44,7 @@ from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QColor,
+    QFontDatabase,
     QCursor,
     QDesktopServices,
     QFont,
@@ -130,7 +131,7 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
-from redmail import keyboard_layout, mail_export, profile_transfer
+from redmail import keyboard_layout, mail_export, memory_report, profile_transfer
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
@@ -1648,6 +1649,21 @@ def _attendee_avatar_letter(name: str, email: str) -> str:
 #: на корпоративной книге с фотографиями переход в «Контакты» заметно тормозил.
 _AVATAR_CACHE: dict[tuple, QIcon] = {}
 _AVATAR_CACHE_LIMIT = 8000
+
+
+def _shrink_photo_bytes(data: bytes, max_side: int = 128) -> tuple[bytes, str] | None:
+    """Фото контакта — уменьшенной JPEG-копией (крупнейший показ — 96 точек).
+    QImage можно использовать и в фоновом потоке."""
+    image = QImage.fromData(data)
+    if image.isNull():
+        return None
+    if max(image.width(), image.height()) > max_side:
+        image = image.scaled(max_side, max_side, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    if not image.convertToFormat(QImage.Format.Format_RGB32).save(buffer, "JPEG", 85):
+        return None
+    return bytes(buffer.data()), "image/jpeg"
 
 
 def _contact_avatar(contact, size: int = 32) -> QIcon:
@@ -6322,6 +6338,8 @@ class _SyncWorker(QThread):
                 bodies = self._mailbox.download_bodies(progress=report, stop=self._stop, limit=limit)
             stats.bodies_downloaded = bodies
             stats.bodies_pending = self._mailbox.pending_bodies()
+            if bodies:
+                memory_report.free_memory()
         except Exception as exc:
             self.failed.emit(_exception_text(exc))
         else:
@@ -6488,6 +6506,8 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
         self.contacts_path = profile.contacts_db_path()
+        # Крупные фото адресной книги — уменьшенными копиями, в фоне после запуска.
+        QTimer.singleShot(20_000, self._shrink_contact_photos)
         # Модуль «Категории писем» (Параметры → «Модули»).
         self.category_store: mail_categories.CategoryStore | None = None
         self._categories_cache: dict[str, mail_categories.Category] = {}
@@ -8515,16 +8535,13 @@ class MainWindow(QMainWindow):
         except Exception:
             return {}
 
-    def on_show_memory(self) -> None:
-        """Справка → «Расход памяти…»: сколько занимает программа целиком и
-        что именно держит в памяти (список писем, кэш цепочки, открытое
-        письмо со вложениями, фоновые задачи). Нужно, чтобы отвечать на
-        вопрос «почему так много памяти» не гаданием, а цифрами."""
-        lines = [f"Всего у процесса: {_process_memory_mb():.0f} МБ (вместе с окном просмотра письма)"]
-        lines.append(f"Писем в списке: {len(self.current_summaries)}")
-        thread_bytes = sum(
-            len(c.text or "") + len(c.html or "") for c in self._thread_content_cache.values()
-        )
+    def _memory_report_text(self) -> str:
+        """Расклад памяти: процесс, просмотр писем, куча, данные интерфейса,
+        самые объёмные Python-объекты."""
+        lines = memory_report.process_lines()
+        lines.append("")
+        lines.append(f"Писем в списке: {len(self.current_summaries)}, строк таблицы {self.table.rowCount()}, плиток {self.card_list.count()}")
+        thread_bytes = sum(len(c.text or "") + len(c.html or "") for c in self._thread_content_cache.values())
         lines.append(f"Кэш цепочки: {len(self._thread_content_cache)} писем, {thread_bytes / (1024 * 1024):.1f} МБ текста")
         content = self.current_content
         if content is not None:
@@ -8534,18 +8551,70 @@ class MainWindow(QMainWindow):
                 f"Открытое письмо: текст {(len(content.text or '') + len(content.html or '')) / (1024 * 1024):.1f} МБ, "
                 f"вложения {attachments_bytes / (1024 * 1024):.1f} МБ, картинки {inline_bytes / (1024 * 1024):.1f} МБ"
             )
-        lines.append(f"Фоновых задач: {len(self._background_workers)}")
-        lines.append(f"Учётных записей подключено: {len(self.mailboxes)}, архивов открыто: {len(self.archives)}")
+        cached_contacts = getattr(self, "_contacts_cache", None)
+        if cached_contacts is not None:
+            contacts = cached_contacts[1]
+            photo_bytes = sum(len(c.photo or b"") for c in contacts)
+            lines.append(f"Контакты в памяти: {len(contacts)}, фотографии {photo_bytes / (1024 * 1024):.1f} МБ")
+        lines.append(f"Аватары в кэше: {len(_AVATAR_CACHE)}")
+        for key, mailbox in self.mailboxes.items():
+            session = getattr(mailbox, "session", None)
+            id_map = getattr(session, "_id_map", None)
+            extra = f", сопоставлений писем Exchange {len(id_map)}" if isinstance(id_map, dict) else ""
+            lines.append(f"Учётная запись {key}{extra}")
+        lines.append(
+            f"Фоновых задач: {len(self._background_workers)}, окон писем открыто: {len(self._message_windows)}, "
+            f"архивов открыто: {len(self.archives)}"
+        )
         stats = self._storage_stats()
         if stats:
             lines.append(f"База почты на диске: {stats.get('db_bytes', 0) / (1024 * 1024):.0f} МБ")
         lines.append("")
-        lines.append(
-            "Основную часть занимает сам интерфейс Qt вместе со встроенным просмотром письма "
-            "(обычно 350–500 МБ). Список писем, кэш цепочки и открытое письмо освобождаются "
-            "при переходе к другой папке."
-        )
-        QMessageBox.information(self, "Расход памяти", "\n".join(lines))
+        lines.append("Самые объёмные Python-объекты (тип, количество, МБ):")
+        for name, count, megabytes in memory_report.python_objects():
+            lines.append(f"  {name}: {count}, {megabytes:.1f} МБ")
+        return "\n".join(lines)
+
+    def on_show_memory(self) -> None:
+        """Справка → «Расход памяти…»: расклад цифрами (жалоба: «наша
+        программа жрёт много памяти, evolution в 3–5 раз меньше»). Текст
+        можно скопировать, кнопка «Освободить» показывает, сколько памяти
+        удерживалось без дела."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Расход памяти")
+        dialog.resize(760, 640)
+        text_edit = QPlainTextEdit(dialog)
+        text_edit.setReadOnly(True)
+        text_edit.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+
+        def refresh(title: str = "") -> None:
+            report = self._memory_report_text()
+            text_edit.setPlainText((title + "\n\n" if title else "") + report)
+            _log.info("Расход памяти%s:\n%s", f" ({title})" if title else "", report)
+
+        def free() -> None:
+            before = memory_report.process_lines()[0]
+            self._thread_content_cache.clear()
+            _AVATAR_CACHE.clear()
+            memory_report.free_memory()
+            refresh(f"До освобождения: {before}")
+
+        free_button = QPushButton("Освободить и пересчитать", dialog)
+        free_button.clicked.connect(free)
+        copy_button = QPushButton("Копировать", dialog)
+        copy_button.clicked.connect(lambda: QApplication.clipboard().setText(text_edit.toPlainText()))
+        close_button = QPushButton("Закрыть", dialog)
+        close_button.clicked.connect(dialog.accept)
+        buttons = QHBoxLayout()
+        buttons.addWidget(free_button)
+        buttons.addWidget(copy_button)
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(text_edit)
+        layout.addLayout(buttons)
+        refresh()
+        dialog.exec()
 
     def on_show_log(self) -> None:
         """Справка → «Журнал подключений…» (пожелание: "писать лог
@@ -9491,6 +9560,7 @@ class MainWindow(QMainWindow):
 
         def done(_result: object = None) -> None:
             self._autoarchive_active = False
+            memory_report.free_memory()  # через автоархив проходят сотни мегабайт писем
             if worker in self._background_workers:
                 self._background_workers.remove(worker)
             self._set_busy(None)
@@ -11830,6 +11900,21 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._save_event_from_dialog(dialog, existing=None)
+
+    def _shrink_contact_photos(self) -> None:
+        worker = _CallableWorker(contact_store.shrink_large_photos, Path(self.contacts_path), _shrink_photo_bytes, parent=self)
+
+        def finished(result: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if result:
+                _log.info("Адресная книга: уменьшено фотографий %s", result)
+                memory_report.free_memory()
+
+        worker.succeeded.connect(finished)
+        worker.failed.connect(lambda text: (_log.warning("Уменьшение фото контактов не удалось: %s", text), finished()))
+        self._background_workers.append(worker)
+        worker.start()
 
     def _contacts_signature(self) -> tuple[int, int] | None:
         """Отпечаток файла адресной книги: меняется при любой записи в неё,

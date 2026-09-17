@@ -145,6 +145,33 @@ def new_uid() -> str:
     return f"{uuid4()}@redmail"
 
 
+#: Фотографии больше этого уменьшаются: книга целиком живёт в памяти, а
+#: показываются фото кружками 24–96 точек (корпоративная выгрузка — до 185 КБ
+#: на человека, 18 МБ на 955 фото).
+PHOTO_MAX_BYTES = 12_000
+
+
+def shrink_large_photos(path: Path, shrink, *, max_bytes: int = PHOTO_MAX_BYTES) -> int:
+    """Уменьшает крупные фотографии в книге. shrink(bytes) -> (bytes, тип)
+    или None (не картинка / уменьшать нечего). Возвращает число уменьшенных."""
+    if not path.exists():
+        return 0
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            "SELECT id, photo FROM contacts WHERE photo IS NOT NULL AND LENGTH(photo) > ?", (max_bytes,)
+        ).fetchall()
+        changed = 0
+        for contact_id, photo in rows:
+            result = shrink(bytes(photo))
+            if result is None or len(result[0]) >= len(photo):
+                continue
+            conn.execute("UPDATE contacts SET photo = ?, photo_type = ? WHERE id = ?", (result[0], result[1], contact_id))
+            changed += 1
+        if changed:
+            conn.commit()
+    return changed
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(path)
     conn.executescript(_SCHEMA)
