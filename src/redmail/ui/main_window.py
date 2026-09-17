@@ -6131,6 +6131,12 @@ class _CalDavCalendarServer:
     def push_event(self, event) -> None:
         self._session.push_event(event, self._username, self._username)
 
+    def push_occurrence(self, event) -> None:
+        self._session.push_occurrence(event, self._username, self._username)
+
+    def cancel_occurrence(self, uid: str) -> None:
+        self._session.cancel_occurrence(uid)
+
     def delete_event(self, uid: str) -> None:
         self._session.delete_event(uid)
 
@@ -6147,6 +6153,12 @@ class _ExchangeCalendarServer:
 
     def push_event(self, event) -> None:
         ews_calendar.push_event(self._session, event)
+
+    def push_occurrence(self, event) -> None:
+        ews_calendar.push_occurrence(self._session, event)
+
+    def cancel_occurrence(self, uid: str) -> None:
+        ews_calendar.cancel_occurrence(self._session, uid)
 
     def delete_event(self, uid: str) -> None:
         ews_calendar.delete_event(self._session, uid)
@@ -12207,6 +12219,23 @@ class MainWindow(QMainWindow):
                 return
 
         attendee_emails = dialog.attendee_emails()
+        recurrence_rule = dialog.recurrence_rule()
+        exdates: list[datetime] = []
+        if existing is not None:
+            scope = self._ask_series_scope(existing, "Изменить")
+            if scope is None:
+                return
+            if scope == self.SCOPE_ONE:
+                existing = calendar_store.detach_occurrence(self.calendar_path, existing)
+                recurrence_rule = None  # отдельный день серии сам не повторяется
+            else:
+                master = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(existing.uid))
+                if master is not None:
+                    # В окне был показан один день серии — время всей серии
+                    # сдвигается на ту же разницу, на которую изменили этот день.
+                    start, end = master.dtstart + (start - existing.dtstart), master.dtend + (end - existing.dtend)
+                    existing = master
+                exdates = list(existing.exdates)
         event = calendar_store.Event(
             uid=existing.uid if existing else calendar_store.new_uid(),
             summary=dialog.summary() or "(без темы)",
@@ -12220,7 +12249,8 @@ class MainWindow(QMainWindow):
             is_organizer=True,
             my_participation="accepted",
             sequence=(existing.sequence + 1) if existing else 0,
-            recurrence_rule=dialog.recurrence_rule(),
+            recurrence_rule=recurrence_rule,
+            exdates=exdates,
             color=dialog.color(),
             calendar_id=dialog.calendar_id(),
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
@@ -12310,6 +12340,30 @@ class MainWindow(QMainWindow):
         self._background_workers.append(worker)
         worker.start()
 
+    SCOPE_ONE = "one"
+    SCOPE_ALL = "all"
+
+    def _ask_series_scope(self, event: calendar_store.Event, action: str) -> str | None:
+        """Для дня повторяющейся встречи: изменить только его или всю серию.
+        Не серия — сразу «вся встреча». None — пользователь передумал."""
+        if not calendar_store.is_series(self.calendar_path, event):
+            return self.SCOPE_ALL
+        series = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(event.uid))
+        box = QMessageBox(self)
+        box.setWindowTitle("Повторяющаяся встреча")
+        box.setText(f"«{event.summary}» — повторяющаяся встреча. {action}:")
+        one = box.addButton("Только этот день", QMessageBox.ButtonRole.AcceptRole)
+        whole = None
+        if series is not None and series.recurrence_rule or action.startswith("Отменить"):
+            whole = box.addButton("Всю серию", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() is one:
+            return self.SCOPE_ONE
+        if whole is not None and box.clickedButton() is whole:
+            return self.SCOPE_ALL
+        return None
+
     def on_calendar_event_drag_rescheduled(
         self, event: calendar_store.Event, day_delta: int, minute_delta: int
     ) -> None:
@@ -12346,7 +12400,19 @@ class MainWindow(QMainWindow):
             self.refresh_calendar_view()  # вернуть блок на исходное место
             return
 
-        updated = calendar_store.reschedule_event(self.calendar_path, event.uid, new_start, new_end)
+        scope = self._ask_series_scope(event, "Перенести")
+        if scope is None:
+            self.refresh_calendar_view()
+            return
+        if scope == self.SCOPE_ONE:
+            target = calendar_store.detach_occurrence(self.calendar_path, event)
+            updated = calendar_store.reschedule_event(self.calendar_path, target.uid, new_start, new_end)
+        else:
+            master = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(event.uid)) or event
+            # Серия сдвигается на тот же промежуток, на который перетащили день.
+            updated = calendar_store.reschedule_event(
+                self.calendar_path, master.uid, master.dtstart + delta, master.dtend + delta
+            )
         if updated is None:
             self.refresh_calendar_view()
             return
@@ -12377,6 +12443,16 @@ class MainWindow(QMainWindow):
         )
         if confirm != QMessageBox.StandardButton.Yes:
             return
+        scope = self._ask_series_scope(event, "Отменить")
+        if scope is None:
+            return
+        if scope == self.SCOPE_ONE:
+            # Отменяется один день: участникам — CANCEL с RECURRENCE-ID,
+            # на сервер — исключение этого дня из серии.
+            event = calendar_store.detach_occurrence(self.calendar_path, event)
+        elif calendar_store.is_series(self.calendar_path, event):
+            master = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(event.uid))
+            event = master or replace(event, uid=calendar_store.series_uid(event.uid))
 
         attendee_emails = [a.email for a in event.attendees]
         exchange_calendar = self._is_exchange_calendar(event.calendar_id)
@@ -12403,7 +12479,13 @@ class MainWindow(QMainWindow):
                 severity="warning",
             )
 
-        calendar_store.delete_event(self.calendar_path, event.uid)
+        if scope == self.SCOPE_ONE:
+            calendar_store.delete_event(self.calendar_path, event.uid)
+            calendar_store.add_exdate(
+                self.calendar_path, calendar_store.series_uid(event.uid), calendar_store.instance_start(event.uid)
+            )
+        else:
+            calendar_store.delete_series(self.calendar_path, event.uid)
         if self._is_server_calendar(event.calendar_id):
             # Удаление должно дойти до сервера, иначе синхронизация вернёт
             # встречу (для Exchange отмену участникам разошлёт сам Exchange).

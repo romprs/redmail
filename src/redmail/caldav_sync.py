@@ -8,10 +8,11 @@ from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
 import caldav
+import icalendar
 import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
 
-from redmail import itip
+from redmail import calendar_store, itip
 from redmail.applog import get_logger
 
 _log = get_logger("caldav")
@@ -485,7 +486,9 @@ class CalDavSession:
 
         try:
             if existing is not None:
-                existing.data = ics_text
+                # В объекте на сервере могут быть и изменённые дни серии
+                # (VEVENT с RECURRENCE-ID) — заменяем только основную запись.
+                existing.data = _replace_master(existing.data, ics_text)
                 _with_connection_retry(existing.save)
                 _log.info("CalDAV %s: событие обновлено uid=%s", self.account.url, event.uid)
             else:
@@ -531,6 +534,41 @@ class CalDavSession:
         except Exception:
             pass  # уборка тестового события — не критично, если не получилось
 
+    def _series_resource(self, uid: str):
+        calendar = self._primary_calendar()
+        try:
+            return _with_connection_retry(calendar.event_by_uid, calendar_store.series_uid(uid))
+        except NotFoundError:
+            raise CalDavSyncError("Серия встреч не найдена на сервере") from None
+        except Exception as exc:
+            raise CalDavSyncError(f"Не удалось найти серию встреч на сервере: {exc}") from exc
+
+    def push_occurrence(self, event: Event, organizer_email: str, organizer_name: str) -> None:
+        """Изменённый день серии — VEVENT с RECURRENCE-ID в объекте серии."""
+        resource = self._series_resource(event.uid)
+        override = itip.build_vevent(
+            event, organizer_email=organizer_email, organizer_name=organizer_name, status=event.status.upper()
+        )
+        try:
+            resource.data = _set_override(resource.data, override, calendar_store.instance_start(event.uid))
+            _with_connection_retry(resource.save)
+            _log.info("CalDAV %s: день серии изменён uid=%s", self.account.url, event.uid)
+        except Exception as exc:
+            raise CalDavSyncError(f"Не удалось изменить день серии на сервере: {exc}") from exc
+
+    def cancel_occurrence(self, uid: str) -> None:
+        """Отменённый день серии — EXDATE в основной записи серии."""
+        try:
+            resource = self._series_resource(uid)
+        except CalDavSyncError:
+            return  # серии уже нет — отменять нечего
+        try:
+            resource.data = _exclude_date(resource.data, calendar_store.instance_start(uid))
+            _with_connection_retry(resource.save)
+            _log.info("CalDAV %s: день серии отменён uid=%s", self.account.url, uid)
+        except Exception as exc:
+            raise CalDavSyncError(f"Не удалось отменить день серии на сервере: {exc}") from exc
+
     def delete_event(self, uid: str) -> None:
         calendar = self._primary_calendar()
         try:
@@ -551,3 +589,46 @@ class CalDavSession:
             self._client.close()
         except Exception:
             pass
+
+
+def _as_text(data) -> str:
+    return data.decode("utf-8") if isinstance(data, bytes) else str(data)
+
+
+def _same_moment(value, moment) -> bool:
+    return itip._to_utc(value.dt) == moment
+
+
+def _replace_master(existing_data, new_ics: str) -> str:
+    try:
+        current = icalendar.Calendar.from_ical(_as_text(existing_data))
+    except Exception:
+        return new_ics  # серверный объект не разобрать — записываем новую версию целиком
+    new = icalendar.Calendar.from_ical(new_ics)
+    new_master = next(c for c in new.walk("VEVENT"))
+    components = [c for c in current.subcomponents if not (c.name == "VEVENT" and "RECURRENCE-ID" not in c)]
+    current.subcomponents = [new_master, *components]
+    return current.to_ical().decode("utf-8")
+
+
+def _set_override(existing_data, override, original) -> str:
+    current = icalendar.Calendar.from_ical(_as_text(existing_data))
+    current.subcomponents = [
+        c for c in current.subcomponents
+        if not (c.name == "VEVENT" and "RECURRENCE-ID" in c and _same_moment(c["RECURRENCE-ID"], original))
+    ]
+    current.add_component(override)
+    return current.to_ical().decode("utf-8")
+
+
+def _exclude_date(existing_data, original) -> str:
+    current = icalendar.Calendar.from_ical(_as_text(existing_data))
+    current.subcomponents = [
+        c for c in current.subcomponents
+        if not (c.name == "VEVENT" and "RECURRENCE-ID" in c and _same_moment(c["RECURRENCE-ID"], original))
+    ]
+    for component in current.walk("VEVENT"):
+        if "RECURRENCE-ID" not in component:
+            component.add("exdate", original)
+            component["SEQUENCE"] = int(component.get("SEQUENCE", 0)) + 1
+    return current.to_ical().decode("utf-8")

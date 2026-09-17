@@ -195,3 +195,51 @@ def delete_event(session, uid: str) -> None:
     except Exception as exc:
         _log.error("EWS календарь: удаление встречи uid=%s не удалось: %s", uid, exc)
         raise EwsCalendarError(f"Не удалось удалить встречу в Exchange: {exc}") from exc
+
+
+def _find_occurrence(account, uid: str):
+    """Экземпляр серии Exchange по UID серии и исходному началу дня."""
+    original = calendar_store.instance_start(uid)
+    series = calendar_store.series_uid(uid)
+    if original is None:
+        return None
+    window = timedelta(days=1)
+    for item in account.calendar.view(start=_ews_datetime(original - window), end=_ews_datetime(original + window)):
+        if not isinstance(item, CalendarItem) or str(getattr(item, "uid", "") or "") != series:
+            continue
+        if _to_utc(getattr(item, "original_start", None) or item.start) == original:
+            return item
+    return None
+
+
+def push_occurrence(session, event: Event) -> None:
+    """Перенос или правка одного дня серии; участникам Exchange сообщит сам."""
+    account = getattr(session, "_account", None) or session
+    try:
+        item = _find_occurrence(account, event.uid)
+        if item is None:
+            raise EwsCalendarError("день серии не найден на сервере")
+        item.subject = event.summary
+        item.start = _ews_datetime(event.dtstart)
+        item.end = _ews_datetime(event.dtend)
+        item.location = event.location or None
+        item.save(send_meeting_invitations="SendToAllAndSaveCopy" if event.attendees else "SendToNone")
+        _log.info("EWS календарь: день серии изменён uid=%s", event.uid)
+    except EwsCalendarError:
+        raise
+    except Exception as exc:
+        _log.error("EWS календарь: изменение дня серии uid=%s не удалось: %s", event.uid, exc)
+        raise EwsCalendarError(f"Не удалось изменить день серии в Exchange: {exc}") from exc
+
+
+def cancel_occurrence(session, uid: str) -> None:
+    account = getattr(session, "_account", None) or session
+    try:
+        item = _find_occurrence(account, uid)
+        if item is None:
+            return  # уже отменён
+        item.delete(send_meeting_cancellations="SendToAllAndSaveCopy")
+        _log.info("EWS календарь: день серии отменён uid=%s", uid)
+    except Exception as exc:
+        _log.error("EWS календарь: отмена дня серии uid=%s не удалось: %s", uid, exc)
+        raise EwsCalendarError(f"Не удалось отменить день серии в Exchange: {exc}") from exc

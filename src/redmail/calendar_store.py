@@ -83,6 +83,14 @@ def is_instance_uid(uid: str) -> bool:
 def series_uid(uid: str) -> str:
     return uid.split(INSTANCE_SEPARATOR, 1)[0]
 
+
+def instance_start(uid: str) -> datetime | None:
+    """Исходное начало экземпляра (RECURRENCE-ID) из его ключа."""
+    if INSTANCE_SEPARATOR not in uid:
+        return None
+    stamp = uid.split(INSTANCE_SEPARATOR, 1)[1]
+    return datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -411,6 +419,45 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
         conn.commit()
 
 
+def is_series(path: Path, event: Event) -> bool:
+    """Встреча — день повторяющейся серии (развёрнутый из правила или
+    отдельный экземпляр с сервера)? Тогда у пользователя спрашивают:
+    менять только этот день или всю серию."""
+    if is_instance_uid(event.uid):
+        return True
+    stored = get_event(path, event.uid)
+    return stored is not None and bool(stored.recurrence_rule)
+
+
+def add_exdate(path: Path, uid: str, moment: datetime) -> None:
+    master = get_event(path, uid)
+    if master is None or not master.recurrence_rule:
+        return
+    moment = moment.astimezone(timezone.utc).replace(microsecond=0)
+    if moment not in {m.astimezone(timezone.utc).replace(microsecond=0) for m in master.exdates}:
+        master.exdates.append(moment)
+        save_event(path, master)
+
+
+def detach_occurrence(path: Path, occurrence: Event) -> Event:
+    """Один день серии — в отдельную запись (экземпляр с RECURRENCE-ID).
+    occurrence — день в том виде, как его показывает календарь (время ещё
+    не изменено). В серии этот день исключается, чтобы не показывался
+    дважды. Уже отдельный экземпляр возвращается как есть."""
+    if is_instance_uid(occurrence.uid):
+        return get_event(path, occurrence.uid) or occurrence
+    master = get_event(path, occurrence.uid)
+    if master is None:
+        return occurrence
+    instance = replace(
+        master, id=None, uid=instance_uid(master.uid, occurrence.dtstart), dtstart=occurrence.dtstart,
+        dtend=occurrence.dtend, recurrence_rule=None, exdates=[],
+    )
+    save_event(path, instance)
+    add_exdate(path, master.uid, occurrence.dtstart)
+    return get_event(path, instance.uid) or instance
+
+
 def events_to_push(path: Path, calendar_id: str) -> list[Event]:
     """Свои встречи календаря, изменённые здесь и ещё не отправленные."""
     create_calendar(path)
@@ -462,6 +509,18 @@ def stored_events_in_window(path: Path, calendar_id: str, start: datetime, end: 
             (calendar_id, start.isoformat(), end.isoformat()),
         ).fetchall()
     return [(row[0], bool(row[1])) for row in rows]
+
+
+def delete_series(path: Path, uid: str) -> None:
+    """Серия целиком: основная запись и все её отдельные дни."""
+    series = series_uid(uid)
+    with closing(_connect(path)) as conn:
+        prefix = series + INSTANCE_SEPARATOR
+        uids = [series] + [row[0] for row in conn.execute(
+            "SELECT uid FROM events WHERE substr(uid, 1, ?) = ?", (len(prefix), prefix)
+        )]
+    for item in uids:
+        delete_event(path, item)
 
 
 def delete_event(path: Path, uid: str) -> None:

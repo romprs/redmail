@@ -63,12 +63,16 @@ def sync_calendar(
 
     if not read_only:
         for uid in calendar_store.pending_server_deletes(path, calendar.id):
-            if calendar_store.is_instance_uid(uid):
-                # Отдельный экземпляр серии на сервере по нашему UID не найти;
-                # удаление одного дня серии пока не передаётся.
-                calendar_store.forget_server_delete(path, uid)
-                continue
             try:
+                if calendar_store.is_instance_uid(uid):
+                    cancel = getattr(server, "cancel_occurrence", None)
+                    if cancel is not None:
+                        cancel(uid)  # отмена одного дня серии
+                        calendar_store.forget_server_delete(path, uid)
+                        report.deleted_on_server += 1
+                    else:
+                        calendar_store.forget_server_delete(path, uid)
+                    continue
                 server.delete_event(uid)
             except Exception as exc:
                 report.errors.append(f"удаление встречи: {exc}")
@@ -78,13 +82,18 @@ def sync_calendar(
             report.deleted_on_server += 1
 
         for event in calendar_store.events_to_push(path, calendar.id):
-            if not event.is_organizer or calendar_store.is_instance_uid(event.uid):
-                # Чужие встречи сервер правит сам; правка одного экземпляра
-                # серии пока остаётся локальной (её UID сервер не знает).
-                calendar_store.mark_pushed(path, event.uid)
+            if not event.is_organizer:
+                calendar_store.mark_pushed(path, event.uid)  # чужие встречи сервер правит сам
                 continue
             try:
-                server.push_event(event)
+                if calendar_store.is_instance_uid(event.uid):
+                    push_occurrence = getattr(server, "push_occurrence", None)
+                    if push_occurrence is None:
+                        calendar_store.mark_pushed(path, event.uid)
+                        continue
+                    push_occurrence(event)  # перенос одного дня серии
+                else:
+                    server.push_event(event)
             except Exception as exc:
                 if is_conflict(exc):
                     # На сервере встречу уже меняли в другом месте: верной
@@ -126,6 +135,13 @@ def sync_calendar(
                 event.color = existing.color
         calendar_store.save_event(path, event)
         report.pulled += 1
+
+    # Серия пришла с сервера раньше, чем туда ушёл перенос одного её дня:
+    # этот день в серии не должен появиться второй раз.
+    for uid in waiting_push:
+        original = calendar_store.instance_start(uid)
+        if original is not None:
+            calendar_store.add_exdate(path, calendar_store.series_uid(uid), original)
 
     for uid, waiting in calendar_store.stored_events_in_window(path, calendar.id, window_start, window_end):
         if uid in server_uids or waiting:

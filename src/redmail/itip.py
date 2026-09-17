@@ -226,7 +226,7 @@ def build_caldav_ics(event: Event, organizer_email: str, organizer_name: str) ->
 def build_reply_ics(event: Event, attendee_email: str, attendee_name: str, participation: str) -> bytes:
     cal = _new_calendar("REPLY")
     vevent = icalendar.Event()
-    vevent.add("uid", event.uid)
+    vevent.add("uid", calendar_store.series_uid(event.uid))
     vevent.add("summary", event.summary)
     vevent.add("sequence", event.sequence)
     vevent.add("dtstamp", datetime.now(timezone.utc))
@@ -237,6 +237,9 @@ def build_reply_ics(event: Event, attendee_email: str, attendee_name: str, parti
         organizer.params["CN"] = event.organizer_name
     vevent.add("organizer", organizer, encode=0)
 
+    original = calendar_store.instance_start(event.uid)
+    if original is not None:
+        vevent.add("recurrence-id", original)
     attendee = icalendar.vCalAddress(f"mailto:{attendee_email}")
     attendee.params["CN"] = attendee_name or attendee_email
     attendee.params["PARTSTAT"] = _PARTSTAT_TO_ICAL.get(participation, "NEEDS-ACTION")
@@ -248,8 +251,20 @@ def build_reply_ics(event: Event, attendee_email: str, attendee_name: str, parti
 
 def _build(method: str | None, event: Event, *, organizer_email: str, organizer_name: str, status: str) -> bytes:
     cal = _new_calendar(method)
+    cal.add_component(
+        build_vevent(event, organizer_email=organizer_email, organizer_name=organizer_name, status=status, method=method)
+    )
+    return cal.to_ical()
+
+
+def build_vevent(event: Event, *, organizer_email: str, organizer_name: str, status: str, method: str | None = None):
+    """VEVENT встречи. День серии (экземпляр) — с UID всей серии и
+    RECURRENCE-ID: так его понимают сервер и программы участников."""
     vevent = icalendar.Event()
-    vevent.add("uid", event.uid)
+    vevent.add("uid", calendar_store.series_uid(event.uid))
+    original = calendar_store.instance_start(event.uid)
+    if original is not None:
+        vevent.add("recurrence-id", original)
     vevent.add("summary", event.summary)
     if event.description:
         vevent.add("description", event.description)
@@ -288,9 +303,7 @@ def _build(method: str | None, event: Event, *, organizer_email: str, organizer_
         attach_prop.params["FMTTYPE"] = attachment.content_type
         attach_prop.params["X-FILENAME"] = attachment.filename
         vevent.add("attach", attach_prop, encode=0)
-
-    cal.add_component(vevent)
-    return cal.to_ical()
+    return vevent
 
 
 def _new_calendar(method: str | None) -> icalendar.Calendar:
