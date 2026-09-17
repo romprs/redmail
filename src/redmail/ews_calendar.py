@@ -11,12 +11,13 @@ CalDAV и подписку по ссылке — встречи Exchange не п
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from exchangelib import EWSDateTime, EWSTimeZone, Mailbox
 from exchangelib.items import CalendarItem
 from exchangelib.properties import Attendee as EwsAttendee
 
+from redmail import calendar_store
 from redmail.applog import get_logger
 from redmail.calendar_store import Attendee, Event
 
@@ -82,8 +83,13 @@ def item_to_event(item: CalendarItem, my_email: str) -> Event:
     organizer_email = _mailbox_email(organizer)
     my_participation = _RESPONSE_MAP.get(getattr(item, "my_response_type", "") or "Unknown", "needs-action")
     is_organizer = bool(organizer_email) and organizer_email.casefold() == (my_email or "").casefold()
+    uid = str(item.uid or item.id or "")
+    if getattr(item, "type", "") in ("Occurrence", "Exception"):
+        # Просмотр календаря отдаёт каждый экземпляр серии с UID всей серии —
+        # у каждого свой ключ, иначе от серии остаётся один день.
+        uid = calendar_store.instance_uid(uid, _to_utc(getattr(item, "original_start", None) or item.start))
     return Event(
-        uid=str(item.uid or item.id or ""),
+        uid=uid,
         summary=item.subject or "(без темы)",
         dtstart=_to_utc(item.start),
         dtend=_to_utc(item.end),
@@ -99,21 +105,32 @@ def item_to_event(item: CalendarItem, my_email: str) -> Event:
     )
 
 
+EWS_VIEW_CHUNK = timedelta(days=14)
+
+
 def fetch_events(session, start: datetime, end: datetime, my_email: str) -> list[Event]:
     """Встречи из основного календаря учётной записи в окне [start, end)."""
     account = getattr(session, "_account", None) or session
     try:
-        items = account.calendar.view(start=_ews_datetime(start), end=_ews_datetime(end))
-        events = []
-        for item in items:
-            if not isinstance(item, CalendarItem):
-                continue
-            try:
-                events.append(item_to_event(item, my_email))
-            except Exception as exc:  # одна встреча не должна ломать всю синхронизацию
-                _log.warning("EWS календарь: встреча пропущена (%s)", exc)
+        # Exchange отдаёт в одном просмотре не больше ~1000 встреч («You have
+        # exceeded the maximum number of objects…»), а ежедневные серии за
+        # полгода это легко превышают. Поэтому окно запрашивается частями.
+        events: dict[str, Event] = {}
+        chunk_start = start
+        while chunk_start < end:
+            chunk_end = min(chunk_start + EWS_VIEW_CHUNK, end)
+            for item in account.calendar.view(start=_ews_datetime(chunk_start), end=_ews_datetime(chunk_end)):
+                if not isinstance(item, CalendarItem):
+                    continue
+                try:
+                    event = item_to_event(item, my_email)
+                except Exception as exc:  # одна встреча не должна ломать всю синхронизацию
+                    _log.warning("EWS календарь: встреча пропущена (%s)", exc)
+                    continue
+                events[event.uid] = event  # встреча на стыке частей приходит дважды
+            chunk_start = chunk_end
         _log.info("EWS календарь: получено встреч %d (окно %s — %s)", len(events), start.date(), end.date())
-        return events
+        return list(events.values())
     except Exception as exc:
         _log.error("EWS календарь: получение встреч не удалось: %s", exc)
         raise EwsCalendarError(f"Не удалось получить встречи Exchange: {exc}") from exc

@@ -63,6 +63,11 @@ def sync_calendar(
 
     if not read_only:
         for uid in calendar_store.pending_server_deletes(path, calendar.id):
+            if calendar_store.is_instance_uid(uid):
+                # Отдельный экземпляр серии на сервере по нашему UID не найти;
+                # удаление одного дня серии пока не передаётся.
+                calendar_store.forget_server_delete(path, uid)
+                continue
             try:
                 server.delete_event(uid)
             except Exception as exc:
@@ -73,8 +78,10 @@ def sync_calendar(
             report.deleted_on_server += 1
 
         for event in calendar_store.events_to_push(path, calendar.id):
-            if not event.is_organizer:
-                calendar_store.mark_pushed(path, event.uid)  # чужие встречи сервер правит сам
+            if not event.is_organizer or calendar_store.is_instance_uid(event.uid):
+                # Чужие встречи сервер правит сам; правка одного экземпляра
+                # серии пока остаётся локальной (её UID сервер не знает).
+                calendar_store.mark_pushed(path, event.uid)
                 continue
             try:
                 server.push_event(event)

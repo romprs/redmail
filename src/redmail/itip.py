@@ -84,7 +84,31 @@ def parse_ics_events(ics_bytes: bytes, my_email: str) -> list[Event]:
             events.append(_event_from_vevent(component, method, my_email, None))
         except (KeyError, ValueError):
             continue
-    return events
+    return group_recurrences(events)
+
+
+def group_recurrences(events: list[Event]) -> list[Event]:
+    """Экземпляры серии (RECURRENCE-ID: изменённые на сервере или
+    развёрнутые библиотекой CalDAV) получают свой UID, а их даты
+    исключаются из основной записи серии — иначе серия показала бы тот же
+    день дважды. Отменённые экземпляры только исключаются."""
+    series = {event.uid: event for event in events if not calendar_store.is_instance_uid(event.uid)}
+    result = []
+    for event in events:
+        if not calendar_store.is_instance_uid(event.uid):
+            result.append(event)
+            continue
+        master = series.get(calendar_store.series_uid(event.uid))
+        if master is not None and master.recurrence_rule:
+            master.exdates.append(_instance_start(event.uid))
+        if event.status != "cancelled":
+            result.append(event)
+    return result
+
+
+def _instance_start(uid: str) -> datetime:
+    stamp = uid.split(calendar_store.INSTANCE_SEPARATOR, 1)[1]
+    return datetime.strptime(stamp, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
 
 
 def import_ics(path: Path, ics_bytes: bytes, my_email: str = "", calendar_id: str | None = None) -> int:
@@ -135,6 +159,14 @@ def _event_from_vevent(vevent, method: str, my_email: str, raw_ics: bytes | None
     ]
 
     uid = str(vevent.get("UID", "")) or new_uid()
+    recurrence_id = vevent.get("RECURRENCE-ID")
+    if recurrence_id is not None:
+        uid = calendar_store.instance_uid(uid, _to_utc(recurrence_id.dt))
+        recurrence_rule = None  # экземпляр не повторяется сам
+    exdates = []
+    for prop in _as_list(vevent.get("EXDATE")):
+        for moment in getattr(prop, "dts", []):
+            exdates.append(_to_utc(moment.dt))
 
     # Реальный экспорт целого календаря (в отличие от одиночного iTIP-
     # приглашения) не несёт METHOD:, зато почти всегда несёт свой STATUS:
@@ -167,6 +199,7 @@ def _event_from_vevent(vevent, method: str, my_email: str, raw_ics: bytes | None
         attendees=attendees,
         attachments=attachments,
         raw_ics=raw_ics,
+        exdates=exdates,
     )
 
 
@@ -233,6 +266,10 @@ def _build(method: str | None, event: Event, *, organizer_email: str, organizer_
         vevent.add("dtend", event.dtend)
     if event.recurrence_rule:
         vevent.add("rrule", icalendar.vRecur.from_ical(event.recurrence_rule))
+        # Отменённые и изменённые экземпляры: без EXDATE правка серии здесь
+        # вернула бы на сервере удалённые дни.
+        for moment in event.exdates:
+            vevent.add("exdate", moment)
 
     organizer = icalendar.vCalAddress(f"mailto:{organizer_email}")
     organizer.params["CN"] = organizer_name or organizer_email

@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -59,7 +59,29 @@ _MIGRATIONS = (
     # Exchange при этом рассылал участникам обновления, а VK отвечал 412 на
     # встречи, изменённые с тех пор в другом месте.
     "ALTER TABLE events ADD COLUMN needs_push INTEGER NOT NULL DEFAULT 0",
+    # Даты, исключённые из серии (EXDATE и изменённые экземпляры, которые
+    # хранятся отдельными записями) — JSON-список ISO-времён в UTC.
+    "ALTER TABLE events ADD COLUMN exdates TEXT NOT NULL DEFAULT '[]'",
 )
+
+# Экземпляр повторяющейся встречи (изменённый или развёрнутый сервером)
+# хранится отдельной записью: у всех экземпляров серии один UID, и при
+# хранении по UID каждый следующий затирал предыдущий — от серии оставался
+# один день (жалоба: «сначала данные прилетели, потом часть пропала»).
+INSTANCE_SEPARATOR = "|RID:"
+
+
+def instance_uid(uid: str, recurrence_id: datetime) -> str:
+    stamp = recurrence_id.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    return f"{uid}{INSTANCE_SEPARATOR}{stamp}"
+
+
+def is_instance_uid(uid: str) -> bool:
+    return INSTANCE_SEPARATOR in uid
+
+
+def series_uid(uid: str) -> str:
+    return uid.split(INSTANCE_SEPARATOR, 1)[0]
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -117,7 +139,7 @@ CREATE TABLE IF NOT EXISTS calendars (
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
     "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-    "recurrence_rule, color, calendar_id, raw_ics"
+    "recurrence_rule, color, calendar_id, raw_ics, exdates"
 )
 
 
@@ -150,6 +172,7 @@ class Event:
     calendar_id: str = DEFAULT_CALENDAR_ID
     attachments: list[Attachment] = field(default_factory=list)
     raw_ics: bytes | None = None
+    exdates: list[datetime] = field(default_factory=list)  # исключённые из серии начала экземпляров (UTC)
 
 
 @dataclass
@@ -241,7 +264,15 @@ def _row_to_event(conn: sqlite3.Connection, row) -> Event:
         calendar_id=row[17],
         attachments=_load_attachments(conn, row[1]),
         raw_ics=row[18],
+        exdates=_load_exdates(row[19]),
     )
+
+
+def _load_exdates(value: str | None) -> list[datetime]:
+    try:
+        return [datetime.fromisoformat(item) for item in json.loads(value or "[]")]
+    except (TypeError, ValueError):
+        return []
 
 
 def _load_attachments(conn: sqlite3.Connection, uid: str) -> list[Attachment]:
@@ -311,7 +342,10 @@ def _expand_recurring(events: list[Event], start: datetime, end: datetime) -> li
         except (ValueError, TypeError):
             expanded.append(event)  # неразбираемое правило — не теряем событие целиком
             continue
+        excluded = {moment.astimezone(timezone.utc).replace(microsecond=0) for moment in event.exdates}
         for occurrence_start in occurrences:
+            if occurrence_start.astimezone(timezone.utc).replace(microsecond=0) in excluded:
+                continue  # отменённый или изменённый экземпляр (он хранится отдельно)
             expanded.append(replace(event, dtstart=occurrence_start, dtend=occurrence_start + duration))
     expanded.sort(key=lambda e: e.dtstart)
     return expanded
@@ -337,15 +371,15 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-            "recurrence_rule, color, calendar_id, raw_ics, needs_push) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recurrence_rule, color, calendar_id, raw_ics, needs_push, exdates) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
             "organizer_email=excluded.organizer_email, organizer_name=excluded.organizer_name, "
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
             "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
-            "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics, "
+            "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics, exdates=excluded.exdates, "
             "needs_push=MAX(events.needs_push, excluded.needs_push)",
             (
                 event.uid,
@@ -367,6 +401,7 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
                 event.calendar_id,
                 event.raw_ics,
                 int(needs_push),
+                json.dumps([moment.astimezone(timezone.utc).isoformat() for moment in event.exdates]),
             ),
         )
         if needs_push:
