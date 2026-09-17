@@ -476,7 +476,108 @@ def save_mail_rules(rules: list[MailRule]) -> None:
 GREETING_NONE = "none"
 GREETING_HELLO = "hello"
 GREETING_TIME_OF_DAY = "time_of_day"
-_GREETING_MODES = (GREETING_NONE, GREETING_HELLO, GREETING_TIME_OF_DAY)
+#: Свой список приветствий пользователя (см. load_greetings).
+GREETING_LIST = "list"
+_GREETING_MODES = (GREETING_NONE, GREETING_HELLO, GREETING_TIME_OF_DAY, GREETING_LIST)
+
+
+@dataclass
+class Greeting:
+    """Одно приветствие из списка. start/end — «ЧЧ:ММ» или пусто (всегда);
+    end «24:00» — до полуночи; интервал может переходить через полночь."""
+
+    text: str
+    start: str = ""
+    end: str = ""
+
+
+GREETINGS_HELLO = (Greeting("Здравствуйте!"),)
+# Ночью — «Здравствуйте!»: «доброй ночи» в деловой переписке звучит как прощание.
+GREETINGS_TIME_OF_DAY = (
+    Greeting("Доброе утро!", "04:00", "12:00"),
+    Greeting("Добрый день!", "12:00", "18:00"),
+    Greeting("Добрый вечер!", "18:00", "24:00"),
+    Greeting("Здравствуйте!"),
+)
+
+
+def _minutes(value: str) -> int | None:
+    """«ЧЧ:ММ» → минуты от полуночи; пусто → None; ошибка — ValueError."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    hours, _, minutes = value.partition(":")
+    if not (hours.isdigit() and minutes.isdigit() and len(minutes) == 2):
+        raise ValueError(f"время «{value}»: ожидается ЧЧ:ММ")
+    total = int(hours) * 60 + int(minutes)
+    if int(minutes) > 59 or total > 24 * 60:
+        raise ValueError(f"время «{value}»: ожидается от 00:00 до 24:00")
+    return total
+
+
+def validate_greeting(greeting: Greeting) -> None:
+    if not greeting.text.strip():
+        raise ValueError("пустое приветствие")
+    start, end = _minutes(greeting.start), _minutes(greeting.end)
+    if (start is None) != (end is None):
+        raise ValueError(f"«{greeting.text}»: укажите и начало, и конец времени — или оставьте оба пустыми")
+
+
+def _greeting_matches(greeting: Greeting, minute: int) -> bool:
+    start, end = _minutes(greeting.start), _minutes(greeting.end)
+    if start is None or end is None:
+        return True
+    if start <= end:
+        return start <= minute < end
+    return minute >= start or minute < end  # через полночь
+
+
+def pick_greeting(greetings, now=None) -> str:
+    """Первое приветствие списка, подходящее по текущему времени."""
+    moment = now or datetime.now()
+    minute = moment.hour * 60 + moment.minute
+    for greeting in greetings:
+        try:
+            if _greeting_matches(greeting, minute):
+                return greeting.text.strip()
+        except ValueError:
+            continue
+    return ""
+
+
+def load_greetings() -> list[Greeting]:
+    """Свой список приветствий; если его ещё нет — приветствия по времени суток."""
+    raw = _load_settings_dict().get("greetings")
+    result = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            greeting = Greeting(str(item.get("text", "")), str(item.get("start", "")), str(item.get("end", "")))
+            try:
+                validate_greeting(greeting)
+            except ValueError:
+                continue
+            result.append(greeting)
+    return result or list(GREETINGS_TIME_OF_DAY)
+
+
+def save_greetings(greetings: list[Greeting]) -> None:
+    for greeting in greetings:
+        validate_greeting(greeting)
+    data = _load_settings_dict()
+    data["greetings"] = [asdict(greeting) for greeting in greetings]
+    _save_settings_dict(data)
+
+
+def greeting_choices() -> list[str]:
+    """Варианты для переключателя в окне письма — без повторов."""
+    texts = []
+    for greeting in [*load_greetings(), *GREETINGS_HELLO]:
+        text = greeting.text.strip()
+        if text and text not in texts:
+            texts.append(text)
+    return texts
 
 
 def load_greeting_mode() -> str:
@@ -495,19 +596,12 @@ def greeting_text(mode: str, now=None) -> str:
     времени суток. Ночью по времени суток — тоже «Здравствуйте!»: «доброй
     ночи» в деловой переписке звучит как прощание."""
     if mode == GREETING_HELLO:
-        return "Здравствуйте!"
-    if mode != GREETING_TIME_OF_DAY:
-        return ""
-    from datetime import datetime
-
-    hour = (now or datetime.now()).hour
-    if 4 <= hour < 12:
-        return "Доброе утро!"
-    if 12 <= hour < 18:
-        return "Добрый день!"
-    if 18 <= hour < 24:
-        return "Добрый вечер!"
-    return "Здравствуйте!"
+        return pick_greeting(GREETINGS_HELLO, now)
+    if mode == GREETING_TIME_OF_DAY:
+        return pick_greeting(GREETINGS_TIME_OF_DAY, now)
+    if mode == GREETING_LIST:
+        return pick_greeting(load_greetings(), now)
+    return ""
 
 
 def load_font_scale() -> float:

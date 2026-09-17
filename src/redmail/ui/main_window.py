@@ -162,8 +162,14 @@ from redmail.config_store import (
     greeting_text,
     save_greeting_mode,
     GREETING_HELLO,
+    GREETING_LIST,
     GREETING_NONE,
     GREETING_TIME_OF_DAY,
+    Greeting,
+    greeting_choices,
+    load_greetings,
+    save_greetings,
+    validate_greeting,
     load_profile_dir,
     load_contacts_view_mode,
     load_mail_view_mode,
@@ -2712,6 +2718,110 @@ class BrandsDialog(QDialog):
         self._reload()
 
 
+class GreetingsDialog(QDialog):
+    """Свой список приветствий: текст и время, когда оно подходит. В письмо
+    ставится первое подходящее по времени; строка без времени — всегда."""
+
+    def __init__(self, parent, greetings: list[Greeting]):
+        super().__init__(parent)
+        self.setWindowTitle("Приветствия")
+        self.resize(640, 420)
+        self.table = QTableWidget(0, 3, self)
+        self.table.setHorizontalHeaderLabels(["Приветствие", "С (ЧЧ:ММ)", "До (ЧЧ:ММ)"])
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for greeting in greetings:
+            self._add_row(greeting)
+        add_button = QPushButton("Добавить", self)
+        add_button.clicked.connect(lambda: self._add_row(Greeting(""), edit=True))
+        remove_button = QPushButton("Удалить", self)
+        remove_button.clicked.connect(self._remove_row)
+        up_button = QPushButton("Выше", self)
+        up_button.clicked.connect(lambda: self._move_row(-1))
+        down_button = QPushButton("Ниже", self)
+        down_button.clicked.connect(lambda: self._move_row(1))
+        reset_button = QPushButton("По времени суток", self)
+        reset_button.setToolTip("Вернуть «Доброе утро!», «Добрый день!», «Добрый вечер!», «Здравствуйте!»")
+        reset_button.clicked.connect(self._reset)
+        side = QVBoxLayout()
+        for button in (add_button, remove_button, up_button, down_button, reset_button):
+            side.addWidget(button)
+        side.addStretch(1)
+        body = QHBoxLayout()
+        body.addWidget(self.table, 1)
+        body.addLayout(side)
+        hint = QLabel(
+            "В письмо ставится первое приветствие сверху, подходящее по времени. Время можно не указывать — "
+            "тогда приветствие подходит всегда (поставьте такое последним). Интервал может переходить через "
+            "полночь: с 22:00 до 04:00. В окне письма приветствие можно сменить или убрать.", self,
+        )
+        hint.setWordWrap(True)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(body)
+        layout.addWidget(hint)
+        layout.addWidget(buttons)
+
+    def _add_row(self, greeting: Greeting, *, edit: bool = False) -> None:
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        for column, value in enumerate((greeting.text, greeting.start, greeting.end)):
+            self.table.setItem(row, column, QTableWidgetItem(value))
+        if edit:
+            self.table.setCurrentCell(row, 0)
+            self.table.editItem(self.table.item(row, 0))
+
+    def _remove_row(self) -> None:
+        row = self.table.currentRow()
+        if row >= 0:
+            self.table.removeRow(row)
+
+    def _move_row(self, step: int) -> None:
+        row = self.table.currentRow()
+        target = row + step
+        if row < 0 or not 0 <= target < self.table.rowCount():
+            return
+        values = [self.table.item(row, c).text() if self.table.item(row, c) else "" for c in range(3)]
+        self.table.removeRow(row)
+        self.table.insertRow(target)
+        for column, value in enumerate(values):
+            self.table.setItem(target, column, QTableWidgetItem(value))
+        self.table.setCurrentCell(target, 0)
+
+    def _reset(self) -> None:
+        from redmail.config_store import GREETINGS_TIME_OF_DAY
+
+        self.table.setRowCount(0)
+        for greeting in GREETINGS_TIME_OF_DAY:
+            self._add_row(greeting)
+
+    def greetings(self) -> list[Greeting]:
+        result = []
+        for row in range(self.table.rowCount()):
+            text, start, end = (self.table.item(row, c).text().strip() if self.table.item(row, c) else "" for c in range(3))
+            if text or start or end:
+                result.append(Greeting(text, start, end))
+        return result
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        greetings = self.greetings()
+        if not greetings:
+            QMessageBox.warning(self, "Приветствия", "Добавьте хотя бы одно приветствие.")
+            return
+        try:
+            for greeting in greetings:
+                validate_greeting(greeting)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Приветствия", f"Проверьте строку: {exc}")
+            return
+        super().accept()
+
+
 class SettingsDialog(QDialog):
     """Один диалог на всё: учётная запись (было отдельным «Подключиться…»),
     интервал проверки почты и расположение панели чтения."""
@@ -2793,12 +2903,19 @@ class SettingsDialog(QDialog):
         self.greeting_combo.addItem("Не добавлять", GREETING_NONE)
         self.greeting_combo.addItem("«Здравствуйте!»", GREETING_HELLO)
         self.greeting_combo.addItem("По времени суток: «Доброе утро!», «Добрый день!», «Добрый вечер!»", GREETING_TIME_OF_DAY)
+        self.greeting_combo.addItem("Свой список", GREETING_LIST)
         greeting_index = self.greeting_combo.findData(greeting_mode)
         self.greeting_combo.setCurrentIndex(greeting_index if greeting_index >= 0 else 0)
+        greetings_button = QPushButton("Список приветствий…", self)
+        greetings_button.setToolTip("Свои приветствия и время, когда каждое подходит")
+        greetings_button.clicked.connect(self._on_edit_greetings)
+        greeting_row = QHBoxLayout()
+        greeting_row.addWidget(self.greeting_combo, 1)
+        greeting_row.addWidget(greetings_button)
 
         general_form = QFormLayout()
         general_form.addRow("Проверять почту каждые", self.interval_edit)
-        general_form.addRow("Приветствие в начале письма", self.greeting_combo)
+        general_form.addRow("Приветствие в начале письма", greeting_row)
         general_form.addRow("Масштаб шрифта", self.font_scale_spin)
         general_form.addRow("Панель чтения", self.orientation_vertical)
         general_form.addRow("", self.orientation_horizontal)
@@ -3192,6 +3309,13 @@ class SettingsDialog(QDialog):
 
     def pane_orientation(self) -> str:
         return "horizontal" if self.orientation_horizontal.isChecked() else "vertical"
+
+    def _on_edit_greetings(self) -> None:
+        dialog = GreetingsDialog(self, load_greetings())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        save_greetings(dialog.greetings())
+        self.greeting_combo.setCurrentIndex(self.greeting_combo.findData(GREETING_LIST))
 
     def _build_transfer_group(self) -> QGroupBox:
         """Перенос профиля на другой компьютер и выгрузка всей переписки.
@@ -3794,13 +3918,42 @@ class ComposeDialog(QDialog):
         начинается с приветствия (помощник продиктовал), второе не ставим."""
         existing = self.body_edit.toPlainText().lstrip().casefold()
         if existing.startswith(("здравствуй", "добр", "привет")):
-            return
+            return False
         cursor = QTextCursor(self.body_edit.document())
         cursor.movePosition(QTextCursor.MoveOperation.Start)
         cursor.insertText(greeting)
         cursor.insertBlock()
         cursor.insertBlock()
         self.body_edit.setTextCursor(cursor)
+        return True
+
+    def _set_greeting(self, text: str) -> None:
+        """Сменить или убрать приветствие, уже поставленное первой строкой;
+        если его не было — поставить."""
+        document = self.body_edit.document()
+        first = document.firstBlock()
+        if self._greeting and first.text().strip() == self._greeting:
+            cursor = QTextCursor(first)
+            cursor.beginEditBlock()
+            cursor.movePosition(QTextCursor.MoveOperation.EndOfBlock, QTextCursor.MoveMode.KeepAnchor)
+            if text:
+                cursor.insertText(text)
+            else:
+                # вместе с приветствием — пустая строка после него
+                following = first.next()
+                cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
+                if following.isValid() and not following.text().strip():
+                    cursor.movePosition(QTextCursor.MoveOperation.NextBlock, QTextCursor.MoveMode.KeepAnchor)
+                cursor.removeSelectedText()
+            cursor.endEditBlock()
+            self._greeting = text
+        elif text:
+            cursor = QTextCursor(document)
+            cursor.movePosition(QTextCursor.MoveOperation.Start)
+            cursor.insertText(text)
+            cursor.insertBlock()
+            cursor.insertBlock()
+            self._greeting = text
 
     def __init__(
         self,
@@ -3893,7 +4046,8 @@ class ComposeDialog(QDialog):
             self._apply_letter_branding(brand)
         self._greeting = greeting
         if greeting:
-            self._insert_greeting(greeting)
+            if not self._insert_greeting(greeting):
+                self._greeting = ""  # письмо уже начинается с приветствия
             # Приветствие — не правка человека: иначе докачанные позже
             # картинки пересылаемого письма не подставились бы (см.
             # apply_embedded_images), а закрытие пустого письма спрашивало бы
@@ -3988,6 +4142,19 @@ class ComposeDialog(QDialog):
         self.switch_layout_action.triggered.connect(self._on_switch_layout)
         format_toolbar.addAction(self.switch_layout_action)
         self.addAction(self.switch_layout_action)
+        format_toolbar.addSeparator()
+        self.greeting_combo = QComboBox(self)
+        self.greeting_combo.setToolTip("Приветствие первой строкой письма; список — в «Параметры» → «Общие»")
+        self.greeting_combo.addItem("Без приветствия", "")
+        for text in greeting_choices():
+            self.greeting_combo.addItem(text, text)
+        if self._greeting and self.greeting_combo.findData(self._greeting) < 0:
+            self.greeting_combo.addItem(self._greeting, self._greeting)
+        self.greeting_combo.setCurrentIndex(max(0, self.greeting_combo.findData(self._greeting)))
+        self.greeting_combo.currentIndexChanged.connect(
+            lambda _index: self._set_greeting(self.greeting_combo.currentData() or "")
+        )
+        format_toolbar.addWidget(self.greeting_combo)
         self._format_toolbar = format_toolbar
 
         self.body_edit.currentCharFormatChanged.connect(self._sync_format_toolbar)

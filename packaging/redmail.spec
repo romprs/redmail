@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        129%{?dist}
+Release:        130%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -124,6 +124,9 @@ fi
 %dir %{_sysconfdir}/redmail/brands
 
 %changelog
+* Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-130
+- Свой список приветствий: текст и время, когда оно подходит («Параметры» → «Общие» → «Список приветствий…»)
+- В окне письма приветствие меняется на другое из списка или убирается
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-129
 - CalDAV: в журнал пишется строение объектов календаря сервера (серия, правило повтора, часовой пояс, отменённые и изменённые дни — без названий и участников) и причина пропуска непонятного объекта
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-128
