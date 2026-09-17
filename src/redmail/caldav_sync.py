@@ -455,7 +455,10 @@ class CalDavSession:
         одного и того же формата."""
         calendar = self._primary_calendar()
         try:
-            results = _with_connection_retry(calendar.date_search, start, end)
+            # Без разворачивания: сервер отдаёт серию целиком (основная запись
+            # и изменённые дни), серия раскрывается у нас. С развёрнутыми днями
+            # основная запись не приходила, и серию нельзя было править целиком.
+            results = _with_connection_retry(calendar.date_search, start, end, expand=False)
         except Exception as exc:
             _log.error("CalDAV %s: получение событий не удалось: %s", self.account.url, exc)
             raise CalDavSyncError(f"Не удалось получить события с сервера: {exc}") from exc

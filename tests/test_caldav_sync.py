@@ -102,7 +102,7 @@ def test_fetch_events_parses_server_objects_into_events() -> None:
     assert len(events) == 1
     assert events[0].uid == "e1@redmail"
     assert events[0].summary == "Совещание"
-    fake_calendar.date_search.assert_called_once_with(start, end)
+    fake_calendar.date_search.assert_called_once_with(start, end, expand=False)
 
 
 def test_fetch_events_skips_broken_object_without_failing_whole_sync() -> None:

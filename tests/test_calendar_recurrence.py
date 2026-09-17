@@ -165,3 +165,20 @@ def test_ews_view_is_split_under_server_limit_and_keeps_occurrences(monkeypatch)
 def test_instance_uid_helpers(uid: str) -> None:
     assert calendar_store.is_instance_uid(uid) and calendar_store.series_uid(uid) == "x"
     assert calendar_store.instance_uid("x", datetime(2026, 1, 1, 3, tzinfo=timezone(timedelta(hours=3)))) == uid
+
+
+def test_weekday_rule_expands_in_local_time() -> None:
+    # Понедельник 08:30 по Якутску (UTC+9) — это воскресенье 23:30 по UTC.
+    yakutsk = timezone(timedelta(hours=9))
+    start_local = datetime(2026, 9, 14, 8, 30, tzinfo=yakutsk)  # понедельник
+    event = calendar_store.Event(
+        uid="weekdays", summary="Планёрка", dtstart=start_local.astimezone(timezone.utc),
+        dtend=(start_local + timedelta(minutes=30)).astimezone(timezone.utc), recurrence_rule="FREQ=WEEKLY;BYDAY=MO,WE,FR",
+    )
+    window = (datetime(2026, 9, 13, tzinfo=timezone.utc), datetime(2026, 9, 20, tzinfo=timezone.utc))
+    events = calendar_store._expand_recurring([event], *window, local_tz=yakutsk)
+    assert [e.dtstart.astimezone(yakutsk).strftime("%a %H:%M") for e in events] == ["Mon 08:30", "Wed 08:30", "Fri 08:30"]
+    assert all(e.dtstart.tzinfo == timezone.utc for e in events)
+    # В UTC то же правило дало бы воскресенье, вторник и четверг.
+    wrong = calendar_store._expand_recurring([event], *window, local_tz=timezone.utc)
+    assert [e.dtstart.astimezone(yakutsk).strftime("%a") for e in wrong] != ["Mon", "Wed", "Fri"]

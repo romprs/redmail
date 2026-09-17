@@ -337,16 +337,20 @@ def list_events(path: Path, start: datetime | None = None, end: datetime | None 
     return _expand_recurring(events, start, end)
 
 
-def _expand_recurring(events: list[Event], start: datetime, end: datetime) -> list[Event]:
+def _expand_recurring(events: list[Event], start: datetime, end: datetime, local_tz=None) -> list[Event]:
     expanded: list[Event] = []
     for event in events:
         if not event.recurrence_rule:
             expanded.append(event)
             continue
         duration = event.dtend - event.dtstart
+        # Правило раскрывается в местном времени, а не в UTC: «по будням в
+        # 08:30» по Якутску — это 23:30 предыдущего дня по UTC, и BYDAY дал
+        # бы не те дни недели. Встречи на весь день хранятся от полуночи UTC.
+        rule_start = event.dtstart if event.all_day else event.dtstart.astimezone(local_tz)
         try:
-            rule = rrulestr(f"RRULE:{event.recurrence_rule}", dtstart=event.dtstart)
-            occurrences = rule.between(start, end, inc=True)
+            rule = rrulestr(f"RRULE:{event.recurrence_rule}", dtstart=rule_start)
+            occurrences = [moment.astimezone(timezone.utc) for moment in rule.between(start, end, inc=True)]
         except (ValueError, TypeError):
             expanded.append(event)  # неразбираемое правило — не теряем событие целиком
             continue
