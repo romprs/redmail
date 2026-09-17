@@ -182,3 +182,52 @@ def test_weekday_rule_expands_in_local_time() -> None:
     # В UTC то же правило дало бы воскресенье, вторник и четверг.
     wrong = calendar_store._expand_recurring([event], *window, local_tz=timezone.utc)
     assert [e.dtstart.astimezone(yakutsk).strftime("%a") for e in wrong] != ["Mon", "Wed", "Fri"]
+
+
+VK_LIKE_SERIES = """BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VTIMEZONE
+TZID:Asia/Yakutsk
+BEGIN:STANDARD
+DTSTART:19700101T000000
+TZOFFSETFROM:+0900
+TZOFFSETTO:+0900
+END:STANDARD
+END:VTIMEZONE
+BEGIN:VEVENT
+UID:vk-daily
+SUMMARY:ежедневное оперативное совещание
+DTSTART;TZID=Asia/Yakutsk:20260105T083000
+DTEND;TZID=Asia/Yakutsk:20260105T104500
+RRULE:FREQ=WEEKLY;UNTIL=20261231T235959Z;BYDAY=MO,TU,WE,TH,FR
+EXDATE;TZID=Asia/Yakutsk:20260915T083000,20260916T083000
+END:VEVENT
+BEGIN:VEVENT
+UID:vk-daily
+RECURRENCE-ID;TZID=Asia/Yakutsk:20260917T083000
+SUMMARY:ежедневное оперативное совещание
+DTSTART;TZID=Asia/Yakutsk:20260917T093000
+DTEND;TZID=Asia/Yakutsk:20260917T110000
+END:VEVENT
+END:VCALENDAR
+""".encode("utf-8")
+
+
+def test_vk_like_year_series_with_timezone(tmp_path: Path) -> None:
+    yakutsk = timezone(timedelta(hours=9))
+    events = itip.parse_ics_events(VK_LIKE_SERIES, "me@x.ru")
+    path = tmp_path / "c.rmcal"
+    for event in events:
+        calendar_store.save_event(path, event)
+    week = (datetime(2026, 9, 13, 15, tzinfo=timezone.utc), datetime(2026, 9, 20, 15, tzinfo=timezone.utc))  # пн–вс по Якутску
+    stored = calendar_store.list_events(path, *week)
+    # вт 15 и ср 16 отменены (EXDATE), чт 17 перенесён на 09:30, сб/вс нет
+    expected = sorted(["Mon 14 08:30", "Thu 17 09:30", "Fri 18 08:30"])
+    local = calendar_store._expand_recurring(
+        [calendar_store.get_event(path, "vk-daily")], *week, local_tz=yakutsk
+    ) + [e for e in stored if calendar_store.is_instance_uid(e.uid)]
+    assert sorted(e.dtstart.astimezone(yakutsk).strftime("%a %d %H:%M") for e in local) == expected
+    # за окно синхронизации (7 месяцев) серия — это около 150 рабочих дней, как в журнале VK
+    window = (datetime(2026, 8, 18, tzinfo=timezone.utc), datetime(2027, 3, 16, tzinfo=timezone.utc))
+    series_days = calendar_store._expand_recurring([calendar_store.get_event(path, "vk-daily")], *window, local_tz=yakutsk)
+    assert 95 <= len(series_days) <= 100  # до 31.12.2026: сен–дек ≈ 97 будней минус 3

@@ -464,13 +464,25 @@ class CalDavSession:
             raise CalDavSyncError(f"Не удалось получить события с сервера: {exc}") from exc
 
         events: list[Event] = []
+        seen = getattr(self, "_object_shapes", None)
+        if seen is None:
+            seen = self._object_shapes = {}
         for obj in results:
+            href = str(getattr(obj, "url", "") or "")
             try:
                 raw = obj.data
                 raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+                shape = describe_ics_shape(raw_bytes)
+                if seen.get(href) != shape:
+                    # Как сервер записал серию — без названий и участников, и только
+                    # когда объект изменился: чтобы по журналу разбирать формат сервера.
+                    seen[href] = shape
+                    _log.info("CalDAV %s: объект %s — %s", self.account.url, href.rsplit("/", 1)[-1], shape)
                 events.extend(itip.parse_ics_events(raw_bytes, my_email))
-            except Exception:
-                continue  # одно повреждённое/непонятное событие не должно валить всю синхронизацию
+            except Exception as exc:
+                # одно повреждённое/непонятное событие не должно валить всю синхронизацию
+                _log.warning("CalDAV %s: объект %s пропущен: %s", self.account.url, href.rsplit("/", 1)[-1], exc)
+                continue
         _log.info("CalDAV %s: получено объектов %d, событий %d (окно %s — %s)",
                   self.account.url, len(results), len(events), start.date(), end.date())
         return events
@@ -635,3 +647,30 @@ def _exclude_date(existing_data, original) -> str:
             component.add("exdate", original)
             component["SEQUENCE"] = int(component.get("SEQUENCE", 0)) + 1
     return current.to_ical().decode("utf-8")
+
+
+def describe_ics_shape(raw: bytes) -> str:
+    """Строение объекта календаря для журнала: сколько записей, правило
+    повтора, часовой пояс, изменённые и отменённые дни. Без названий,
+    описаний и участников."""
+    calendar = icalendar.Calendar.from_ical(raw)
+    parts = []
+    for vevent in calendar.walk("VEVENT"):
+        start = vevent.get("DTSTART")
+        tzid = start.params.get("TZID", "") if start is not None else ""
+        kind = "день серии" if "RECURRENCE-ID" in vevent else ("серия" if "RRULE" in vevent else "встреча")
+        item = kind
+        if "RRULE" in vevent:
+            item += f" RRULE={vevent['RRULE'].to_ical().decode('ascii')}"
+        if tzid:
+            item += f" TZID={tzid}"
+        elif start is not None:
+            value = start.dt
+            item += " UTC" if getattr(value, "tzinfo", None) is not None else (" без пояса" if hasattr(value, "hour") else " весь день")
+        exdates = sum(len(getattr(prop, "dts", [])) for prop in (vevent.get("EXDATE") if isinstance(vevent.get("EXDATE"), list) else [vevent.get("EXDATE")] if vevent.get("EXDATE") is not None else []))
+        if exdates:
+            item += f" EXDATE×{exdates}"
+        if str(vevent.get("STATUS", "")).upper() == "CANCELLED":
+            item += " отменена"
+        parts.append(item)
+    return "; ".join(parts) or "нет VEVENT"
