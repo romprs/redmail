@@ -130,7 +130,7 @@ from PySide6.QtWebEngineCore import (
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
-from redmail import mail_export, profile_transfer
+from redmail import keyboard_layout, mail_export, profile_transfer
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
@@ -1229,12 +1229,66 @@ def _parse_recipient_list(text: str, contacts: list[contact_store.Contact] | Non
     return [addr for _name, addr in getaddresses([text]) if addr]
 
 
+def _recipient_search_prefix(prefix: str, candidates: list[str]) -> str:
+    """Строка поиска адресата. Набрали не в той раскладке («bdfyjd») и в
+    адресной книге ничего нет, а в другой раскладке («иванов») есть —
+    ищем по ней; выбранный адрес заменит набранное."""
+    folded = prefix.casefold()
+    if any(folded in candidate.casefold() for candidate in candidates):
+        return prefix
+    for variant in keyboard_layout.alternatives(prefix):
+        if any(variant.casefold() in candidate.casefold() for candidate in candidates):
+            return variant
+    return prefix
+
+
+def switch_layout_in_widget(widget) -> bool:
+    """Выделенный текст — или слово перед курсором — в другую раскладку.
+    Работает в теле письма (QTextEdit) и в однострочных полях (тема)."""
+    if isinstance(widget, QTextEdit):
+        cursor = widget.textCursor()
+        if not cursor.hasSelection():
+            # Слово перед курсором — до пробела, а не до знака препинания:
+            # «ж», «э», «б», «ю» в английской раскладке — это ; ' , .
+            block_text = cursor.block().text()
+            start = cursor.positionInBlock()
+            while start > 0 and not block_text[start - 1].isspace():
+                start -= 1
+            cursor.setPosition(cursor.block().position() + start, QTextCursor.MoveMode.KeepAnchor)
+        selected = cursor.selectedText()
+        if not selected.strip():
+            return False
+        start, end = sorted((cursor.anchor(), cursor.position()))
+        cursor.insertText(keyboard_layout.switch_layout(selected))
+        cursor.setPosition(start)
+        cursor.setPosition(start + (end - start), QTextCursor.MoveMode.KeepAnchor)
+        widget.setTextCursor(cursor)
+        return True
+    if isinstance(widget, QLineEdit) and not widget.isReadOnly():
+        text = widget.text()
+        if widget.hasSelectedText():
+            start = widget.selectionStart()
+            end = start + len(widget.selectedText())
+        else:
+            end = widget.cursorPosition()
+            start = end
+            while start > 0 and not text[start - 1].isspace() and text[start - 1] != ",":
+                start -= 1
+        if start == end:
+            return False
+        widget.setText(text[:start] + keyboard_layout.switch_layout(text[start:end]) + text[end:])
+        widget.setSelection(start, end - start)
+        return True
+    return False
+
+
 def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_store.Contact]) -> QCompleter:
     """Автодополнение по адресной книге для поля со списком адресов через
     запятую. Обычный line_edit.setCompleter() достраивал бы ВСЁ поле
     целиком по одному совпадению — здесь достраивается только текущий
     (последний) сегмент после запятой, остальные не трогаются."""
-    completer = QCompleter(_contact_candidates(contacts), line_edit)
+    candidates = _contact_candidates(contacts)
+    completer = QCompleter(candidates, line_edit)
     completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
     completer.setFilterMode(Qt.MatchFlag.MatchContains)
     completer.setWidget(line_edit)
@@ -1289,7 +1343,7 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
         state["prefix_start"] = prefix_start
         state["cursor_pos"] = cursor_pos
         if prefix:
-            completer.setCompletionPrefix(prefix)
+            completer.setCompletionPrefix(_recipient_search_prefix(prefix, candidates))
             completer.complete()
         else:
             completer.popup().hide()
@@ -3699,6 +3753,13 @@ class _ComposeBodyEdit(QTextEdit):
 
 
 class ComposeDialog(QDialog):
+    def _on_switch_layout(self) -> None:
+        widget = QApplication.focusWidget()
+        if widget is None or not self.isAncestorOf(widget):
+            widget = self.body_edit
+        if not switch_layout_in_widget(widget):
+            QApplication.beep()
+
     def _apply_letter_branding(self, brand) -> None:
         document = self.body_edit.document()
         font = QFont(document.defaultFont())
@@ -3900,6 +3961,17 @@ class ComposeDialog(QDialog):
         self._update_color_button()
         format_toolbar.addSeparator()
         format_toolbar.addWidget(insert_image_button)
+        format_toolbar.addSeparator()
+        self.switch_layout_action = QAction("Раскладка", self)
+        self.switch_layout_action.setToolTip(
+            "Текст, набранный не в той раскладке («ghbdtn» → «привет»): выделенное или слово перед курсором "
+            "(Pause или Ctrl+Shift+K)"
+        )
+        self.switch_layout_action.setShortcuts([QKeySequence(Qt.Key.Key_Pause), QKeySequence("Ctrl+Shift+K")])
+        self.switch_layout_action.setShortcutContext(Qt.ShortcutContext.WindowShortcut)
+        self.switch_layout_action.triggered.connect(self._on_switch_layout)
+        format_toolbar.addAction(self.switch_layout_action)
+        self.addAction(self.switch_layout_action)
         self._format_toolbar = format_toolbar
 
         self.body_edit.currentCharFormatChanged.connect(self._sync_format_toolbar)
