@@ -89,7 +89,7 @@ class FakeController:
     def ipc_contacts(self):
         return getattr(self, "contacts", [])
 
-    def ipc_cancel_event(self, uid):
+    def ipc_cancel_event(self, uid, *, start=None, scope=None, confirmed=False):
         self.calls.append(("cancel_event", {"uid": uid}))
 
     def ipc_apply_mail_rules(self, folder=None):
@@ -969,6 +969,7 @@ def _window_stub(**overrides):
     stub._ipc_event_dialog = lambda event, *, title: MainWindow._ipc_event_dialog(
         stub, event, title=title
     )
+    stub._ipc_occurrence = lambda uid, start: MainWindow._ipc_occurrence(stub, uid, start)
     for key, value in overrides.items():
         setattr(stub, key, value)
     return stub

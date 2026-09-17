@@ -171,6 +171,7 @@ def _host(tmp_path: Path, monkeypatch, scope: str):
     host._send_request_to_attendees = lambda event, **kw: host.sent.append(("request", event.uid))
     host._send_message_in_background = lambda message, **kw: host.sent.append(("cancel", message.subject))
     host.smtp_account = object()
+    host._cancel_event_now = lambda event, scope: mw.MainWindow._cancel_event_now(host, event, scope)
     host.account = SimpleNamespace(username="me@x.ru")
     calendar_store.save_event(host.calendar_path, _series())
     return host, mw
@@ -208,3 +209,38 @@ def test_cancel_one_day_keeps_series_and_notifies(tmp_path: Path, monkeypatch) -
     assert 17 not in days and len(days) == 6
     pending = calendar_store.pending_server_deletes(host.calendar_path, "vk")
     assert pending == ["daily-1|RID:20260917T013000Z"] and host.sent[0][0] == "cancel"
+
+
+def test_voice_cancel_one_day_without_windows(tmp_path: Path, monkeypatch) -> None:
+    host, mw = _host(tmp_path, monkeypatch, "ask-not-expected")
+    host._ask_series_scope = lambda *a: (_ for _ in ()).throw(AssertionError("окно вопроса не должно открываться"))
+    host.ipc_focus = lambda: None
+    later = []
+    host._ipc_later = later.append
+    host._ipc_occurrence = lambda uid, start: mw.MainWindow._ipc_occurrence(host, uid, start)
+    found = mw.MainWindow.ipc_find_events(host, subject="Оперативка", on_date=START.astimezone().date() + timedelta(days=2))
+    assert len(found) == 1 and found[0]["recurring"] is True
+    mw.MainWindow.ipc_cancel_event(
+        host, found[0]["uid"], start=datetime.fromisoformat(found[0]["start"]), scope="one", confirmed=True
+    )
+    later.pop()()
+    days = [e.dtstart.day for e in calendar_store.list_events(host.calendar_path, *WEEK)]
+    assert 16 not in days and len(days) == 6
+    assert calendar_store.pending_server_deletes(host.calendar_path, "vk") == ["daily-1|RID:20260916T013000Z"]
+
+
+def test_voice_edit_form_opens_on_day_and_saves_with_scope(tmp_path: Path, monkeypatch) -> None:
+    host, mw = _host(tmp_path, monkeypatch, "ask-not-expected")
+    captured = {}
+    host._ipc_event_form = None
+    host.ipc_focus = lambda: None
+    host._ipc_later = lambda fn: captured.setdefault("later", fn)
+    host._ipc_occurrence = lambda uid, start: mw.MainWindow._ipc_occurrence(host, uid, start)
+    host._ipc_event_dialog = lambda event, *, title: captured.setdefault("event", event) or object()
+    host._ipc_exec_event_form = lambda dialog, existing, scope=None: captured.update(existing=existing, scope=scope)
+    monkeypatch.setattr(mw, "_event_form_state", lambda dialog, existing: {"uid": existing.uid})
+    host.account = SimpleNamespace(username="me@x.ru")
+    day = datetime(2026, 9, 17, 1, 30, tzinfo=timezone.utc)
+    mw.MainWindow.ipc_event_form_open(host, uid="daily-1", occurrence_start=day, scope="one")
+    captured["later"]()
+    assert captured["existing"].dtstart == day and captured["scope"] == "one"

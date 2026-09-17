@@ -12354,7 +12354,9 @@ class MainWindow(QMainWindow):
         self._background_workers.append(worker)
         worker.start()
 
-    def _save_event_from_dialog(self, dialog: EventDialog, *, existing: calendar_store.Event | None) -> None:
+    def _save_event_from_dialog(
+        self, dialog: EventDialog, *, existing: calendar_store.Event | None, scope: str | None = None
+    ) -> None:
         start = dialog.start_utc()
         end = dialog.end_utc()
         all_day = dialog.all_day()
@@ -12411,7 +12413,8 @@ class MainWindow(QMainWindow):
         recurrence_rule = dialog.recurrence_rule()
         exdates: list[datetime] = []
         if existing is not None:
-            scope = self._ask_series_scope(existing, "Изменить")
+            if scope is None or not calendar_store.is_series(self.calendar_path, existing):
+                scope = self._ask_series_scope(existing, "Изменить")
             if scope is None:
                 return
             if scope == self.SCOPE_ONE:
@@ -12635,6 +12638,13 @@ class MainWindow(QMainWindow):
         scope = self._ask_series_scope(event, "Отменить")
         if scope is None:
             return
+        self._cancel_event_now(event, scope)
+
+    def _cancel_event_now(self, event: calendar_store.Event, scope: str) -> None:
+        """Отмена без вопросов: подтверждение и «день или серия» уже получены
+        (окном или голосом через помощника)."""
+        if scope == self.SCOPE_ONE and not calendar_store.is_series(self.calendar_path, event):
+            scope = self.SCOPE_ALL
         if scope == self.SCOPE_ONE:
             # Отменяется один день: участникам — CANCEL с RECURRENCE-ID,
             # на сервер — исключение этого дня из серии.
@@ -13422,6 +13432,7 @@ class MainWindow(QMainWindow):
                 "location": event.location,
                 "is_organizer": event.is_organizer,
                 "status": event.status,
+                "recurring": calendar_store.is_series(self.calendar_path, event),
             }
             for event in events
         ]
@@ -13439,14 +13450,27 @@ class MainWindow(QMainWindow):
     # открытого диалога (сигналы сокета обрабатываются там же), поэтому
     # трогать его виджеты отсюда безопасно — это тот же GUI-поток.
 
-    def _ipc_exec_event_form(self, dialog: EventDialog, existing: calendar_store.Event | None) -> None:
+    def _ipc_exec_event_form(
+        self, dialog: EventDialog, existing: calendar_store.Event | None, scope: str | None = None
+    ) -> None:
         self._ipc_event_form = (dialog, existing)
         try:
             accepted = dialog.exec() == QDialog.DialogCode.Accepted
         finally:
             self._ipc_event_form = None
         if accepted:
-            self._save_event_from_dialog(dialog, existing=existing)
+            self._save_event_from_dialog(dialog, existing=existing, scope=scope)
+
+    def _ipc_occurrence(self, uid: str, start: datetime | None) -> calendar_store.Event:
+        """Встреча по uid, а для дня серии — именно этот день (start — его
+        начало, как вернул find_events)."""
+        existing = calendar_store.get_event(self.calendar_path, uid)
+        if existing is None:
+            raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+        if start is not None and existing.recurrence_rule:
+            start = start.astimezone(timezone.utc)
+            existing = replace(existing, dtstart=start, dtend=start + (existing.dtend - existing.dtstart))
+        return existing
 
     def _ipc_open_event_form(self) -> tuple[EventDialog, calendar_store.Event | None]:
         if self._ipc_event_form is None:
@@ -13521,7 +13545,9 @@ class MainWindow(QMainWindow):
         if picker is not None:
             picker.reject()
 
-    def ipc_event_form_open(self, *, uid: str | None = None, **changes) -> dict:
+    def ipc_event_form_open(
+        self, *, uid: str | None = None, occurrence_start: datetime | None = None, scope: str | None = None, **changes
+    ) -> dict:
         if not self.account:
             raise RuntimeError("Нет учётной записи: сначала подключитесь к почте в настройках.")
         if self._ipc_event_form is not None:
@@ -13530,9 +13556,7 @@ class MainWindow(QMainWindow):
             return self.ipc_event_form_set(**changes) if changes else self.ipc_event_form_state()
         existing: calendar_store.Event | None = None
         if uid:
-            existing = calendar_store.get_event(self.calendar_path, uid)
-            if existing is None:
-                raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+            existing = self._ipc_occurrence(uid, occurrence_start)
             if not existing.is_organizer:
                 raise PermissionError("Изменить можно только встречу, которую организовали вы сами.")
             draft, title = existing, "Изменить встречу"
@@ -13555,7 +13579,7 @@ class MainWindow(QMainWindow):
         if changes:
             _apply_event_form_changes(dialog, changes)
         self.ipc_focus()
-        self._ipc_later(lambda: self._ipc_exec_event_form(dialog, existing))
+        self._ipc_later(lambda: self._ipc_exec_event_form(dialog, existing, scope))
         return _event_form_state(dialog, existing)
 
     def ipc_event_form_set(self, **changes) -> dict:
@@ -13597,12 +13621,16 @@ class MainWindow(QMainWindow):
     def ipc_contacts(self) -> list[contact_store.Contact]:
         return self._load_contacts()
 
-    def ipc_cancel_event(self, uid: str) -> None:
-        event = calendar_store.get_event(self.calendar_path, uid)
-        if event is None:
-            raise LookupError(f"Встреча с UID {uid} не найдена в календаре.")
+    def ipc_cancel_event(
+        self, uid: str, *, start: datetime | None = None, scope: str | None = None, confirmed: bool = False
+    ) -> None:
+        event = self._ipc_occurrence(uid, start)
         if not event.is_organizer:
             raise PermissionError("Отменить можно только встречу, которую организовали вы сами.")
+        if confirmed:
+            # Помощник уже спросил голосом и «отменить?», и «день или серия».
+            self._ipc_later(lambda: self._cancel_event_now(event, scope or self.SCOPE_ALL))
+            return
         # Дальше — ровно тот же путь, что у пункта «Отменить встречу» в
         # контекстном меню события: on_cancel_event сама спросит «Отменить
         # «...» и уведомить участников?» и только по «Да» разошлёт CANCEL.

@@ -251,12 +251,23 @@ def _handle_find_events(controller, args) -> dict:
     return {"events": events}
 
 
+def _scope_arg(args) -> str | None:
+    scope = args.get("scope")
+    if scope in (None, ""):
+        return None
+    if scope not in ("one", "all"):
+        raise ValueError("scope: one (только этот день серии) или all (вся серия)")
+    return scope
+
+
 def _handle_cancel_event(controller, args) -> dict:
     uid = _text(args.get("uid"), "uid")
     if not uid:
         raise ValueError("uid обязателен: идентификатор встречи")
-    controller.ipc_cancel_event(uid)
-    return {"opened": "cancel_event", "uid": uid}
+    start = parse_iso_datetime(args.get("occurrence_start"), "occurrence_start") if args.get("occurrence_start") else None
+    confirmed = bool(args.get("confirmed", False))
+    controller.ipc_cancel_event(uid, start=start, scope=_scope_arg(args), confirmed=confirmed)
+    return {"cancelled" if confirmed else "opened": "cancel_event", "uid": uid}
 
 
 def _handle_apply_mail_rules(controller, args) -> dict:
@@ -364,7 +375,14 @@ def _form_changes(args: dict) -> dict:
 
 def _handle_event_form_open(controller, args) -> dict:
     uid = _text(args.get("uid"), "uid") or None
-    form = controller.ipc_event_form_open(uid=uid, **_form_changes(args))
+    extra = {}
+    if uid and args.get("occurrence_start"):
+        # Для дня серии: какой именно день (start из find_events) и что
+        # менять — только его или всю серию (scope).
+        extra["occurrence_start"] = parse_iso_datetime(args.get("occurrence_start"), "occurrence_start")
+    if uid and _scope_arg(args):
+        extra["scope"] = _scope_arg(args)
+    form = controller.ipc_event_form_open(uid=uid, **extra, **_form_changes(args))
     return {"opened": "event_form", "form": form}
 
 
