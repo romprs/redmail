@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Напоминания RedMail
+GenericName=Напоминания о встречах
+Comment=Значок в трее: напоминает о встречах текущего дня
+Exec=/usr/bin/redmail-reminder
+Icon=appointment-soon
+Terminal=false
+Categories=Office;Calendar;
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

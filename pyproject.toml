@@ -25,6 +25,9 @@ dependencies = [
 
 [project.scripts]
 redmail = "redmail.__main__:main"
+# Резидент напоминаний: живёт в трее отдельно от клиента, чтобы напоминать
+# о встречах и когда почта закрыта.
+redmail-reminder = "redmail.ui.reminder_tray:main"
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -20,7 +20,7 @@ mkdir -p "${RPMBUILD_ROOT}"/{SOURCES,SPECS,BUILD,RPMS,SRPMS,BUILDROOT}
 TARBALL="${RPMBUILD_ROOT}/SOURCES/${NAME}-${VERSION}.tar.gz"
 git archive --format=tar.gz --prefix="${NAME}-${VERSION}/" -o "${TARBALL}" HEAD
 
-cp packaging/redmail.desktop "${RPMBUILD_ROOT}/SOURCES/"
+cp packaging/redmail.desktop packaging/redmail-reminder.desktop "${RPMBUILD_ROOT}/SOURCES/"
 cp packaging/redmail.spec "${RPMBUILD_ROOT}/SPECS/"
 
 rpmbuild -ba "${RPMBUILD_ROOT}/SPECS/redmail.spec"

@@ -7,6 +7,7 @@ License:        Proprietary
 URL:            https://github.com/romprs/redmail
 Source0:        %{name}-%{version}.tar.gz
 Source1:        redmail.desktop
+Source2:        redmail-reminder.desktop
 
 BuildArch:      x86_64
 BuildRequires:  python3 >= 3.9
@@ -98,8 +99,13 @@ find %{buildroot}/opt/redmail/venv -type f \( -name "pyvenv.cfg" -o -path "*/bin
 
 mkdir -p %{buildroot}%{_bindir}
 ln -s /opt/redmail/venv/bin/redmail %{buildroot}%{_bindir}/redmail
+ln -s /opt/redmail/venv/bin/redmail-reminder %{buildroot}%{_bindir}/redmail-reminder
 
 install -D -m 644 %{SOURCE1} %{buildroot}%{_datadir}/applications/redmail.desktop
+install -D -m 644 %{SOURCE2} %{buildroot}%{_datadir}/applications/redmail-reminder.desktop
+# Напоминания должны работать и когда почта закрыта — резидент поднимается
+# при входе пользователя в систему.
+install -D -m 644 %{SOURCE2} %{buildroot}%{_sysconfdir}/xdg/autostart/redmail-reminder.desktop
 # Каталог фирменных оформлений организаций (раскладывает администратор).
 mkdir -p %{buildroot}%{_sysconfdir}/redmail/brands
 
@@ -119,7 +125,10 @@ fi
 %files
 /opt/redmail
 %{_bindir}/redmail
+%{_bindir}/redmail-reminder
 %{_datadir}/applications/redmail.desktop
+%{_datadir}/applications/redmail-reminder.desktop
+%{_sysconfdir}/xdg/autostart/redmail-reminder.desktop
 %dir %{_sysconfdir}/redmail
 %dir %{_sysconfdir}/redmail/brands
 

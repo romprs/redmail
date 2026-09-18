@@ -15,6 +15,8 @@ import tempfile
 import threading
 import zlib
 from datetime import date, datetime, time, timedelta, timezone
+from email import message_from_bytes
+from email.policy import default as email_default_policy
 from email.utils import getaddresses
 from pathlib import Path
 from uuid import uuid4
@@ -235,6 +237,7 @@ from redmail.imap_client import (
     ImapSession,
     MessageContent,
     MessageSummary,
+    extract_content,
     html_to_text,
     join_markers,
     split_markers,
@@ -882,6 +885,115 @@ def _populate_body_browser(view: QWebEngineView, content: MessageContent, *, anc
     else:
         html_content = _BODY_WRAP_TEMPLATE.format(content=_linkify(content.text))
     _render_mail_html(view, html_content, anchor=anchor)
+
+
+def is_eml_attachment(filename: str, content_type: str = "") -> bool:
+    """Вложение — само письмо? Такие открываем своим окном, а не отдаём
+    системе: в RED OS для .eml обычно нет зарегистрированной программы, и
+    двойной щелчок раньше просто ничего не делал."""
+    if (content_type or "").split(";", 1)[0].strip().lower() == "message/rfc822":
+        return True
+    return Path(filename or "").suffix.lower() in (".eml", ".mht", ".msg.eml")
+
+
+class EmlAttachmentWindow(QWidget):
+    """Вложенное письмо (.eml) — читается прямо в программе: заголовки,
+    тело и собственные вложения, включая новые письма внутри."""
+
+    def __init__(self, raw: bytes, filename: str, parent: QWidget | None = None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.resize(760, 560)
+        self._raw = raw
+        self._temp_dirs: list[Path] = []
+        try:
+            content = extract_content(message_from_bytes(raw, policy=email_default_policy))
+        except Exception as exc:
+            _log.warning("Вложенное письмо %s не разобрано: %s", filename, exc)
+            content = MessageContent(text=f"Письмо не удалось разобрать: {exc}")
+        self._content = content
+        self.setWindowTitle(content.subject or filename or "Вложенное письмо")
+
+        date_text = content.mail_headers.get("Date", "")
+        header_label = QLabel(
+            _build_message_header_html(
+                content.subject or filename or "(без темы)", content.from_, content.to, content.cc, date_text
+            ),
+            self,
+        )
+        header_label.setWordWrap(True)
+        header_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        header_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+        source_button = QPushButton("Исходный текст", self)
+        source_button.clicked.connect(self._show_source)
+        save_button = QPushButton("Сохранить как…", self)
+        save_button.clicked.connect(self._save_as)
+        buttons = QHBoxLayout()
+        buttons.addWidget(source_button)
+        buttons.addWidget(save_button)
+        buttons.addStretch(1)
+
+        body = _create_mail_browser(self)
+        _populate_body_browser(body, content)
+
+        self.attachments_list = QListWidget(self)
+        self.attachments_list.setMaximumHeight(90)
+        for attachment in content.attachments:
+            self.attachments_list.addItem(f"{attachment.filename} ({_format_size(attachment.size)})")
+        self.attachments_list.setVisible(bool(content.attachments))
+        self.attachments_list.itemDoubleClicked.connect(self._open_attachment)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(header_label)
+        layout.addLayout(buttons)
+        layout.addWidget(body)
+        layout.addWidget(self.attachments_list)
+
+    def _show_source(self) -> None:
+        window = MessageSourceWindow(self.windowTitle(), self._raw, original=True, parent=self)
+        window.show()
+
+    def _save_as(self) -> None:
+        name = _safe_attachment_filename(f"{self._content.subject or 'письмо'}.eml")
+        path, _ = QFileDialog.getSaveFileName(self, "Сохранить письмо", name, "Письмо (*.eml)")
+        if not path:
+            return
+        try:
+            Path(path).write_bytes(self._raw)
+        except OSError as exc:
+            QMessageBox.critical(self, "Не удалось сохранить", str(exc))
+
+    def _open_attachment(self, item: QListWidgetItem) -> None:
+        attachment = self._content.attachments[self.attachments_list.row(item)]
+        open_attachment_payload(self, attachment)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        for temp_dir in self._temp_dirs:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        super().closeEvent(event)
+
+
+def open_attachment_payload(parent: QWidget, attachment: Attachment) -> None:
+    """Открыть вложение: письмо — своим окном, остальное — программой,
+    которую ОС назначила этому типу файла."""
+    if is_eml_attachment(attachment.filename, getattr(attachment, "content_type", "")):
+        window = EmlAttachmentWindow(attachment.payload, attachment.filename, parent)
+        window.show()
+        return
+    try:
+        temp_dir = Path(tempfile.mkdtemp(prefix="redmail_"))
+        temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
+        temp_path.write_bytes(attachment.payload)
+    except OSError as exc:
+        QMessageBox.critical(parent, "Не удалось открыть вложение", str(exc))
+        return
+    holder = getattr(parent, "_temp_attachment_dirs", None)
+    if holder is None:
+        holder = getattr(parent, "_temp_dirs", None)
+    if isinstance(holder, list):
+        holder.append(temp_dir)
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
 
 
 class MessageWindow(QWidget):
@@ -5907,15 +6019,8 @@ class EventDialog(QDialog):
 
     def _open_attachment(self, item: QListWidgetItem) -> None:
         attachment = self.attachments[self.attachments_list.row(item)]
-        try:
-            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_event_"))
-            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
-            temp_path.write_bytes(attachment.payload)
-        except OSError as exc:
-            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
-            return
-        self._temp_dirs.append(temp_dir)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+        # Письмо, приложенное к встрече, тоже открывается своим окном.
+        open_attachment_payload(self, attachment)
 
     def _attachment_context_menu(self, pos) -> None:
         item = self.attachments_list.itemAt(pos)
@@ -6232,15 +6337,8 @@ class EventDetailsDialog(QDialog):
 
     def _open_attachment(self, item: QListWidgetItem) -> None:
         attachment = self.event.attachments[self.attachments_list.row(item)]
-        try:
-            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_event_"))
-            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
-            temp_path.write_bytes(attachment.payload)
-        except OSError as exc:
-            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
-            return
-        self._temp_dirs.append(temp_dir)
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+        # Письмо, приложенное к встрече, тоже открывается своим окном.
+        open_attachment_payload(self, attachment)
 
     def _attachment_context_menu(self, pos) -> None:
         item = self.attachments_list.itemAt(pos)
@@ -12903,18 +13001,9 @@ class MainWindow(QMainWindow):
         self.attachments_list.show()
 
     def on_open_attachment(self, item: QListWidgetItem) -> None:
-        attachment = self.current_attachments[self.attachments_list.row(item)]
-        try:
-            temp_dir = Path(tempfile.mkdtemp(prefix="redmail_"))
-            temp_path = temp_dir / _safe_attachment_filename(attachment.filename)
-            temp_path.write_bytes(attachment.payload)
-        except OSError as exc:
-            QMessageBox.critical(self, "Не удалось открыть вложение", str(exc))
-            return
-        self._temp_attachment_dirs.append(temp_dir)
-        # Открываем той программой, что у ОС зарегистрирована для этого типа
-        # файла — как двойной клик по файлу в файловом менеджере.
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(temp_path)))
+        # Вложенное письмо открывается своим окном, остальное — программой,
+        # назначенной этому типу файла в системе (см. open_attachment_payload).
+        open_attachment_payload(self, self.current_attachments[self.attachments_list.row(item)])
 
     def on_attachment_context_menu(self, pos) -> None:
         item = self.attachments_list.itemAt(pos)
