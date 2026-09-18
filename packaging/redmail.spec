@@ -1,6 +1,6 @@
 Name:           redmail
 Version:        0.0.1
-Release:        131%{?dist}
+Release:        132%{?dist}
 Summary:        Почтовый клиент (аналог Outlook) для RED OS
 
 License:        Proprietary
@@ -124,6 +124,10 @@ fi
 %dir %{_sysconfdir}/redmail/brands
 
 %changelog
+* Fri Sep 18 2026 redmail <redmail@example.com> - 0.0.1-132
+- Календарь Exchange снова синхронизируется: время встреч переводилось с ошибкой, и пропускались ВСЕ встречи (в журнале за день 7354 «встреча пропущена»)
+- Часть окна календаря Exchange без ответа («The request timed out») больше не отменяет всю синхронизацию — берутся остальные части
+- В недельной сетке окно создания события открывается двойным щелчком по пустому месту, одиночный только выделяет день
 * Fri Sep 18 2026 redmail <redmail@example.com> - 0.0.1-131
 - Канал помощника: переход к разделу почты, календаря или контактов («открой календарь» голосом)
 * Thu Sep 17 2026 redmail <redmail@example.com> - 0.0.1-130

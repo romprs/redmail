@@ -119,7 +119,7 @@ def test_fetch_events_wraps_server_error() -> None:
 
     with pytest.raises(ews_calendar.EwsCalendarError) as info:
         ews_calendar.fetch_events(SimpleNamespace(calendar=FailingCalendar()), datetime.now(timezone.utc),
-                                  datetime.now(timezone.utc), "me@x.ru")
+                                  datetime.now(timezone.utc) + timedelta(days=7), "me@x.ru")
     assert "EWS недоступен" in str(info.value)
 
 
@@ -165,3 +165,35 @@ def test_push_event_updates_existing_by_uid(monkeypatch) -> None:
     ews_calendar.push_event(account, event)
     assert saved["uid"] == "uid-1" and saved["subject"] == "Перенос"
     assert saved["mode"] == "SendToAllAndSaveCopy"  # есть участники — приглашения уходят
+
+
+def test_exchange_datetime_is_converted_without_tzinfo_error() -> None:
+    """EWSDateTime.astimezone() не принимает обычный timezone.utc — из-за
+    этого пропускались ВСЕ встречи Exchange (в журнале за день 7354
+    «встреча пропущена: 'tzinfo' … must be of type EWSTimeZone»)."""
+    from exchangelib import EWSDateTime, EWSTimeZone
+
+    yakutsk = EWSDateTime(2026, 9, 18, 7, 0, tzinfo=EWSTimeZone("Asia/Yakutsk"))
+    assert ews_calendar._to_utc(yakutsk) == datetime(2026, 9, 17, 22, 0, tzinfo=timezone.utc)
+    assert ews_calendar._ews_datetime(yakutsk).hour == 22
+
+    item = FakeItem(uid="x", start=yakutsk, end=yakutsk, organizer=FakeMailbox("a@x.ru"))
+    event = ews_calendar.item_to_event(item, "me@x.ru")
+    assert event.dtstart == datetime(2026, 9, 17, 22, 0, tzinfo=timezone.utc)
+
+
+def test_failed_window_chunk_does_not_lose_the_rest(monkeypatch) -> None:
+    monkeypatch.setattr(ews_calendar, "CalendarItem", FakeItem)
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    calls = {"n": 0}
+
+    class Calendar:
+        def view(self, start, end):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise RuntimeError("The request timed out")
+            moment = start + timedelta(hours=1)
+            return [FakeItem(uid=f"uid-{calls['n']}", start=moment, end=moment, organizer=FakeMailbox("a@x.ru"))]
+
+    events = ews_calendar.fetch_events(SimpleNamespace(calendar=Calendar()), start, start + timedelta(days=42), "me@x.ru")
+    assert calls["n"] == 3 and len(events) == 2  # часть окна без ответа — остальные встречи получены

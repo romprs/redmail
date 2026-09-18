@@ -43,14 +43,22 @@ def _to_utc(value) -> datetime:
     if value is None:
         return datetime.now(timezone.utc)
     if isinstance(value, datetime):
-        return value.astimezone(timezone.utc)
+        # EWSDateTime.astimezone() принимает только EWSTimeZone и на обычном
+        # timezone.utc бросает InvalidTypeError — из-за этого пропускались ВСЕ
+        # встречи Exchange («встреча пропущена: 'tzinfo' … must be of type
+        # EWSTimeZone», 7354 записи в журнале за день). Сначала переводим в
+        # обычный datetime, у него astimezone работает как обычно.
+        plain = datetime(
+            value.year, value.month, value.day, value.hour, value.minute, value.second,
+            value.microsecond, tzinfo=value.tzinfo or timezone.utc,
+        )
+        return plain.astimezone(timezone.utc)
     # EWSDate (весь день) — начало суток
     return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
 
 
 def _ews_datetime(value: datetime) -> EWSDateTime:
-    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    return EWSDateTime.from_datetime(aware.astimezone(timezone.utc)).astimezone(EWSTimeZone("UTC"))
+    return EWSDateTime.from_datetime(_to_utc(value)).astimezone(EWSTimeZone("UTC"))
 
 
 def _mailbox_email(mailbox) -> str:
@@ -117,9 +125,21 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str) -> list
         # полгода это легко превышают. Поэтому окно запрашивается частями.
         events: dict[str, Event] = {}
         chunk_start = start
+        failed = 0
+        last_error: Exception | None = None
         while chunk_start < end:
             chunk_end = min(chunk_start + EWS_VIEW_CHUNK, end)
-            for item in account.calendar.view(start=_ews_datetime(chunk_start), end=_ews_datetime(chunk_end)):
+            try:
+                items = list(account.calendar.view(start=_ews_datetime(chunk_start), end=_ews_datetime(chunk_end)))
+            except Exception as exc:
+                # Сервер не ответил на эту часть окна («The request timed out»)
+                # — берём остальные, а не теряем весь календарь.
+                failed += 1
+                last_error = exc
+                _log.warning("EWS календарь: часть окна %s — %s не получена: %s", chunk_start.date(), chunk_end.date(), exc)
+                chunk_start = chunk_end
+                continue
+            for item in items:
                 if not isinstance(item, CalendarItem):
                     continue
                 try:
@@ -129,7 +149,12 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str) -> list
                     continue
                 events[event.uid] = event  # встреча на стыке частей приходит дважды
             chunk_start = chunk_end
-        _log.info("EWS календарь: получено встреч %d (окно %s — %s)", len(events), start.date(), end.date())
+        if failed and not events:
+            raise EwsCalendarError(f"Не удалось получить встречи Exchange: {last_error}")
+        _log.info(
+            "EWS календарь: получено встреч %d (окно %s — %s%s)",
+            len(events), start.date(), end.date(), f", частей без ответа {failed}" if failed else "",
+        )
         return list(events.values())
     except Exception as exc:
         _log.error("EWS календарь: получение встреч не удалось: %s", exc)

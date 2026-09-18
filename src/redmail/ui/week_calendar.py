@@ -444,7 +444,11 @@ class WeekGridWidget(QWidget):
     # событий перехватывают свои события мыши сами, сюда попадают только
     # клики мимо них) — день + минуты от полуночи, чтобы создать встречу
     # прямо на этом месте, как в Google Calendar/Outlook.
-    emptySlotClicked = Signal(object, int)  # (date, minutes_from_midnight)
+    emptySlotClicked = Signal(object, int)  # (date, minutes_from_midnight) — выделить время
+    #: Двойной клик по пустому месту — создать событие. Одиночный клик
+    #: событие НЕ создаёт (жалоба: «по клику открывает создание события —
+    #: было по двойному, страшно мышь наводить»).
+    emptySlotDoubleClicked = Signal(object, int)
     emptySlotContextMenuRequested = Signal(object, int, object)  # (date, minutes, global_pos)
 
     def __init__(self, parent: QWidget | None = None):
@@ -536,6 +540,13 @@ class WeekGridWidget(QWidget):
             if slot is not None:
                 self.emptySlotClicked.emit(*slot)
         super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.button() == Qt.MouseButton.LeftButton:
+            slot = self._slot_at(event.position().toPoint())
+            if slot is not None:
+                self.emptySlotDoubleClicked.emit(*slot)
+        super().mouseDoubleClickEvent(event)
 
     def contextMenuEvent(self, event) -> None:  # noqa: N802 - Qt override
         slot = self._slot_at(event.pos())

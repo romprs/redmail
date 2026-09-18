@@ -7192,6 +7192,7 @@ class MainWindow(QMainWindow):
         self.calendar_week_grid.eventDragRescheduled.connect(self.on_calendar_event_drag_rescheduled)
         self.calendar_week_grid.eventContextMenuRequested.connect(self.on_calendar_event_context_menu)
         self.calendar_week_grid.emptySlotClicked.connect(self.on_calendar_empty_slot_clicked)
+        self.calendar_week_grid.emptySlotDoubleClicked.connect(self.on_calendar_empty_slot_double_clicked)
         self.calendar_week_grid.emptySlotContextMenuRequested.connect(self.on_calendar_empty_slot_context_menu)
 
         calendar_scroll = QScrollArea(self)
@@ -12055,6 +12056,13 @@ class MainWindow(QMainWindow):
         self.calendar_week_grid.set_selected_day(day)
 
     def on_calendar_empty_slot_clicked(self, day: date, minutes: int) -> None:
+        """Одиночный клик — только выделить день: окно создания события по
+        одному клику открывалось случайно при любом движении мышью."""
+        self.calendar_selected_day = day
+        self.calendar_week_header.set_selected_day(day)
+        self.calendar_week_grid.set_selected_day(day)
+
+    def on_calendar_empty_slot_double_clicked(self, day: date, minutes: int) -> None:
         self.on_new_event(default_start=self._slot_to_datetime(day, minutes))
 
     def on_calendar_empty_slot_context_menu(self, day: date, minutes: int, global_pos) -> None:
