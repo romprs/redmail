@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -37,6 +37,14 @@ class Reminder:
     dtend: datetime
     location: str
     mode: str
+    #: Кто позвал. Для чужой встречи (и для встречи из календаря коллеги)
+    #: это главное, чего не хватает в напоминании: по теме «Планёрка» не
+    #: понять, чья она — поэтому автора называем сами, без настройки.
+    organizer: str = ""
+    #: Встречу организовали мы сами — тогда автора называть незачем.
+    mine: bool = True
+    #: Календарь, откуда встреча (свой, коллеги, Exchange).
+    calendar_name: str = ""
 
     @property
     def key(self) -> str:
@@ -114,13 +122,82 @@ class ReminderState:
         self.save()
 
 
-def due_reminders(calendar_path: Path, state: ReminderState, now: datetime) -> list[Reminder]:
+@dataclass(frozen=True)
+class OthersPolicy:
+    """Что делать с ЧУЖИМИ встречами — теми, где организатор не мы
+    (приглашение с сервера, встреча из календаря коллеги). Своей встрече
+    способ напоминания выбирают в окне встречи, а в приглашении выбирать
+    некому: без этой настройки о чужих встречах не напомнили бы вовсе.
+
+    authors пуст — напоминать обо всех чужих; иначе только о встречах этих
+    организаторов (имя или адрес, сравнение без учёта регистра)."""
+
+    mode: str = calendar_store.REMIND_WINDOW
+    minutes: int = 15
+    authors: tuple[str, ...] = ()
+
+    @classmethod
+    def load(cls) -> "OthersPolicy":
+        try:
+            from redmail import config_store
+
+            mode, minutes, authors = config_store.load_others_reminder()
+            return cls(mode=mode, minutes=minutes, authors=authors)
+        except Exception as exc:
+            _log.warning("Напоминания: настройка чужих встреч не прочитана: %s", exc)
+            return cls()
+
+    def applies_to(self, event) -> bool:
+        if self.mode == calendar_store.REMIND_NONE:
+            return False
+        if not self.authors:
+            return True
+        who = f"{event.organizer_name} {event.organizer_email}".casefold()
+        return any(author.casefold() in who for author in self.authors)
+
+
+def _with_others_policy(events, policy: OthersPolicy, now: datetime) -> list:
+    """Чужим встречам без своего выбора проставляем способ из настройки —
+    и тогда они попадают в напоминания наравне со своими."""
+    result = []
+    for event in events:
+        if event.remind_mode != calendar_store.REMIND_NONE and event.remind_minutes >= 0:
+            # Способ выбран руками — такую встречу уже отобрал по времени
+            # calendar_store.due_reminders, настройка её не перебивает и
+            # раньше срока не показывает.
+            continue
+        if event.is_organizer or not policy.applies_to(event):
+            continue
+        moment = event.dtstart - timedelta(minutes=policy.minutes)
+        if moment <= now < event.dtend:
+            result.append(replace(event, remind_minutes=policy.minutes, remind_mode=policy.mode))
+    return result
+
+
+def due_reminders(
+    calendar_path: Path, state: ReminderState, now: datetime, policy: OthersPolicy | None = None
+) -> list[Reminder]:
     """Напоминания, которые пора показать прямо сейчас."""
+    policy = OthersPolicy() if policy is None else policy
     try:
         events = calendar_store.due_reminders(calendar_path, now)
+        if policy.mode != calendar_store.REMIND_NONE:
+            # Чужие встречи в calendar_store.due_reminders не попадают (у них
+            # способ не выбран) — добираем их отдельно по настройке.
+            window = calendar_store.list_events(
+                calendar_path, now - timedelta(hours=24), now + timedelta(hours=24)
+            )
+            known = {event.uid for event in events}
+            extra = [event for event in window if event.uid not in known and event.status != "cancelled"]
+            events = events + _with_others_policy(extra, policy, now)
     except Exception as exc:
         _log.warning("Напоминания: календарь не прочитан: %s", exc)
         return []
+    calendar_names: dict[str, str] = {}
+    try:
+        calendar_names = {cal.id: cal.name for cal in calendar_store.list_calendars(calendar_path)}
+    except Exception:
+        pass
     result: list[Reminder] = []
     for event in events:
         reminder = Reminder(
@@ -130,6 +207,9 @@ def due_reminders(calendar_path: Path, state: ReminderState, now: datetime) -> l
             dtend=event.dtend,
             location=event.location,
             mode=event.remind_mode,
+            organizer=(event.organizer_name or event.organizer_email or "").strip(),
+            mine=bool(event.is_organizer),
+            calendar_name=calendar_names.get(event.calendar_id, ""),
         )
         if state.is_pending(reminder, now):
             result.append(reminder)
@@ -148,7 +228,10 @@ def spoken_text(reminder: Reminder, now: datetime) -> str:
     else:
         when = "уже идёт"
     place = f", место — {reminder.location}" if reminder.location else ""
-    return f"Напоминание: {reminder.summary} {when}, в {start:%H:%M}{place}"
+    # Чужую встречу называем по автору: «Планёрка» без имени организатора
+    # ничего не говорит, когда таких планёрок несколько.
+    author = f", позвал {reminder.organizer}" if not reminder.mine and reminder.organizer else ""
+    return f"Напоминание: {reminder.summary} {when}, в {start:%H:%M}{author}{place}"
 
 
 def today_events(calendar_path: Path, now: datetime) -> list[calendar_store.Event]:

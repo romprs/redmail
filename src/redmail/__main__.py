@@ -10,10 +10,12 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QSplashScreen
 
-from redmail import applog, tls_trust
-from redmail import profile
-from redmail import config_store
-from redmail.ui import theme
+# Модули программы здесь НЕ импортируются: их загрузка занимает заметную
+# долю секунды, а до неё на экране нет ничего (жалоба: «после запуска
+# проходит 3–5 секунд, прежде чем появляется окно с описанием — ощущение,
+# что реакции нет»). Сначала показываем заставку, потом импортируем, и
+# каждый шаг виден на ней. Из PySide6 берём только то, что нужно самой
+# заставке.
 
 _SPLASH_SIZE = (420, 240)
 _SPLASH_BG = "#1a73e8"
@@ -87,6 +89,23 @@ def build_splash_pixmap(version: str) -> QPixmap:
     return pixmap
 
 
+def seconds_since_process_start() -> float | None:
+    """Сколько секунд прошло с момента запуска процесса. Нужно, чтобы в
+    журнале было видно, где именно уходит время до заставки: интерпретатор
+    и его модули стартуют ДО первой строчки нашего кода, и изнутри
+    программы это время иначе не измерить. Только Linux (/proc); на других
+    системах — None."""
+    try:
+        with open("/proc/self/stat", encoding="ascii") as handle:
+            fields = handle.read().rsplit(") ", 1)[1].split()
+        start_ticks = int(fields[19])  # 22-е поле stat, первые два уже отрезаны
+        with open("/proc/uptime", encoding="ascii") as handle:
+            uptime = float(handle.read().split()[0])
+        return max(0.0, uptime - start_ticks / os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _ensure_session_bus_address() -> None:
     """Запуск не из сессии рабочего стола (ssh, автозапуск до экспорта
     переменных) — без DBUS_SESSION_BUS_ADDRESS keyring не найдёт
@@ -104,31 +123,9 @@ def main() -> int:
 
     if cli.wants_cli(sys.argv):
         return cli.run(sys.argv)
-    log_file = applog.setup_logging()
-    _ensure_session_bus_address()
-    # HTTPS (CalDAV, Exchange, подписка на календарь) — доверенные корни из
-    # файла, указанного в настройках, иначе из системного хранилища:
-    # корпоративный ЦС неизвестен requests сам по себе.
-    try:
-        tls_trust.apply_trust(config_store.load_tls_ca_file())
-    except Exception as exc:  # настройки не должны мешать запуску
-        applog.get_logger("app").warning("Доверенные корни HTTPS: %s", exc)
-    applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
     app = QApplication(sys.argv)
-
-    # Жалоба (и после первой правки с repaint()): "информационное окно
-    # выводится не сразу, долго висит, потом появляется, и практически
-    # мгновенно открывается окно приложения" — то есть задержка была ДО
-    # показа заставки, а не после. Две причины: (1) `from
-    # redmail.ui.main_window import MainWindow` стоял на уровне модуля и
-    # тянул за собой PySide6.QtWebEngine* — инициализация Chromium занимает
-    # секунды ещё до входа в main(); теперь импорт отложен и сам является
-    # шагом "Загрузка интерфейса…" уже при видимой заставке; (2)
-    # app_version() запускает `rpm -q` (до 2 с на медленной VM) — тоже до
-    # показа. Заставка показывается сразу с версией "…", версия
-    # дорисовывается следом. repaint() — синхронная перерисовка: одного
-    # processEvents() недостаточно, чтобы окно гарантированно оказалось
-    # на экране до долгой блокировки потока (особенно X11 без композитора).
+    # Заставка — первое, что делает программа после создания приложения:
+    # версия («…») и модули подтягиваются уже при ней на экране.
     splash = QSplashScreen(build_splash_pixmap("…"))
     splash.show()
     splash.repaint()
@@ -141,6 +138,31 @@ def main() -> int:
         splash.repaint()
         app.processEvents()
 
+    _splash_delay = seconds_since_process_start()
+
+    report("Загрузка модулей…")
+    from redmail import applog, config_store, profile, tls_trust  # noqa: F401 - profile нужен ниже
+    from redmail.ui import theme
+
+    log_file = applog.setup_logging()
+    _ensure_session_bus_address()
+    # HTTPS (CalDAV, Exchange, подписка на календарь) — доверенные корни из
+    # файла, указанного в настройках, иначе из системного хранилища:
+    # корпоративный ЦС неизвестен requests сам по себе.
+    try:
+        tls_trust.apply_trust(config_store.load_tls_ca_file())
+    except Exception as exc:  # настройки не должны мешать запуску
+        applog.get_logger("app").warning("Доверенные корни HTTPS: %s", exc)
+    applog.get_logger("app").info("Запуск программы (журнал: %s)", log_file)
+    if _splash_delay is not None:
+        # Жалоба: «после запуска проходит 3–5 секунд, прежде чем появляется
+        # окно с описанием». Записываем, сколько на самом деле прошло от
+        # запуска процесса до заставки — иначе не понять, где время.
+        applog.get_logger("app").info("Заставка показана через %.1f с после запуска", _splash_delay)
+
+    # Долгое — после того, как заставка уже на экране: импорт интерфейса
+    # тянет PySide6.QtWebEngine* (инициализация Chromium — секунды), а
+    # app_version() спрашивает rpm (до 2 с на медленной машине).
     version = app_version()
     applog.get_logger("app").info("Версия %s", version)
     splash.setPixmap(build_splash_pixmap(version))

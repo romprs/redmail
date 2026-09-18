@@ -199,6 +199,30 @@ def save_auto_archive_enabled(enabled: bool) -> None:
     _save_settings_dict(data)
 
 
+def load_others_reminder() -> tuple[str, int, tuple[str, ...]]:
+    """Напоминания о ЧУЖИХ встречах: (способ, за сколько минут, авторы).
+
+    Своей встрече способ выбирают прямо в окне встречи, а приглашение
+    приходит с сервера — в нём выбирать некому, и без этой настройки о
+    чужих встречах не напоминалось бы вовсе. Пустой список авторов —
+    напоминать обо всех; иначе только о встречах этих организаторов."""
+    data = _load_settings_dict()
+    mode = str(data.get("others_reminder_mode", "window"))
+    minutes = int(data.get("others_reminder_minutes", 15) or 15)
+    authors = data.get("others_reminder_authors") or []
+    if not isinstance(authors, list):
+        authors = []
+    return mode, minutes, tuple(str(a).strip() for a in authors if str(a).strip())
+
+
+def save_others_reminder(mode: str, minutes: int, authors: "list[str] | tuple[str, ...]") -> None:
+    data = _load_settings_dict()
+    data["others_reminder_mode"] = str(mode)
+    data["others_reminder_minutes"] = int(minutes)
+    data["others_reminder_authors"] = [str(a).strip() for a in authors if str(a).strip()]
+    _save_settings_dict(data)
+
+
 def load_maintenance_window() -> tuple[bool, int, int]:
     """Часы обслуживания базы: (включено, час начала, час конца). Пока
     включено — автоархив, фоновая докачка тел и сжатие базы идут только в

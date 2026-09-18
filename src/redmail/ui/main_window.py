@@ -33,6 +33,7 @@ from PySide6.QtCore import (
     QPointF,
     QRect,
     QRectF,
+    QSignalBlocker,
     QSize,
     Qt,
     QStringListModel,
@@ -149,6 +150,7 @@ from redmail.config_store import (
     delete_on_server_for,
     load_auto_archive_enabled,
     load_maintenance_window,
+    load_others_reminder,
     load_disabled_accounts,
     load_domain_rewrites,
     load_tls_ca_file,
@@ -199,6 +201,7 @@ from redmail.config_store import (
     set_domain_rewrites,
     save_auto_archive_enabled,
     save_maintenance_window,
+    save_others_reminder,
     save_disabled_accounts,
     save_domain_rewrites_by_account,
     save_tls_ca_file,
@@ -1380,6 +1383,28 @@ def _recipient_search_prefix(prefix: str, candidates: list[str]) -> str:
     return prefix
 
 
+def fix_search_layout(line_edit: QLineEdit, matches) -> str:
+    """Строка поиска, набранная не в той раскладке: «bdfyjd» → «иванов».
+
+    Если по набранному не находится ничего, а в другой раскладке находится,
+    исправляем текст прямо в поле — человек видит, по чему на самом деле
+    идёт поиск, и может продолжать печатать уже правильно. Возвращает
+    строку, по которой надо фильтровать."""
+    typed = line_edit.text()
+    if not typed.strip() or matches(typed):
+        return typed
+    for variant in keyboard_layout.alternatives(typed):
+        if matches(variant):
+            blocker = QSignalBlocker(line_edit)
+            try:
+                line_edit.setText(variant)
+                line_edit.setCursorPosition(len(variant))
+            finally:
+                del blocker
+            return variant
+    return typed
+
+
 def switch_layout_in_widget(widget) -> bool:
     """Выделенный текст — или слово перед курсором — в другую раскладку.
     Работает в теле письма (QTextEdit) и в однострочных полях (тема)."""
@@ -1481,7 +1506,20 @@ def _install_recipient_completer(line_edit: QLineEdit, contacts: list[contact_st
         state["prefix_start"] = prefix_start
         state["cursor_pos"] = cursor_pos
         if prefix:
-            completer.setCompletionPrefix(_recipient_search_prefix(prefix, candidates))
+            search = _recipient_search_prefix(prefix, candidates)
+            if search != prefix:
+                # Набрано не в той раскладке, а в другой адресат находится:
+                # исправляем прямо в поле (жалоба: «при выборе из книги
+                # есть, но не меняется введённый текст») — дальше человек
+                # печатает уже правильными буквами.
+                head, tail = text[:prefix_start], text[cursor_pos:]
+                spaces = len(text[prefix_start:cursor_pos]) - len(text[prefix_start:cursor_pos].lstrip())
+                fixed = head + text[prefix_start:prefix_start + spaces] + search
+                line_edit.setText(fixed + tail)
+                cursor_pos = len(fixed)
+                line_edit.setCursorPosition(cursor_pos)
+                state["cursor_pos"] = cursor_pos
+            completer.setCompletionPrefix(search)
             completer.complete()
         else:
             completer.popup().hide()
@@ -1577,8 +1615,20 @@ class ContactPickerDialog(QDialog):
                 addresses += int(item.data(Qt.ItemDataRole.UserRole + 1) or 0)
         self.summary_label.setText(f"Отмечено: {checked}, адресов: {addresses}")
 
-    def _apply_filter(self, text: str) -> None:
+    def _labels(self) -> list[str]:
+        return [
+            str(self.list_widget.item(row).data(Qt.ItemDataRole.UserRole + 2) or self.list_widget.item(row).text()).lower()
+            for row in range(self.list_widget.count())
+        ]
+
+    def _matches(self, text: str) -> bool:
         needle = text.strip().lower()
+        return not needle or any(needle in label for label in self._labels())
+
+    def _apply_filter(self, text: str) -> None:
+        # Набрали не в той раскладке — поле исправляется само, как и в
+        # поиске писем и контактов.
+        needle = fix_search_layout(self.filter_edit, self._matches).strip().lower()
         for row in range(self.list_widget.count()):
             item = self.list_widget.item(row)
             label = str(item.data(Qt.ItemDataRole.UserRole + 2) or item.text()).lower()
@@ -2979,6 +3029,7 @@ class SettingsDialog(QDialog):
         storage_stats: dict | None = None,
         auto_archive_enabled: bool = True,
         maintenance_window: tuple[bool, int, int] = (False, 22, 7),
+        others_reminder: tuple[str, int, tuple[str, ...]] = ("window", 15, ()),
         tls_ca_file: str = "",
         font_scale: float = 1.0,
         greeting_mode: str = GREETING_NONE,
@@ -3148,7 +3199,7 @@ class SettingsDialog(QDialog):
         # экран (жалоба: "окно параметров не входит на экран — сделай
         # вкладки, разнеси функционал").
         tabs = QTabWidget(self)
-        tabs.addTab(_settings_tab(general_group, archive_dir_group), "Общие")
+        tabs.addTab(_settings_tab(general_group, others_group, archive_dir_group), "Общие")
         layout = QVBoxLayout(self)
 
         # Хранилище (переход на хранение «как в Outlook»): каталог профиля с
@@ -3189,6 +3240,38 @@ class SettingsDialog(QDialog):
         maintenance_row.addWidget(QLabel("до", self))
         maintenance_row.addWidget(self.maintenance_end_edit)
         maintenance_row.addStretch(1)
+        # Напоминания о ЧУЖИХ встречах: в приглашении с сервера способ
+        # выбирать некому (пожелание: «про чужие события — упоминать
+        # автоматом или включить настройку, например по автору»).
+        others_mode, others_minutes, others_authors = others_reminder
+        self.others_remind_mode_combo = QComboBox(self)
+        for label, value in _REMIND_MODE_OPTIONS:
+            self.others_remind_mode_combo.addItem(label, value)
+        mode_index = self.others_remind_mode_combo.findData(others_mode)
+        self.others_remind_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.others_remind_when_combo = QComboBox(self)
+        for label, value in _REMIND_WHEN_OPTIONS:
+            self.others_remind_when_combo.addItem(label, value)
+        when_index = self.others_remind_when_combo.findData(int(others_minutes))
+        self.others_remind_when_combo.setCurrentIndex(when_index if when_index >= 0 else 2)
+        self.others_remind_authors_edit = QLineEdit(", ".join(others_authors), self)
+        self.others_remind_authors_edit.setPlaceholderText("пусто — обо всех; иначе: Орлов, petrov@corp.ru")
+        others_row = QHBoxLayout()
+        others_row.addWidget(self.others_remind_mode_combo)
+        others_row.addWidget(self.others_remind_when_combo)
+        others_row.addStretch(1)
+        others_form = QFormLayout()
+        others_form.addRow("Напоминать", others_row)
+        others_form.addRow("Только от авторов", self.others_remind_authors_edit)
+        others_hint = QLabel(
+            "О своих встречах напоминание выбирается в самом окне встречи. Здесь — про чужие: "
+            "приглашения коллег и встречи из их календарей. В напоминании называется автор.", self,
+        )
+        others_hint.setWordWrap(True)
+        others_form.addRow(others_hint)
+        others_group = QGroupBox("Напоминания о чужих встречах", self)
+        others_group.setLayout(others_form)
+
         stats = storage_stats or {}
         stats_text = (
             f"База почты: {stats.get('db_bytes', 0) / (1024 * 1024):.1f} МБ, писем {stats.get('messages', 0)}, "
@@ -3385,6 +3468,18 @@ class SettingsDialog(QDialog):
         )
         if path:
             self.tls_ca_edit.setText(path)
+
+    def others_reminder(self) -> tuple[str, int, list[str]]:
+        authors = [
+            part.strip()
+            for part in self.others_remind_authors_edit.text().replace(";", ",").split(",")
+            if part.strip()
+        ]
+        return (
+            self.others_remind_mode_combo.currentData() or calendar_store.REMIND_NONE,
+            int(self.others_remind_when_combo.currentData() or 15),
+            authors,
+        )
 
     def maintenance_window(self) -> tuple[bool, int, int]:
         return (
@@ -9088,6 +9183,7 @@ class MainWindow(QMainWindow):
             storage_stats=self._storage_stats(),
             auto_archive_enabled=load_auto_archive_enabled(),
             maintenance_window=load_maintenance_window(),
+            others_reminder=load_others_reminder(),
             tls_ca_file=load_tls_ca_file(),
             accounts=known_accounts,
             disabled_accounts=tuple(load_disabled_accounts()),
@@ -9115,6 +9211,7 @@ class MainWindow(QMainWindow):
             save_auto_archive_size_mb(dialog.auto_archive_size_mb())
             save_auto_archive_enabled(dialog.auto_archive_enabled())
             save_maintenance_window(*dialog.maintenance_window())
+            save_others_reminder(*dialog.others_reminder())
             save_tls_ca_file(dialog.tls_ca_file())
             tls_trust.apply_trust(dialog.tls_ca_file())
             self._apply_disabled_accounts(dialog.disabled_accounts())
@@ -10099,13 +10196,32 @@ class MainWindow(QMainWindow):
         self.thread_list.clear()
         self.thread_list.hide()
 
+    def _row_search_text(self, row: int) -> str:
+        """По чему ищем в строке. В плитке столбцов не видно и выбрать
+        столбец фильтра негде (жалоба: «в режиме плитки поиск только по
+        теме») — там ищем по тому, что на самой плитке и написано: от кого
+        и тема. В таблице — по выбранному столбцу, как раньше."""
+        if self.mail_view_mode == "cards":
+            parts = [self.table.item(row, column) for column in (COL_SENDER, COL_SUBJECT)]
+            return " ".join(item.text() for item in parts if item is not None).lower()
+        item = self.table.item(row, self.filter_column)
+        return item.text().lower() if item is not None else ""
+
+    def _rows_match(self, needle: str) -> bool:
+        needle = needle.strip().lower()
+        if not needle:
+            return True
+        return any(needle in self._row_search_text(row) for row in range(self.table.rowCount()))
+
     def on_filter_changed(self, text: str) -> None:
+        # Набрали не в той раскладке — исправляем строку поиска, если в
+        # другой раскладке письма находятся.
+        text = fix_search_layout(self.filter_edit, self._rows_match)
         needle = text.strip().lower()
         for row in range(self.table.rowCount()):
             visible = True
             if needle:
-                value = self.table.item(row, self.filter_column).text().lower()
-                visible = needle in value
+                visible = needle in self._row_search_text(row)
             summary = self._summary_for_row(row)
             if visible and summary is not None:
                 visible = self._summary_passes_filters(summary) and not self._thread_hidden(summary, needle)
@@ -12488,8 +12604,21 @@ class MainWindow(QMainWindow):
         self._apply_contacts_filter()
         self._contacts_view_signature = self._contacts_signature()
 
+    def _contact_haystack(self, contact) -> str:
+        return " ".join([
+            contact.display_name, " ".join(contact.emails), contact.organization,
+            contact.phone, contact.title, contact.department,
+        ]).casefold()
+
+    def _contacts_match(self, text: str) -> bool:
+        needle = text.strip().casefold()
+        if not needle:
+            return True
+        return any(needle in self._contact_haystack(contact) for contact in self._contacts_by_row)
+
     def _apply_contacts_filter(self, *_args) -> None:
-        needle = self.contacts_search_edit.text().strip().casefold()
+        # Та же правка раскладки, что и в поиске писем: «bdfyjd» → «иванов».
+        needle = fix_search_layout(self.contacts_search_edit, self._contacts_match).strip().casefold()
         kind = self.contacts_kind_combo.currentIndex()  # 0 все, 1 люди, 2 группы
         shown = 0
         for row, contact in enumerate(self._contacts_by_row):
@@ -12499,11 +12628,7 @@ class MainWindow(QMainWindow):
             elif kind == 2 and not contact.is_group:
                 visible = False
             if visible and needle:
-                haystack = " ".join([
-                    contact.display_name, " ".join(contact.emails), contact.organization,
-                    contact.phone, contact.title, contact.department,
-                ]).casefold()
-                visible = needle in haystack
+                visible = needle in self._contact_haystack(contact)
             self.contacts_table.setRowHidden(row, not visible)
             card = self.contacts_card_list.item(row)
             if card is not None:

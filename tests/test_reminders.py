@@ -138,3 +138,93 @@ def test_reminder_window_shows_subject_as_plain_text() -> None:
     finally:
         window.close()
     assert app is not None
+
+
+def test_others_meeting_is_announced_with_author(tmp_path: Path) -> None:
+    """Чужую встречу называем по автору: тема «Планёрка» без имени
+    организатора ничего не говорит."""
+    calendar = tmp_path / "test.rmcal"
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    calendar_store.save_event(calendar, calendar_store.Event(
+        uid="theirs@redmail", summary="Планёрка", dtstart=start, dtend=start + timedelta(hours=1),
+        organizer_email="orlov@example.com", organizer_name="Орлов Олег", is_organizer=False,
+        remind_minutes=15, remind_mode=calendar_store.REMIND_VOICE,
+    ))
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    now = start - timedelta(minutes=15)
+
+    reminder = reminders.due_reminders(calendar, state, now)[0]
+    assert reminder.mine is False and reminder.organizer == "Орлов Олег"
+    assert "Орлов Олег" in reminders.spoken_text(reminder, now)
+
+
+def test_own_meeting_is_announced_without_author(tmp_path: Path) -> None:
+    calendar = tmp_path / "test.rmcal"
+    event = _event(calendar, mode=calendar_store.REMIND_VOICE)
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    now = event.dtstart - timedelta(minutes=15)
+
+    reminder = reminders.due_reminders(calendar, state, now)[0]
+    assert reminder.mine is True
+    assert "позвал" not in reminders.spoken_text(reminder, now)
+
+
+def _invitation(path: Path, *, uid: str = "inv@redmail", author: str = "Орлов Олег") -> calendar_store.Event:
+    """Приглашение с сервера: организатор чужой, способ напоминания в нём
+    никто не выбирал."""
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    event = calendar_store.Event(
+        uid=uid, summary="Планёрка", dtstart=start, dtend=start + timedelta(hours=1),
+        organizer_email="orlov@example.com", organizer_name=author, is_organizer=False,
+    )
+    calendar_store.save_event(path, event)
+    return event
+
+
+def test_others_meeting_reminded_by_settings(tmp_path: Path) -> None:
+    """О чужой встрече напоминаем по настройке: в приглашении способ
+    выбирать некому."""
+    calendar = tmp_path / "test.rmcal"
+    event = _invitation(calendar)
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    policy = reminders.OthersPolicy(mode=calendar_store.REMIND_VOICE, minutes=20)
+
+    assert reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=30), policy) == []
+    due = reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=15), policy)
+    assert [r.summary for r in due] == ["Планёрка"]
+    assert due[0].mode == calendar_store.REMIND_VOICE and due[0].mine is False
+
+
+def test_others_meetings_can_be_limited_to_chosen_authors(tmp_path: Path) -> None:
+    calendar = tmp_path / "test.rmcal"
+    _invitation(calendar, uid="from-boss@redmail", author="Орлов Олег")
+    _invitation(calendar, uid="from-other@redmail", author="Гостев Пётр")
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    policy = reminders.OthersPolicy(mode=calendar_store.REMIND_WINDOW, minutes=15, authors=("Орлов",))
+
+    now = datetime(2026, 9, 1, 9, 50, tzinfo=timezone.utc)
+    assert [r.uid for r in reminders.due_reminders(calendar, state, now, policy)] == ["from-boss@redmail"]
+
+
+def test_others_meetings_can_be_turned_off(tmp_path: Path) -> None:
+    calendar = tmp_path / "test.rmcal"
+    event = _invitation(calendar)
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    policy = reminders.OthersPolicy(mode=calendar_store.REMIND_NONE)
+
+    assert reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=10), policy) == []
+
+
+def test_own_choice_wins_over_settings_for_others_meeting(tmp_path: Path) -> None:
+    """Если способ у встречи выбран руками, настройка его не перебивает."""
+    calendar = tmp_path / "test.rmcal"
+    event = _invitation(calendar)
+    event.remind_minutes = 5
+    event.remind_mode = calendar_store.REMIND_BOTH
+    calendar_store.save_event(calendar, event)
+    state = reminders.ReminderState(tmp_path / reminders.STATE_FILE)
+    policy = reminders.OthersPolicy(mode=calendar_store.REMIND_VOICE, minutes=60)
+
+    assert reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=30), policy) == []
+    due = reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=3), policy)
+    assert due and due[0].mode == calendar_store.REMIND_BOTH

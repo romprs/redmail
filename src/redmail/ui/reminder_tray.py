@@ -86,6 +86,19 @@ class ReminderWindow(QDialog):
         summary.setWordWrap(True)
 
         when = QLabel(f"{start:%d.%m.%Y %H:%M} — {end:%H:%M}", self)
+
+        # Чужая встреча: кто позвал и в каком календаре она лежит. По одной
+        # теме этого не понять, а для встречи из календаря коллеги это
+        # главное (пожелание: «про чужие события упоминать по автору»).
+        details = []
+        if not reminder.mine and reminder.organizer:
+            details.append(f"Организатор: {reminder.organizer}")
+        if reminder.calendar_name:
+            details.append(f"Календарь: {reminder.calendar_name}")
+        author = QLabel(" · ".join(details), self)
+        author.setTextFormat(Qt.TextFormat.PlainText)
+        author.setWordWrap(True)
+        author.setVisible(bool(details))
         place = QLabel(reminder.location, self)
         place.setTextFormat(Qt.TextFormat.PlainText)
         place.setWordWrap(True)
@@ -108,6 +121,7 @@ class ReminderWindow(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(summary)
         layout.addWidget(when)
+        layout.addWidget(author)
         layout.addWidget(place)
         layout.addLayout(buttons)
         self.resize(420, 180)
@@ -182,7 +196,10 @@ class ReminderTray:
         if not self._enabled:
             return
         now = datetime.now().astimezone()
-        for reminder in reminders.due_reminders(self._calendar_path, self._state, now):
+        # Настройку чужих встреч читаем каждый раз: её меняют в почте, а
+        # резидент живёт отдельно и перезапускать его ради этого незачем.
+        policy = reminders.OthersPolicy.load()
+        for reminder in reminders.due_reminders(self._calendar_path, self._state, now, policy):
             self._fire(reminder, now)
 
     def _fire(self, reminder: reminders.Reminder, now: datetime) -> None:
