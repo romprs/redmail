@@ -387,6 +387,47 @@ def test_save_and_load_ews_accounts_round_trip(tmp_path: Path) -> None:
     assert loaded[1].password == ""  # для kerberos пароль не хранится вовсе
 
 
+def test_save_and_load_ews_accounts_keeps_shared_mailboxes_and_offline_choice(tmp_path: Path) -> None:
+    """Подписка на ящики коллег и выбор «хранить их письма локально» —
+    часть учётной записи: после перезапуска настройка должна остаться."""
+    ews_file = tmp_path / "ews_accounts.json"
+    store: dict[str, str] = {}
+    set_patch = patch(
+        "redmail.config_store.keyring.set_password",
+        side_effect=lambda _service, user, pw: store.__setitem__(user, pw),
+    )
+    get_patch = patch(
+        "redmail.config_store.keyring.get_password",
+        side_effect=lambda _service, user: store.get(user),
+    )
+    account = EwsAccount(
+        email="ivan@corp.example",
+        password="p1",
+        shared_mailboxes=("petrov@corp.example", "sidorov@corp.example"),
+        shared_offline=True,
+    )
+
+    with patch("redmail.config_store._ews_accounts_path", return_value=ews_file), set_patch, get_patch:
+        save_ews_accounts([account])
+        loaded = load_ews_accounts()
+
+    assert loaded[0].shared_mailboxes == ("petrov@corp.example", "sidorov@corp.example")
+    assert loaded[0].shared_offline is True
+
+
+def test_load_ews_accounts_without_shared_settings_defaults_to_no_offline_copy(tmp_path: Path) -> None:
+    """Старые файлы настроек (без этих полей) читаются как «ящиков нет,
+    офлайн-копии чужих писем нет»."""
+    ews_file = tmp_path / "ews_accounts.json"
+    ews_file.write_text('[{"email": "ivan@corp.example", "auth_type": "kerberos"}]', encoding="utf-8")
+
+    with patch("redmail.config_store._ews_accounts_path", return_value=ews_file):
+        loaded = load_ews_accounts()
+
+    assert loaded[0].shared_mailboxes == ()
+    assert loaded[0].shared_offline is False
+
+
 def test_load_ews_accounts_skips_entry_with_missing_password(tmp_path: Path) -> None:
     ews_file = tmp_path / "ews_accounts.json"
     store: dict[str, str] = {}

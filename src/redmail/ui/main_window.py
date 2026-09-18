@@ -3798,6 +3798,11 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
             "Почтовые ящики коллег, доступ к которым вам выдан. Открываются вашей учётной записью "
             "по правам владельца — его пароль не нужен. Появятся в дереве папок отдельными ветками."
         )
+        self.shared_offline_check = QCheckBox("Хранить письма ящиков коллег локально (офлайн-копия и архив)")
+        self.shared_offline_check.setToolTip(
+            "Выключено: папки коллег открываются с сервера при обращении — база не растёт. "
+            "Включено: письма коллег скачиваются, доступны без сети и попадают в автоархив вместе со своими."
+        )
 
         form = QFormLayout()
         form.addRow("Email", self.email_edit)
@@ -3806,6 +3811,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
         form.addRow("Пароль", self.password_edit)
         form.addRow("Сервер EWS", self.server_edit)
         form.addRow("Ящики коллег", self.shared_edit)
+        form.addRow("", self.shared_offline_check)
 
         self.test_button = QPushButton("Проверить подключение")
         self.test_button.clicked.connect(self._on_test)
@@ -3826,6 +3832,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
             self.password_edit.setText(account.password)
             self.server_edit.setText(account.server)
             self.shared_edit.setText(", ".join(account.shared_mailboxes))
+            self.shared_offline_check.setChecked(account.shared_offline)
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -3852,6 +3859,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
             shared_mailboxes=tuple(
                 part.strip() for part in self.shared_edit.text().replace(";", ",").split(",") if part.strip()
             ),
+            shared_offline=self.shared_offline_check.isChecked(),
         )
 
     def _on_test(self) -> None:
@@ -9635,10 +9643,14 @@ class MainWindow(QMainWindow):
             return
         key, headers = self._sync_queue.pop(0)
         mailbox = self.mailboxes.get(key)
-        # Папки подписанных ящиков коллег в офлайн-копию не входят: чужой
-        # ящик может быть огромным, а нужен на просмотр — его содержимое
-        # запрашивается с сервера при открытии папки.
-        folders = [name for name in self.mailbox_folders.get(key, []) if not is_shared_folder(name)]
+        # Папки подписанных ящиков коллег входят в офлайн-копию (и, значит,
+        # в автоархив) только если это включено в учётной записи: чужой ящик
+        # может быть огромным, а нужен обычно на просмотр — тогда его
+        # содержимое запрашивается с сервера при открытии папки.
+        folders = list(self.mailbox_folders.get(key, []))
+        account = self.mailbox_accounts.get(key)
+        if not getattr(account, "shared_offline", False):
+            folders = [name for name in folders if not is_shared_folder(name)]
         if mailbox is None or not folders:
             self._sync_next(bodies_limit)
             return

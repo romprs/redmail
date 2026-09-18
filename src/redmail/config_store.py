@@ -971,6 +971,7 @@ def load_ews_accounts() -> list[EwsAccount]:
                     server=entry.get("server", ""),
                     auth_type=auth_type,
                     shared_mailboxes=tuple(entry.get("shared_mailboxes", []) or ()),
+                    shared_offline=bool(entry.get("shared_offline", False)),
                 )
             )
         except KeyError:
@@ -991,6 +992,7 @@ def merge_ews_accounts(accounts: list[EwsAccount], *, forget: str | None = None)
             "server": account.server,
             "auth_type": account.auth_type,
             "shared_mailboxes": list(account.shared_mailboxes),
+            "shared_offline": account.shared_offline,
         }
     if forget:
         merged.pop(forget, None)
@@ -1012,6 +1014,7 @@ def save_ews_accounts(accounts: list[EwsAccount]) -> None:
                 "server": account.server,
                 "auth_type": account.auth_type,
                 "shared_mailboxes": list(account.shared_mailboxes),
+                "shared_offline": account.shared_offline,
             }
         )
     path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
