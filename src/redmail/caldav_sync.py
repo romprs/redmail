@@ -239,6 +239,31 @@ def _parse_multistatus(tree) -> list[_PropfindResult]:
     return results
 
 
+def same_server(account_url: str, candidate: str) -> bool:
+    """Ссылка ведёт на тот же сервер, что настроен в учётной записи?
+
+    Обнаружение календарей идёт по href, которые вернул САМ сервер, и
+    ходит по ним с нашим логином и паролем. Абсолютная ссылка на чужой
+    узел увела бы учётные данные постороннему (достаточно одного
+    скомпрометированного или враждебного календарного сервера), поэтому
+    ходим только по своему: та же схема, тот же узел, тот же порт."""
+    mine, theirs = urlparse(account_url), urlparse(candidate)
+    if not theirs.netloc:
+        return True  # относительный путь — это тот же сервер
+    return (
+        (theirs.scheme or mine.scheme).lower() == mine.scheme.lower()
+        and theirs.hostname is not None
+        and mine.hostname is not None
+        and theirs.hostname.lower() == mine.hostname.lower()
+        and (theirs.port or _default_port(theirs.scheme or mine.scheme))
+        == (mine.port or _default_port(mine.scheme))
+    )
+
+
+def _default_port(scheme: str) -> int:
+    return 443 if (scheme or "").lower() == "https" else 80
+
+
 def _resourcetype_tags(result: "_PropfindResult") -> list[str]:
     """Теги DAV:resourcetype ответа списком — свойство приходит и одним
     значением, и списком, и вовсе отсутствует."""
@@ -432,6 +457,12 @@ class CalDavSession:
         def remember(raw: str, source: str) -> None:
             if not raw:
                 return
+            # Проверяем ДО склейки: caldav на ссылку с чужим узлом бросает
+            # ValueError, и враждебный (или просто криво настроенный) сервер
+            # так ронял бы весь поиск календарей.
+            if not same_server(self.account.url, raw):
+                _log.warning("CalDAV %s: ссылка на чужой сервер пропущена (%s): %s", self.account.url, source, raw)
+                return
             url = str(self._client.url.join(raw))
             path = _href_path(url)
             if path in seen_paths:
@@ -444,6 +475,10 @@ class CalDavSession:
             remember(href, "calendar-home-set")
         for prop in _PROXY_PROPS:
             for proxy_href in self._principal_hrefs(str(principal.url), prop):
+                if not same_server(self.account.url, proxy_href):
+                    _log.warning("CalDAV %s: доверенный принципал на чужом сервере пропущен: %s",
+                                 self.account.url, proxy_href)
+                    continue
                 proxy_url = str(self._client.url.join(proxy_href))
                 _log.info("CalDAV %s: доверенный принципал %s (%s)", self.account.url, proxy_url, prop.rsplit("}", 1)[-1])
                 for href in self._principal_hrefs(proxy_url, _CALDAV_HOME_SET_PROP):
@@ -516,6 +551,12 @@ class CalDavSession:
                       f" «{result.properties.get('{DAV:}displayname')}»" if result.properties.get("{DAV:}displayname") else "")
             if result.status not in (200, 207):
                 continue
+            if not same_server(self.account.url, result.href):
+                # Сервер вернул ссылку на другой узел: ходить туда с нашим
+                # логином и паролем нельзя (см. same_server).
+                _log.warning("CalDAV %s: ответ со ссылкой на чужой сервер пропущен: %s",
+                             self.account.url, result.href)
+                continue
             full_url = str(self._client.url.join(result.href))
             path = _href_path(full_url)
             if path == own_path:
@@ -536,6 +577,9 @@ class CalDavSession:
         """Описание календаря из ответа PROPFIND; None — если это не
         календарь или он уже в списке."""
         if result.status not in (200, 207) or _CALDAV_CALENDAR_TAG not in _resourcetype_tags(result):
+            return None
+        if not same_server(self.account.url, result.href):
+            _log.warning("CalDAV %s: календарь на чужом сервере пропущен: %s", self.account.url, result.href)
             return None
         full_url = str(self._client.url.join(result.href))
         path = _href_path(full_url)

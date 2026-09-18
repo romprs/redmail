@@ -893,7 +893,7 @@ def is_eml_attachment(filename: str, content_type: str = "") -> bool:
     двойной щелчок раньше просто ничего не делал."""
     if (content_type or "").split(";", 1)[0].strip().lower() == "message/rfc822":
         return True
-    return Path(filename or "").suffix.lower() in (".eml", ".mht", ".msg.eml")
+    return Path(filename or "").suffix.lower() in (".eml", ".mht")
 
 
 class EmlAttachmentWindow(QWidget):
@@ -906,15 +906,20 @@ class EmlAttachmentWindow(QWidget):
         self.resize(760, 560)
         self._raw = raw
         self._temp_dirs: list[Path] = []
+        date_text = ""
         try:
-            content = extract_content(message_from_bytes(raw, policy=email_default_policy))
+            message = message_from_bytes(raw, policy=email_default_policy)
+            content = extract_content(message)
+            # Дата письма в MessageContent не попадает (там только заголовки
+            # для разбора рассылок) — берём из самого письма, иначе в шапке
+            # вложенного письма даты не было бы вовсе.
+            date_text = " ".join(str(message.get("Date", "")).split())
         except Exception as exc:
             _log.warning("Вложенное письмо %s не разобрано: %s", filename, exc)
             content = MessageContent(text=f"Письмо не удалось разобрать: {exc}")
         self._content = content
         self.setWindowTitle(content.subject or filename or "Вложенное письмо")
 
-        date_text = content.mail_headers.get("Date", "")
         header_label = QLabel(
             _build_message_header_html(
                 content.subject or filename or "(без темы)", content.from_, content.to, content.cc, date_text
@@ -8097,7 +8102,9 @@ class MainWindow(QMainWindow):
         # Без офлайн-копии ящиков коллег их письма не качаются фоном: в папке
         # коллеги видны заголовки, тело берётся с сервера при открытии письма.
         skip_shared = excluded_shared_folders(
-            (info.name for info in folders), bool(getattr(account, "shared_offline", False))
+            (info.name for info in folders),
+            bool(getattr(account, "shared_offline", False)),
+            tuple(getattr(account, "shared_mailboxes", ()) or ()),
         )
         self.mailboxes[key].skip_body_folders = tuple(
             [info.name for info in folders if _folder_role(info.name) == "all"] + list(skip_shared)
@@ -9823,7 +9830,9 @@ class MainWindow(QMainWindow):
         # содержимое запрашивается с сервера при открытии папки.
         account = self.mailbox_accounts.get(key)
         excluded = set(excluded_shared_folders(
-            self.mailbox_folders.get(key, []), bool(getattr(account, "shared_offline", False))
+            self.mailbox_folders.get(key, []),
+            bool(getattr(account, "shared_offline", False)),
+            tuple(getattr(account, "shared_mailboxes", ()) or ()),
         ))
         folders = [name for name in self.mailbox_folders.get(key, []) if name not in excluded]
         if mailbox is None or not folders:
@@ -9936,9 +9945,11 @@ class MainWindow(QMainWindow):
         skip = {name for name in (self.mailbox_trash_folders.get(key), self.mailbox_drafts_folders.get(key)) if name}
         # Ящики коллег без офлайн-копии в архив не попадают: архив — это
         # своя почта, за чужую он расти не должен.
+        archive_account = self.mailbox_accounts.get(key)
         skip |= set(excluded_shared_folders(
             self.mailbox_folders.get(key, []),
-            bool(getattr(self.mailbox_accounts.get(key), "shared_offline", False)),
+            bool(getattr(archive_account, "shared_offline", False)),
+            tuple(getattr(archive_account, "shared_mailboxes", ()) or ()),
         ))
         try:
             plan = autoarchive.make_plan(mailbox.account_key, threshold, skip_folders=skip)

@@ -119,6 +119,11 @@ def test_excluded_shared_folders_depends_on_offline_choice() -> None:
     )
     assert excluded_shared_folders(folders, True) == ()
 
+    # Своя папка с похожим названием из локальной копии не выпадает:
+    # сравниваем с адресами подписанных ящиков, а не с одной меткой.
+    own = ["Ящик подрядчика", "Ящик petrov@example.com/Inbox"]
+    assert excluded_shared_folders(own, False, ("petrov@example.com",)) == ("Ящик petrov@example.com/Inbox",)
+
 
 def test_folder_message_count_then_fetch_summaries() -> None:
     item = _fake_item(date=datetime(2026, 1, 15, 10, 30))

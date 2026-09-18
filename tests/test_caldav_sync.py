@@ -466,3 +466,36 @@ def test_list_calendar_names_authorization_error_without_negotiate_says_sso_unav
         session = CalDavSession(_account())
         with pytest.raises(CalDavSyncError, match="SSO .* недоступен"):
             session.list_calendar_names()
+
+
+def test_same_server_blocks_links_to_other_hosts() -> None:
+    """Обнаружение ходит по ссылкам, которые вернул сервер, с нашим логином
+    и паролем: ссылка на чужой узел увела бы учётные данные."""
+    from redmail.caldav_sync import same_server
+
+    mine = "https://calendar.example.corp/caldav/"
+    assert same_server(mine, "/calendars/ivan/") is True
+    assert same_server(mine, "https://calendar.example.corp/calendars/ivan/") is True
+    assert same_server(mine, "https://calendar.example.corp:443/calendars/ivan/") is True
+    assert same_server(mine, "https://evil.example.net/calendars/ivan/") is False
+    assert same_server(mine, "http://calendar.example.corp/calendars/ivan/") is False
+    assert same_server(mine, "https://calendar.example.corp:8443/calendars/ivan/") is False
+
+
+def test_discovery_skips_calendar_on_another_host() -> None:
+    foreign = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>https://evil.example.net/calendars/ivan/personal/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+<d:displayname>Чужой</d:displayname></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+    fake_client = MagicMock()
+    fake_client.url = URL("https://calendar.example.corp/")
+    fake_client.principal.return_value.url = "https://calendar.example.corp/principals/ivan@corp.ru/"
+    fake_client.principal.return_value.calendar_home_set.url = "https://calendar.example.corp/caldav/"
+    fake_client.propfind.side_effect = lambda url, body, depth: _propfind_response(foreign)
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        calendars = CalDavSession(_account()).list_calendars_detailed()
+
+    assert calendars == []

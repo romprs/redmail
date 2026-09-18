@@ -112,15 +112,27 @@ class EwsAccount:
 SHARED_FOLDER_MARK = "Ящик "
 
 
-def is_shared_folder(path: str) -> bool:
+def is_shared_folder(path: str, mailboxes: "tuple[str, ...] | list[str]" = ()) -> bool:
     """Папка подписанного ящика коллеги. Попадает ли она в офлайн-копию и
     архив, решает настройка учётной записи shared_offline: по умолчанию
     нет — чужой ящик может быть сколь угодно большим, а нужен обычно на
-    просмотр."""
-    return path.startswith(SHARED_FOLDER_MARK)
+    просмотр.
+
+    mailboxes — адреса подписанных ящиков. С ними сравнение точное: своя
+    папка, названная «Ящик подрядчика», не должна выпадать из локальной
+    копии из-за совпадения первых букв. Без них (старые вызовы) остаётся
+    проверка по метке."""
+    if not path.startswith(SHARED_FOLDER_MARK):
+        return False
+    if not mailboxes:
+        return True
+    return any(
+        path == shared_folder_prefix(mailbox) or path.startswith(shared_folder_prefix(mailbox) + "/")
+        for mailbox in mailboxes
+    )
 
 
-def excluded_shared_folders(folders, shared_offline: bool) -> tuple[str, ...]:
+def excluded_shared_folders(folders, shared_offline: bool, mailboxes: "tuple[str, ...] | list[str]" = ()) -> tuple[str, ...]:
     """Папки подписанных ящиков, которые НЕ входят в локальную копию, когда
     офлайн-копия чужих ящиков выключена: их не обходит фоновая
     синхронизация, для них не качаются тела писем и они не попадают в
@@ -128,7 +140,7 @@ def excluded_shared_folders(folders, shared_offline: bool) -> tuple[str, ...]:
     же правилам, что и своя."""
     if shared_offline:
         return ()
-    return tuple(name for name in folders if is_shared_folder(name))
+    return tuple(name for name in folders if is_shared_folder(name, mailboxes))
 
 
 def shared_folder_prefix(mailbox: str) -> str:
