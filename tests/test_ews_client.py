@@ -106,6 +106,20 @@ def test_list_folders_keeps_own_mail_when_colleague_mailbox_is_unavailable() -> 
     assert names == ["Входящие"]
 
 
+def test_excluded_shared_folders_depends_on_offline_choice() -> None:
+    """Галочка «хранить письма ящиков коллег локально» — ровно два варианта:
+    выключено — папки коллег не обходит фоновая синхронизация, для них не
+    качаются тела и они не идут в автоархив; включено — чужая почта живёт по
+    тем же правилам, что и своя."""
+    from redmail.ews_client import excluded_shared_folders
+
+    folders = ["Inbox", "Sent Items", "Ящик petrov@example.com/Inbox", "Ящик petrov@example.com/Sent Items"]
+    assert excluded_shared_folders(folders, False) == (
+        "Ящик petrov@example.com/Inbox", "Ящик petrov@example.com/Sent Items",
+    )
+    assert excluded_shared_folders(folders, True) == ()
+
+
 def test_folder_message_count_then_fetch_summaries() -> None:
     item = _fake_item(date=datetime(2026, 1, 15, 10, 30))
     inbox = _fake_folder("Входящие", total_count=1)

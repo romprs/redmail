@@ -219,7 +219,13 @@ from redmail.config_store import (
     save_window_geometry,
     save_compose_geometry,
 )
-from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession, is_shared_folder
+from redmail.ews_client import (
+    EwsAccount,
+    EwsConnectionError,
+    EwsSession,
+    excluded_shared_folders,
+    is_shared_folder,
+)
 from redmail import ics_subscription, remote_images
 from redmail.imap_client import (
     HTML_ONLY_PLACEHOLDER,
@@ -7927,7 +7933,14 @@ class MainWindow(QMainWindow):
         # «Вся почта»/All Mail у Gmail — зеркало всех остальных папок: в полную
         # локальную копию не входит, иначе база удваивается (на .80: 3.3 ГБ).
         self.mailbox_folders[key] = [info.name for info in folders if _folder_role(info.name) != "all"]
-        self.mailboxes[key].skip_body_folders = tuple(info.name for info in folders if _folder_role(info.name) == "all")
+        # Без офлайн-копии ящиков коллег их письма не качаются фоном: в папке
+        # коллеги видны заголовки, тело берётся с сервера при открытии письма.
+        skip_shared = excluded_shared_folders(
+            (info.name for info in folders), bool(getattr(account, "shared_offline", False))
+        )
+        self.mailboxes[key].skip_body_folders = tuple(
+            [info.name for info in folders if _folder_role(info.name) == "all"] + list(skip_shared)
+        )
         self.mailbox_accounts[key] = account
         self.mailbox_smtp_accounts[key] = smtp_account
         self.mailbox_protocols[key] = protocol
@@ -9647,10 +9660,11 @@ class MainWindow(QMainWindow):
         # в автоархив) только если это включено в учётной записи: чужой ящик
         # может быть огромным, а нужен обычно на просмотр — тогда его
         # содержимое запрашивается с сервера при открытии папки.
-        folders = list(self.mailbox_folders.get(key, []))
         account = self.mailbox_accounts.get(key)
-        if not getattr(account, "shared_offline", False):
-            folders = [name for name in folders if not is_shared_folder(name)]
+        excluded = set(excluded_shared_folders(
+            self.mailbox_folders.get(key, []), bool(getattr(account, "shared_offline", False))
+        ))
+        folders = [name for name in self.mailbox_folders.get(key, []) if name not in excluded]
         if mailbox is None or not folders:
             self._sync_next(bodies_limit)
             return
@@ -9759,6 +9773,12 @@ class MainWindow(QMainWindow):
             _log.warning("Автоархив: перенос файлов в профиль не удался: %s", exc)
         threshold = load_auto_archive_size_mb() * 1024 * 1024
         skip = {name for name in (self.mailbox_trash_folders.get(key), self.mailbox_drafts_folders.get(key)) if name}
+        # Ящики коллег без офлайн-копии в архив не попадают: архив — это
+        # своя почта, за чужую он расти не должен.
+        skip |= set(excluded_shared_folders(
+            self.mailbox_folders.get(key, []),
+            bool(getattr(self.mailbox_accounts.get(key), "shared_offline", False)),
+        ))
         try:
             plan = autoarchive.make_plan(mailbox.account_key, threshold, skip_folders=skip)
         except Exception as exc:

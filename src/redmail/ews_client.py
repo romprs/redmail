@@ -120,6 +120,17 @@ def is_shared_folder(path: str) -> bool:
     return path.startswith(SHARED_FOLDER_MARK)
 
 
+def excluded_shared_folders(folders, shared_offline: bool) -> tuple[str, ...]:
+    """Папки подписанных ящиков, которые НЕ входят в локальную копию, когда
+    офлайн-копия чужих ящиков выключена: их не обходит фоновая
+    синхронизация, для них не качаются тела писем и они не попадают в
+    автоархив. Включена — не исключается ничего, чужая почта живёт по тем
+    же правилам, что и своя."""
+    if shared_offline:
+        return ()
+    return tuple(name for name in folders if is_shared_folder(name))
+
+
 def shared_folder_prefix(mailbox: str) -> str:
     """Ветка дерева папок для ящика коллеги. Имя пути — обычная строка с
     разделителем «/», поэтому подписанный ящик виден как отдельная ветка и
