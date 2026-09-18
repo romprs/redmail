@@ -219,7 +219,7 @@ from redmail.config_store import (
     save_window_geometry,
     save_compose_geometry,
 )
-from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession
+from redmail.ews_client import EwsAccount, EwsConnectionError, EwsSession, is_shared_folder
 from redmail import ics_subscription, remote_images
 from redmail.imap_client import (
     HTML_ONLY_PLACEHOLDER,
@@ -9635,7 +9635,10 @@ class MainWindow(QMainWindow):
             return
         key, headers = self._sync_queue.pop(0)
         mailbox = self.mailboxes.get(key)
-        folders = self.mailbox_folders.get(key, [])
+        # Папки подписанных ящиков коллег в офлайн-копию не входят: чужой
+        # ящик может быть огромным, а нужен на просмотр — его содержимое
+        # запрашивается с сервера при открытии папки.
+        folders = [name for name in self.mailbox_folders.get(key, []) if not is_shared_folder(name)]
         if mailbox is None or not folders:
             self._sync_next(bodies_limit)
             return
