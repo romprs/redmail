@@ -197,3 +197,31 @@ def test_failed_window_chunk_does_not_lose_the_rest(monkeypatch) -> None:
 
     events = ews_calendar.fetch_events(SimpleNamespace(calendar=Calendar()), start, start + timedelta(days=42), "me@x.ru")
     assert calls["n"] == 3 and len(events) == 2  # часть окна без ответа — остальные встречи получены
+
+
+def test_shared_mailbox_calendar_uses_own_credentials(monkeypatch) -> None:
+    """Подписка на календарь коллеги: тот же сеанс (наша учётная запись),
+    но ящик — его; пароль владельца не нужен."""
+    monkeypatch.setattr(ews_calendar, "CalendarItem", FakeItem)
+    start = datetime(2026, 9, 18, tzinfo=timezone.utc)
+    opened: list[str] = []
+
+    class Calendar:
+        def __init__(self, uid):
+            self.uid = uid
+
+        def view(self, start, end):
+            moment = start + timedelta(hours=1)
+            return [FakeItem(uid=self.uid, start=moment, end=moment, organizer=FakeMailbox("a@x.ru"))]
+
+    mine, colleague = SimpleNamespace(calendar=Calendar("my")), SimpleNamespace(calendar=Calendar("theirs"))
+
+    def mailbox_account(email):
+        opened.append(email)
+        return colleague
+
+    session = SimpleNamespace(_account=mine, mailbox_account=mailbox_account)
+    events = ews_calendar.fetch_events(session, start, start + timedelta(days=1), "me@x.ru")
+    assert [e.uid for e in events] == ["my"] and opened == []
+    events = ews_calendar.fetch_events(session, start, start + timedelta(days=1), "me@x.ru", "ivanov@x.ru")
+    assert [e.uid for e in events] == ["theirs"] and opened == ["ivanov@x.ru"]

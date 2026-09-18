@@ -244,3 +244,27 @@ def test_voice_edit_form_opens_on_day_and_saves_with_scope(tmp_path: Path, monke
     mw.MainWindow.ipc_event_form_open(host, uid="daily-1", occurrence_start=day, scope="one")
     captured["later"]()
     assert captured["existing"].dtstart == day and captured["scope"] == "one"
+
+
+def test_calendar_dialog_keeps_colleague_mailbox_for_exchange(monkeypatch) -> None:
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from redmail import calendar_store as store
+    from redmail.ui import main_window as mw
+
+    QApplication.instance() or QApplication([])
+    dialog = mw.AddCalendarDialog(None)
+    dialog.name_edit.setText("Календарь Иванова")
+    index = dialog.source_combo.findData(store.SOURCE_EWS)
+    dialog.source_combo.setCurrentIndex(index)
+    assert dialog.ews_group.isVisibleTo(dialog)
+    dialog.ews_mailbox_edit.setText("ivanov@example.ru")
+    assert dialog.caldav_url() == "ivanov@example.ru" and dialog.source_type() == store.SOURCE_EWS
+    warnings = []
+    monkeypatch.setattr(mw.QMessageBox, "warning", lambda *a: warnings.append(a[-1]))
+    dialog.ews_mailbox_edit.setText("иванов")
+    dialog._on_accept()
+    assert warnings and dialog.result() == 0

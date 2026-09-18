@@ -5297,6 +5297,20 @@ class AddCalendarDialog(QDialog):
         ics_form.addRow(ics_hint)
         self.ics_group.setLayout(ics_form)
 
+        # Подписка на календарь коллеги в Exchange: пусто — свой календарь.
+        self.ews_mailbox_edit = QLineEdit(self)
+        self.ews_mailbox_edit.setPlaceholderText("ivanov@example.ru — пусто, если это ваш календарь")
+        ews_hint = QLabel(
+            "Календарь коллеги открывается ВАШЕЙ учётной записью Exchange по правам, которые он вам выдал "
+            "(подписка) — его пароль не нужен. Если коллега прав не давал, сервер ответит отказом.", self,
+        )
+        ews_hint.setWordWrap(True)
+        self.ews_group = QGroupBox("Календарь Exchange", self)
+        ews_form = QFormLayout()
+        ews_form.addRow("Ящик коллеги", self.ews_mailbox_edit)
+        ews_form.addRow(ews_hint)
+        self.ews_group.setLayout(ews_form)
+
         self.caldav_url_edit = QLineEdit(self)
         self.caldav_url_edit.setPlaceholderText("https://calendar.example.corp/caldav/")
         caldav_hint_label = QLabel(
@@ -5339,6 +5353,7 @@ class AddCalendarDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addLayout(form)
         layout.addWidget(self.caldav_group)
+        layout.addWidget(self.ews_group)
         layout.addWidget(self.ics_group)
         layout.addStretch(1)
         layout.addWidget(buttons)
@@ -5348,6 +5363,7 @@ class AddCalendarDialog(QDialog):
     def _on_source_changed(self) -> None:
         self.caldav_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_CALDAV)
         self.ics_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_ICS)
+        self.ews_group.setVisible(self.source_combo.currentData() == calendar_store.SOURCE_EWS)
 
     def _on_test_connection(self) -> None:
         url = self.caldav_url_edit.text().strip()
@@ -5469,6 +5485,10 @@ class AddCalendarDialog(QDialog):
             QMessageBox.warning(self, "Укажите название", "Название календаря обязательно.")
             return
         if self.source_combo.currentData() == calendar_store.SOURCE_EWS:
+            mailbox = self.ews_mailbox_edit.text().strip()
+            if mailbox and "@" not in mailbox:
+                QMessageBox.warning(self, "Укажите ящик", "Ящик коллеги — это его почтовый адрес.")
+                return
             self.accept()
             return
         if self.source_combo.currentData() == calendar_store.SOURCE_CALDAV and not self.caldav_url_edit.text().strip():
@@ -5491,8 +5511,13 @@ class AddCalendarDialog(QDialog):
         return self.source_combo.currentData()
 
     def caldav_url(self) -> str:
-        if self.source_combo.currentData() == calendar_store.SOURCE_ICS:
+        """Адрес источника: URL CalDAV, ссылка .ics или — для Exchange —
+        ящик коллеги, на календарь которого оформлена подписка."""
+        source = self.source_combo.currentData()
+        if source == calendar_store.SOURCE_ICS:
             return ics_subscription.normalize_url(self.ics_url_edit.text())
+        if source == calendar_store.SOURCE_EWS:
+            return self.ews_mailbox_edit.text().strip()
         return self.caldav_url_edit.text().strip()
 
 
@@ -6320,26 +6345,29 @@ class _CalDavCalendarServer:
 
 
 class _ExchangeCalendarServer:
-    """Календарь Exchange по тому же подключению, что и почта."""
+    """Календарь Exchange по тому же подключению, что и почта. mailbox —
+    ящик коллеги (подписка): открывается нашей учётной записью по выданным
+    им правам, пароль владельца не нужен."""
 
-    def __init__(self, session, email: str) -> None:
+    def __init__(self, session, email: str, mailbox: str = "") -> None:
         self._session = session
         self._email = email
+        self._mailbox = mailbox
 
     def push_event(self, event) -> None:
-        ews_calendar.push_event(self._session, event)
+        ews_calendar.push_event(self._session, event, self._mailbox)
 
     def push_occurrence(self, event) -> None:
-        ews_calendar.push_occurrence(self._session, event)
+        ews_calendar.push_occurrence(self._session, event, self._mailbox)
 
     def cancel_occurrence(self, uid: str) -> None:
-        ews_calendar.cancel_occurrence(self._session, uid)
+        ews_calendar.cancel_occurrence(self._session, uid, self._mailbox)
 
     def delete_event(self, uid: str) -> None:
-        ews_calendar.delete_event(self._session, uid)
+        ews_calendar.delete_event(self._session, uid, self._mailbox)
 
     def fetch_events(self, start, end):
-        return ews_calendar.fetch_events(self._session, start, end, self._email)
+        return ews_calendar.fetch_events(self._session, start, end, self._email, self._mailbox)
 
 
 class _IcsCalendarServer:
@@ -11641,7 +11669,15 @@ class MainWindow(QMainWindow):
                     problems.append(f"«{cal.name}»: не подключена учётная запись Exchange")
                     continue
                 email = getattr(getattr(session, "account", None), "email", "") or ""
-                plans.append((cal, lambda session=session, email=email: (_ExchangeCalendarServer(session, email), None), False))
+                # Для подписки на чужой календарь в caldav_url лежит адрес ящика коллеги.
+                mailbox = cal.caldav_url.strip()
+                plans.append((
+                    cal,
+                    lambda session=session, email=email, mailbox=mailbox: (
+                        _ExchangeCalendarServer(session, email, mailbox), None
+                    ),
+                    bool(mailbox) and False,
+                ))
             elif cal.source_type == calendar_store.SOURCE_ICS:
                 username = getattr(self.account, "username", "") if self.account else ""
                 plans.append((cal, lambda cal=cal, username=username: (_IcsCalendarServer(cal.caldav_url, username), None), True))

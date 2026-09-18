@@ -198,7 +198,7 @@ class EwsSession:
         if account.server:
             config_kwargs["server"] = account.server
         try:
-            config = Configuration(**config_kwargs)
+            config = self._config = Configuration(**config_kwargs)
             self._account = ExchangeAccount(
                 primary_smtp_address=account.email,
                 config=config,
@@ -229,6 +229,31 @@ class EwsSession:
         # Папки, где получатели уже дописаны старым письмам (см.
         # sync_engine._backfill_recipients).
         self.recipients_backfilled: set[str] = set()
+
+    def mailbox_account(self, email: str):
+        """Ящик коллеги, открытый ПОД СВОЕЙ учётной записью (доступ делегата):
+        подписка на чужой календарь или папку не требует его пароля — только
+        выданных им прав. Пусто — свой ящик."""
+        email = (email or "").strip()
+        if not email or email.casefold() == (self.account.email or "").casefold():
+            return self._account
+        cached = getattr(self, "_mailbox_accounts", None)
+        if cached is None:
+            cached = self._mailbox_accounts = {}
+        key = email.casefold()
+        if key not in cached:
+            try:
+                cached[key] = ExchangeAccount(
+                    primary_smtp_address=email,
+                    config=self._config,
+                    autodiscover=not bool(self.account.server),
+                    access_type=DELEGATE,
+                )
+            except Exception as exc:
+                _log.error("EWS: ящик %s не открылся: %s", email, exc)
+                raise EwsConnectionError(f"Ящик {email} не открылся: {exc}") from exc
+            _log.info("EWS: открыт ящик коллеги %s (правами %s)", email, self.account.email)
+        return cached[key]
 
     def close(self) -> None:
         pass  # exchangelib сам управляет пулом HTTP-соединений, отдельно закрывать нечего

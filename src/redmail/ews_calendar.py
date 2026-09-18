@@ -116,9 +116,19 @@ def item_to_event(item: CalendarItem, my_email: str) -> Event:
 EWS_VIEW_CHUNK = timedelta(days=14)
 
 
-def fetch_events(session, start: datetime, end: datetime, my_email: str) -> list[Event]:
-    """Встречи из основного календаря учётной записи в окне [start, end)."""
-    account = getattr(session, "_account", None) or session
+def _account_for(session, mailbox: str = ""):
+    """Свой ящик или ящик коллеги (подписка): открывается нашей учётной
+    записью, пароль владельца не нужен."""
+    if mailbox:
+        chooser = getattr(session, "mailbox_account", None)
+        if chooser is not None:
+            return chooser(mailbox)
+    return getattr(session, "_account", None) or session
+
+
+def fetch_events(session, start: datetime, end: datetime, my_email: str, mailbox: str = "") -> list[Event]:
+    """Встречи из календаря учётной записи (или ящика коллеги) в окне [start, end)."""
+    account = _account_for(session, mailbox)
     try:
         # Exchange отдаёт в одном просмотре не больше ~1000 встреч («You have
         # exceeded the maximum number of objects…»), а ежедневные серии за
@@ -170,9 +180,9 @@ def _find_item(account, uid: str):
         return None
 
 
-def push_event(session, event: Event) -> None:
+def push_event(session, event: Event, mailbox: str = "") -> None:
     """Создать встречу на сервере или обновить уже существующую (по UID)."""
-    account = getattr(session, "_account", None) or session
+    account = _account_for(session, mailbox)
     try:
         existing = _find_item(account, event.uid)
         required = [
@@ -209,8 +219,8 @@ def push_event(session, event: Event) -> None:
         raise EwsCalendarError(f"Не удалось сохранить встречу в Exchange: {exc}") from exc
 
 
-def delete_event(session, uid: str) -> None:
-    account = getattr(session, "_account", None) or session
+def delete_event(session, uid: str, mailbox: str = "") -> None:
+    account = _account_for(session, mailbox)
     try:
         existing = _find_item(account, uid)
         if existing is None:
@@ -237,9 +247,9 @@ def _find_occurrence(account, uid: str):
     return None
 
 
-def push_occurrence(session, event: Event) -> None:
+def push_occurrence(session, event: Event, mailbox: str = "") -> None:
     """Перенос или правка одного дня серии; участникам Exchange сообщит сам."""
-    account = getattr(session, "_account", None) or session
+    account = _account_for(session, mailbox)
     try:
         item = _find_occurrence(account, event.uid)
         if item is None:
@@ -257,8 +267,8 @@ def push_occurrence(session, event: Event) -> None:
         raise EwsCalendarError(f"Не удалось изменить день серии в Exchange: {exc}") from exc
 
 
-def cancel_occurrence(session, uid: str) -> None:
-    account = getattr(session, "_account", None) or session
+def cancel_occurrence(session, uid: str, mailbox: str = "") -> None:
+    account = _account_for(session, mailbox)
     try:
         item = _find_occurrence(account, uid)
         if item is None:
