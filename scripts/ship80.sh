@@ -43,7 +43,17 @@ if [ -n "$bad" ]; then
 fi
 
 EXP=$(sha256sum "$SRC" | cut -d' ' -f1)
-GOT=$($SSH "cd $DEST_DIR && cat $(echo $PARTS) > /var/tmp/$NAME && sha256sum /var/tmp/$NAME | cut -d' ' -f1 && rm -rf $DEST_DIR" </dev/null 2>/dev/null | tr -d '\r')
+# Сборка — с несколькими попытками и сбросом кэша перед подсчётом суммы:
+# на .80 сбоит ОЗУ, и собранный файл портится уже при записи/чтении через
+# страничный кэш, хотя все куски по отдельности целы (каждая попытка даёт
+# свою сумму — признак именно памяти, а не потери при передаче).
+GOT=""
+for attempt in 1 2 3 4 5 6; do
+  GOT=$($SSH "cd $DEST_DIR && cat $(echo $PARTS) > /var/tmp/$NAME && sync && echo 3 > /proc/sys/vm/drop_caches; sha256sum /var/tmp/$NAME | cut -d' ' -f1" </dev/null 2>/dev/null | tr -d '\r')
+  [ "$GOT" = "$EXP" ] && break
+  echo "attempt $attempt: собранный файл не совпал, пересобираю"
+done
+$SSH "rm -rf $DEST_DIR" </dev/null 2>/dev/null
 rm -rf "$W"
 if [ "$GOT" = "$EXP" ]; then
   echo "delivered /var/tmp/$NAME OK"
