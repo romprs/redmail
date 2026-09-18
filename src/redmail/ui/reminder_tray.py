@@ -75,6 +75,10 @@ class ReminderWindow(QDialog):
         end = reminder.dtend.astimezone()
 
         summary = QLabel(reminder.summary, self)
+        # Тема и место приходят из письма-приглашения, то есть их пишет кто
+        # угодно: QLabel сам распознаёт разметку, и тема с тегами
+        # отрисовалась бы как HTML. Показываем ровно тот текст, что есть.
+        summary.setTextFormat(Qt.TextFormat.PlainText)
         font = summary.font()
         font.setPointSize(font.pointSize() + 3)
         font.setBold(True)
@@ -83,6 +87,7 @@ class ReminderWindow(QDialog):
 
         when = QLabel(f"{start:%d.%m.%Y %H:%M} — {end:%H:%M}", self)
         place = QLabel(reminder.location, self)
+        place.setTextFormat(Qt.TextFormat.PlainText)
         place.setWordWrap(True)
         place.setVisible(bool(reminder.location))
 
@@ -168,7 +173,9 @@ class ReminderTray:
             return
         for event in events:
             start = event.dtstart.astimezone()
-            action = self._today_menu.addAction(f"{start:%H:%M}  {event.summary or '(без темы)'}")
+            # «&» в теме встречи QMenu считает подчёркиванием буквы — удваиваем.
+            title = (event.summary or "(без темы)").replace("&", "&&")
+            action = self._today_menu.addAction(f"{start:%H:%M}  {title}")
             action.triggered.connect(lambda _checked=False: voice_client.focus_mail_client(section="calendar"))
 
     def check_now(self) -> None:

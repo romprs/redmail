@@ -108,3 +108,33 @@ def test_today_events_only_current_day(tmp_path: Path) -> None:
     ))
 
     assert [e.summary for e in reminders.today_events(calendar, now)] == ["Сегодня"]
+
+
+def test_reminder_window_shows_subject_as_plain_text() -> None:
+    """Тему встречи пишет тот, кто прислал приглашение: показываем её
+    текстом, а не разметкой."""
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QLabel
+
+    from redmail.ui import reminder_tray
+
+    app = QApplication.instance() or QApplication([])
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    reminder = reminders.Reminder(
+        "u", "<b>Планёрка</b>", start, start + timedelta(hours=1), "<i>переговорная</i>", "window"
+    )
+    window = reminder_tray.ReminderWindow(reminder)
+    try:
+        labels = window.findChildren(QLabel)
+        assert labels[0].text() == "<b>Планёрка</b>"
+        assert labels[0].textFormat() == Qt.TextFormat.PlainText
+        assert all(
+            label.textFormat() == Qt.TextFormat.PlainText
+            for label in labels if label.text() in ("<b>Планёрка</b>", "<i>переговорная</i>")
+        )
+    finally:
+        window.close()
+    assert app is not None
