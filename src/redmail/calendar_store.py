@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
@@ -31,7 +31,12 @@ _FORMAT_VERSION = 3
 # (миграция ниже проставляет его им как DEFAULT), пользователю не нужно
 # ничего разбирать руками после обновления.
 DEFAULT_CALENDAR_ID = "default"
-_DEFAULT_CALENDAR_NAME = "Мои встречи"
+# Локальный календарь ни с чем не синхронизируется: это личные записи и
+# задачи, участникам они уходят только вручную («Переслать» — письмо с
+# приглашением). Встречи же живут в календаре с сервером, помеченном
+# основным (см. set_default_calendar).
+_DEFAULT_CALENDAR_NAME = "Задачи"
+_LEGACY_DEFAULT_CALENDAR_NAMES = ("Мои встречи",)
 _DEFAULT_CALENDAR_COLOR = "#3B6FB6"
 
 SOURCE_LOCAL = "local"
@@ -45,6 +50,14 @@ SOURCE_ICS = "ics"
 # по EWS (замечание: «календарь в exchange передаётся по ews, у нас это не
 # предусмотрено»). Адрес не нужен — берётся учётная запись Exchange.
 SOURCE_EWS = "ews"
+
+# Способы напоминания о встрече. Выбираются при создании встречи — общего
+# умолчания нет намеренно: у одной встречи уместно окно, у другой голос.
+REMIND_NONE = "none"
+REMIND_WINDOW = "window"
+REMIND_VOICE = "voice"
+REMIND_BOTH = "both"
+REMIND_MODES = (REMIND_NONE, REMIND_WINDOW, REMIND_VOICE, REMIND_BOTH)
 
 # Столбцы, добавленные после первого релиза — CREATE TABLE IF NOT EXISTS их
 # для уже существующих файлов не создаст, поэтому досоздаём миграцией.
@@ -62,6 +75,13 @@ _MIGRATIONS = (
     # Даты, исключённые из серии (EXDATE и изменённые экземпляры, которые
     # хранятся отдельными записями) — JSON-список ISO-времён в UTC.
     "ALTER TABLE events ADD COLUMN exdates TEXT NOT NULL DEFAULT '[]'",
+    # Основной календарь: в него по умолчанию попадают встречи, созданные
+    # в программе и голосовым помощником. Признак ровно у одного календаря.
+    "ALTER TABLE calendars ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0",
+    # Напоминание о встрече: за сколько минут и каким способом (см.
+    # REMIND_MODES). -1 в remind_minutes — напоминать не нужно.
+    "ALTER TABLE events ADD COLUMN remind_minutes INTEGER NOT NULL DEFAULT -1",
+    f"ALTER TABLE events ADD COLUMN remind_mode TEXT NOT NULL DEFAULT '{REMIND_NONE}'",
 )
 
 # Экземпляр повторяющейся встречи (изменённый или развёрнутый сервером)
@@ -147,7 +167,7 @@ CREATE TABLE IF NOT EXISTS calendars (
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
     "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-    "recurrence_rule, color, calendar_id, raw_ics, exdates"
+    "recurrence_rule, color, calendar_id, raw_ics, exdates, remind_minutes, remind_mode"
 )
 
 
@@ -181,6 +201,10 @@ class Event:
     attachments: list[Attachment] = field(default_factory=list)
     raw_ics: bytes | None = None
     exdates: list[datetime] = field(default_factory=list)  # исключённые из серии начала экземпляров (UTC)
+    # Напоминание: за сколько минут до начала предупредить и как именно.
+    # remind_minutes < 0 или remind_mode == REMIND_NONE — не напоминать.
+    remind_minutes: int = -1
+    remind_mode: str = REMIND_NONE
 
 
 @dataclass
@@ -197,6 +221,9 @@ class Calendar:
     # локальные вперемешку с внешними.
     source_type: str = SOURCE_LOCAL
     caldav_url: str = ""
+    # Основной календарь: сюда по умолчанию пишутся новые встречи, в том
+    # числе созданные голосом. Ровно один на профиль (см. set_default_calendar).
+    is_default: bool = False
 
 
 def new_uid() -> str:
@@ -273,6 +300,8 @@ def _row_to_event(conn: sqlite3.Connection, row) -> Event:
         attachments=_load_attachments(conn, row[1]),
         raw_ics=row[18],
         exdates=_load_exdates(row[19]),
+        remind_minutes=row[20],
+        remind_mode=row[21],
     )
 
 
@@ -383,8 +412,9 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
         conn.execute(
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-            "recurrence_rule, color, calendar_id, raw_ics, needs_push, exdates) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "recurrence_rule, color, calendar_id, raw_ics, needs_push, exdates, "
+            "remind_minutes, remind_mode) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
@@ -392,6 +422,7 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
             "is_organizer=excluded.is_organizer, status=excluded.status, my_participation=excluded.my_participation, "
             "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
             "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics, exdates=excluded.exdates, "
+            "remind_minutes=excluded.remind_minutes, remind_mode=excluded.remind_mode, "
             "needs_push=MAX(events.needs_push, excluded.needs_push)",
             (
                 event.uid,
@@ -414,6 +445,8 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
                 event.raw_ics,
                 int(needs_push),
                 json.dumps([moment.astimezone(timezone.utc).isoformat() for moment in event.exdates]),
+                int(event.remind_minutes),
+                event.remind_mode if event.remind_mode in REMIND_MODES else REMIND_NONE,
             ),
         )
         if needs_push:
@@ -606,7 +639,7 @@ def apply_reply(path: Path, uid: str, attendee_email: str, participation: str) -
 def _row_to_calendar(row) -> Calendar:
     return Calendar(
         id=row[0], name=row[1], color=row[2], visible=bool(row[3]), sort_order=row[4],
-        source_type=row[5], caldav_url=row[6],
+        source_type=row[5], caldav_url=row[6], is_default=bool(row[7]),
     )
 
 
@@ -617,10 +650,53 @@ def list_calendars(path: Path) -> list[Calendar]:
     create_calendar(path)
     with closing(_connect(path)) as conn:
         rows = conn.execute(
-            "SELECT id, name, color, visible, sort_order, source_type, caldav_url "
+            "SELECT id, name, color, visible, sort_order, source_type, caldav_url, is_default "
             "FROM calendars ORDER BY sort_order, name"
         ).fetchall()
         return [_row_to_calendar(row) for row in rows]
+
+
+def default_calendar_id(path: Path) -> str:
+    """Календарь, в который пишутся новые встречи — в том числе созданные
+    голосовым помощником. Это помеченный основным; если такого нет —
+    первый календарь с сервером (локальный держим для задач); если и его
+    нет — локальный."""
+    calendars = list_calendars(path)
+    for calendar in calendars:
+        if calendar.is_default:
+            return calendar.id
+    for calendar in calendars:
+        if calendar.source_type != SOURCE_LOCAL:
+            return calendar.id
+    return calendars[0].id if calendars else DEFAULT_CALENDAR_ID
+
+
+def set_default_calendar(path: Path, calendar_id: str) -> None:
+    """Делает календарь основным. Признак ровно у одного: снимаем со всех
+    остальных в той же записи."""
+    create_calendar(path)
+    with closing(_connect(path)) as conn:
+        conn.execute("UPDATE calendars SET is_default = 0")
+        conn.execute("UPDATE calendars SET is_default = 1 WHERE id = ?", (calendar_id,))
+        conn.commit()
+
+
+def due_reminders(path: Path, now: datetime, *, horizon_hours: int = 24) -> list[Event]:
+    """Встречи, о которых пора напомнить: время напоминания уже наступило,
+    а сама встреча ещё не началась... не закончилась. Разворачивает серии,
+    поэтому напоминания приходят и на повторяющиеся встречи."""
+    window_start = now - timedelta(hours=horizon_hours)
+    window_end = now + timedelta(hours=horizon_hours)
+    due: list[Event] = []
+    for event in list_events(path, window_start, window_end):
+        if event.status == "cancelled":
+            continue
+        if event.remind_mode == REMIND_NONE or event.remind_minutes < 0:
+            continue
+        moment = event.dtstart - timedelta(minutes=event.remind_minutes)
+        if moment <= now < event.dtend:
+            due.append(event)
+    return sorted(due, key=lambda item: item.dtstart)
 
 
 def create_user_calendar(

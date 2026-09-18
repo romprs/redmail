@@ -365,7 +365,7 @@ def test_create_user_calendar_round_trip(tmp_path: Path) -> None:
     created = calendar_store.create_user_calendar(path, "Работа", "#2E7D32")
     calendars = calendar_store.list_calendars(path)
     names = {c.name for c in calendars}
-    assert names == {"Мои встречи", "Работа"}
+    assert names == {"Задачи", "Работа"}  # локальный календарь — это личные записи и задачи
     assert created.color == "#2E7D32"
     assert created.visible is True
 
@@ -488,3 +488,62 @@ def test_existing_calendar_file_from_before_multi_calendar_migrates_cleanly(tmp_
     calendars = calendar_store.list_calendars(path)
     assert len(calendars) == 1
     assert calendars[0].id == calendar_store.DEFAULT_CALENDAR_ID
+
+
+def test_default_calendar_prefers_marked_then_server_then_local(tmp_path: Path) -> None:
+    """Основной календарь — тот, что помечен признаком: в него пишутся новые
+    встречи, в том числе созданные голосом. Пока ничего не помечено, это
+    первый календарь с сервером: локальный держим под задачи."""
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    assert calendar_store.default_calendar_id(path) == calendar_store.DEFAULT_CALENDAR_ID
+
+    work = calendar_store.create_user_calendar(
+        path, "Exchange", "#2E7D32", source_type=calendar_store.SOURCE_EWS
+    )
+    assert calendar_store.default_calendar_id(path) == work.id
+
+    calendar_store.set_default_calendar(path, calendar_store.DEFAULT_CALENDAR_ID)
+    assert calendar_store.default_calendar_id(path) == calendar_store.DEFAULT_CALENDAR_ID
+    marked = [c for c in calendar_store.list_calendars(path) if c.is_default]
+    assert len(marked) == 1  # признак ровно у одного
+
+
+def test_due_reminders_returns_event_only_inside_its_reminder_window(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.remind_minutes = 15
+    event.remind_mode = calendar_store.REMIND_WINDOW
+    calendar_store.save_event(path, event)
+
+    start = event.dtstart
+    assert calendar_store.due_reminders(path, start - timedelta(minutes=20)) == []
+    assert [e.uid for e in calendar_store.due_reminders(path, start - timedelta(minutes=10))] == [event.uid]
+    assert [e.uid for e in calendar_store.due_reminders(path, start + timedelta(minutes=30))] == [event.uid]
+    assert calendar_store.due_reminders(path, start + timedelta(hours=2)) == []
+
+
+def test_due_reminders_skips_events_without_reminder_and_cancelled(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    silent = _event(uid="silent@redmail")
+    calendar_store.save_event(path, silent)  # напоминание не выбрано при создании
+
+    cancelled = _event(uid="cancelled@redmail")
+    cancelled.remind_minutes = 15
+    cancelled.remind_mode = calendar_store.REMIND_VOICE
+    cancelled.status = "cancelled"
+    calendar_store.save_event(path, cancelled)
+
+    assert calendar_store.due_reminders(path, silent.dtstart - timedelta(minutes=5)) == []
+
+
+def test_reminder_choice_survives_save_and_load(tmp_path: Path) -> None:
+    path = tmp_path / "test.rmcal"
+    event = _event()
+    event.remind_minutes = 30
+    event.remind_mode = calendar_store.REMIND_BOTH
+    calendar_store.save_event(path, event)
+
+    loaded = calendar_store.get_event(path, event.uid)
+    assert loaded.remind_minutes == 30
+    assert loaded.remind_mode == calendar_store.REMIND_BOTH

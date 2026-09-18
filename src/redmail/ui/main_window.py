@@ -2093,6 +2093,14 @@ def _calendar_icon(kind: str, size: int = 16) -> QIcon:
         for frac, shorten in ((0.28, 0.0), (0.5, 0.0), (0.72, size * 0.25)):
             y = m + frac * r
             painter.drawLine(QPointF(m, y), QPointF(size - m - shorten, y))
+    elif kind == "bell":
+        path = QPainterPath()
+        path.moveTo(size * 0.22, size * 0.68)
+        path.cubicTo(size * 0.30, size * 0.60, size * 0.26, size * 0.18, cx, size * 0.16)
+        path.cubicTo(size * 0.74, size * 0.18, size * 0.70, size * 0.60, size * 0.78, size * 0.68)
+        path.closeSubpath()
+        painter.drawPath(path)
+        painter.drawArc(QRectF(cx - size * 0.12, size * 0.70, size * 0.24, size * 0.18), 180 * 16, 180 * 16)
     elif kind == "calendar":
         painter.drawRoundedRect(QRectF(m, size * 0.20, size - 2 * m, size - size * 0.20 - m), 2, 2)
         painter.drawLine(QPointF(size * 0.32, m), QPointF(size * 0.32, size * 0.28))
@@ -5111,6 +5119,25 @@ class ArchiveTargetDialog(QDialog):
         return bool(self.move_radio and self.move_radio.isChecked())
 
 
+# Напоминание о встрече: за сколько и каким способом. Выбор делается при
+# создании встречи — общего умолчания нет намеренно (решение пользователя:
+# «спрашивать при создании встречи»).
+_REMIND_MODE_OPTIONS: list[tuple[str, str]] = [
+    ("не напоминать", calendar_store.REMIND_NONE),
+    ("окном", calendar_store.REMIND_WINDOW),
+    ("голосом", calendar_store.REMIND_VOICE),
+    ("голосом и окном", calendar_store.REMIND_BOTH),
+]
+_REMIND_WHEN_OPTIONS: list[tuple[str, int]] = [
+    ("за 5 минут", 5),
+    ("за 10 минут", 10),
+    ("за 15 минут", 15),
+    ("за 30 минут", 30),
+    ("за час", 60),
+    ("за сутки", 1440),
+]
+
+
 _RECURRENCE_OPTIONS: list[tuple[str, str | None]] = [
     ("Не повторяется", None),
     ("Каждый день", "FREQ=DAILY"),
@@ -5667,6 +5694,22 @@ class EventDialog(QDialog):
             index = self.recurrence_combo.findData(event.recurrence_rule)
             self.recurrence_combo.setCurrentIndex(index if index >= 0 else 0)
 
+        # Напоминание выбирается у каждой встречи отдельно: у одной уместно
+        # окно, у другой — голос, о третьей напоминать не надо вовсе.
+        self.remind_when_combo = QComboBox(self)
+        for label, minutes in _REMIND_WHEN_OPTIONS:
+            self.remind_when_combo.addItem(label, minutes)
+        self.remind_mode_combo = QComboBox(self)
+        for label, mode in _REMIND_MODE_OPTIONS:
+            self.remind_mode_combo.addItem(label, mode)
+        self.remind_mode_combo.currentIndexChanged.connect(self._on_remind_mode_changed)
+        if event:
+            when_index = self.remind_when_combo.findData(event.remind_minutes)
+            self.remind_when_combo.setCurrentIndex(when_index if when_index >= 0 else 0)
+            mode_index = self.remind_mode_combo.findData(event.remind_mode)
+            self.remind_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self._on_remind_mode_changed()
+
         self.color_button = QPushButton(self)
         self.color_button.clicked.connect(self._open_color_menu)
         self._apply_color_button_style()
@@ -5725,6 +5768,13 @@ class EventDialog(QDialog):
         repeat_row.addWidget(self.recurrence_combo)
         repeat_row.addStretch(1)
 
+        remind_row = QHBoxLayout()
+        remind_row.addWidget(_icon_label("bell", self))
+        remind_row.addWidget(QLabel("Напомнить", self))
+        remind_row.addWidget(self.remind_mode_combo)
+        remind_row.addWidget(self.remind_when_combo)
+        remind_row.addStretch(1)
+
         clear_attendees_button = QPushButton("✕", self)
         clear_attendees_button.setToolTip("Убрать всех участников")
         clear_attendees_button.setFixedWidth(28)
@@ -5768,6 +5818,7 @@ class EventDialog(QDialog):
         layout.addWidget(self.summary_edit)
         layout.addLayout(time_row)
         layout.addLayout(repeat_row)
+        layout.addLayout(remind_row)
         layout.addLayout(calendar_row)
         layout.addLayout(attendees_row)
         attendees_list_row = QHBoxLayout()
@@ -5921,6 +5972,18 @@ class EventDialog(QDialog):
 
     def all_day(self) -> bool:
         return self.all_day_check.isChecked()
+
+    def _on_remind_mode_changed(self) -> None:
+        """«За сколько» имеет смысл только если напоминать вообще просили."""
+        self.remind_when_combo.setEnabled(self.remind_mode_combo.currentData() != calendar_store.REMIND_NONE)
+
+    def remind_mode(self) -> str:
+        return self.remind_mode_combo.currentData() or calendar_store.REMIND_NONE
+
+    def remind_minutes(self) -> int:
+        if self.remind_mode() == calendar_store.REMIND_NONE:
+            return -1
+        return int(self.remind_when_combo.currentData() or 15)
 
     def _on_all_day_toggled(self, checked: bool) -> None:
         # "Весь день" — время суток не имеет значения, только даты; прячем
@@ -11922,8 +11985,16 @@ class MainWindow(QMainWindow):
         self._calendars_by_row = calendars
         self.calendars_list.blockSignals(True)
         self.calendars_list.clear()
+        default_id = calendar_store.default_calendar_id(self.calendar_path) if calendars else ""
         for cal in calendars:
-            item = QListWidgetItem(_dot_icon(cal.color), cal.name)
+            # Основной календарь виден сразу: в него уходят новые встречи и
+            # то, что диктуется голосовому помощнику.
+            title = f"{cal.name} — основной" if cal.id == default_id else cal.name
+            item = QListWidgetItem(_dot_icon(cal.color), title)
+            if cal.id == default_id:
+                item_font = item.font()
+                item_font.setBold(True)
+                item.setFont(item_font)
             item.setData(Qt.ItemDataRole.UserRole, cal.id)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             item.setCheckState(Qt.CheckState.Checked if cal.visible else Qt.CheckState.Unchecked)
@@ -11977,6 +12048,15 @@ class MainWindow(QMainWindow):
         calendar_id = item.data(Qt.ItemDataRole.UserRole)
         calendar = next((cal for cal in self._calendars_by_row if cal.id == calendar_id), None)
         menu = QMenu(self)
+        default_action = menu.addAction("Сделать основным")
+        default_action.setToolTip(
+            "В основной календарь попадают новые встречи, в том числе созданные голосом"
+        )
+        try:
+            default_action.setEnabled(calendar_id != calendar_store.default_calendar_id(self.calendar_path))
+        except Exception:
+            pass
+        menu.addSeparator()
         rename_action = menu.addAction("Переименовать…")
         color_action = menu.addAction("Цвет…")
         connection_action = None
@@ -11988,7 +12068,15 @@ class MainWindow(QMainWindow):
             delete_action.setEnabled(False)
             delete_action.setToolTip("Нельзя удалить единственный оставшийся календарь")
         chosen = menu.exec(self.calendars_list.mapToGlobal(pos))
-        if chosen is rename_action:
+        if chosen is default_action:
+            try:
+                calendar_store.set_default_calendar(self.calendar_path, calendar_id)
+            except Exception as exc:
+                QMessageBox.warning(self, "Не удалось сохранить", str(exc))
+                return
+            self._refresh_calendars_list(select_id=calendar_id)
+            self.statusBar().showMessage("Основной календарь изменён", 5000)
+        elif chosen is rename_action:
             self._rename_calendar(calendar_id, item.text())
         elif chosen is color_action:
             self._recolor_calendar(calendar_id)
@@ -12120,8 +12208,15 @@ class MainWindow(QMainWindow):
             candidate_start = self._slot_to_datetime(self.calendar_selected_day, 9 * 60)
             if candidate_start > datetime.now().astimezone():
                 default_start = candidate_start
+        # Новая встреча ложится в основной календарь. Выбор в списке слева
+        # его перебивает: пользователь явно указал, куда писать.
         current_item = self.calendars_list.currentItem()
         default_calendar_id = current_item.data(Qt.ItemDataRole.UserRole) if current_item else None
+        if default_calendar_id is None:
+            try:
+                default_calendar_id = calendar_store.default_calendar_id(self.calendar_path)
+            except Exception:
+                default_calendar_id = None
         dialog = EventDialog(
             self,
             my_email=self.account.username,
@@ -12539,6 +12634,8 @@ class MainWindow(QMainWindow):
             calendar_id=dialog.calendar_id(),
             attendees=[calendar_store.Attendee(email=addr) for addr in attendee_emails],
             attachments=list(dialog.attachments),
+            remind_minutes=dialog.remind_minutes(),
+            remind_mode=dialog.remind_mode(),
         )
         calendar_store.save_event(self.calendar_path, event, needs_push=True)
         if self._is_exchange_calendar(event.calendar_id):
@@ -13397,9 +13494,17 @@ class MainWindow(QMainWindow):
         self._ipc_later(lambda: self._exec_compose(dialog))
 
     def _ipc_default_calendar_id(self) -> str:
+        """Куда голосовой помощник кладёт продиктованную встречу: в основной
+        календарь (локальный — это задачи, а не совещания). Календарь,
+        выбранный в списке слева, перебивает — пользователь указал явно."""
         item = self.calendars_list.currentItem()
         value = item.data(Qt.ItemDataRole.UserRole) if item else None
-        return value or calendar_store.DEFAULT_CALENDAR_ID
+        if value:
+            return value
+        try:
+            return calendar_store.default_calendar_id(self.calendar_path)
+        except Exception:
+            return calendar_store.DEFAULT_CALENDAR_ID
 
     def _ipc_event_dialog(self, event: calendar_store.Event, *, title: str) -> EventDialog:
         """EventDialog с уже заполненными полями.
