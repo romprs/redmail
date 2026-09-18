@@ -146,6 +146,13 @@ class CalDavCalendarInfo:
 
 _CALDAV_CALENDAR_TAG = "{urn:ietf:params:xml:ns:caldav}calendar"
 _CALDAV_HOME_SET_PROP = "{urn:ietf:params:xml:ns:caldav}calendar-home-set"
+# Делегирование по-календарьсерверному (Apple, Nextcloud, SOGo): принципал,
+# которому нас назначили доверенным лицом, отдаёт свой дом календарей. У VK
+# таких свойств может не быть — тогда список просто пуст, ошибки нет.
+_PROXY_PROPS = [
+    "{http://calendarserver.org/ns/}calendar-proxy-read-for",
+    "{http://calendarserver.org/ns/}calendar-proxy-write-for",
+]
 _CALENDAR_DISCOVERY_PROPS = [
     "{DAV:}resourcetype",
     "{DAV:}displayname",
@@ -230,6 +237,13 @@ def _parse_multistatus(tree) -> list[_PropfindResult]:
             status = _status_code(direct.text) if direct is not None else 200
         results.append(_PropfindResult(href=href, status=status, properties=properties))
     return results
+
+
+def _resourcetype_tags(result: "_PropfindResult") -> list[str]:
+    """Теги DAV:resourcetype ответа списком — свойство приходит и одним
+    значением, и списком, и вовсе отсутствует."""
+    resourcetype = result.properties.get("{DAV:}resourcetype") or []
+    return [str(t) for t in (resourcetype if isinstance(resourcetype, list) else [resourcetype])]
 
 
 def _href_path(href: str) -> str:
@@ -368,39 +382,114 @@ class CalDavSession:
         Evolution в такие коллекции спускается."""
         try:
             principal = self._client.principal()
+            principal_url = str(principal.url)
+            _log.info("CalDAV %s: принципал %s", self.account.url, principal_url)
             home_urls = self._calendar_home_urls(principal)
         except AuthorizationError as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}.{_auth_scheme_hint(self.account.url)}") from exc
         except Exception as exc:
             raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
 
-        my_principal_path = _href_path(str(principal.url))
+        my_principal_path = _href_path(principal_url)
         infos: list[CalDavCalendarInfo] = []
         seen: set[str] = set()
+        failure: CalDavSyncError | None = None
         for home_url in home_urls:
-            self._collect_calendars(home_url, my_principal_path, infos, seen, depth_left=2)
+            _log.info("CalDAV %s: обход дома календарей %s", self.account.url, home_url)
+            try:
+                self._collect_calendars(home_url, my_principal_path, infos, seen, depth_left=2)
+            except CalDavSyncError as exc:
+                # Домов несколько (свой, доверенных лиц, коллекция настроенного
+                # календаря): отказ одного не должен прятать календари из
+                # остальных — об ошибке скажем, только если не нашли ничего.
+                _log.warning("CalDAV %s: дом %s не обойден: %s", self.account.url, home_url, exc)
+                failure = failure or exc
+        if not infos:
+            # Сервер не показал ни одного календаря обходом домов (жалоба
+            # "при поиске календарей не находит, но синхронится"): сам
+            # настроенный адрес заведомо рабочий — проверяем его напрямую,
+            # чтобы список не оказался пустым там, где синхронизация идёт.
+            self._collect_configured_calendar(my_principal_path, infos, seen)
+            if not infos and failure is not None:
+                raise failure
         _log.info("CalDAV %s: домов календарей %d, найдено календарей %d (расшаренных %d)",
                   self.account.url, len(home_urls), len(infos), sum(1 for i in infos if i.is_shared))
+        for info in infos:
+            _log.info("CalDAV %s: календарь «%s» %s%s%s", self.account.url, info.name, info.url,
+                      f", владелец {info.owner}" if info.owner else "",
+                      " (расшаренный)" if info.is_shared else "")
         return infos
 
     def _calendar_home_urls(self, principal) -> list[str]:
-        """Все href из calendar-home-set принципала (не только первый)."""
+        """Свой дом календарей плюс дома принципалов, которые назначили нас
+        доверенным лицом (calendar-proxy), плюс коллекция, в которой лежит
+        НАСТРОЕННЫЙ календарь: у части серверов (VK) calendar-home-set у
+        принципала не совпадает с реальным путём календарей, и без этого
+        обход не находит ничего."""
         urls: list[str] = []
+        seen_paths: set[str] = set()
+
+        def remember(raw: str, source: str) -> None:
+            if not raw:
+                return
+            url = str(self._client.url.join(raw))
+            path = _href_path(url)
+            if path in seen_paths:
+                return
+            seen_paths.add(path)
+            urls.append(url)
+            _log.info("CalDAV %s: дом календарей %s (%s)", self.account.url, url, source)
+
+        for href in self._principal_hrefs(str(principal.url), _CALDAV_HOME_SET_PROP):
+            remember(href, "calendar-home-set")
+        for prop in _PROXY_PROPS:
+            for proxy_href in self._principal_hrefs(str(principal.url), prop):
+                proxy_url = str(self._client.url.join(proxy_href))
+                _log.info("CalDAV %s: доверенный принципал %s (%s)", self.account.url, proxy_url, prop.rsplit("}", 1)[-1])
+                for href in self._principal_hrefs(proxy_url, _CALDAV_HOME_SET_PROP):
+                    remember(href, f"доверенный {proxy_url}")
+        if not urls:
+            try:
+                remember(str(principal.calendar_home_set.url), "calendar_home_set библиотеки")
+            except Exception as exc:
+                _log.warning("CalDAV %s: дом календарей не определён: %s", self.account.url, exc)
+        parent = self.account.url.rstrip("/").rsplit("/", 1)[0] + "/"
+        remember(parent, "коллекция настроенного календаря")
+        return urls
+
+    def _principal_hrefs(self, principal_url: str, prop: str) -> list[str]:
+        """Значение ссылочного свойства принципала (дом календарей, списки
+        доверенных лиц). Отсутствие свойства — не ошибка: у каждого сервера
+        свой набор."""
+        hrefs: list[str] = []
+        try:
+            response = _with_connection_retry(self._client.propfind, principal_url, _propfind_body([prop]), 0)
+            for result in _parse_multistatus(response.tree):
+                value = result.properties.get(prop)
+                for href in value if isinstance(value, list) else [value]:
+                    if isinstance(href, str) and href:
+                        hrefs.append(href)
+        except Exception as exc:
+            _log.info("CalDAV %s: свойство %s у %s не получено: %s",
+                      self.account.url, prop.rsplit("}", 1)[-1], principal_url, exc)
+        return hrefs
+
+    def _collect_configured_calendar(
+        self, my_principal_path: str, infos: list[CalDavCalendarInfo], seen: set[str]
+    ) -> None:
+        """Настроенный адрес как календарь — на случай, когда обход домов
+        пуст, а синхронизация с этим адресом работает."""
         try:
             response = _with_connection_retry(
-                self._client.propfind, str(principal.url), _propfind_body([_CALDAV_HOME_SET_PROP]), 0
+                self._client.propfind, self.account.url, _propfind_body(_CALENDAR_DISCOVERY_PROPS), 0
             )
-            for result in _parse_multistatus(response.tree):
-                value = result.properties.get(_CALDAV_HOME_SET_PROP)
-                hrefs = value if isinstance(value, list) else [value]
-                for href in hrefs:
-                    if isinstance(href, str) and href:
-                        urls.append(str(self._client.url.join(href)))
-        except Exception:
-            pass  # ниже — обычный путь библиотеки, как раньше
-        if not urls:
-            urls.append(str(principal.calendar_home_set.url))
-        return urls
+        except Exception as exc:
+            _log.warning("CalDAV %s: настроенный календарь не опрошен: %s", self.account.url, exc)
+            return
+        for result in _parse_multistatus(response.tree):
+            info = self._calendar_info(result, my_principal_path, seen)
+            if info is not None:
+                infos.append(info)
 
     def _collect_calendars(
         self, url: str, my_principal_path: str, infos: list[CalDavCalendarInfo], seen: set[str], depth_left: int
@@ -414,13 +503,19 @@ class CalDavSession:
         except Exception as exc:
             if depth_left == 2:
                 raise CalDavSyncError(f"Не удалось получить список календарей: {exc}") from exc
+            _log.info("CalDAV %s: коллекция %s не отвечает: %s", self.account.url, url, exc)
             return  # вложенная коллекция не отвечает — не роняем весь список
         own_path = _href_path(url)
         for result in _parse_multistatus(response.tree):
+            tags = _resourcetype_tags(result)
+            # Что именно отдал сервер — в журнал: по жалобе "не находит, но
+            # синхронится" иначе не увидеть, какие коллекции пришли и почему
+            # не признаны календарями.
+            _log.info("CalDAV %s: ответ %s статус %s тип [%s]%s", self.account.url, result.href, result.status,
+                      ", ".join(t.rsplit("}", 1)[-1] for t in tags) or "—",
+                      f" «{result.properties.get('{DAV:}displayname')}»" if result.properties.get("{DAV:}displayname") else "")
             if result.status not in (200, 207):
                 continue
-            resourcetype = result.properties.get("{DAV:}resourcetype") or []
-            tags = [str(t) for t in (resourcetype if isinstance(resourcetype, list) else [resourcetype])]
             full_url = str(self._client.url.join(result.href))
             path = _href_path(full_url)
             if path == own_path:
@@ -428,25 +523,36 @@ class CalDavSession:
             # Точное имя тега, не подстрока "calendar": у расшаренных
             # коллекций в resourcetype бывает {http://calendarserver.org/ns/}shared
             # — "calendarserver" содержит "calendar", ложное срабатывание.
-            is_calendar = _CALDAV_CALENDAR_TAG in tags
-            is_collection = any(t.endswith("}collection") for t in tags)
-            if is_calendar:
-                if path in seen:
-                    continue
-                seen.add(path)
-                owner_raw = result.properties.get("{DAV:}owner")
-                if isinstance(owner_raw, list):
-                    owner_raw = owner_raw[0] if owner_raw else None
-                owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
-                infos.append(CalDavCalendarInfo(
-                    url=full_url,
-                    name=result.properties.get("{DAV:}displayname") or result.href,
-                    owner=owner,
-                    is_shared=owner is not None and _href_path(owner) != my_principal_path,
-                    read_only=not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set")),
-                ))
-            elif is_collection and depth_left > 1:
+            if _CALDAV_CALENDAR_TAG in tags:
+                info = self._calendar_info(result, my_principal_path, seen)
+                if info is not None:
+                    infos.append(info)
+            elif any(t.endswith("}collection") for t in tags) and depth_left > 1:
                 self._collect_calendars(full_url, my_principal_path, infos, seen, depth_left - 1)
+
+    def _calendar_info(
+        self, result: "_PropfindResult", my_principal_path: str, seen: set[str]
+    ) -> CalDavCalendarInfo | None:
+        """Описание календаря из ответа PROPFIND; None — если это не
+        календарь или он уже в списке."""
+        if result.status not in (200, 207) or _CALDAV_CALENDAR_TAG not in _resourcetype_tags(result):
+            return None
+        full_url = str(self._client.url.join(result.href))
+        path = _href_path(full_url)
+        if path in seen:
+            return None
+        seen.add(path)
+        owner_raw = result.properties.get("{DAV:}owner")
+        if isinstance(owner_raw, list):
+            owner_raw = owner_raw[0] if owner_raw else None
+        owner = owner_raw if isinstance(owner_raw, str) and owner_raw else None
+        return CalDavCalendarInfo(
+            url=full_url,
+            name=result.properties.get("{DAV:}displayname") or result.href,
+            owner=owner,
+            is_shared=owner is not None and _href_path(owner) != my_principal_path,
+            read_only=not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set")),
+        )
 
     def fetch_events(self, start: datetime, end: datetime, my_email: str) -> list[Event]:
         """События сервера в окне [start, end). Разбор VEVENT переиспользует

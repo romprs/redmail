@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
+from caldav.lib.url import URL
 
 from redmail import itip
 from redmail.caldav_sync import CalDavAccount, CalDavSession, CalDavSyncError, probe_auth_schemes
@@ -338,6 +339,82 @@ def test_list_calendars_detailed_marks_shared_calendar_and_privileges() -> None:
     assert shared.owner == "/principals/coworker@corp.ru/"
     assert shared.is_shared is True
     assert shared.read_only is True
+
+
+_EMPTY_HOME_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:"><d:response><d:href>/caldav/</d:href>
+<d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+_CONFIGURED_CALENDAR_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>/caldav/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+<d:displayname>Календарь</d:displayname></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+_PROXY_PRINCIPAL_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"><d:response>
+<d:href>/principals/ivan@corp.ru/</d:href><d:propstat><d:prop>
+<cs:calendar-proxy-read-for><d:href>/principals/boss@corp.ru/</d:href></cs:calendar-proxy-read-for>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+_BOSS_HOME_SET_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>/principals/boss@corp.ru/</d:href><d:propstat><d:prop>
+<c:calendar-home-set><d:href>/calendars/boss@corp.ru/</d:href></c:calendar-home-set>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+_BOSS_CALENDAR_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>/calendars/boss@corp.ru/personal/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+<d:displayname>Календарь директора</d:displayname>
+<d:owner><d:href>/principals/boss@corp.ru/</d:href></d:owner></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+
+def test_list_calendars_detailed_falls_back_to_configured_url_when_homes_are_empty() -> None:
+    """Жалоба: «при поиске календарей не находит, но синхронится». Настроенный
+    адрес заведомо рабочий — он и попадает в список."""
+    fake_client = MagicMock()
+    fake_client.url = URL("https://calendar.example.corp/")
+    fake_client.principal.return_value.url = "https://calendar.example.corp/principals/ivan@corp.ru/"
+    fake_client.principal.return_value.calendar_home_set.url = "https://calendar.example.corp/caldav/"
+    fake_client.propfind.side_effect = lambda url, body, depth: _propfind_response(
+        _CONFIGURED_CALENDAR_XML if depth == 0 and "principals" not in url else _EMPTY_HOME_XML
+    )
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        calendars = CalDavSession(_account()).list_calendars_detailed()
+
+    assert [c.name for c in calendars] == ["Календарь"]
+    assert calendars[0].url == "https://calendar.example.corp/caldav/"
+
+
+def test_list_calendars_detailed_walks_calendars_of_principal_who_delegated_us() -> None:
+    """Делегирование calendar-proxy: календарь того, кто назначил нас
+    доверенным лицом, открывается НАШЕЙ учётной записью — по подписке."""
+    def answer(url: str, body: str, depth: int):
+        if "principals/ivan" in url:
+            return _propfind_response(_PROXY_PRINCIPAL_XML if "proxy" in body else _EMPTY_HOME_XML)
+        if "principals/boss" in url:
+            return _propfind_response(_BOSS_HOME_SET_XML)
+        if "calendars/boss" in url:
+            return _propfind_response(_BOSS_CALENDAR_XML)
+        return _propfind_response(_EMPTY_HOME_XML)
+
+    fake_client = MagicMock()
+    fake_client.url = URL("https://calendar.example.corp/")
+    fake_client.principal.return_value.url = "https://calendar.example.corp/principals/ivan@corp.ru/"
+    fake_client.principal.return_value.calendar_home_set.url = "https://calendar.example.corp/caldav/"
+    fake_client.propfind.side_effect = answer
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=fake_client):
+        calendars = CalDavSession(_account()).list_calendars_detailed()
+
+    assert [c.name for c in calendars] == ["Календарь директора"]
+    assert calendars[0].is_shared is True and calendars[0].owner == "/principals/boss@corp.ru/"
 
 
 def _http_401(schemes: list[str]) -> urllib.error.HTTPError:

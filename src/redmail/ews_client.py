@@ -75,9 +75,18 @@ class EwsAccount:
     password: str = ""
     server: str = ""  # явный адрес EWS-сервера; пусто = автообнаружение (autodiscover)
     auth_type: str = "basic"  # "basic" | "ntlm" | "kerberos"
+    #: Ящики коллег, на папки которых мы подписаны. Открываются НАШЕЙ
+    #: учётной записью по правам, которые выдал владелец (доступ делегата) —
+    #: пароль владельца не нужен и не хранится.
+    shared_mailboxes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         self.server = normalize_ews_server(self.server)
+        # Из настроек список приходит обычным list — приводим к кортежу,
+        # чтобы учётная запись оставалась сравнимой и хешируемой.
+        self.shared_mailboxes = tuple(
+            address.strip() for address in self.shared_mailboxes if str(address).strip()
+        )
         if not self.username:
             # Для Kerberos/SSO логин не нужен для входа (билет и так
             # привязан к пользователю ОС), но username всё равно
@@ -94,6 +103,13 @@ class EwsAccount:
         # CachedMailbox._account_key) — реальный адрес сервера, если он не
         # указан явно, приложение узнаёт через autodiscover само.
         return self.server or self.email.rsplit("@", 1)[-1]
+
+
+def shared_folder_prefix(mailbox: str) -> str:
+    """Ветка дерева папок для ящика коллеги. Имя пути — обычная строка с
+    разделителем «/», поэтому подписанный ящик виден как отдельная ветка и
+    работает со всем остальным кодом (кэш, синхронизация) без исключений."""
+    return f"Ящик {mailbox}"
 
 
 #: Служебные папки Exchange, которые не показываем и не синхронизируем:
@@ -293,6 +309,15 @@ class EwsSession:
             walk(self._account.msg_folder_root, "")
         except Exception as exc:
             raise EwsConnectionError(str(exc)) from exc
+        for mailbox in self.account.shared_mailboxes:
+            # Ящик коллеги — отдельной веткой дерева. Отказ по одному ящику
+            # (права отозваны, ящик удалён) не должен лишать пользователя
+            # собственной почты, поэтому только в журнал.
+            prefix = shared_folder_prefix(mailbox)
+            try:
+                walk(self.mailbox_account(mailbox).msg_folder_root, prefix)
+            except Exception as exc:
+                _log.warning("EWS: папки ящика %s недоступны: %s", mailbox, exc)
         return result
 
     def create_folder(self, name: str) -> None:

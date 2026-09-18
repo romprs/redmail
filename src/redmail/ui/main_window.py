@@ -3790,6 +3790,14 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
         self.password_edit.setEchoMode(QLineEdit.EchoMode.Password)
         self.server_edit = QLineEdit()
         self.server_edit.setPlaceholderText("необязательно — по умолчанию автообнаружение по email")
+        # Подписка на ящики коллег: открываются ВАШЕЙ учётной записью по
+        # выданным ими правам, пароли владельцев не нужны.
+        self.shared_edit = QLineEdit()
+        self.shared_edit.setPlaceholderText("ivanov@corp.example, petrov@corp.example")
+        self.shared_edit.setToolTip(
+            "Почтовые ящики коллег, доступ к которым вам выдан. Открываются вашей учётной записью "
+            "по правам владельца — его пароль не нужен. Появятся в дереве папок отдельными ветками."
+        )
 
         form = QFormLayout()
         form.addRow("Email", self.email_edit)
@@ -3797,6 +3805,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
         form.addRow("Логин", self.username_edit)
         form.addRow("Пароль", self.password_edit)
         form.addRow("Сервер EWS", self.server_edit)
+        form.addRow("Ящики коллег", self.shared_edit)
 
         self.test_button = QPushButton("Проверить подключение")
         self.test_button.clicked.connect(self._on_test)
@@ -3816,6 +3825,7 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
             self.username_edit.setText(account.username if account.username != account.email else "")
             self.password_edit.setText(account.password)
             self.server_edit.setText(account.server)
+            self.shared_edit.setText(", ".join(account.shared_mailboxes))
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
@@ -3839,6 +3849,9 @@ class EwsAccountDialog(_AccountOptionsMixin, QDialog):
             password=self.password_edit.text(),
             server=self.server_edit.text().strip(),
             auth_type=self.auth_combo.currentData(),
+            shared_mailboxes=tuple(
+                part.strip() for part in self.shared_edit.text().replace(";", ",").split(",") if part.strip()
+            ),
         )
 
     def _on_test(self) -> None:

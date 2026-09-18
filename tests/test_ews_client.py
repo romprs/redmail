@@ -78,6 +78,34 @@ def test_list_folders_walks_tree_and_builds_paths() -> None:
     assert "Входящие/Проекты" in names
 
 
+def test_list_folders_adds_branch_for_subscribed_colleague_mailbox() -> None:
+    """Подписка на ящик коллеги: его папки — отдельная ветка дерева,
+    открытая НАШЕЙ учётной записью (пароль владельца не нужен)."""
+    my_root = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[_fake_folder("Входящие")]))
+    colleague = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[_fake_folder("Входящие")]))
+    with patch("redmail.ews_client.Configuration"), patch(
+        "redmail.ews_client.ExchangeAccount", side_effect=[my_root, colleague]
+    ) as account_cls:
+        session = EwsSession(_account(shared_mailboxes=("petrov@example.com",)))
+        names = [f.name for f in session.list_folders()]
+
+    assert names == ["Входящие", "Ящик petrov@example.com/Входящие"]
+    # Чужой ящик открыт правами делегата под нашей учётной записью.
+    assert account_cls.call_args.kwargs["primary_smtp_address"] == "petrov@example.com"
+    assert session._folder("Ящик petrov@example.com/Входящие") is colleague.msg_folder_root.children[0]
+
+
+def test_list_folders_keeps_own_mail_when_colleague_mailbox_is_unavailable() -> None:
+    my_root = SimpleNamespace(msg_folder_root=_fake_folder("root", children=[_fake_folder("Входящие")]))
+    with patch("redmail.ews_client.Configuration"), patch(
+        "redmail.ews_client.ExchangeAccount", side_effect=[my_root, PermissionError("доступ закрыт")]
+    ):
+        session = EwsSession(_account(shared_mailboxes=("petrov@example.com",)))
+        names = [f.name for f in session.list_folders()]
+
+    assert names == ["Входящие"]
+
+
 def test_folder_message_count_then_fetch_summaries() -> None:
     item = _fake_item(date=datetime(2026, 1, 15, 10, 30))
     inbox = _fake_folder("Входящие", total_count=1)
