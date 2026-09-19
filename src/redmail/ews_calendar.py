@@ -115,6 +115,14 @@ def item_to_event(item: CalendarItem, my_email: str) -> Event:
 
 EWS_VIEW_CHUNK = timedelta(days=14)
 
+#: Признаки того, что сервер просит снизить темп, а не что запрос плохой.
+_THROTTLE_MARKERS = ("back off", "ErrorServerBusy", "Max timeout reached", "server is busy", "too busy")
+
+
+def _is_throttled(exc: Exception) -> bool:
+    text = str(exc)
+    return any(marker.casefold() in text.casefold() for marker in _THROTTLE_MARKERS)
+
 
 def _account_for(session, mailbox: str = ""):
     """Свой ящик или ящик коллеги (подписка): открывается нашей учётной
@@ -148,6 +156,14 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str, mailbox
                 last_error = exc
                 _log.warning("EWS календарь: часть окна %s — %s не получена: %s", chunk_start.date(), chunk_end.date(), exc)
                 chunk_start = chunk_end
+                if _is_throttled(exc):
+                    # Сервер просит притормозить — остальные части окна
+                    # сейчас ответят тем же. Останавливаемся и оставляем то,
+                    # что уже получили: на журнале пользователя такой
+                    # «долбёж» давал два десятка отказов подряд и пустой
+                    # календарь.
+                    _log.warning("EWS календарь: сервер просит подождать — остальные части окна отложены")
+                    break
                 continue
             for item in items:
                 if not isinstance(item, CalendarItem):

@@ -3189,6 +3189,38 @@ class SettingsDialog(QDialog):
         accounts_rules_group = QGroupBox("Учётные записи и правила почты", self)
         accounts_rules_group.setLayout(accounts_rules_layout)
 
+        # Напоминания о ЧУЖИХ встречах: в приглашении с сервера способ
+        # выбирать некому (пожелание: «про чужие события — упоминать
+        # автоматом или включить настройку, например по автору»).
+        others_mode, others_minutes, others_authors = others_reminder
+        self.others_remind_mode_combo = QComboBox(self)
+        for label, value in _REMIND_MODE_OPTIONS:
+            self.others_remind_mode_combo.addItem(label, value)
+        mode_index = self.others_remind_mode_combo.findData(others_mode)
+        self.others_remind_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
+        self.others_remind_when_combo = QComboBox(self)
+        for label, value in _REMIND_WHEN_OPTIONS:
+            self.others_remind_when_combo.addItem(label, value)
+        when_index = self.others_remind_when_combo.findData(int(others_minutes))
+        self.others_remind_when_combo.setCurrentIndex(when_index if when_index >= 0 else 2)
+        self.others_remind_authors_edit = QLineEdit(", ".join(others_authors), self)
+        self.others_remind_authors_edit.setPlaceholderText("пусто — обо всех; иначе: Орлов, petrov@corp.ru")
+        others_row = QHBoxLayout()
+        others_row.addWidget(self.others_remind_mode_combo)
+        others_row.addWidget(self.others_remind_when_combo)
+        others_row.addStretch(1)
+        others_form = QFormLayout()
+        others_form.addRow("Напоминать", others_row)
+        others_form.addRow("Только от авторов", self.others_remind_authors_edit)
+        others_hint = QLabel(
+            "О своих встречах напоминание выбирается в самом окне встречи. Здесь — про чужие: "
+            "приглашения коллег и встречи из их календарей. В напоминании называется автор.", self,
+        )
+        others_hint.setWordWrap(True)
+        others_form.addRow(others_hint)
+        others_group = QGroupBox("Напоминания о чужих встречах", self)
+        others_group.setLayout(others_form)
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
@@ -3240,38 +3272,6 @@ class SettingsDialog(QDialog):
         maintenance_row.addWidget(QLabel("до", self))
         maintenance_row.addWidget(self.maintenance_end_edit)
         maintenance_row.addStretch(1)
-        # Напоминания о ЧУЖИХ встречах: в приглашении с сервера способ
-        # выбирать некому (пожелание: «про чужие события — упоминать
-        # автоматом или включить настройку, например по автору»).
-        others_mode, others_minutes, others_authors = others_reminder
-        self.others_remind_mode_combo = QComboBox(self)
-        for label, value in _REMIND_MODE_OPTIONS:
-            self.others_remind_mode_combo.addItem(label, value)
-        mode_index = self.others_remind_mode_combo.findData(others_mode)
-        self.others_remind_mode_combo.setCurrentIndex(mode_index if mode_index >= 0 else 0)
-        self.others_remind_when_combo = QComboBox(self)
-        for label, value in _REMIND_WHEN_OPTIONS:
-            self.others_remind_when_combo.addItem(label, value)
-        when_index = self.others_remind_when_combo.findData(int(others_minutes))
-        self.others_remind_when_combo.setCurrentIndex(when_index if when_index >= 0 else 2)
-        self.others_remind_authors_edit = QLineEdit(", ".join(others_authors), self)
-        self.others_remind_authors_edit.setPlaceholderText("пусто — обо всех; иначе: Орлов, petrov@corp.ru")
-        others_row = QHBoxLayout()
-        others_row.addWidget(self.others_remind_mode_combo)
-        others_row.addWidget(self.others_remind_when_combo)
-        others_row.addStretch(1)
-        others_form = QFormLayout()
-        others_form.addRow("Напоминать", others_row)
-        others_form.addRow("Только от авторов", self.others_remind_authors_edit)
-        others_hint = QLabel(
-            "О своих встречах напоминание выбирается в самом окне встречи. Здесь — про чужие: "
-            "приглашения коллег и встречи из их календарей. В напоминании называется автор.", self,
-        )
-        others_hint.setWordWrap(True)
-        others_form.addRow(others_hint)
-        others_group = QGroupBox("Напоминания о чужих встречах", self)
-        others_group.setLayout(others_form)
-
         stats = storage_stats or {}
         stats_text = (
             f"База почты: {stats.get('db_bytes', 0) / (1024 * 1024):.1f} МБ, писем {stats.get('messages', 0)}, "

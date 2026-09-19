@@ -112,6 +112,35 @@ def test_fetch_events_skips_broken_items_and_uses_window() -> None:
     assert calls["window"][0].year == 2026
 
 
+def test_fetch_events_stops_asking_when_server_asks_to_wait() -> None:
+    """Сервер просит притормозить — остальные части окна сейчас ответят тем
+    же. На журнале пользователя такой перебор давал два десятка отказов
+    подряд и пустой календарь; берём то, что уже получили."""
+    start = datetime(2026, 9, 15, tzinfo=timezone.utc)
+    good = FakeItem(uid="ok", start=start, end=start + timedelta(hours=1), organizer=FakeMailbox("a@x.ru"))
+    windows: list[tuple] = []
+
+    class ThrottlingCalendar:
+        def view(self, start, end):
+            windows.append((start, end))
+            if len(windows) == 1:
+                return [good]
+            raise RuntimeError("Max timeout reached (gave up when asked to back off 80.000 seconds)")
+
+    events = ews_calendar.fetch_events(
+        SimpleNamespace(calendar=ThrottlingCalendar()), start, start + timedelta(days=200), "me@x.ru"
+    )
+    assert [e.uid for e in events] == ["ok"]
+    assert len(windows) == 2  # первая часть получена, на второй остановились
+
+
+def test_throttling_is_told_apart_from_real_errors() -> None:
+    assert ews_calendar._is_throttled(RuntimeError("ErrorServerBusy: server too busy"))
+    assert ews_calendar._is_throttled(RuntimeError("Max timeout reached (gave up when asked to back off 80s)"))
+    assert not ews_calendar._is_throttled(RuntimeError("The request timed out."))
+    assert not ews_calendar._is_throttled(RuntimeError("EWS недоступен"))
+
+
 def test_fetch_events_wraps_server_error() -> None:
     class FailingCalendar:
         def view(self, start, end):
