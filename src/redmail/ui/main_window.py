@@ -151,7 +151,6 @@ from redmail.config_store import (
     load_auto_archive_enabled,
     load_maintenance_window,
     load_others_reminder,
-    load_shared_calendars_scan_at,
     load_disabled_accounts,
     load_domain_rewrites,
     load_tls_ca_file,
@@ -203,7 +202,6 @@ from redmail.config_store import (
     save_auto_archive_enabled,
     save_maintenance_window,
     save_others_reminder,
-    save_shared_calendars_scan_at,
     save_disabled_accounts,
     save_domain_rewrites_by_account,
     save_tls_ca_file,
@@ -12038,75 +12036,6 @@ class MainWindow(QMainWindow):
         переноса или удаления встречи, чтобы изменение сразу ушло на сервер."""
         QTimer.singleShot(delay_ms, lambda: self.on_caldav_sync(silent=True))
 
-    #: Как часто пробегать по пользователям сервера в поисках открытых нам
-    #: календарей. Чаще незачем: доступ выдают редко, а перебор не бесплатный.
-    SHARED_SCAN_INTERVAL = timedelta(hours=6)
-
-    #: Сколько чужих календарей подключаем за один проход — предохранитель на
-    #: случай сервера, где всем видно всё.
-    MAX_AUTO_SHARED_CALENDARS = 20
-
-    def _shared_scan_plan(self, plans):
-        """(как открыть сессию CalDAV, логины из адресной книги) — или None,
-        если искать сейчас не нужно (нет CalDAV-календарей, или последний
-        поиск был недавно)."""
-        caldav_plans = [
-            (cal, open_server) for cal, open_server, _ro in plans
-            if cal.source_type == calendar_store.SOURCE_CALDAV
-        ]
-        if not caldav_plans:
-            return None
-        try:
-            last = load_shared_calendars_scan_at()
-        except Exception:
-            last = 0.0
-        now = datetime.now(timezone.utc).timestamp()
-        if now - last < self.SHARED_SCAN_INTERVAL.total_seconds():
-            return None
-        _cal, open_server = caldav_plans[0]
-        logins = []
-        try:
-            for contact in self._load_contacts():
-                for email in contact.emails[:1]:
-                    if "@" in email:
-                        logins.append(email)
-        except Exception:
-            logins = []
-
-        def open_session():
-            _server, session = open_server()
-            return session
-
-        return open_session, logins[:200]
-
-    def _add_found_shared_calendars(self, found: list) -> int:
-        """Подключить найденные чужие календари как свои источники."""
-        if not found:
-            return 0
-        used_colors = {cal.color for cal in self._calendars_by_row}
-        added = 0
-        for info in found[: self.MAX_AUTO_SHARED_CALENDARS]:
-            owner = (info.owner or "").rstrip("/").rsplit("/", 1)[-1]
-            name = f"{info.name} ({owner})" if owner else info.name
-            color = next(
-                (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used_colors),
-                _EVENT_COLOR_PALETTE[0][1],
-            )
-            used_colors.add(color)
-            try:
-                calendar_store.create_user_calendar(
-                    self.calendar_path, name, color,
-                    source_type=calendar_store.SOURCE_CALDAV, caldav_url=info.url,
-                )
-            except Exception as exc:
-                _log.warning("Календари: чужой календарь «%s» не подключён: %s", name, exc)
-                continue
-            _log.info("Календари: подключён открытый нам календарь «%s» %s", name, info.url)
-            added += 1
-        if added:
-            self._refresh_calendars_list()
-        return added
-
     def on_caldav_sync(self, *, silent: bool = False) -> None:
         """Синхронизация всех календарей с серверами — CalDAV (VK и др.),
         Exchange и подписок по ссылке — в фоне (сетевые запросы раньше
@@ -12180,28 +12109,8 @@ class MainWindow(QMainWindow):
         calendar_path = self.calendar_path
         window_start = datetime.now(timezone.utc) - timedelta(days=30)
         window_end = datetime.now(timezone.utc) + timedelta(days=180)
-        # Заодно с синхронизацией — поиск чужих календарей, открытых нам
-        # (пожелание: «не кнопкой — синхронизируешь календарь, пробегись»).
-        # Не на каждой синхронизации: это перебор пользователей сервера.
-        scan_plan = self._shared_scan_plan(plans)
-        known_urls = {cal.caldav_url.rstrip("/") for cal in calendars if cal.caldav_url}
 
-        def do_sync() -> tuple[list, list]:
-            found: list = []
-            if scan_plan is not None:
-                open_session, logins = scan_plan
-                session = None
-                try:
-                    session = open_session()
-                    found = [
-                        info for info in session.scan_shared_calendars(extra_logins=logins)
-                        if info.url.rstrip("/") not in known_urls
-                    ]
-                except Exception as exc:
-                    _log.info("Календари: поиск открытых чужих календарей не удался: %s", exc)
-                finally:
-                    if session is not None:
-                        session.close()
+        def do_sync() -> list:
             reports = []
             for cal, open_server, read_only in plans:
                 try:
@@ -12218,7 +12127,7 @@ class MainWindow(QMainWindow):
                 finally:
                     if closable is not None:
                         closable.close()
-            return reports, found
+            return reports
 
         self._calendar_sync_running = True
         if not silent:
@@ -12232,23 +12141,12 @@ class MainWindow(QMainWindow):
 
         def on_success(result: object) -> None:
             finish()
-            reports, found = result if isinstance(result, tuple) else (result or [], [])
-            if scan_plan is not None:
-                # Отмечаем сам факт обхода, даже если ничего не нашлось —
-                # иначе перебор пользователей повторялся бы каждую
-                # синхронизацию.
-                try:
-                    save_shared_calendars_scan_at(datetime.now(timezone.utc).timestamp())
-                except Exception as exc:
-                    _log.info("Календари: время поиска не сохранено: %s", exc)
-            added = self._add_found_shared_calendars(list(found))
+            reports = list(result or [])
             self.refresh_calendar_view()
             pushed = sum(r.pushed for r in reports)
             pulled = sum(r.pulled for r in reports)
             errors = problems + [f"«{r.name}»: {error}" for r in reports for error in r.errors]
             summary = f"Календари: отправлено {pushed}, получено {pulled}"
-            if added:
-                summary += f", подключено чужих календарей {added}"
             if errors:
                 summary += f", ошибок {len(errors)}"
             self.statusBar().showMessage(summary, 7000)

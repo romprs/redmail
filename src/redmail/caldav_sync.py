@@ -147,12 +147,6 @@ class CalDavCalendarInfo:
 _CALDAV_CALENDAR_TAG = "{urn:ietf:params:xml:ns:caldav}calendar"
 _CALDAV_HOME_SET_PROP = "{urn:ietf:params:xml:ns:caldav}calendar-home-set"
 _CURRENT_USER_PRINCIPAL_PROP = "{DAV:}current-user-principal"
-_PRINCIPAL_COLLECTION_SET_PROP = "{DAV:}principal-collection-set"
-
-#: Сколько пользователей сервера обходим при поиске «что мне открыли».
-#: Больше — это уже перебор по всей организации: и долго, и сервер вправе
-#: счесть это перебором.
-MAX_SCANNED_PRINCIPALS = 300
 # Делегирование по-календарьсерверному (Apple, Nextcloud, SOGo): принципал,
 # которому нас назначили доверенным лицом, отдаёт свой дом календарей. У VK
 # таких свойств может не быть — тогда список просто пуст, ошибки нет.
@@ -526,100 +520,6 @@ class CalDavSession:
             _log.info("CalDAV %s: календарь коллеги «%s» %s%s", self.account.url, info.name, info.url,
                       " (только чтение)" if info.read_only else "")
         return infos
-
-    def list_principals(self, limit: int = MAX_SCANNED_PRINCIPALS) -> list[str]:
-        """Пользователи сервера — из каталога принципалов. Пусто, если
-        сервер не даёт его перечислить (многие закрывают это намеренно)."""
-        my_principal = self._current_user_principal() or self.account.url
-        collections = [
-            str(self._client.url.join(href))
-            for href in self._principal_hrefs(my_principal, _PRINCIPAL_COLLECTION_SET_PROP)
-            if same_server(self.account.url, href)
-        ]
-        if not collections:
-            # Каталог не назван — берём родителя своего принципала:
-            # /principals/<домен>/<я>/ → /principals/<домен>/
-            parent = my_principal.rstrip("/").rsplit("/", 1)[0] + "/"
-            collections = [parent]
-        found: list[str] = []
-        seen: set[str] = set()
-        for collection in collections:
-            _log.info("CalDAV %s: перечисляю пользователей в %s", self.account.url, collection)
-            try:
-                response = _with_connection_retry(
-                    self._client.propfind, collection, _propfind_body(["{DAV:}resourcetype"]), 1
-                )
-            except Exception as exc:
-                _log.info("CalDAV %s: каталог пользователей %s не перечислен: %s", self.account.url, collection, exc)
-                continue
-            own_path = _href_path(collection)
-            for result in _parse_multistatus(response.tree):
-                if not same_server(self.account.url, result.href):
-                    continue
-                url = str(self._client.url.join(result.href))
-                path = _href_path(url)
-                if path == own_path or path in seen:
-                    continue
-                seen.add(path)
-                found.append(url if url.endswith("/") else url + "/")
-                if len(found) >= limit:
-                    _log.info("CalDAV %s: пользователей больше %d — обход ограничен", self.account.url, limit)
-                    return found
-        return found
-
-    def scan_shared_calendars(
-        self, *, extra_logins=(), limit: int = MAX_SCANNED_PRINCIPALS, progress=None, stop=None
-    ) -> list[CalDavCalendarInfo]:
-        """Пробежать по пользователям сервера и собрать календари, которые
-        ОТКРЫТЫ нам. Вопрос пользователя: «а нельзя сразу все календари
-        пробежать и доступные подтянуть?» — можно, но только перебором:
-        у VK нет ни одного свойства, где сервер перечислил бы, что тебе
-        расшарили (в своём доме календарей их нет, см. журнал).
-
-        extra_logins — логины из адресной книги: если сервер не даёт
-        перечислить пользователей, обходим хотя бы известных коллег.
-        progress(сделано, всего, имя) — для окна хода; stop() — отмена."""
-        my_principal_path = _href_path(self._current_user_principal() or self.account.url)
-        targets: list[str] = []
-        seen_paths: set[str] = set()
-
-        def add(url: str) -> None:
-            path = _href_path(url)
-            if path and path != my_principal_path and path not in seen_paths:
-                seen_paths.add(path)
-                targets.append(url)
-
-        for principal_url in self.list_principals(limit):
-            add(principal_url)
-        for login in extra_logins:
-            for home in colleague_home_urls(self.account.url, str(login).split("@", 1)[0]):
-                add(home)
-        if not targets:
-            raise CalDavSyncError(
-                "Сервер не даёт перечислить пользователей, а адресная книга пуста — "
-                "укажите логин коллеги вручную."
-            )
-
-        infos: list[CalDavCalendarInfo] = []
-        seen: set[str] = set()
-        total = len(targets)
-        _log.info("CalDAV %s: обход %d пользователей в поисках открытых календарей", self.account.url, total)
-        for number, target in enumerate(targets, start=1):
-            if stop is not None and stop():
-                _log.info("CalDAV %s: обход прерван пользователем", self.account.url)
-                break
-            name = target.rstrip("/").rsplit("/", 1)[-1]
-            if progress is not None:
-                progress(number, total, name)
-            for home in (target if target.rstrip("/").endswith("calendars") else target.rstrip("/") + "/calendars/",):
-                try:
-                    self._collect_calendars(home, my_principal_path, infos, seen, depth_left=1)
-                except Exception as exc:
-                    # Нет прав или нет такого дома — обычное дело при обходе.
-                    _log.debug("CalDAV %s: %s пропущен: %s", self.account.url, home, exc)
-        shared = [info for info in infos if info.is_shared]
-        _log.info("CalDAV %s: открытых чужих календарей найдено %d", self.account.url, len(shared))
-        return shared
 
     def _calendar_home_urls(self, principal) -> list[str]:
         """Свой дом календарей плюс дома принципалов, которые назначили нас

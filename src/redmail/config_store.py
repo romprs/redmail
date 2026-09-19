@@ -199,23 +199,6 @@ def save_auto_archive_enabled(enabled: bool) -> None:
     _save_settings_dict(data)
 
 
-def load_shared_calendars_scan_at() -> float:
-    """Когда последний раз искали открытые нам чужие календари (unix-время).
-
-    Поиск — это перебор пользователей сервера, поэтому он идёт не на каждой
-    синхронизации, а изредка (см. SHARED_SCAN_INTERVAL в окне программы)."""
-    try:
-        return float(_load_settings_dict().get("shared_calendars_scan_at", 0) or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def save_shared_calendars_scan_at(moment: float) -> None:
-    data = _load_settings_dict()
-    data["shared_calendars_scan_at"] = float(moment)
-    _save_settings_dict(data)
-
-
 def load_others_reminder() -> tuple[str, int, tuple[str, ...]]:
     """Напоминания о ЧУЖИХ встречах: (способ, за сколько минут, авторы).
 
