@@ -5374,6 +5374,10 @@ class _CalendarPickerDialog(QDialog):
         self.resize(440, 320)
 
         self.list_widget = QListWidget(self)
+        # У VK оба своих календаря называются «Основной» — различить их в
+        # списке можно только по адресу (жалоба: «поиск дал 2 календаря
+        # моих»). Одинаковые имена дополняем хвостом адреса.
+        names = [info.name for info in calendars]
         for info in calendars:
             if info.is_shared:
                 suffix = f" — общий, от {info.owner or 'неизвестно'}"
@@ -5381,7 +5385,10 @@ class _CalendarPickerDialog(QDialog):
                     suffix += ", только чтение"
             else:
                 suffix = " — только чтение" if info.read_only else ""
+            if names.count(info.name) > 1:
+                suffix += f" [{info.url.rstrip('/').rsplit('/', 1)[-1][:12]}]"
             item = QListWidgetItem(f"{info.name}{suffix}")
+            item.setToolTip(info.url)
             item.setData(Qt.ItemDataRole.UserRole, info)
             self.list_widget.addItem(item)
         if self.list_widget.count():
@@ -5598,11 +5605,22 @@ class AddCalendarDialog(QDialog):
         self.caldav_test_status = QLabel("", self)
         self.caldav_test_status.setWordWrap(True)
 
+        # У VK расшаренный коллегой календарь в наш дом календарей НЕ
+        # попадает (видно в журнале поиска: там только свои) — он остаётся
+        # под принципалом владельца. Поэтому отдельная кнопка: назвать
+        # коллегу и посмотреть, что он нам открыл.
+        self.caldav_colleague_edit = QLineEdit(self)
+        self.caldav_colleague_edit.setPlaceholderText("логин или почта коллеги, например ivanov")
+        self.caldav_colleague_button = QPushButton("Найти календари коллеги…", self)
+        self.caldav_colleague_button.clicked.connect(self._on_discover_colleague_calendars)
+
         self.caldav_group = QGroupBox("Подключение CalDAV", self)
         caldav_form = QFormLayout()
         caldav_form.addRow("Адрес сервера", self.caldav_url_edit)
         caldav_form.addRow(caldav_hint_label)
         caldav_form.addRow(self.caldav_discover_button)
+        caldav_form.addRow("Календарь коллеги", self.caldav_colleague_edit)
+        caldav_form.addRow(self.caldav_colleague_button)
         caldav_form.addRow(self.caldav_test_button)
         caldav_form.addRow(self.caldav_test_status)
         self.caldav_group.setLayout(caldav_form)
@@ -5738,6 +5756,57 @@ class AddCalendarDialog(QDialog):
 
         def on_failure(error_text: str) -> None:
             self.caldav_discover_button.setEnabled(True)
+            self.caldav_test_status.setText(f"Ошибка поиска: {error_text}")
+            self._test_workers.remove(worker)
+
+        worker.succeeded.connect(on_success)
+        worker.failed.connect(on_failure)
+        self._test_workers.append(worker)
+        worker.start()
+
+    def _on_discover_colleague_calendars(self) -> None:
+        """Календари коллеги: открываются НАШЕЙ учётной записью по правам,
+        которые он выдал — его пароль не нужен."""
+        url = self.caldav_url_edit.text().strip()
+        who = self.caldav_colleague_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Укажите адрес", "Сначала укажите адрес своего календаря CalDAV.")
+            return
+        if not who:
+            QMessageBox.warning(self, "Укажите коллегу", "Введите логин или почтовый адрес коллеги.")
+            return
+        account = _caldav_account_for(self, url)
+        self.caldav_colleague_button.setEnabled(False)
+        self.caldav_test_status.setText(f"Ищу календари коллеги {who}…")
+
+        def discover() -> list[caldav_sync.CalDavCalendarInfo]:
+            session = caldav_sync.CalDavSession(account)
+            try:
+                return session.list_colleague_calendars(who)
+            finally:
+                session.close()
+
+        worker = _CallableWorker(discover, parent=self)
+
+        def on_success(calendars: object) -> None:
+            self.caldav_colleague_button.setEnabled(True)
+            self._test_workers.remove(worker)
+            if not calendars:
+                self.caldav_test_status.setText(
+                    f"У коллеги {who} не нашлось календарей, открытых вам. Он должен выдать доступ в своём календаре."
+                )
+                return
+            picker = _CalendarPickerDialog(self, calendars)
+            if picker.exec() == QDialog.DialogCode.Accepted:
+                chosen = picker.selected()
+                if chosen is not None:
+                    self.caldav_url_edit.setText(chosen.url)
+                    if not self.name_edit.text().strip():
+                        self.name_edit.setText(f"{chosen.name} ({who})")
+                    self.caldav_test_status.setText(f"Выбран календарь коллеги: {chosen.name}")
+
+        def on_failure(error_text: str) -> None:
+            self.caldav_colleague_button.setEnabled(True)
             self.caldav_test_status.setText(f"Ошибка поиска: {error_text}")
             self._test_workers.remove(worker)
 

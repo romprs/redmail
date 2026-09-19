@@ -499,3 +499,83 @@ def test_discovery_skips_calendar_on_another_host() -> None:
         calendars = CalDavSession(_account()).list_calendars_detailed()
 
     assert calendars == []
+
+
+_CURRENT_PRINCIPAL_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:"><d:response><d:href>/principals/corp.ru/ivan/calendars/997fb/</d:href>
+<d:propstat><d:prop><d:current-user-principal><d:href>/principals/corp.ru/ivan/</d:href></d:current-user-principal>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+_MY_HOME_XML = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>/principals/corp.ru/ivan/calendars/997fb/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype><d:displayname>Основной</d:displayname>
+<d:owner><d:href>/principals/corp.ru/ivan/</d:href></d:owner></d:prop>
+<d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+
+def _vk_like_client(answer):
+    fake_client = MagicMock()
+    fake_client.url = URL("https://calendar.corp.ru/")
+    # Библиотека не смогла определить принципал и подставила базовый адрес —
+    # ровно как у VK в журнале пользователя.
+    fake_client.principal.return_value.url = "https://calendar.corp.ru/principals/corp.ru/ivan/calendars/997fb/"
+    fake_client.principal.return_value.calendar_home_set.url = "https://calendar.corp.ru/principals/corp.ru/ivan/calendars/"
+    fake_client.propfind.side_effect = answer
+    return fake_client
+
+
+def _vk_account() -> CalDavAccount:
+    return CalDavAccount(
+        url="https://calendar.corp.ru/principals/corp.ru/ivan/calendars/997fb/", username="ivan", password="secret"
+    )
+
+
+def test_own_calendars_are_not_marked_as_shared() -> None:
+    """Жалоба: «поиск дал 2 календаря моих», и оба показывались общими.
+    Библиотека выдаёт за принципал сам адрес календаря — спрашиваем
+    принципал у сервера сами."""
+    def answer(url, body, depth):
+        if "current-user-principal" in body:
+            return _propfind_response(_CURRENT_PRINCIPAL_XML)
+        return _propfind_response(_MY_HOME_XML)
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=_vk_like_client(answer)):
+        calendars = CalDavSession(_vk_account()).list_calendars_detailed()
+
+    assert [c.name for c in calendars] == ["Основной"]
+    assert calendars[0].is_shared is False
+
+
+def test_colleague_home_urls_replace_login_in_path() -> None:
+    from redmail.caldav_sync import colleague_home_urls
+
+    urls = colleague_home_urls("https://calendar.corp.ru/principals/corp.ru/ivan/calendars/997fb/", "petrov")
+    assert urls[0] == "https://calendar.corp.ru/principals/corp.ru/petrov/calendars/"
+    assert colleague_home_urls("https://calendar.corp.ru/dav/ivan/", "petrov") == []
+
+
+def test_colleague_calendars_are_found_under_his_principal() -> None:
+    """У VK расшаренный календарь остаётся под принципалом владельца — в
+    наш дом он не попадает, поэтому ищем по логину коллеги."""
+    colleague_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav"><d:response>
+<d:href>/principals/corp.ru/petrov/calendars/aaa/</d:href><d:propstat><d:prop>
+<d:resourcetype><d:collection/><c:calendar/></d:resourcetype><d:displayname>Основной</d:displayname>
+<d:owner><d:href>/principals/corp.ru/petrov/</d:href></d:owner>
+<d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>
+</d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response></d:multistatus>'''
+
+    def answer(url, body, depth):
+        if "current-user-principal" in body:
+            return _propfind_response(_CURRENT_PRINCIPAL_XML)
+        if "petrov" in url:
+            return _propfind_response(colleague_xml)
+        return _propfind_response(_MY_HOME_XML)
+
+    with patch("redmail.caldav_sync.caldav.DAVClient", return_value=_vk_like_client(answer)):
+        calendars = CalDavSession(_vk_account()).list_colleague_calendars("petrov@corp.ru")
+
+    assert len(calendars) == 1
+    assert calendars[0].is_shared is True and calendars[0].read_only is True
+    assert calendars[0].url.endswith("/principals/corp.ru/petrov/calendars/aaa/")

@@ -146,6 +146,7 @@ class CalDavCalendarInfo:
 
 _CALDAV_CALENDAR_TAG = "{urn:ietf:params:xml:ns:caldav}calendar"
 _CALDAV_HOME_SET_PROP = "{urn:ietf:params:xml:ns:caldav}calendar-home-set"
+_CURRENT_USER_PRINCIPAL_PROP = "{DAV:}current-user-principal"
 # Делегирование по-календарьсерверному (Apple, Nextcloud, SOGo): принципал,
 # которому нас назначили доверенным лицом, отдаёт свой дом календарей. У VK
 # таких свойств может не быть — тогда список просто пуст, ошибки нет.
@@ -275,6 +276,43 @@ def _href_path(href: str) -> str:
     """Путь без схемы/хоста и завершающего слэша — owner может прийти и
     абсолютным URL, и просто путём, сравнивать нужно только путь."""
     return unquote(urlparse(href).path).rstrip("/")
+
+
+def colleague_home_urls(account_url: str, login: str) -> list[str]:
+    """Адреса, по которым у этого сервера лежат календари коллеги.
+
+    Из собственного адреса вида
+    https://сервер/principals/<домен>/<я>/calendars/<id>/ получаем
+    https://сервер/principals/<домен>/<коллега>/calendars/ — и его же без
+    завершающего /calendars/ на случай другой раскладки путей."""
+    parsed = urlparse(account_url)
+    parts = [part for part in unquote(parsed.path).split("/") if part]
+    if "principals" not in parts:
+        return []
+    index = parts.index("principals")
+    # /principals/<домен>/<логин>/… — логин идёт через один сегмент после домена.
+    if len(parts) < index + 3:
+        return []
+    own = parts[: index + 3]
+    own[index + 2] = login
+    base = f"{parsed.scheme}://{parsed.netloc}/" + "/".join(own)
+    return [f"{base}/calendars/", f"{base}/"]
+
+
+def _is_foreign_owner(owner: str | None, my_principal_path: str) -> bool:
+    """Календарь принадлежит не нам? Сравниваем пути принципалов, но
+    снисходительно: у части серверов путь принципала и путь владельца
+    отличаются хвостом (/principals/<домен>/<логин>/ против
+    /principals/<домен>/<логин>/calendars/<id>/). Если один путь — начало
+    другого, это один и тот же человек."""
+    if not owner:
+        return False
+    owner_path, mine = _href_path(owner), my_principal_path
+    if not mine:
+        return False
+    if owner_path == mine:
+        return False
+    return not (owner_path.startswith(mine + "/") or mine.startswith(owner_path + "/"))
 
 
 def _has_write_privilege(value: object) -> bool:
@@ -407,7 +445,7 @@ class CalDavSession:
         Evolution в такие коллекции спускается."""
         try:
             principal = self._client.principal()
-            principal_url = str(principal.url)
+            principal_url = self._current_user_principal() or str(principal.url)
             _log.info("CalDAV %s: принципал %s", self.account.url, principal_url)
             home_urls = self._calendar_home_urls(principal)
         except AuthorizationError as exc:
@@ -443,6 +481,44 @@ class CalDavSession:
             _log.info("CalDAV %s: календарь «%s» %s%s%s", self.account.url, info.name, info.url,
                       f", владелец {info.owner}" if info.owner else "",
                       " (расшаренный)" if info.is_shared else "")
+        return infos
+
+    def list_colleague_calendars(self, who: str) -> list[CalDavCalendarInfo]:
+        """Календари коллеги — по его логину или адресу почты.
+
+        У VK расшаренный календарь НЕ попадает в наш дом календарей (это
+        видно в журнале: в доме только свои). Он остаётся под принципалом
+        владельца, и открыть его можно СВОЕЙ учётной записью, если коллега
+        выдал права. Адрес строится из нашего же: в пути
+        /principals/<домен>/<логин>/calendars/ подменяется логин."""
+        login = (who or "").strip()
+        if not login:
+            return []
+        login = login.split("@", 1)[0]
+        homes = colleague_home_urls(self.account.url, login)
+        if not homes:
+            raise CalDavSyncError(
+                "Не удалось понять, где лежат календари коллеги: адрес календаря не похож на "
+                "…/principals/<домен>/<логин>/calendars/…"
+            )
+        my_principal_path = _href_path(self._current_user_principal() or self.account.url)
+        infos: list[CalDavCalendarInfo] = []
+        seen: set[str] = set()
+        failure: Exception | None = None
+        for home in homes:
+            _log.info("CalDAV %s: обход календарей коллеги %s", self.account.url, home)
+            try:
+                self._collect_calendars(home, my_principal_path, infos, seen, depth_left=2)
+            except Exception as exc:
+                _log.warning("CalDAV %s: календари коллеги (%s) не получены: %s", self.account.url, home, exc)
+                failure = failure or exc
+        if not infos and failure is not None:
+            raise CalDavSyncError(
+                f"Календари коллеги {login} недоступны: {failure}. Возможно, он не открыл вам доступ."
+            )
+        for info in infos:
+            _log.info("CalDAV %s: календарь коллеги «%s» %s%s", self.account.url, info.name, info.url,
+                      " (только чтение)" if info.read_only else "")
         return infos
 
     def _calendar_home_urls(self, principal) -> list[str]:
@@ -491,6 +567,30 @@ class CalDavSession:
         parent = self.account.url.rstrip("/").rsplit("/", 1)[0] + "/"
         remember(parent, "коллекция настроенного календаря")
         return urls
+
+    def _current_user_principal(self) -> str:
+        """Свой принципал — тот, что сервер называет сам (DAV:current-user-
+        principal у настроенного адреса).
+
+        Библиотека caldav, когда сервер не ответил на её запрос принципала,
+        молча подставляет БАЗОВЫЙ адрес — то есть сам календарь. На VK так и
+        вышло: «принципал» оказался адресом календаря, и владелец
+        собственных календарей (/principals/<домен>/<логин>/) с ним не
+        совпадал — все свои календари помечались расшаренными (жалоба:
+        «поиск дал 2 моих календаря»)."""
+        try:
+            response = _with_connection_retry(
+                self._client.propfind, self.account.url, _propfind_body([_CURRENT_USER_PRINCIPAL_PROP]), 0
+            )
+        except Exception as exc:
+            _log.info("CalDAV %s: принципал у сервера не спрошен: %s", self.account.url, exc)
+            return ""
+        for result in _parse_multistatus(response.tree):
+            value = result.properties.get(_CURRENT_USER_PRINCIPAL_PROP)
+            for href in value if isinstance(value, list) else [value]:
+                if isinstance(href, str) and href and same_server(self.account.url, href):
+                    return str(self._client.url.join(href))
+        return ""
 
     def _principal_hrefs(self, principal_url: str, prop: str) -> list[str]:
         """Значение ссылочного свойства принципала (дом календарей, списки
@@ -594,7 +694,7 @@ class CalDavSession:
             url=full_url,
             name=result.properties.get("{DAV:}displayname") or result.href,
             owner=owner,
-            is_shared=owner is not None and _href_path(owner) != my_principal_path,
+            is_shared=_is_foreign_owner(owner, my_principal_path),
             read_only=not _has_write_privilege(result.properties.get("{DAV:}current-user-privilege-set")),
         )
 
