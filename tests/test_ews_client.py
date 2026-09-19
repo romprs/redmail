@@ -331,12 +331,16 @@ def test_empty_server_means_autodiscover() -> None:
 
 
 def test_connection_waits_when_server_asks_to_throttle() -> None:
-    """Сервер, попросивший подождать, не должен сразу ронять обход папок."""
+    """Сервер, попросивший подождать, не должен сразу ронять обход папок.
+
+    Настоящий Exchange просил 80 секунд, а предел был 60 — и каждая часть
+    окна календаря падала с «Max timeout reached». Ждём заметно дольше:
+    синхронизация идёт в фоне."""
     with patch("redmail.ews_client.Configuration") as config, patch("redmail.ews_client.ExchangeAccount"):
         EwsSession(_account(server="mail.example.com"))
 
     policy = config.call_args.kwargs["retry_policy"]
-    assert policy.max_wait == 60
+    assert policy.max_wait >= 120
 
 
 class ErrorItemNotFound(Exception):
