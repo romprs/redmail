@@ -6725,6 +6725,9 @@ class _ExchangeCalendarServer:
     def shift_series(self, uid: str, delta) -> None:
         ews_calendar.shift_series(self._session, uid, delta, self._mailbox)
 
+    def respond(self, uid: str, participation: str) -> None:
+        ews_calendar.respond(self._session, uid, participation, self._mailbox)
+
     def delete_event(self, uid: str) -> None:
         ews_calendar.delete_event(self._session, uid, self._mailbox)
 
@@ -11654,7 +11657,11 @@ class MainWindow(QMainWindow):
                     _log.debug("Категория письма %s/%d не определена: %s", folder, uid, exc)
             if not calendar_mail.has_calendar_data(content):
                 return
-            if calendar_mail.apply_calendar_parts(calendar_path, content, my_email):
+            if calendar_mail.apply_calendar_parts(
+                calendar_path, content, my_email,
+                target_calendar_id=calendar_store.default_calendar_id(calendar_path),
+                server_keeps_invites=isinstance(account, EwsAccount),
+            ):
                 self._calendar_changed_in_background = True
 
         return hook
@@ -11817,7 +11824,13 @@ class MainWindow(QMainWindow):
             return
         my_email = getattr(self.account, "email", "") or self.account.username
         try:
-            results = calendar_mail.apply_calendar_parts(self.calendar_path, content, my_email)
+            # Новое приглашение — в основной календарь; из ящика Exchange —
+            # без своей копии: встречу в календарь Exchange кладёт сервер.
+            results = calendar_mail.apply_calendar_parts(
+                self.calendar_path, content, my_email,
+                target_calendar_id=calendar_store.default_calendar_id(self.calendar_path),
+                server_keeps_invites=isinstance(self.account, EwsAccount),
+            )
         except Exception as exc:
             # Не проглатывать молча — иначе панель приглашения просто не
             # появляется без единого следа, почему.
@@ -11883,6 +11896,17 @@ class MainWindow(QMainWindow):
     def on_invite_response(self, participation: str) -> None:
         if self.current_invite is None or not self.account:
             return
+        if isinstance(self.account, EwsAccount) and self.selected_summary is not None and self.current_folder:
+            # Ящик Exchange: ответ — самим сервером по письму-приглашению (как
+            # Outlook); своей почты SMTP у такой учётной записи нет.
+            invite_event = self.current_invite.event
+            session = self.mailbox.interactive_session() if self.mailbox is not None else None
+            folder, uid = self.current_folder, self.selected_summary.uid
+            self._respond_via_exchange(
+                lambda: session.respond_to_meeting(folder, uid, participation), invite_event, participation
+            )
+            self.current_invite = None
+            return
         event = self._respond_to_invite(self.current_invite.event.uid, participation)
         if event is None:
             return
@@ -11898,12 +11922,51 @@ class MainWindow(QMainWindow):
         """То же самое, что on_invite_response, но для встречи, открытой
         прямо из календаря (EventDetailsDialog), а не из панели приглашения
         в почте — раньше поменять участие можно было только через письмо."""
+        if self._is_exchange_calendar(event.calendar_id):
+            session = self._ews_session_for_calendar()
+            calendar = self._calendar_by_id(event.calendar_id)
+            if session is not None and calendar is not None:
+                email = getattr(getattr(session, "account", None), "email", "") or ""
+                server = _ExchangeCalendarServer(session, email, calendar.caldav_url.strip())
+                self._respond_via_exchange(lambda: server.respond(event.uid, participation), event, participation)
+                return
         updated = self._respond_to_invite(event.uid, participation)
         if updated is None:
             return
         self.selected_calendar_event = updated
         self.refresh_calendar_view()
         self.statusBar().showMessage(f"Ответ сохранён, отправляется: {_REPLY_VERBS[participation].lower()}", 3000)
+
+    def _respond_via_exchange(self, send, event: calendar_store.Event, participation: str) -> None:
+        """Ответ на приглашение через Exchange — в фоне; наша копия встречи
+        (если есть) получает тот же ответ, календарь Exchange обновит
+        синхронизация."""
+        verb = _REPLY_VERBS[participation]
+        for button in (self.invite_accept_button, self.invite_tentative_button, self.invite_decline_button):
+            button.setEnabled(False)
+        self.invite_label.setText(f"«{event.summary}» — {_PARTICIPATION_LABELS[participation]}")
+        self.statusBar().showMessage(f"Ответ отправляется через Exchange: {verb.lower()}")
+        worker = _CallableWorker(send, parent=self)
+
+        def done(_result: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            try:
+                calendar_store.set_my_participation(self.calendar_path, event.uid, participation)
+            except Exception:
+                pass
+            self.statusBar().showMessage(f"Ответ на приглашение отправлен: {verb.lower()}", 5000)
+            self._schedule_calendar_sync(1000)
+
+        def failed(error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            QMessageBox.warning(self, "Не удалось ответить на приглашение", error_text)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        self._background_workers.append(worker)
+        worker.start()
 
     def _respond_to_invite(self, uid: str, participation: str) -> calendar_store.Event | None:
         if not self.account:

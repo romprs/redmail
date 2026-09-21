@@ -11,7 +11,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.utils import parseaddr
 from pathlib import Path
@@ -64,7 +64,15 @@ def has_calendar_data(content) -> bool:
     return bool(calendar_payloads(content))
 
 
-def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | None = None) -> list[CalendarPartResult]:
+def apply_calendar_parts(
+    path: Path,
+    content,
+    my_email: str,
+    *,
+    now: datetime | None = None,
+    target_calendar_id: str | None = None,
+    server_keeps_invites: bool = False,
+) -> list[CalendarPartResult]:
     """Разбирает календарные части письма и вносит их в календарь.
 
     Приглашение (REQUEST) добавляет или обновляет встречу, не трогая уже
@@ -76,7 +84,13 @@ def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | 
     Менять уже известную встречу может только её организатор, ответ
     участника — только сам участник. Письма теперь разбираются и без
     открытия, поэтому отмену «от имени» организатора, присланную кем-то
-    другим (UID встречи знает любой приглашённый), в календарь не вносим."""
+    другим (UID встречи знает любой приглашённый), в календарь не вносим.
+
+    target_calendar_id — куда класть НОВОЕ приглашение: в основной
+    календарь (решение пользователя: «класть их в основной календарь»), а
+    не в локальный «Задачи». server_keeps_invites — письмо пришло в ящик
+    Exchange: сервер сам уже положил встречу в свой календарь, и своя копия
+    из письма дала бы дубль (так «Планёрка» стояла в 9:00 дважды)."""
     cutoff = (now or datetime.now(timezone.utc)) - PAST_HORIZON
     sender = parseaddr(getattr(content, "from_", "") or "")[1].strip().lower()
     results: list[CalendarPartResult] = []
@@ -89,7 +103,10 @@ def apply_calendar_parts(path: Path, content, my_email: str, *, now: datetime | 
         method = str(calendar.get("method", "") or "").upper()
         try:
             if method in _ITIP_METHODS:
-                result = _apply_itip(path, payload, method, my_email, cutoff, sender)
+                result = _apply_itip(
+                    path, payload, method, my_email, cutoff, sender,
+                    target_calendar_id=target_calendar_id, server_keeps_invites=server_keeps_invites,
+                )
             else:
                 result = _apply_publish(path, payload, my_email, cutoff)
         except Exception as exc:
@@ -104,8 +121,15 @@ def _same_address(first: str, second: str) -> bool:
     return bool(first) and bool(second) and first.strip().lower() == second.strip().lower()
 
 
+def _known_series_day(path: Path, uid: str) -> calendar_store.Event | None:
+    """Серия уже есть в календаре днями (Exchange присылает серию
+    развёрнутой: у каждого дня свой ключ «UID|RID:…»)."""
+    return calendar_store.first_series_day(path, uid)
+
+
 def _apply_itip(
     path: Path, payload: bytes, method: str, my_email: str, cutoff: datetime, sender: str,
+    *, target_calendar_id: str | None = None, server_keeps_invites: bool = False,
 ) -> CalendarPartResult | None:
     invite = itip.parse_invite(payload, my_email=my_email)
     event = invite.event
@@ -118,6 +142,19 @@ def _apply_itip(
             # Уже известную встречу меняет только организатор; переслать
             # приглашение коллеге можно, но изменить им нашу встречу — нет.
             return CalendarPartResult(method=method, event=existing, invite=invite, rejected_sender=sender or "?")
+        if existing is None:
+            series_day = _known_series_day(path, event.uid)
+            if series_day is not None:
+                # Та же серия уже в календаре днями — вторую копию не заводим.
+                return CalendarPartResult(method=method, event=series_day, invite=invite)
+            if server_keeps_invites:
+                # Ящик Exchange: встречу в свой календарь сервер положил сам,
+                # она придёт синхронизацией календаря. Показываем письмо, но
+                # копию не заводим.
+                return CalendarPartResult(method=method, event=event, invite=invite)
+            event = replace(event, origin=calendar_store.ORIGIN_MAIL)
+            if target_calendar_id:
+                event = replace(event, calendar_id=target_calendar_id)
         stored = calendar_store.apply_invite(path, "REQUEST", event)
         return CalendarPartResult(method=method, event=stored, invite=invite)
     if method == "CANCEL":

@@ -165,3 +165,60 @@ def test_ics_file_does_not_overwrite_known_meeting(tmp_path: Path) -> None:
 
     assert results == []
     assert calendar_store.get_event(path, "meet-1@example.com").summary == "Планёрка"
+
+
+def test_new_invitation_goes_to_main_calendar_marked_as_from_mail(tmp_path: Path) -> None:
+    """Решение пользователя: «класть их в основной календарь», а не в
+    локальный «Задачи»."""
+    path = tmp_path / "calendar.rmcal"
+    main = calendar_store.create_user_calendar(path, "VK", "#1E88E5", source_type=calendar_store.SOURCE_CALDAV)
+    content = _content(Attachment("invite.ics", "text/calendar", _ics("REQUEST")))
+
+    calendar_mail.apply_calendar_parts(path, content, "me@example.com", now=NOW, target_calendar_id=main.id)
+
+    stored = calendar_store.get_event(path, "meet-1@example.com")
+    assert stored.calendar_id == main.id
+    assert stored.origin == calendar_store.ORIGIN_MAIL
+
+
+def test_invitation_in_exchange_mailbox_is_not_copied(tmp_path: Path) -> None:
+    """Ящик Exchange: встречу в свой календарь кладёт сам сервер — копия из
+    письма давала дубль («Планёрка» в 9:00 дважды)."""
+    path = tmp_path / "calendar.rmcal"
+    content = _content(Attachment("invite.ics", "text/calendar", _ics("REQUEST")))
+
+    results = calendar_mail.apply_calendar_parts(
+        path, content, "me@example.com", now=NOW, server_keeps_invites=True
+    )
+
+    assert [r.method for r in results] == ["REQUEST"]  # письмо показывается как приглашение
+    assert calendar_store.get_event(path, "meet-1@example.com") is None  # а копии нет
+
+
+def test_invitation_for_series_already_present_as_days_is_not_duplicated(tmp_path: Path) -> None:
+    """Серия Exchange хранится днями (ключ «UID|RID:…») — приглашение на эту
+    серию не должно завести вторую, целую копию."""
+    path = tmp_path / "calendar.rmcal"
+    day_start = NOW + timedelta(days=2)
+    calendar_store.save_event(path, calendar_store.Event(
+        uid=calendar_store.instance_uid("meet-1@example.com", day_start), summary="Планёрка",
+        dtstart=day_start, dtend=day_start + timedelta(hours=1), organizer_email="boss@example.com",
+    ))
+    content = _content(Attachment("invite.ics", "text/calendar", _ics("REQUEST")))
+
+    calendar_mail.apply_calendar_parts(path, content, "me@example.com", now=NOW)
+
+    assert calendar_store.get_event(path, "meet-1@example.com") is None
+
+
+def test_sync_does_not_delete_invitation_from_mail_missing_on_server(tmp_path: Path) -> None:
+    """Приглашение из письма лежит в основном (серверном) календаре, но на
+    его сервере его нет — синхронизация не должна считать его «удалённым на
+    сервере» и стирать."""
+    path = tmp_path / "calendar.rmcal"
+    main = calendar_store.create_user_calendar(path, "Exchange", "#1E88E5", source_type=calendar_store.SOURCE_EWS)
+    content = _content(Attachment("invite.ics", "text/calendar", _ics("REQUEST")))
+    calendar_mail.apply_calendar_parts(path, content, "me@example.com", now=NOW, target_calendar_id=main.id)
+
+    window = calendar_store.stored_events_in_window(path, main.id, NOW - timedelta(days=30), NOW + timedelta(days=180))
+    assert window == []  # в зеркало удалений не входит

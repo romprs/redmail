@@ -614,6 +614,16 @@ class EwsSession:
         self._id_map[uid] = (item.id, item.changekey)
         return uid
 
+    def respond_to_meeting(self, folder: str, uid: int, participation: str) -> None:
+        """Ответ на письмо-приглашение средствами Exchange (принять, под
+        вопросом, отклонить). Сервер сам отметит ответ во встрече и сообщит
+        организатору — как делает Outlook."""
+        from redmail import ews_calendar
+
+        item = self._get_item(uid, folder)
+        ews_calendar.respond_to_item(item, participation)
+        _log.info("EWS: ответ «%s» на приглашение %s/%d отправлен", participation, folder, uid)
+
     def _get_item(self, uid: int, folder: str | None = None):
         entry = self._id_map.get(uid)
         if entry is None and folder is not None and folder in self._folders_by_path:

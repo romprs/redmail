@@ -82,7 +82,18 @@ _MIGRATIONS = (
     # REMIND_MODES). -1 в remind_minutes — напоминать не нужно.
     "ALTER TABLE events ADD COLUMN remind_minutes INTEGER NOT NULL DEFAULT -1",
     f"ALTER TABLE events ADD COLUMN remind_mode TEXT NOT NULL DEFAULT '{REMIND_NONE}'",
+    # Откуда встреча: ORIGIN_MAIL — внесена из письма-приглашения. Такую
+    # синхронизация не удаляет как «пропавшую с сервера»: на сервере
+    # основного календаря её может и не быть (приглашение пришло в другой
+    # ящик), а отправлять её туда нельзя — Exchange разослал бы приглашения
+    # от нашего имени.
+    "ALTER TABLE events ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
 )
+
+ORIGIN_MAIL = "mail"
+#: Встреча получена с сервера календаря: с этого момента её судьбу решает
+#: сервер, и пометка «из письма» снимается.
+ORIGIN_SERVER = "server"
 
 # Экземпляр повторяющейся встречи (изменённый или развёрнутый сервером)
 # хранится отдельной записью: у всех экземпляров серии один UID, и при
@@ -167,7 +178,7 @@ CREATE TABLE IF NOT EXISTS calendars (
 _COLUMNS = (
     "id, uid, sequence, summary, description, location, dtstart, dtend, all_day, "
     "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
-    "recurrence_rule, color, calendar_id, raw_ics, exdates, remind_minutes, remind_mode"
+    "recurrence_rule, color, calendar_id, raw_ics, exdates, remind_minutes, remind_mode, origin"
 )
 
 
@@ -205,6 +216,8 @@ class Event:
     # remind_minutes < 0 или remind_mode == REMIND_NONE — не напоминать.
     remind_minutes: int = -1
     remind_mode: str = REMIND_NONE
+    #: Откуда встреча (см. ORIGIN_MAIL); пусто — обычная (своя или с сервера).
+    origin: str = ""
 
 
 @dataclass
@@ -309,6 +322,7 @@ def _row_to_event(conn: sqlite3.Connection, row) -> Event:
         exdates=_load_exdates(row[19]),
         remind_minutes=row[20],
         remind_mode=row[21],
+        origin=row[22] or "",
     )
 
 
@@ -437,8 +451,8 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
             "INSERT INTO events (uid, sequence, summary, description, location, dtstart, dtend, all_day, "
             "organizer_email, organizer_name, is_organizer, status, my_participation, attendees, "
             "recurrence_rule, color, calendar_id, raw_ics, needs_push, exdates, "
-            "remind_minutes, remind_mode) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "remind_minutes, remind_mode, origin) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "sequence=excluded.sequence, summary=excluded.summary, description=excluded.description, "
             "location=excluded.location, dtstart=excluded.dtstart, dtend=excluded.dtend, all_day=excluded.all_day, "
@@ -447,6 +461,7 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
             "attendees=excluded.attendees, recurrence_rule=excluded.recurrence_rule, color=excluded.color, "
             "calendar_id=excluded.calendar_id, raw_ics=excluded.raw_ics, exdates=excluded.exdates, "
             "remind_minutes=excluded.remind_minutes, remind_mode=excluded.remind_mode, "
+            "origin=CASE WHEN excluded.origin != '' THEN excluded.origin ELSE events.origin END, "
             "needs_push=MAX(events.needs_push, excluded.needs_push)",
             (
                 event.uid,
@@ -471,6 +486,7 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
                 json.dumps([moment.astimezone(timezone.utc).isoformat() for moment in event.exdates]),
                 int(event.remind_minutes),
                 event.remind_mode if event.remind_mode in REMIND_MODES else REMIND_NONE,
+                event.origin or "",
             ),
         )
         if needs_push:
@@ -566,12 +582,27 @@ def stored_events_in_window(path: Path, calendar_id: str, start: datetime, end: 
     create_calendar(path)
     with closing(_connect(path)) as conn:
         rows = conn.execute(
-            "SELECT uid, needs_push FROM events WHERE calendar_id = ? AND dtstart >= ? AND dtstart < ?",
+            # Встречи из писем-приглашений в зеркало удалений не входят (см.
+            # ORIGIN_MAIL): их на сервере календаря и не должно быть.
+            "SELECT uid, needs_push FROM events WHERE calendar_id = ? AND dtstart >= ? AND dtstart < ? "
+            f"AND origin != '{ORIGIN_MAIL}'",
             # В UTC, как хранится: по этому окну решается, что удалено на
             # сервере, — ошибка сравнения поясов здесь стоила бы встреч.
             (calendar_id, _utc_text(start), _utc_text(end)),
         ).fetchall()
     return [(row[0], bool(row[1])) for row in rows]
+
+
+def first_series_day(path: Path, uid: str) -> Event | None:
+    """Какой-нибудь хранимый день серии с этим UID (ключ «UID|RID:…») —
+    чтобы понять, что серия уже есть в календаре днями."""
+    create_calendar(path)
+    prefix = f"{uid}{INSTANCE_SEPARATOR}"
+    with closing(_connect(path)) as conn:
+        row = conn.execute(
+            f"SELECT {_COLUMNS} FROM events WHERE substr(uid, 1, ?) = ? LIMIT 1", (len(prefix), prefix)
+        ).fetchone()
+        return _row_to_event(conn, row) if row else None
 
 
 def delete_series(path: Path, uid: str) -> None:

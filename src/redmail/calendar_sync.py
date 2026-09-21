@@ -125,7 +125,7 @@ def sync_calendar(
         existing = calendar_store.get_event(path, event.uid)
         if event.uid in waiting_push:
             continue  # локальная правка не ушла — не затираем её серверной копией
-        event = replace(event, calendar_id=calendar.id)
+        event = replace(event, calendar_id=calendar.id, origin=calendar_store.ORIGIN_SERVER)
         if existing is not None:
             # Полей, которых нет в iCalendar (ручной цвет) и вложений сервер
             # может не хранить — не даём синхронизации тихо их стереть.

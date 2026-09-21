@@ -266,6 +266,41 @@ def push_event(session, event: Event, mailbox: str = "") -> None:
         raise EwsCalendarError(f"Не удалось сохранить встречу в Exchange: {exc}") from exc
 
 
+#: Наш ответ участника → метод exchangelib у приглашения/встречи.
+_RESPONSE_METHODS = {"accepted": "accept", "tentative": "tentatively_accept", "declined": "decline"}
+
+
+def respond_to_item(item, participation: str) -> None:
+    """Ответить на приглашение средствами самого Exchange — как Outlook:
+    сервер отмечает ответ в своей встрече и сам сообщает организатору. Для
+    ящика Exchange это единственный верный путь: своей почты SMTP у такой
+    учётной записи нет, а своей копии встречи мы не заводим."""
+    method = _RESPONSE_METHODS.get(participation)
+    if method is None:
+        raise EwsCalendarError(f"неизвестный ответ на приглашение: {participation}")
+    getattr(item, method)()
+
+
+def respond(session, uid: str, participation: str, mailbox: str = "") -> None:
+    """Ответ на встречу из календаря Exchange (день серии или отдельная)."""
+    account = _account_for(session, mailbox)
+    try:
+        if calendar_store.is_instance_uid(uid):
+            item = _find_occurrence(account, uid)
+        else:
+            found = _find_item(account, uid)
+            item = account.calendar.get(id=found.id) if found is not None else None
+        if item is None:
+            raise EwsCalendarError("встреча не найдена на сервере")
+        respond_to_item(item, participation)
+        _log.info("EWS календарь: ответ «%s» на встречу uid=%s", participation, uid)
+    except EwsCalendarError:
+        raise
+    except Exception as exc:
+        _log.error("EWS календарь: ответ на встречу uid=%s не отправлен: %s", uid, exc)
+        raise EwsCalendarError(f"Не удалось ответить на встречу в Exchange: {exc}") from exc
+
+
 def delete_event(session, uid: str, mailbox: str = "") -> None:
     account = _account_for(session, mailbox)
     try:
