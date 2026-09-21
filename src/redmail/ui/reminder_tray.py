@@ -42,6 +42,19 @@ POLL_SECONDS = 30
 SNOOZE_MINUTES = 5
 
 
+def _dot_icon(color: str, size: int = 12) -> QIcon:
+    """Цветной кружок — маркер календаря в меню «Сегодня»."""
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setBrush(QColor(color or "#3B6FB6"))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.drawEllipse(1, 1, size - 2, size - 2)
+    painter.end()
+    return QIcon(pixmap)
+
+
 def _bell_icon(size: int = 22) -> QIcon:
     """Колокольчик рисуем сами — как и значки в окне встречи: на этой
     платформе уже находились пробелы в покрытии эмодзи-шрифтом."""
@@ -202,7 +215,7 @@ class ReminderTray:
         self._enabled_action.toggled.connect(self._on_enabled_toggled)
         self.menu.addAction(self._enabled_action)
         open_action = QAction("Открыть календарь", self.menu)
-        open_action.triggered.connect(lambda: voice_client.focus_mail_client(section="calendar"))
+        open_action.triggered.connect(lambda: self._open_calendar_from_menu())
         self.menu.addAction(open_action)
         self.menu.addSeparator()
         quit_action = QAction("Выход", self.menu)
@@ -223,18 +236,29 @@ class ReminderTray:
         _log.info("Напоминания %s", "включены" if enabled else "выключены")
 
     def _refresh_today_menu(self) -> None:
+        """Встречи сегодня — по календарям: заголовок календаря и у каждой
+        встречи цветной кружок его цвета (пожелание: «разделение по
+        календарям не мешало бы или маркер» — одна и та же встреча из двух
+        календарей выглядела дублем)."""
         self._today_menu.clear()
         events = reminders.today_events(self._calendar_path, datetime.now().astimezone())
         if not events:
             empty = self._today_menu.addAction("Встреч нет")
             empty.setEnabled(False)
             return
-        for event in events:
-            start = event.dtstart.astimezone()
-            # «&» в теме встречи QMenu считает подчёркиванием буквы — удваиваем.
-            title = (event.summary or "(без темы)").replace("&", "&&")
-            action = self._today_menu.addAction(f"{start:%H:%M}  {title}")
-            action.triggered.connect(lambda _checked=False: voice_client.focus_mail_client(section="calendar"))
+        for calendar, calendar_events in reminders.group_by_calendar(self._calendar_path, events):
+            self._today_menu.addSection(calendar.name.replace("&", "&&"))
+            icon = _dot_icon(calendar.color)
+            for event in calendar_events:
+                start = event.dtstart.astimezone()
+                # «&» в теме встречи QMenu считает подчёркиванием буквы — удваиваем.
+                title = (event.summary or "(без темы)").replace("&", "&&")
+                action = self._today_menu.addAction(icon, f"{start:%H:%M}  {title}")
+                action.triggered.connect(lambda _checked=False: self._open_calendar_from_menu())
+
+    def _open_calendar_from_menu(self) -> None:
+        if not voice_client.focus_mail_client(section="calendar"):
+            self.tray.showMessage("Почтовый клиент закрыт", "Запустите почтовый клиент, чтобы открыть календарь.")
 
     def check_now(self) -> None:
         if not self._enabled:

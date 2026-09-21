@@ -64,7 +64,12 @@ def _mail_endpoint() -> str | None:
     return endpoints[0] if endpoints else None
 
 
-def _send_line(address: str, payload: dict) -> bool:
+def _send_line(address: str, payload: dict, *, wait_reply: bool = False) -> bool:
+    """Отправить строку JSON. wait_reply — дождаться ответа и вернуть его
+    «ok»: почтовый клиент отвечает на каждую команду, и если закрыть
+    соединение, не дождавшись ответа, он успевает увидеть обрыв раньше,
+    чем прочтёт команду, — и отбрасывает её (так «Открыть календарь» из
+    напоминалки молча ничего не делал)."""
     try:
         conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         conn.settimeout(_TIMEOUT_SECONDS)
@@ -74,9 +79,24 @@ def _send_line(address: str, payload: dict) -> bool:
         return False
     try:
         conn.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
-        return True
+        if not wait_reply:
+            return True
+        reply = b""
+        while not reply.endswith(b"\n"):
+            chunk = conn.recv(4096)
+            if not chunk:
+                break
+            reply += chunk
+        try:
+            answer = json.loads(reply.decode("utf-8") or "{}")
+        except ValueError:
+            _log.info("Канал %s: непонятный ответ: %r", address, reply[:200])
+            return False
+        if not answer.get("ok"):
+            _log.info("Канал %s: команда не выполнена: %s", address, answer.get("error") or answer)
+        return bool(answer.get("ok"))
     except OSError as exc:
-        _log.info("Канал %s: запрос не отправлен: %s", address, exc)
+        _log.info("Канал %s: запрос не выполнен: %s", address, exc)
         return False
     finally:
         conn.close()
@@ -95,4 +115,4 @@ def focus_mail_client(*, section: str = "calendar") -> bool:
         _log.info("Почтовый клиент не найден: нет ни файла адреса, ни сокета по умолчанию")
         return False
     request = {"action": "focus", "args": {"section": section}}
-    return any(_send_line(endpoint, request) for endpoint in endpoints)
+    return any(_send_line(endpoint, request, wait_reply=True) for endpoint in endpoints)

@@ -335,6 +335,15 @@ def _save_attachments(conn: sqlite3.Connection, uid: str, attachments: list[Atta
         )
 
 
+def _utc_text(moment: datetime) -> str:
+    """Время для хранения и сравнения — всегда строкой ISO в UTC. Время
+    сравнивается в SQL как строки, и одно значение в другом поясе ломает
+    порядок (см. list_events)."""
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc)
+    return moment.isoformat()
+
+
 def list_events(path: Path, start: datetime | None = None, end: datetime | None = None) -> list[Event]:
     """События, пересекающиеся с полуинтервалом [start, end) (обе границы
     опциональны). Повторяющиеся события (recurrence_rule) раскрываются в
@@ -343,6 +352,14 @@ def list_events(path: Path, start: datetime | None = None, end: datetime | None 
     COUNT/UNTIL) было бы некуда, поэтому в этом случае возвращается только
     хранимый первый экземпляр как есть."""
     create_calendar(path)
+    # Время хранится строкой ISO в UTC, и сравнение идёт как строк. Границу
+    # в другом поясе приводим к UTC, иначе сравнение врёт: «…T00:00+09:00»
+    # по строке больше «…T00:00+00:00», хотя это на девять часов раньше, —
+    # так в «Сегодня» у напоминалки попадала завтрашняя встреча в 9:00.
+    if start is not None and start.tzinfo is not None:
+        start = start.astimezone(timezone.utc)
+    if end is not None and end.tzinfo is not None:
+        end = end.astimezone(timezone.utc)
     query = f"SELECT {_COLUMNS} FROM events"
     clauses: list[str] = []
     params: list[str] = []
@@ -437,8 +454,8 @@ def save_event(path: Path, event: Event, *, needs_push: bool = False) -> None:
                 event.summary,
                 event.description,
                 event.location,
-                event.dtstart.isoformat(),
-                event.dtend.isoformat(),
+                _utc_text(event.dtstart),
+                _utc_text(event.dtend),
                 int(event.all_day),
                 event.organizer_email,
                 event.organizer_name,
@@ -550,7 +567,9 @@ def stored_events_in_window(path: Path, calendar_id: str, start: datetime, end: 
     with closing(_connect(path)) as conn:
         rows = conn.execute(
             "SELECT uid, needs_push FROM events WHERE calendar_id = ? AND dtstart >= ? AND dtstart < ?",
-            (calendar_id, start.isoformat(), end.isoformat()),
+            # В UTC, как хранится: по этому окну решается, что удалено на
+            # сервере, — ошибка сравнения поясов здесь стоила бы встреч.
+            (calendar_id, _utc_text(start), _utc_text(end)),
         ).fetchall()
     return [(row[0], bool(row[1])) for row in rows]
 

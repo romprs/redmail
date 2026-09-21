@@ -565,3 +565,22 @@ def test_old_default_calendar_name_becomes_tasks_but_custom_name_stays(tmp_path:
     calendar_store.create_calendar(path)
     names = {c.id: c.name for c in calendar_store.list_calendars(path)}
     assert names[calendar_store.DEFAULT_CALENDAR_ID] == "Личное"
+
+
+def test_window_in_local_time_does_not_pick_up_tomorrow(tmp_path: Path) -> None:
+    """Найдено на .80: в «Сегодня» у напоминалки попала завтрашняя встреча в
+    9:00. Граница дня была в местном поясе (+09:00), встречи хранятся в UTC,
+    и строковое сравнение считало завтрашние 9:00 (= 00:00 UTC) раньше
+    местной полуночи."""
+    tz = timezone(timedelta(hours=9))
+    path = tmp_path / "test.rmcal"
+    tomorrow_nine = datetime(2026, 9, 22, 9, tzinfo=tz)
+    calendar_store.save_event(path, Event(
+        uid="tomorrow@redmail", summary="Завтра", dtstart=tomorrow_nine.astimezone(timezone.utc),
+        dtend=(tomorrow_nine + timedelta(hours=1)).astimezone(timezone.utc), organizer_email="me@x.ru",
+    ))
+    today_start = datetime(2026, 9, 21, 0, tzinfo=tz)
+    today = calendar_store.list_events(path, today_start, today_start + timedelta(days=1))
+    assert today == []
+    tomorrow = calendar_store.list_events(path, today_start + timedelta(days=1), today_start + timedelta(days=2))
+    assert [e.uid for e in tomorrow] == ["tomorrow@redmail"]

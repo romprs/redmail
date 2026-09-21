@@ -269,6 +269,28 @@ def spoken_text(reminder: Reminder, now: datetime) -> str:
     return f"Напоминание: {reminder.summary} {when}, в {start:%H:%M}{author}{place}"
 
 
+def group_by_calendar(calendar_path: Path, events: list) -> list[tuple]:
+    """(календарь, его встречи по времени) — в порядке списка «Мои
+    календари». Встречи календаря, которого уже нет, собираются в
+    безымянную группу, а не теряются."""
+    try:
+        calendars = calendar_store.list_calendars(calendar_path)
+    except Exception:
+        calendars = []
+    by_id = {calendar.id: calendar for calendar in calendars}
+    groups: dict[str, list] = {}
+    for event in events:
+        groups.setdefault(event.calendar_id, []).append(event)
+    order = [calendar.id for calendar in calendars] + [cid for cid in groups if cid not in by_id]
+    result = []
+    for calendar_id in order:
+        if calendar_id not in groups:
+            continue
+        calendar = by_id.get(calendar_id) or calendar_store.Calendar(id=calendar_id, name="Календарь", color="#9E9E9E")
+        result.append((calendar, sorted(groups[calendar_id], key=lambda event: event.dtstart)))
+    return result
+
+
 def today_events(calendar_path: Path, now: datetime) -> list[calendar_store.Event]:
     """Встречи текущего дня — для меню в трее (что сегодня)."""
     local_now = now.astimezone()

@@ -29,6 +29,9 @@ def test_focus_falls_back_to_default_socket_when_address_file_is_missing(tmp_pat
     def accept() -> None:
         conn, _ = server.accept()
         got.append(conn.recv(1000))
+        # Почта отвечает на каждую команду; напоминалка ждёт этот ответ —
+        # без него она закрывала соединение раньше, чем почта читала команду.
+        conn.sendall(b'{"ok": true, "focused": true}\n')
         conn.close()
 
     thread = threading.Thread(target=accept)

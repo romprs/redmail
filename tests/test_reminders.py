@@ -311,3 +311,22 @@ def test_resident_stays_alive_while_the_app_runs(monkeypatch) -> None:
 
     assert reminder_tray.main(["redmail-reminder"]) == 0
     assert alive_during_exec == [True]
+
+
+def test_today_menu_is_grouped_by_calendar(tmp_path: Path) -> None:
+    """Пожелание: в «Сегодня» разделение по календарям — одна и та же встреча
+    из двух календарей иначе выглядела дублем."""
+    calendar = tmp_path / "test.rmcal"
+    work = calendar_store.create_user_calendar(calendar, "Exchange", "#1E88E5", source_type=calendar_store.SOURCE_EWS)
+    now = datetime.now().astimezone()
+    nine = now.replace(hour=9, minute=0, second=0, microsecond=0)
+    for uid, cal_id, hour in (("a", work.id, 11), ("b", calendar_store.DEFAULT_CALENDAR_ID, 9), ("c", work.id, 9)):
+        start = nine.replace(hour=hour)
+        calendar_store.save_event(calendar, calendar_store.Event(
+            uid=uid, summary=uid, dtstart=start.astimezone(timezone.utc),
+            dtend=(start + timedelta(hours=1)).astimezone(timezone.utc), organizer_email="me@x.ru", calendar_id=cal_id,
+        ))
+    groups = reminders.group_by_calendar(calendar, reminders.today_events(calendar, now))
+    assert [(cal.name, [e.uid for e in events]) for cal, events in groups] == [
+        ("Задачи", ["b"]), ("Exchange", ["c", "a"]),
+    ]
