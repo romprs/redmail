@@ -162,30 +162,52 @@ def test_grid_stretches_to_fill_a_taller_window() -> None:
     assert grid.hour_height() == grid.HOUR_HEIGHT
 
 
-def test_compact_mode_hides_night_hours_and_widens_the_day() -> None:
-    """Сжатый режим: видны рабочие часы, и они растягиваются на окно."""
+def _at(day_offset: int, hour: int, minute: int = 0) -> datetime:
+    monday = wc.week_start_for(datetime.now().date())
+    return (datetime.combine(monday, datetime.min.time()).astimezone() + timedelta(days=day_offset)).replace(
+        hour=hour, minute=minute
+    )
+
+
+def test_compact_mode_follows_earliest_and_latest_meeting_of_the_week() -> None:
+    """Пожелание: сжатый режим «в динамике — смотрим неделю, раннее и
+    позднее задания». Самая ранняя встреча недели в 9:00, самая поздняя
+    кончается в 18:30 — видны 9:00–19:00, и они растягиваются на окно."""
     _app()
     grid = wc.WeekGridWidget()
-    grid.set_viewport_height(13 * 50)
+    grid.set_viewport_height(10 * 60)
+    monday = wc.week_start_for(datetime.now().date())
     grid.set_compact(True)
-    assert grid.visible_hours() == (wc.WeekGridWidget.COMPACT_FIRST_HOUR, wc.WeekGridWidget.COMPACT_LAST_HOUR)
-    assert grid.hour_height() == 50  # 13 рабочих часов на ту же высоту — крупнее
+    grid.set_week(monday, [_event("a", _at(0, 9)), _event("b", _at(3, 17, 30)), _event("c", _at(1, 12))])
+    assert grid.visible_hours() == (9, 19)
+    assert grid.hour_height() == 60  # 10 часов на 600 пикселей
     grid.set_compact(False)
     assert grid.visible_hours() == (0, 24)
 
 
-def test_compact_mode_never_hides_a_meeting() -> None:
-    """Встреча в 6 утра в сжатом режиме не прячется — рамка раздвигается."""
+def test_compact_mode_range_changes_with_the_week() -> None:
     _app()
     grid = wc.WeekGridWidget()
     monday = wc.week_start_for(datetime.now().date())
-    early = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=6)
-    late = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=21)
     grid.set_compact(True)
-    grid.set_week(monday, [_event("early", early), _event("late", late)])
+    grid.set_week(monday, [_event("a", _at(0, 6)), _event("b", _at(2, 21))])
     assert grid.visible_hours() == (6, 22)
-    block = grid._blocks[0] if grid._blocks[0].calendar_event.uid == "early" else grid._blocks[1]
-    assert block.geometry().y() == 0  # ранняя встреча — у самого верха, а не за его пределами
+    grid.set_week(monday, [_event("a", _at(0, 10)), _event("b", _at(2, 15))])
+    assert grid.visible_hours() == (10, 16)
+
+
+def test_compact_mode_keeps_a_minimum_span_and_falls_back_for_empty_week() -> None:
+    _app()
+    grid = wc.WeekGridWidget()
+    monday = wc.week_start_for(datetime.now().date())
+    grid.set_compact(True)
+    grid.set_week(monday, [_event("a", _at(0, 10))])  # одна встреча на час
+    first, last = grid.visible_hours()
+    assert first <= 10 and last >= 11 and last - first == wc.WeekGridWidget.COMPACT_MIN_HOURS
+    grid.set_week(monday, [_event("a", _at(0, 22))])  # поздняя — раздвигаем вверх, не за полночь
+    assert grid.visible_hours() == (18, 24)
+    grid.set_week(monday, [])
+    assert grid.visible_hours() == (wc.WeekGridWidget.COMPACT_FIRST_HOUR, wc.WeekGridWidget.COMPACT_LAST_HOUR)
 
 
 def test_clicking_an_empty_slot_in_compact_mode_gives_real_time() -> None:

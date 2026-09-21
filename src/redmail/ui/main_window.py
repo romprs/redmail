@@ -7521,8 +7521,8 @@ class MainWindow(QMainWindow):
         self.calendar_compact_action = QAction("Сжатый режим", self)
         self.calendar_compact_action.setCheckable(True)
         self.calendar_compact_action.setToolTip(
-            "Показывать только рабочие часы (7:00–20:00). Если в неделе есть встречи раньше или позже — "
-            "рамка раздвигается, чтобы их не спрятать."
+            "Показывать только часы от самой ранней до самой поздней встречи недели — "
+            "они растягиваются на всю высоту окна. Неделя без встреч — 7:00–20:00."
         )
         self.calendar_compact_action.toggled.connect(self._on_calendar_compact_toggled)
         calendar_toolbar.addAction(self.calendar_compact_action)

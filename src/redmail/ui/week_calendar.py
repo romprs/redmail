@@ -535,11 +535,15 @@ class WeekGridWidget(QWidget):
     emptySlotDoubleClicked = Signal(object, int)
     emptySlotContextMenuRequested = Signal(object, int, object)  # (date, minutes, global_pos)
 
-    #: Сжатый режим: рабочие часы, если в неделе нет встреч раньше/позже
-    #: (жалоба: «у меня нет событий с 00:00 до 9:00 — можно скрыть всё до
-    #: 7:00, это позволит сделать временную рамку шире»).
+    #: Сжатый режим: видны часы от самой ранней до самой поздней встречи
+    #: показанной недели (пожелание: «определять в динамике — смотрим
+    #: неделю, раннее и позднее задания»). Рабочие часы — только для
+    #: недели без встреч.
     COMPACT_FIRST_HOUR = 7
     COMPACT_LAST_HOUR = 20
+    #: Не меньше стольких часов на экране: одна встреча на час иначе
+    #: растянулась бы на всю высоту окна.
+    COMPACT_MIN_HOURS = 6
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -616,11 +620,17 @@ class WeekGridWidget(QWidget):
 
     def _update_scale(self) -> None:
         if self._compact:
-            first, last = self.COMPACT_FIRST_HOUR, self.COMPACT_LAST_HOUR
             span = self._week_hours()
-            if span is not None:
-                # Встречи вне рабочих часов не прячем — рамка раздвигается.
-                first, last = min(first, span[0]), max(last, span[1])
+            if span is None:
+                first, last = self.COMPACT_FIRST_HOUR, self.COMPACT_LAST_HOUR
+            else:
+                first, last = span
+                # Слишком узкий день (одна короткая встреча) раздвигаем до
+                # COMPACT_MIN_HOURS: сначала вниз, упёрлись в полночь — вверх.
+                missing = self.COMPACT_MIN_HOURS - (last - first)
+                if missing > 0:
+                    last = min(24, last + missing)
+                    first = max(0, last - self.COMPACT_MIN_HOURS)
         else:
             first, last = 0, 24
         self._first_hour, self._last_hour = first, max(first + 1, last)
