@@ -184,10 +184,10 @@ class ReminderWindow(QDialog):
         QDesktopServices.openUrl(url)
 
     def _open_calendar(self) -> None:
-        if not voice_client.focus_mail_client(section="calendar"):
-            QMessageBox.information(
-                self, "Почтовый клиент закрыт", "Запустите почтовый клиент, чтобы открыть календарь."
-            )
+        """Календарь на этой встрече; почта закрыта — запускается сама."""
+        result = voice_client.open_mail_calendar(self.reminder.uid, self.reminder.dtstart)
+        if result == voice_client.FAILED:
+            QMessageBox.warning(self, "Календарь", "Не удалось запустить почтовый клиент.")
             return
         self.accept()
 
@@ -254,11 +254,18 @@ class ReminderTray:
                 # «&» в теме встречи QMenu считает подчёркиванием буквы — удваиваем.
                 title = (event.summary or "(без темы)").replace("&", "&&")
                 action = self._today_menu.addAction(icon, f"{start:%H:%M}  {title}")
-                action.triggered.connect(lambda _checked=False: self._open_calendar_from_menu())
+                action.triggered.connect(
+                    lambda _checked=False, uid=event.uid, when=event.dtstart: self._open_calendar_from_menu(uid, when)
+                )
 
-    def _open_calendar_from_menu(self) -> None:
-        if not voice_client.focus_mail_client(section="calendar"):
-            self.tray.showMessage("Почтовый клиент закрыт", "Запустите почтовый клиент, чтобы открыть календарь.")
+    def _open_calendar_from_menu(self, uid: str = "", start: datetime | None = None) -> None:
+        """Календарь (а по клику на встречу — и она сама). Почта закрыта —
+        запускаем её, как голосовое «создать встречу»."""
+        result = voice_client.open_mail_calendar(uid, start)
+        if result == voice_client.LAUNCHED:
+            self.tray.showMessage("Календарь", "Запускаю почтовый клиент…")
+        elif result == voice_client.FAILED:
+            self.tray.showMessage("Календарь", "Не удалось запустить почтовый клиент.")
 
     def check_now(self) -> None:
         if not self._enabled:

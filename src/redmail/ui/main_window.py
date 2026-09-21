@@ -13907,6 +13907,47 @@ class MainWindow(QMainWindow):
             action.setChecked(True)
             show()
 
+    def ipc_show_event(self, uid: str, start: datetime | None = None) -> bool:
+        """Календарь на неделе встречи, встреча выделена и открыта — клик
+        по встрече в напоминалке. start нужен для серии: у всех её дней
+        один uid, а открыть надо тот день, о котором напомнили. Окно
+        встречи открывается после ответа на команду (модальный диалог
+        иначе держал бы ответ, и напоминалка сочла бы почту закрытой).
+        False — встречи в календаре нет: тогда просто открыт календарь."""
+        self.ipc_focus(section="calendar")
+        event = self._find_calendar_event(uid, start)
+        if event is None:
+            return False
+        day = event.dtstart.astimezone().date()
+        self.calendar_selected_day = day
+        self.calendar_week_start = week_start_for(day)
+        self.calendar_month_anchor = day.replace(day=1)
+        self.refresh_calendar_view()
+        self.selected_calendar_event = event
+        self._apply_calendar_selection_highlight()
+        self._calendar_scrolled_to_now = True
+        self._calendar_scroll.verticalScrollBar().setValue(
+            self.calendar_week_grid.scroll_position_for(event.dtstart)
+        )
+        self._ipc_later(lambda: self._on_calendar_event_double_clicked(event))
+        return True
+
+    def _find_calendar_event(self, uid: str, start: datetime | None) -> calendar_store.Event | None:
+        """Встреча по uid; для серии — день, ближайший к start (если start
+        не задан — ближайший к текущему моменту)."""
+        moment = start or datetime.now(timezone.utc)
+        try:
+            events = calendar_store.list_events(
+                self.calendar_path, start=moment - timedelta(days=2), end=moment + timedelta(days=2)
+            )
+        except Exception as exc:
+            _log.warning("Встреча для показа не прочитана: %s", exc)
+            return None
+        matches = [event for event in events if event.uid == uid]
+        if not matches:
+            return None
+        return min(matches, key=lambda event: abs((event.dtstart - moment).total_seconds()))
+
     def ipc_compose_email(
         self, *, to: str, subject: str = "", body: str = "", cc: str = "", bcc: str = ""
     ) -> None:

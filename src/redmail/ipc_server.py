@@ -193,6 +193,17 @@ def _handle_focus(controller, args) -> dict:
     return {"focused": True, "section": section}
 
 
+def _handle_show_event(controller, args) -> dict:
+    """Открыть календарь на встрече (клик по встрече в напоминалке). Ничего
+    не меняет и не отправляет: окно встречи — то же, что по двойному клику."""
+    uid = _text(args.get("uid"), "uid")
+    if not uid:
+        raise ValueError("uid обязателен")
+    start = parse_iso_datetime(args["start"], "start") if args.get("start") else None
+    found = controller.ipc_show_event(uid, start)
+    return {"focused": True, "section": "calendar", "found": bool(found)}
+
+
 def _handle_compose_email(controller, args) -> dict:
     to = _recipients_text(args.get("to"), "to")
     if not to:
@@ -586,6 +597,7 @@ def _handle_find_contacts(controller, args) -> dict:
 _HANDLERS = {
     "ping": _handle_ping,
     "focus": _handle_focus,
+    "show_event": _handle_show_event,
     "compose_email": _handle_compose_email,
     "create_event": _handle_create_event,
     "update_event": _handle_update_event,
@@ -656,18 +668,51 @@ def _is_alive(name: str) -> bool:
     return connected
 
 
-def focus_running_instance(name: str | None = None) -> bool:
+#: Ключи запуска из напоминалки: открыть календарь, а то и встречу.
+LAUNCH_CALENDAR = "--calendar"
+LAUNCH_SHOW_EVENT = "--show-event"
+LAUNCH_EVENT_START = "--event-start"
+
+
+def launch_request(argv: list[str]) -> dict | None:
+    """Команда из ключей запуска: почта закрыта, напоминалка запускает её с
+    --calendar или --show-event=<uid> [--event-start=<ISO>] — и она сразу
+    открывается на календаре (как «создать встречу» голосом, которая тоже
+    сама запускает почту). Значения — только через «=»: uid, начинающийся
+    с «-», тогда не примут за другой ключ."""
+    values: dict[str, str] = {}
+    for arg in argv[1:]:
+        key, sep, value = arg.partition("=")
+        if key == LAUNCH_CALENDAR:
+            values.setdefault(key, "")
+        elif key in (LAUNCH_SHOW_EVENT, LAUNCH_EVENT_START) and sep:
+            values[key] = value
+    uid = values.get(LAUNCH_SHOW_EVENT, "").strip()
+    if uid:
+        args = {"uid": uid}
+        if values.get(LAUNCH_EVENT_START):
+            args["start"] = values[LAUNCH_EVENT_START]
+        return {"action": "show_event", "args": args}
+    if LAUNCH_CALENDAR in values:
+        return {"action": "focus", "args": {"section": "calendar"}}
+    return None
+
+
+def focus_running_instance(name: str | None = None, request: dict | None = None) -> bool:
     """Один экземпляр программы: если по имени сокета уже отвечает живой
     redmail, попросить его поднять окно и вернуть True — тогда новый
     процесс не стартует (жалоба: "смог открыть 2 окна почты — это
-    неправильно"). Ответа не ждём дольше PROBE_TIMEOUT_MS."""
+    неправильно"). Ответа не ждём дольше PROBE_TIMEOUT_MS. request — что
+    передать запущенному вместо простого focus (запуск с --show-event из
+    напоминалки, когда почта успела подняться сама)."""
     name = name or server_name()
     probe = QLocalSocket()
     probe.connectToServer(name)
     if not probe.waitForConnected(PROBE_TIMEOUT_MS):
         probe.abort()
         return False
-    probe.write(json.dumps({"action": "focus", "args": {}}).encode("utf-8") + b"\n")
+    request = request or {"action": "focus", "args": {}}
+    probe.write(json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n")
     probe.waitForBytesWritten(PROBE_TIMEOUT_MS)
     probe.waitForReadyRead(PROBE_TIMEOUT_MS)
     # Штатное отключение, а не abort(): abort может сбросить ещё не

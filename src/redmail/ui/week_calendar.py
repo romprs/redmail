@@ -753,6 +753,12 @@ class WeekGridWidget(QWidget):
         now = datetime.now()
         return max(0, int(self._minutes_to_y((now.hour - 1) * 60)))
 
+    def scroll_position_for(self, moment: datetime) -> int:
+        """Прокрутка, при которой встреча в moment видна с часом запаса
+        сверху (открытие встречи из напоминалки)."""
+        local = moment.astimezone()
+        return max(0, int(self._minutes_to_y((local.hour - 1) * 60 + local.minute)))
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)

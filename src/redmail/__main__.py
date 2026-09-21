@@ -174,7 +174,8 @@ def main() -> int:
 
     from redmail import ipc_server
 
-    if ipc_server.focus_running_instance():
+    launch_request = ipc_server.launch_request(sys.argv)
+    if ipc_server.focus_running_instance(request=launch_request):
         # Уже запущен — поднять существующее окно и выйти, второго не открывать.
         applog.get_logger("app").info("Уже запущен другой экземпляр — показываю его окно и выхожу")
         splash.close()
@@ -210,6 +211,12 @@ def main() -> int:
     report("Готово")
     window.show()
     splash.finish(window)
+    if launch_request is not None:
+        # Запуск из напоминалки: календарь (и встреча) — когда окно уже
+        # на экране; ошибку handle_request возвращает, а не бросает.
+        from PySide6.QtCore import QTimer
+
+        QTimer.singleShot(0, lambda: ipc_server.handle_request(window, launch_request))
     if pending_error:
         from PySide6.QtWidgets import QMessageBox
 

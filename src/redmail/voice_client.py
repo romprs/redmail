@@ -1,14 +1,18 @@
 """Связь резидента напоминаний с голосовым помощником и почтовым клиентом.
 
 Оба соседа могут быть не запущены — это нормальное состояние, а не ошибка:
-напоминание тогда показывается окном, а «открыть календарь» честно говорит,
-что почта закрыта. Поэтому здесь нет исключений наружу, только True/False.
+напоминание тогда показывается окном, а «открыть календарь» запускает почту.
+Поэтому здесь нет исключений наружу, только результат.
 """
 from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
+import subprocess
+import time
+from datetime import datetime
 from pathlib import Path
 
 from redmail.applog import get_logger
@@ -116,3 +120,81 @@ def focus_mail_client(*, section: str = "calendar") -> bool:
         return False
     request = {"action": "focus", "args": {"section": section}}
     return any(_send_line(endpoint, request, wait_reply=True) for endpoint in endpoints)
+
+
+#: Где искать программу почты, если её нет в PATH (резидент стартует из
+#: автозапуска, PATH там бывает урезан).
+_MAIL_BINARIES = ("redmail", "/usr/bin/redmail")
+
+OPENED = "opened"
+LAUNCHED = "launched"
+FAILED = "failed"
+
+#: Почта стартует несколько секунд (заставка, Chromium), и канал в это время
+#: ещё молчит: повторный клик не должен запускать вторую копию.
+_LAUNCH_GRACE_SECONDS = 30.0
+_last_launch: float | None = None
+
+
+def _mail_binary() -> str | None:
+    for candidate in _MAIL_BINARIES:
+        found = shutil.which(candidate)
+        if found:
+            return found
+    return None
+
+
+def _launch_detached(argv: list[str]) -> bool:
+    """Запустить и не ждать. Через systemd-run, если он есть: почта уходит
+    в свой юнит и не погибнет при перезапуске резидента напоминаний
+    (так же запускает почту голосовой помощник)."""
+    try:
+        if shutil.which("systemd-run"):
+            result = subprocess.run(
+                ["systemd-run", "--user", "--collect", "--quiet", "--", *argv],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=_TIMEOUT_SECONDS,
+            )
+            if result.returncode == 0:
+                return True
+        subprocess.Popen(argv, start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("Почтовый клиент не запущен: %s", exc)
+        return False
+
+
+def open_mail_calendar(uid: str = "", start: datetime | None = None) -> str:
+    """Открыть в почте календарь, а если задан uid — и саму встречу.
+    Почта закрыта — запустить её с ключами, она откроется сразу на
+    календаре (как «создать встречу» голосом). OPENED — открыто в уже
+    запущенной почте, LAUNCHED — почта запускается, FAILED — не удалось."""
+    if uid:
+        request = {"action": "show_event", "args": {"uid": uid}}
+        if start is not None:
+            request["args"]["start"] = start.isoformat()
+    else:
+        request = {"action": "focus", "args": {"section": "calendar"}}
+    if any(_send_line(endpoint, request, wait_reply=True) for endpoint in _mail_endpoints()):
+        return OPENED
+    binary = _mail_binary()
+    if binary is None:
+        _log.warning("Почтовый клиент не найден: нет программы redmail")
+        return FAILED
+    # Аргументы — отдельными элементами списка, без оболочки; значения
+    # через «=», чтобы uid не приняли за ключ.
+    argv = [binary]
+    if uid:
+        argv.append(f"--show-event={uid}")
+        if start is not None:
+            argv.append(f"--event-start={start.isoformat()}")
+    else:
+        argv.append("--calendar")
+    global _last_launch
+    if _last_launch is not None and time.monotonic() - _last_launch < _LAUNCH_GRACE_SECONDS:
+        _log.info("Почта уже запускается — второй раз не запускаю")
+        return LAUNCHED
+    _log.info("Почта не отвечает — запускаю её на календаре")
+    if not _launch_detached(argv):
+        return FAILED
+    _last_launch = time.monotonic()
+    return LAUNCHED
