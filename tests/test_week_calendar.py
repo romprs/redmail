@@ -82,3 +82,28 @@ def test_tooltip_shows_full_title_and_escapes_markup() -> None:
     assert "&lt;b&gt;Совещание&lt;/b&gt;" in tooltip  # тема из письма не превращается в разметку
     assert "Переговорная &lt;3&gt;" in tooltip
     assert "Орлов Олег" in tooltip  # чужая встреча — с организатором
+
+
+def test_tooltip_appears_when_hovering_the_text_inside_a_block() -> None:
+    """Жалоба: «подсказка на встрече не высвечивается». Мышь почти всегда
+    оказывается над надписью внутри карточки, а не над рамкой — подсказка
+    должна всплыть и там."""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QHelpEvent
+    from PySide6.QtWidgets import QLabel, QToolTip
+
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.resize(7 * 150 + grid.TIME_AXIS_WIDTH, grid.HOUR_HEIGHT * 24)
+    monday = wc.week_start_for(datetime.now().date())
+    at_ten = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=10)
+    grid.set_week(monday, [_event("a", at_ten, summary="Очень длинная тема совещания по проекту")])
+    grid.show()
+    try:
+        label = grid._blocks[0].findChild(QLabel)
+        event = QHelpEvent(QHelpEvent.Type.ToolTip, QPoint(5, 5), label.mapToGlobal(QPoint(5, 5)))
+        QApplication.sendEvent(label, event)
+        assert "Очень длинная тема совещания по проекту" in QToolTip.text()
+    finally:
+        QToolTip.hideText()
+        grid.close()

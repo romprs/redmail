@@ -228,3 +228,49 @@ def test_own_choice_wins_over_settings_for_others_meeting(tmp_path: Path) -> Non
     assert reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=30), policy) == []
     due = reminders.due_reminders(calendar, state, event.dtstart - timedelta(minutes=3), policy)
     assert due and due[0].mode == calendar_store.REMIND_BOTH
+
+
+def test_meeting_link_found_in_description() -> None:
+    text = (
+        "Повестка: итоги недели.\n"
+        "Подключиться: https://telemost.yandex.ru/j/12345678901234.\n"
+        "Материалы: https://docs.example.ru/a?b=1"
+    )
+    assert reminders.links_in(text) == [
+        "https://telemost.yandex.ru/j/12345678901234", "https://docs.example.ru/a?b=1",
+    ]
+    assert reminders.meeting_link(text) == "https://telemost.yandex.ru/j/12345678901234"
+    assert reminders.meeting_link("просто текст без ссылок") == ""
+
+
+def test_only_web_links_become_clickable() -> None:
+    """Текст встречи пишет автор приглашения: кликабельны только http(s), всё
+    остальное — просто текст."""
+    text = "file:///etc/passwd javascript:alert(1) <b>жирно</b> https://zoom.us/j/1"
+    assert reminders.links_in(text) == ["https://zoom.us/j/1"]
+
+
+def test_reminder_window_shows_description_with_links_and_join_button() -> None:
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QPushButton
+
+    from redmail.ui import reminder_tray
+
+    QApplication.instance() or QApplication([])
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    reminder = reminders.Reminder(
+        "u", "Планёрка", start, start + timedelta(hours=1), "", "window",
+        description="Ссылка: https://teams.microsoft.com/l/meetup-join/abc <script>x</script>",
+    )
+    window = reminder_tray.ReminderWindow(reminder)
+    try:
+        html_text = reminder_tray.description_html(reminder.description)
+        assert '<a href="https://teams.microsoft.com/l/meetup-join/abc">' in html_text
+        assert "&lt;script&gt;" in html_text and "<script>" not in html_text
+        assert window.join_link == "https://teams.microsoft.com/l/meetup-join/abc"
+        join = next(b for b in window.findChildren(QPushButton) if b.text() == "Подключиться к встрече")
+        assert not join.isHidden()
+    finally:
+        window.close()

@@ -10,11 +10,12 @@ voice_client.speak): своего синтеза речи здесь нет и �
 """
 from __future__ import annotations
 
+import html
 import sys
 from datetime import datetime, timedelta
 
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QAction, QColor, QIcon, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import Qt, QTimer, QUrl
+from PySide6.QtGui import QAction, QColor, QDesktopServices, QIcon, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSystemTrayIcon,
+    QTextBrowser,
     QVBoxLayout,
 )
 
@@ -58,6 +60,24 @@ def _bell_icon(size: int = 22) -> QIcon:
     painter.drawEllipse(size * 0.42, size * 0.70, size * 0.16, size * 0.16)
     painter.end()
     return QIcon(pixmap)
+
+
+def description_html(text: str) -> str:
+    """Текст встречи для окна напоминания: всё экранировано, ссылки http(s)
+    кликабельны, переносы строк сохранены."""
+    if not text:
+        return ""
+    parts: list[str] = []
+    position = 0
+    for url in reminders.links_in(text):
+        index = text.find(url, position)
+        if index < 0:
+            continue
+        parts.append(html.escape(text[position:index]))
+        parts.append(f'<a href="{html.escape(url, quote=True)}">{html.escape(url)}</a>')
+        position = index + len(url)
+    parts.append(html.escape(text[position:]))
+    return "<div style='white-space: pre-wrap'>" + "".join(parts) + "</div>"
 
 
 class ReminderWindow(QDialog):
@@ -104,6 +124,22 @@ class ReminderWindow(QDialog):
         place.setWordWrap(True)
         place.setVisible(bool(reminder.location))
 
+        # Текст встречи — прямо в напоминании: в нём бывают ссылки на
+        # видеовстречу, и открывать ради них календарь незачем (пожелание
+        # пользователя). Текст пишет автор приглашения, поэтому он
+        # экранируется, а ссылками становятся только http(s).
+        self.description = QTextBrowser(self)
+        self.description.setOpenLinks(False)
+        self.description.anchorClicked.connect(self._open_link)
+        self.description.setHtml(description_html(reminder.description))
+        self.description.setVisible(bool(reminder.description.strip()))
+        self.description.setMinimumHeight(90)
+
+        self.join_link = reminders.meeting_link(reminder.description)
+        join_button = QPushButton("Подключиться к встрече", self)
+        join_button.setVisible(bool(self.join_link))
+        join_button.clicked.connect(lambda: self._open_link(QUrl(self.join_link)))
+
         open_button = QPushButton("Открыть календарь", self)
         open_button.clicked.connect(self._open_calendar)
         snooze_button = QPushButton(f"Отложить на {SNOOZE_MINUTES} минут", self)
@@ -113,6 +149,7 @@ class ReminderWindow(QDialog):
         close_button.setDefault(True)
 
         buttons = QHBoxLayout()
+        buttons.addWidget(join_button)
         buttons.addWidget(open_button)
         buttons.addWidget(snooze_button)
         buttons.addStretch(1)
@@ -123,8 +160,15 @@ class ReminderWindow(QDialog):
         layout.addWidget(when)
         layout.addWidget(author)
         layout.addWidget(place)
+        layout.addWidget(self.description, 1)
         layout.addLayout(buttons)
-        self.resize(420, 180)
+        self.resize(520, 320 if reminder.description.strip() else 180)
+
+    def _open_link(self, url: QUrl) -> None:
+        """Открыть ссылку в браузере — только http(s)."""
+        if url.scheme().lower() not in ("http", "https"):
+            return
+        QDesktopServices.openUrl(url)
 
     def _open_calendar(self) -> None:
         if not voice_client.focus_mail_client(section="calendar"):

@@ -807,6 +807,23 @@ def test_endpoint_file_written_and_removed(qapp, tmp_path) -> None:
         assert not endpoint.exists()
 
 
+def test_closing_old_instance_keeps_address_file_of_new_one(qapp, tmp_path) -> None:
+    """Перезапуск почты: новый экземпляр уже переписал файл адреса своим,
+    а старый, закрываясь, стирал его — и напоминалка писала «откройте
+    почту», хотя почта была открыта. Чужой файл закрывающийся экземпляр
+    не трогает."""
+    with patch("redmail.ipc_server.app_dir", return_value=tmp_path):
+        server = IpcServer(FakeController(), name=_unique_name())
+        assert server.start()
+        endpoint = tmp_path / "ipc-endpoint.json"
+        newer = json.loads(endpoint.read_text(encoding="utf-8"))
+        newer["pid"] = os.getpid() + 100000  # файл уже от другого, живого процесса
+        endpoint.write_text(json.dumps(newer), encoding="utf-8")
+        server.stop()
+        assert endpoint.exists()
+        assert json.loads(endpoint.read_text(encoding="utf-8"))["pid"] == newer["pid"]
+
+
 def test_modal_loop_does_not_block_the_response(qapp, tmp_path) -> None:
     """Ключевая проверка требования «диалог не должен ломать цикл событий».
 

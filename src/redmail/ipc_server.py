@@ -786,8 +786,20 @@ class IpcServer(QObject):
             pass  # адрес можно собрать и по имени — не повод не поднимать канал
 
     def _remove_endpoint_file(self) -> None:
+        """Убрать файл адреса — но только СВОЙ. Раньше закрывающийся
+        экземпляр удалял файл, не глядя, чей он: при перезапуске программы
+        старый процесс, уходя, стирал адрес уже запущенного нового, и
+        напоминалка и голосовой помощник переставали находить почту
+        (жалоба: «кнопка открыть календарь пишет — откройте почту»)."""
+        path = endpoint_file_path()
         try:
-            endpoint_file_path().unlink(missing_ok=True)
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if isinstance(data, dict) and data.get("pid") not in (None, os.getpid()):
+            return  # файл уже переписал другой, живой экземпляр
+        try:
+            path.unlink(missing_ok=True)
         except OSError:
             pass
 

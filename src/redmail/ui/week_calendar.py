@@ -231,8 +231,12 @@ class _EventBlock(QFrame):
         label.setWordWrap(not pill)
         layout.addWidget(label)
         # Полная тема при наведении: в узкой колонке (особенно когда встречи
-        # стоят рядом) название обрезано.
-        self.setToolTip(event_tooltip(calendar_event))
+        # стоят рядом) название обрезано. Подсказка — и на карточке, и на
+        # надписи: надпись занимает почти всю карточку, и мышь почти всегда
+        # оказывается именно над ней.
+        tooltip = event_tooltip(calendar_event)
+        self.setToolTip(tooltip)
+        label.setToolTip(tooltip)
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._draggable:

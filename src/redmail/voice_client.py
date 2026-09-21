@@ -34,15 +34,34 @@ def voice_socket_path() -> Path:
     return Path(override) if override else _runtime_dir() / VOICE_SOCKET_NAME
 
 
-def _mail_endpoint() -> str | None:
-    """Адрес канала почтового клиента — он пишет его при старте."""
+#: Где почтовый клиент слушает по умолчанию (QLocalServer кладёт сокет во
+#: временный каталог под этим именем) — если файла с адресом нет.
+_DEFAULT_MAIL_SOCKETS = ("/tmp/redmail-ipc",)
+
+
+def _mail_endpoints() -> list[str]:
+    """Адреса канала почтового клиента: из файла, который он пишет при
+    старте, и запасной по умолчанию. Запасной нужен на случай, когда файла
+    нет — так было при перезапуске почты (старый экземпляр стирал адрес
+    нового), и кнопка «Открыть календарь» считала почту закрытой."""
+    endpoints: list[str] = []
     base = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
     try:
         data = json.loads((base / "redmail" / "ipc-endpoint.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    value = data.get("full_server_name")
-    return value if isinstance(value, str) and value else None
+        value = data.get("full_server_name")
+        if isinstance(value, str) and value:
+            endpoints.append(value)
+    except (OSError, ValueError) as exc:
+        _log.info("Адрес почты из файла не прочитан: %s", exc)
+    for fallback in _DEFAULT_MAIL_SOCKETS:
+        if fallback not in endpoints and Path(fallback).exists():
+            endpoints.append(fallback)
+    return endpoints
+
+
+def _mail_endpoint() -> str | None:
+    endpoints = _mail_endpoints()
+    return endpoints[0] if endpoints else None
 
 
 def _send_line(address: str, payload: dict) -> bool:
@@ -71,7 +90,9 @@ def speak(text: str) -> bool:
 
 def focus_mail_client(*, section: str = "calendar") -> bool:
     """Поднять окно почтового клиента на нужном разделе."""
-    endpoint = _mail_endpoint()
-    if not endpoint:
+    endpoints = _mail_endpoints()
+    if not endpoints:
+        _log.info("Почтовый клиент не найден: нет ни файла адреса, ни сокета по умолчанию")
         return False
-    return _send_line(endpoint, {"action": "focus", "args": {"section": section}})
+    request = {"action": "focus", "args": {"section": section}}
+    return any(_send_line(endpoint, request) for endpoint in endpoints)

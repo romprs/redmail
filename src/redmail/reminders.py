@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -45,6 +46,9 @@ class Reminder:
     mine: bool = True
     #: Календарь, откуда встреча (свой, коллеги, Exchange).
     calendar_name: str = ""
+    #: Текст встречи: в нём бывают ссылки на видеовстречу — открывать ради
+    #: них календарь незачем, подключиться можно прямо из напоминания.
+    description: str = ""
 
     @property
     def key(self) -> str:
@@ -210,10 +214,41 @@ def due_reminders(
             organizer=(event.organizer_name or event.organizer_email or "").strip(),
             mine=bool(event.is_organizer),
             calendar_name=calendar_names.get(event.calendar_id, ""),
+            description=event.description or "",
         )
         if state.is_pending(reminder, now):
             result.append(reminder)
     return result
+
+
+_LINK_PATTERN = re.compile(r"https?://[^\s<>\"')\]]+", re.IGNORECASE)
+
+#: Узлы сервисов видеовстреч: такую ссылку показываем кнопкой
+#: «Подключиться», а не только в тексте.
+_MEETING_HOSTS = (
+    "teams.microsoft.com", "teams.live.com", "zoom.us", "telemost.yandex", "meet.google.com",
+    "vk.com/call", "calls.vk.com", "jitsi", "webinar.ru", "ktalk.ru", "mts-link.ru", "sberjazz",
+    "trueconf", "vcs.", "bbb.",
+)
+
+
+def links_in(text: str) -> list[str]:
+    """Ссылки http(s) из текста встречи — только эти схемы: текст пишет
+    автор приглашения, и file:, javascript: и прочее открывать нельзя."""
+    seen: list[str] = []
+    for match in _LINK_PATTERN.finditer(text or ""):
+        url = match.group(0).rstrip(".,;:!?")
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def meeting_link(text: str) -> str:
+    """Ссылка на видеовстречу, если в тексте она есть."""
+    for url in links_in(text):
+        if any(host in url.casefold() for host in _MEETING_HOSTS):
+            return url
+    return ""
 
 
 def spoken_text(reminder: Reminder, now: datetime) -> str:
