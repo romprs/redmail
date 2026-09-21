@@ -283,9 +283,17 @@ def main(argv: list[str] | None = None) -> int:
     if not QSystemTrayIcon.isSystemTrayAvailable():
         _log.error("В этой сессии нет системного лотка — напоминания показывать негде")
         return 1
-    ReminderTray(app)
+    # Ссылка на резидент обязательна до конца работы приложения. Без неё
+    # Python удалял объект сразу после создания: значок в трее оставался,
+    # а таймер проверки календаря и пункты меню молча переставали работать —
+    # напоминание не всплывало, «Сегодня» и «Открыть календарь» не
+    # отзывались (найдено на .80: встреча с напоминанием в 22:38 так и не
+    # напомнила).
+    tray = ReminderTray(app)
     _log.info("Резидент напоминаний запущен (профиль %s)", profile.profile_dir())
-    return app.exec()
+    exit_code = app.exec()
+    del tray
+    return exit_code
 
 
 if __name__ == "__main__":

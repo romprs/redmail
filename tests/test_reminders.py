@@ -274,3 +274,40 @@ def test_reminder_window_shows_description_with_links_and_join_button() -> None:
         assert not join.isHidden()
     finally:
         window.close()
+
+
+def test_resident_stays_alive_while_the_app_runs(monkeypatch) -> None:
+    """Найдено на .80: значок в трее был, а напоминания не всплывали и меню
+    не отзывалось — объект резидента удалялся сразу после создания, потому
+    что main() не держал на него ссылку. Пока приложение работает, резидент
+    должен быть жив."""
+    import gc
+    import os
+    import weakref
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QSystemTrayIcon
+
+    from redmail.ui import reminder_tray
+
+    app = QApplication.instance() or QApplication([])
+    alive_during_exec: list[bool] = []
+    created: list = []
+
+    class FakeTray:
+        def __init__(self, application) -> None:
+            created.append(weakref.ref(self))
+
+    def fake_exec() -> int:
+        gc.collect()
+        alive_during_exec.append(created[0]() is not None)
+        return 0
+
+    monkeypatch.setattr(reminder_tray, "ReminderTray", FakeTray)
+    monkeypatch.setattr(reminder_tray, "QApplication", lambda argv: app)
+    monkeypatch.setattr(app, "exec", fake_exec)
+    monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
+    monkeypatch.setattr(reminder_tray.applog, "setup_logging", lambda: None)
+
+    assert reminder_tray.main(["redmail-reminder"]) == 0
+    assert alive_during_exec == [True]

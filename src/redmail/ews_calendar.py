@@ -314,6 +314,60 @@ def push_occurrence(session, event: Event, mailbox: str = "") -> None:
         raise EwsCalendarError(f"Не удалось изменить день серии в Exchange: {exc}") from exc
 
 
+def _shift_weekdays(weekdays, days: int):
+    """Дни недели еженедельной серии при переносе серии на days дней:
+    планёрка по понедельникам и средам, перенесённая на день, — по вторникам
+    и четвергам. Дни — числа 1..7 (пн..вс), как у exchangelib."""
+    shifted = []
+    for day in weekdays:
+        number = int(day)
+        shifted.append((number - 1 + days) % 7 + 1)
+    return sorted(set(shifted))
+
+
+def shift_series(session, uid: str, delta: timedelta, mailbox: str = "") -> None:
+    """Перенести ВСЮ серию Exchange на delta (жалоба: «при переносе
+    повторяющейся встречи не даёт перенести все повторения, только один
+    день»). Exchange присылает серию развёрнутой по дням, основной записи
+    с правилом у нас нет — поэтому переносим на сервере: берём основную
+    запись серии через любой её день, сдвигаем начало и конец, а при
+    переносе на другой день недели — и дни повторения. Участникам
+    обновление разошлёт сам Exchange."""
+    account = _account_for(session, mailbox)
+    try:
+        occurrence = _find_occurrence(account, uid)
+        if occurrence is None:
+            raise EwsCalendarError("день серии не найден на сервере")
+        master = occurrence.recurring_master()
+        old_local = _to_utc(master.start).astimezone()
+        master.start = master.start + delta
+        master.end = master.end + delta
+        recurrence = getattr(master, "recurrence", None)
+        # На сколько дней сдвинулась серия — по датам в местном времени:
+        # перенос на полчаса через полночь тоже меняет день недели.
+        days = (_to_utc(master.start).astimezone().date() - old_local.date()).days
+        if recurrence is not None:
+            pattern = recurrence.pattern
+            kind = type(pattern).__name__
+            if days and kind == "WeeklyPattern":
+                pattern.weekdays = _shift_weekdays(pattern.weekdays, days)
+            elif days and kind not in ("DailyPattern", "DailyRegeneration"):
+                raise EwsCalendarError(
+                    "серия повторяется по числам месяца или года — перенести её на другой день "
+                    "перетаскиванием нельзя; измените правило повтора в окне встречи"
+                )
+            boundary = recurrence.boundary
+            if boundary is not None and hasattr(boundary, "start"):
+                boundary.start = (master.start).date()
+        master.save(send_meeting_invitations="SendToAllAndSaveCopy" if getattr(master, "required_attendees", None) else "SendToNone")
+        _log.info("EWS календарь: серия %s перенесена на %s", calendar_store.series_uid(uid), delta)
+    except EwsCalendarError:
+        raise
+    except Exception as exc:
+        _log.error("EWS календарь: перенос серии uid=%s не удался: %s", uid, exc)
+        raise EwsCalendarError(f"Не удалось перенести серию в Exchange: {exc}") from exc
+
+
 def cancel_occurrence(session, uid: str, mailbox: str = "") -> None:
     account = _account_for(session, mailbox)
     try:

@@ -6722,6 +6722,9 @@ class _ExchangeCalendarServer:
     def cancel_occurrence(self, uid: str) -> None:
         ews_calendar.cancel_occurrence(self._session, uid, self._mailbox)
 
+    def shift_series(self, uid: str, delta) -> None:
+        ews_calendar.shift_series(self._session, uid, delta, self._mailbox)
+
     def delete_event(self, uid: str) -> None:
         ews_calendar.delete_event(self._session, uid, self._mailbox)
 
@@ -13077,7 +13080,11 @@ class MainWindow(QMainWindow):
         box.setText(f"«{event.summary}» — повторяющаяся встреча. {action}:")
         one = box.addButton("Только этот день", QMessageBox.ButtonRole.AcceptRole)
         whole = None
-        if series is not None and series.recurrence_rule or action.startswith("Отменить"):
+        # Exchange присылает серию развёрнутой по дням — основной записи с
+        # правилом у нас нет, но всю серию можно изменить на сервере
+        # (жалоба: «не даёт перенести все повторения, только один день»).
+        exchange_series = calendar_store.is_instance_uid(event.uid) and self._is_exchange_calendar(event.calendar_id)
+        if series is not None and series.recurrence_rule or exchange_series or action.startswith("Отменить"):
             whole = box.addButton("Всю серию", QMessageBox.ButtonRole.AcceptRole)
         box.addButton("Отмена", QMessageBox.ButtonRole.RejectRole)
         box.exec()
@@ -13127,11 +13134,15 @@ class MainWindow(QMainWindow):
         if scope is None:
             self.refresh_calendar_view()
             return
+        master_here = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(event.uid))
+        if scope == self.SCOPE_ALL and master_here is None and self._is_exchange_calendar(event.calendar_id)                 and calendar_store.is_instance_uid(event.uid):
+            self._shift_exchange_series(event, delta, when_text)
+            return
         if scope == self.SCOPE_ONE:
             target = calendar_store.detach_occurrence(self.calendar_path, event)
             updated = calendar_store.reschedule_event(self.calendar_path, target.uid, new_start, new_end)
         else:
-            master = calendar_store.get_event(self.calendar_path, calendar_store.series_uid(event.uid)) or event
+            master = master_here or event
             # Серия сдвигается на тот же промежуток, на который перетащили день.
             updated = calendar_store.reschedule_event(
                 self.calendar_path, master.uid, master.dtstart + delta, master.dtend + delta
@@ -13147,6 +13158,38 @@ class MainWindow(QMainWindow):
                 self._schedule_calendar_sync()
         self.refresh_calendar_view()
         self.statusBar().showMessage(f"Перенесено: «{updated.summary}» → {when_text}", 5000)
+
+    def _shift_exchange_series(self, event: calendar_store.Event, delta: timedelta, when_text: str) -> None:
+        """Перенос всей серии Exchange на сервере — в фоне: запрос к серверу
+        может идти секунды, окно не должно замирать. Локальные дни серии
+        обновит следующая синхронизация календаря."""
+        session = self._ews_session_for_calendar()
+        calendar = self._calendar_by_id(event.calendar_id)
+        if session is None or calendar is None:
+            QMessageBox.warning(self, "Перенос серии", "Нет подключения к Exchange — серию перенести нельзя.")
+            self.refresh_calendar_view()
+            return
+        email = getattr(getattr(session, "account", None), "email", "") or ""
+        server = _ExchangeCalendarServer(session, email, calendar.caldav_url.strip())
+        worker = _CallableWorker(lambda: server.shift_series(event.uid, delta), parent=self)
+        self.statusBar().showMessage(f"Переношу серию «{event.summary}»…")
+
+        def done(_result: object = None) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            self.statusBar().showMessage(f"Серия «{event.summary}» перенесена (этот день теперь — {when_text})", 6000)
+            self._schedule_calendar_sync(500)
+
+        def failed(error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            QMessageBox.warning(self, "Перенос серии", error_text)
+            self.refresh_calendar_view()
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        self._background_workers.append(worker)
+        worker.start()
 
     def on_cancel_event(self) -> None:
         event = self.selected_calendar_event
