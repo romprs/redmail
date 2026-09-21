@@ -263,6 +263,13 @@ def create_calendar(path: Path) -> None:
             "INSERT OR IGNORE INTO calendars (id, name, color, visible, sort_order) VALUES (?, ?, ?, 1, 0)",
             (DEFAULT_CALENDAR_ID, _DEFAULT_CALENDAR_NAME, _DEFAULT_CALENDAR_COLOR),
         )
+        # В профилях, созданных до переименования, локальный календарь
+        # так и назывался «Мои встречи». Переименовываем, только если имя
+        # осталось прежним стандартным — своё название пользователя не трогаем.
+        conn.execute(
+            f"UPDATE calendars SET name = ? WHERE id = ? AND name IN ({','.join('?' * len(_LEGACY_DEFAULT_CALENDAR_NAMES))})",
+            (_DEFAULT_CALENDAR_NAME, DEFAULT_CALENDAR_ID, *_LEGACY_DEFAULT_CALENDAR_NAMES),
+        )
         conn.commit()
 
 

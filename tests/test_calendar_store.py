@@ -547,3 +547,21 @@ def test_reminder_choice_survives_save_and_load(tmp_path: Path) -> None:
     loaded = calendar_store.get_event(path, event.uid)
     assert loaded.remind_minutes == 30
     assert loaded.remind_mode == calendar_store.REMIND_BOTH
+
+
+def test_old_default_calendar_name_becomes_tasks_but_custom_name_stays(tmp_path: Path) -> None:
+    """Локальный календарь — это задачи. В старых профилях он назывался «Мои
+    встречи»; переименовываем только стандартное имя, своё — не трогаем."""
+    path = tmp_path / "test.rmcal"
+    calendar_store.create_calendar(path)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE calendars SET name = 'Мои встречи' WHERE id = ?", (calendar_store.DEFAULT_CALENDAR_ID,))
+    calendar_store.create_calendar(path)
+    names = {c.id: c.name for c in calendar_store.list_calendars(path)}
+    assert names[calendar_store.DEFAULT_CALENDAR_ID] == "Задачи"
+
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE calendars SET name = 'Личное' WHERE id = ?", (calendar_store.DEFAULT_CALENDAR_ID,))
+    calendar_store.create_calendar(path)
+    names = {c.id: c.name for c in calendar_store.list_calendars(path)}
+    assert names[calendar_store.DEFAULT_CALENDAR_ID] == "Личное"
