@@ -338,7 +338,10 @@ def shift_series(session, uid: str, delta: timedelta, mailbox: str = "") -> None
         occurrence = _find_occurrence(account, uid)
         if occurrence is None:
             raise EwsCalendarError("день серии не найден на сервере")
+        # recurring_master() в библиотеке — только ссылка на основную запись,
+        # без полей; сами поля (начало, правило повтора) надо загрузить.
         master = occurrence.recurring_master()
+        master.refresh()
         old_local = _to_utc(master.start).astimezone()
         master.start = master.start + delta
         master.end = master.end + delta
