@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from datetime import date, datetime, timedelta
 
 from PySide6.QtCore import QRectF, Qt, QTimer, Signal
@@ -89,6 +90,63 @@ def _event_color(calendar_event: Event, calendar_color: str | None = None) -> st
 _DRAG_THRESHOLD_PX = 6
 
 
+def overlap_columns(intervals: list[tuple[float, float]]) -> list[tuple[int, int]]:
+    """Раскладка пересекающихся встреч по колонкам внутри дня, как у
+    Google/Outlook: (номер колонки, сколько колонок в группе) для каждого
+    интервала (начало, конец) в исходном порядке.
+
+    Раньше встречи на одно время рисовались поверх друг друга и читать их
+    было невозможно (жалоба: «несколько событий на одно время нечитабельны —
+    размещать рядом, а не поверх»). Группа — цепочка встреч, пересекающихся
+    хотя бы попарно; внутри неё каждая встреча занимает первую колонку, где
+    предыдущая уже кончилась, а ширина всех встреч группы делится на число
+    колонок этой группы."""
+    order = sorted(range(len(intervals)), key=lambda i: (intervals[i][0], -intervals[i][1]))
+    result: list[tuple[int, int]] = [(0, 1)] * len(intervals)
+    group: list[int] = []
+    column_ends: list[float] = []
+    group_end = float("-inf")
+
+    def close_group() -> None:
+        for index in group:
+            result[index] = (result[index][0], len(column_ends))
+
+    for index in order:
+        start, end = intervals[index]
+        if group and start >= group_end:
+            close_group()
+            group, column_ends, group_end = [], [], float("-inf")
+        for column, column_end in enumerate(column_ends):
+            if column_end <= start:
+                column_ends[column] = end
+                break
+        else:
+            column = len(column_ends)
+            column_ends.append(end)
+        result[index] = (column, 0)
+        group.append(index)
+        group_end = max(group_end, end)
+    if group:
+        close_group()
+    return result
+
+
+def event_tooltip(calendar_event: Event) -> str:
+    """Подсказка при наведении: полная тема (в узкой колонке она обрезана),
+    время, место и организатор. Тему и место пишет кто угодно — экранируем,
+    иначе подсказка отрисовала бы их как разметку."""
+    start = calendar_event.dtstart.astimezone()
+    end = calendar_event.dtend.astimezone()
+    when = "весь день" if calendar_event.all_day else f"{start:%d.%m %H:%M}–{end:%H:%M}"
+    lines = [f"<b>{html.escape(calendar_event.summary or '(без темы)')}</b>", html.escape(when)]
+    if calendar_event.location:
+        lines.append(f"Место: {html.escape(calendar_event.location)}")
+    organizer = calendar_event.organizer_name or calendar_event.organizer_email
+    if organizer and not calendar_event.is_organizer:
+        lines.append(f"Организатор: {html.escape(organizer)}")
+    return "<br>".join(lines)
+
+
 class _EventBlock(QFrame):
     clicked = Signal(object)
     doubleClicked = Signal(object)
@@ -172,6 +230,9 @@ class _EventBlock(QFrame):
         # обрезанная по ширине, как в референсе.
         label.setWordWrap(not pill)
         layout.addWidget(label)
+        # Полная тема при наведении: в узкой колонке (особенно когда встречи
+        # стоят рядом) название обрезано.
+        self.setToolTip(event_tooltip(calendar_event))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._draggable:
@@ -492,21 +553,36 @@ class WeekGridWidget(QWidget):
         self._blocks = []
 
         col_w = self._day_column_width()
+        # Встречи раскладываются по дням, внутри дня — по колонкам, если
+        # пересекаются по времени (см. overlap_columns).
+        by_day: dict[int, list[tuple[Event, float, float]]] = {}
         for ev in self._events:
             start_local = ev.dtstart.astimezone()
             end_local = ev.dtend.astimezone()
             day_index = (start_local.date() - self._week_start).days
             if not (0 <= day_index < 7):
                 continue
-
             start_minutes = start_local.hour * 60 + start_local.minute
+            # Короткие встречи рисуются не ниже 20 минут — и занимают столько
+            # же места при раскладке, иначе соседняя легла бы на них сверху.
             duration_minutes = max(20, (end_local - start_local).total_seconds() / 60)
+            by_day.setdefault(day_index, []).append((ev, start_minutes, start_minutes + duration_minutes))
+
+        placed: list[tuple[Event, float, float, float, float]] = []
+        for day_index, day_events in by_day.items():
+            columns = overlap_columns([(start, end) for _ev, start, end in day_events])
+            day_x = self.TIME_AXIS_WIDTH + day_index * col_w
+            for (ev, start, end), (column, count) in zip(day_events, columns):
+                width = (col_w - 4) / count
+                placed.append((ev, day_x + 2 + column * width, start, end, width))
+
+        for ev, x, start_minutes, end_minutes, width in placed:
             y = start_minutes / 60 * self.HOUR_HEIGHT
-            h = duration_minutes / 60 * self.HOUR_HEIGHT
-            x = self.TIME_AXIS_WIDTH + day_index * col_w
+            h = (end_minutes - start_minutes) / 60 * self.HOUR_HEIGHT
 
             block = _EventBlock(ev, self, calendar_color=self._calendar_colors.get(ev.calendar_id))
-            block.setGeometry(int(x) + 2, int(y), int(col_w) - 4, max(20, int(h)))
+            # Зазор в пиксель между соседями, чтобы карточки не сливались.
+            block.setGeometry(int(x), int(y), max(8, int(width) - 1), max(20, int(h)))
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
             block.dragFinished.connect(self._on_block_drag_finished)
