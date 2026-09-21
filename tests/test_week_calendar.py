@@ -84,15 +84,19 @@ def test_tooltip_shows_full_title_and_escapes_markup() -> None:
     assert "Орлов Олег" in tooltip  # чужая встреча — с организатором
 
 
-def test_tooltip_appears_when_hovering_the_text_inside_a_block() -> None:
-    """Жалоба: «подсказка на встрече не высвечивается». Мышь почти всегда
-    оказывается над надписью внутри карточки, а не над рамкой — подсказка
-    должна всплыть и там."""
+def test_tooltip_over_a_block_is_readable() -> None:
+    """Жалоба: «подсказка — чёрный квадрат, текста нет». Подсказка
+    наследовала от надписи в карточке прозрачный фон (на X11 — чёрный) и
+    тёмный текст. Проверяем то, что видит человек: наведение на надпись
+    даёт подсказку со светлым фоном и тёмным текстом на нём."""
     from PySide6.QtCore import QPoint
     from PySide6.QtGui import QHelpEvent
     from PySide6.QtWidgets import QLabel, QToolTip
 
-    _app()
+    from redmail.ui import theme
+
+    app = _app()
+    theme.apply_theme(app, "light")
     grid = wc.WeekGridWidget()
     grid.resize(7 * 150 + grid.TIME_AXIS_WIDTH, grid.HOUR_HEIGHT * 24)
     monday = wc.week_start_for(datetime.now().date())
@@ -100,10 +104,98 @@ def test_tooltip_appears_when_hovering_the_text_inside_a_block() -> None:
     grid.set_week(monday, [_event("a", at_ten, summary="Очень длинная тема совещания по проекту")])
     grid.show()
     try:
-        label = grid._blocks[0].findChild(QLabel)
-        event = QHelpEvent(QHelpEvent.Type.ToolTip, QPoint(5, 5), label.mapToGlobal(QPoint(5, 5)))
-        QApplication.sendEvent(label, event)
+        block = grid._blocks[0]
+        label = block.findChild(QLabel)
+        # Надпись пропускает мышь сквозь себя — наведение достаётся карточке.
+        from PySide6.QtCore import Qt
+        assert label.testAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        QApplication.sendEvent(block, QHelpEvent(QHelpEvent.Type.ToolTip, QPoint(5, 5), block.mapToGlobal(QPoint(5, 5))))
         assert "Очень длинная тема совещания по проекту" in QToolTip.text()
+        tip = None
+        for widget in QApplication.topLevelWidgets():
+            try:
+                if widget.metaObject().className() == "QTipLabel" and "Очень длинная" in widget.text():
+                    tip = widget
+            except RuntimeError:
+                continue  # подсказка от прошлого теста уже удалена
+        assert tip is not None
+        # Снимок сразу: без мыши в тестовом окружении подсказка вскоре
+        # закрывается сама и удаляется.
+        image = tip.grab().toImage()
+        colors = [image.pixelColor(x, y) for x in range(0, image.width(), 2) for y in range(0, image.height(), 2)]
+        light = sum(1 for c in colors if c.lightness() > 200)
+        dark = sum(1 for c in colors if c.lightness() < 90)
+        assert light > len(colors) // 2  # фон светлый, а не чёрный
+        assert dark > 0                  # и на нём есть текст
     finally:
         QToolTip.hideText()
         grid.close()
+
+
+def test_tooltip_puts_each_field_on_its_own_unwrapped_line() -> None:
+    """Пожелание: «тема в 1 строку, время в другой, место в 3-ю» — каждая
+    строка без переноса, чтобы длинная тема была видна целиком."""
+    from redmail.calendar_store import Attendee
+
+    start = datetime(2026, 9, 21, 10, tzinfo=timezone.utc)
+    event = _event("a", start, summary="Совещание по проекту Феникс с подрядчиком и заказчиком")
+    event.location = "Переговорная 3"
+    event.attendees = [Attendee(email=f"u{n}@x.ru", name=f"Участник {n}") for n in range(7)]
+    lines = wc.event_tooltip(event).split("<br>")
+    assert "Совещание по проекту Феникс с подрядчиком и заказчиком" in lines[0]
+    assert f"{start.astimezone():%H:%M}" in lines[1] and f"{start.astimezone():%d.%m.%Y}" in lines[1]
+    assert lines[2] == "<nobr>Место: Переговорная 3</nobr>"
+    assert "Организатор: Орлов Олег" in lines[3]
+    assert "Участник 0" in lines[4] and "и ещё 2" in lines[4]
+    assert all(line.startswith("<nobr>") for line in lines)
+
+
+def test_grid_stretches_to_fill_a_taller_window() -> None:
+    """Жалоба: «растягиваю вниз — внизу пустота». Час растягивается под
+    высоту видимой области, но не мельче прежнего."""
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.set_viewport_height(24 * 60)  # высокое окно — по 60 пикселей на час
+    assert grid.hour_height() == 60
+    assert grid.height() == 24 * 60 or grid.minimumHeight() == 24 * 60
+    grid.set_viewport_height(300)  # низкое окно — час не мельче прежних 36
+    assert grid.hour_height() == grid.HOUR_HEIGHT
+
+
+def test_compact_mode_hides_night_hours_and_widens_the_day() -> None:
+    """Сжатый режим: видны рабочие часы, и они растягиваются на окно."""
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.set_viewport_height(13 * 50)
+    grid.set_compact(True)
+    assert grid.visible_hours() == (wc.WeekGridWidget.COMPACT_FIRST_HOUR, wc.WeekGridWidget.COMPACT_LAST_HOUR)
+    assert grid.hour_height() == 50  # 13 рабочих часов на ту же высоту — крупнее
+    grid.set_compact(False)
+    assert grid.visible_hours() == (0, 24)
+
+
+def test_compact_mode_never_hides_a_meeting() -> None:
+    """Встреча в 6 утра в сжатом режиме не прячется — рамка раздвигается."""
+    _app()
+    grid = wc.WeekGridWidget()
+    monday = wc.week_start_for(datetime.now().date())
+    early = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=6)
+    late = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=21)
+    grid.set_compact(True)
+    grid.set_week(monday, [_event("early", early), _event("late", late)])
+    assert grid.visible_hours() == (6, 22)
+    block = grid._blocks[0] if grid._blocks[0].calendar_event.uid == "early" else grid._blocks[1]
+    assert block.geometry().y() == 0  # ранняя встреча — у самого верха, а не за его пределами
+
+
+def test_clicking_an_empty_slot_in_compact_mode_gives_real_time() -> None:
+    """Клик по пустому месту: в сжатом режиме верх сетки — это 7:00, а не
+    полночь, и новая встреча должна создаваться на то время, куда кликнули."""
+    from PySide6.QtCore import QPoint
+
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.resize(7 * 100 + grid.TIME_AXIS_WIDTH, 800)
+    grid.set_compact(True)
+    day, minutes = grid._slot_at(QPoint(grid.TIME_AXIS_WIDTH + 10, int(grid.hour_height() * 2)))
+    assert minutes == 9 * 60  # два часа от верха сжатой сетки — 9:00

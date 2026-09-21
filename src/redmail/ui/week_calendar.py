@@ -131,19 +131,38 @@ def overlap_columns(intervals: list[tuple[float, float]]) -> list[tuple[int, int
     return result
 
 
+_WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+
+
 def event_tooltip(calendar_event: Event) -> str:
-    """Подсказка при наведении: полная тема (в узкой колонке она обрезана),
-    время, место и организатор. Тему и место пишет кто угодно — экранируем,
-    иначе подсказка отрисовала бы их как разметку."""
+    """Подсказка при наведении — развёрнутая, каждое поле своей строкой:
+    тема, день и время, место, организатор, участники (пожелание: «тема в 1
+    строку, время в другой, место в 3-ю»). Строки не переносятся — длинная
+    тема видна целиком, ради неё подсказка и нужна: в узкой колонке тема
+    обрезана. Тему, место и имена пишет автор приглашения — всё
+    экранируется, иначе подсказка отрисовала бы их как разметку."""
     start = calendar_event.dtstart.astimezone()
     end = calendar_event.dtend.astimezone()
-    when = "весь день" if calendar_event.all_day else f"{start:%d.%m %H:%M}–{end:%H:%M}"
-    lines = [f"<b>{html.escape(calendar_event.summary or '(без темы)')}</b>", html.escape(when)]
+    day = f"{_WEEKDAYS[start.weekday()]} {start:%d.%m.%Y}"
+    when = f"{day}, весь день" if calendar_event.all_day else f"{day}, {start:%H:%M}–{end:%H:%M}"
+
+    def line(text: str) -> str:
+        return f"<nobr>{text}</nobr>"
+
+    lines = [line(f"<b>{html.escape(calendar_event.summary or '(без темы)')}</b>"), line(html.escape(when))]
     if calendar_event.location:
-        lines.append(f"Место: {html.escape(calendar_event.location)}")
+        lines.append(line(f"Место: {html.escape(calendar_event.location)}"))
     organizer = calendar_event.organizer_name or calendar_event.organizer_email
-    if organizer and not calendar_event.is_organizer:
-        lines.append(f"Организатор: {html.escape(organizer)}")
+    if organizer:
+        who = "вы" if calendar_event.is_organizer else organizer
+        lines.append(line(f"Организатор: {html.escape(who)}"))
+    names = [a.name or a.email for a in calendar_event.attendees if (a.name or a.email)]
+    if names:
+        shown = ", ".join(names[:5])
+        more = f" и ещё {len(names) - 5}" if len(names) > 5 else ""
+        lines.append(line(f"Участники: {html.escape(shown)}{more}"))
+    if calendar_event.recurrence_rule:
+        lines.append(line("Повторяется"))
     return "<br>".join(lines)
 
 
@@ -231,12 +250,12 @@ class _EventBlock(QFrame):
         label.setWordWrap(not pill)
         layout.addWidget(label)
         # Полная тема при наведении: в узкой колонке (особенно когда встречи
-        # стоят рядом) название обрезано. Подсказка — и на карточке, и на
-        # надписи: надпись занимает почти всю карточку, и мышь почти всегда
-        # оказывается именно над ней.
-        tooltip = event_tooltip(calendar_event)
-        self.setToolTip(tooltip)
-        label.setToolTip(tooltip)
+        # стоят рядом) название обрезано. Подсказка — у карточки, а надпись
+        # пропускает мышь сквозь себя: повешенная на надпись подсказка
+        # наследовала её прозрачный фон и тёмный текст и выходила чёрным
+        # квадратом без текста.
+        label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.setToolTip(event_tooltip(calendar_event))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._draggable:
@@ -516,8 +535,22 @@ class WeekGridWidget(QWidget):
     emptySlotDoubleClicked = Signal(object, int)
     emptySlotContextMenuRequested = Signal(object, int, object)  # (date, minutes, global_pos)
 
+    #: Сжатый режим: рабочие часы, если в неделе нет встреч раньше/позже
+    #: (жалоба: «у меня нет событий с 00:00 до 9:00 — можно скрыть всё до
+    #: 7:00, это позволит сделать временную рамку шире»).
+    COMPACT_FIRST_HOUR = 7
+    COMPACT_LAST_HOUR = 20
+
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
+        # Высота часа подстраивается под окно (set_viewport_height): раньше
+        # была постоянной, и растянутое окно оставалось пустым внизу.
+        # HOUR_HEIGHT — нижняя граница, мельче читать уже трудно.
+        self._hour_height = float(self.HOUR_HEIGHT)
+        self._viewport_height = 0
+        self._compact = False
+        self._first_hour = 0
+        self._last_hour = 24
         self.setMinimumHeight(self.HOUR_HEIGHT * 24)
         self._week_start = week_start_for(date.today())
         self._events: list[Event] = []
@@ -538,7 +571,68 @@ class WeekGridWidget(QWidget):
         self._events = timed_events
         if calendar_colors is not None:
             self._calendar_colors = calendar_colors
+        self._update_scale()
         self._relayout()
+
+    # -- масштаб: какие часы видны и сколько пикселей на час -----------------
+
+    def set_compact(self, compact: bool) -> None:
+        """Сжатый режим: скрыть часы без встреч (ночь и раннее утро)."""
+        self._compact = compact
+        self._update_scale()
+        self._relayout()
+
+    def is_compact(self) -> bool:
+        return self._compact
+
+    def set_viewport_height(self, height: int) -> None:
+        """Высота видимой области (прокрутки): видимые часы растягиваются на
+        неё целиком, пока час не становится мельче HOUR_HEIGHT — дальше
+        сетка прокручивается, как раньше."""
+        if height == self._viewport_height:
+            return
+        self._viewport_height = height
+        self._update_scale()
+        self._relayout()
+
+    def visible_hours(self) -> tuple[int, int]:
+        return self._first_hour, self._last_hour
+
+    def hour_height(self) -> float:
+        return self._hour_height
+
+    def _week_hours(self) -> tuple[int, int] | None:
+        """Самый ранний час начала и самый поздний час конца встреч недели."""
+        first, last = None, None
+        for ev in self._events:
+            start_local = ev.dtstart.astimezone()
+            if not (0 <= (start_local.date() - self._week_start).days < 7):
+                continue
+            end_local = ev.dtend.astimezone()
+            end_hour = 24 if end_local.date() > start_local.date() else end_local.hour + (1 if end_local.minute else 0)
+            first = start_local.hour if first is None else min(first, start_local.hour)
+            last = end_hour if last is None else max(last, end_hour)
+        return (first, last) if first is not None else None
+
+    def _update_scale(self) -> None:
+        if self._compact:
+            first, last = self.COMPACT_FIRST_HOUR, self.COMPACT_LAST_HOUR
+            span = self._week_hours()
+            if span is not None:
+                # Встречи вне рабочих часов не прячем — рамка раздвигается.
+                first, last = min(first, span[0]), max(last, span[1])
+        else:
+            first, last = 0, 24
+        self._first_hour, self._last_hour = first, max(first + 1, last)
+        hours = self._last_hour - self._first_hour
+        fit = self._viewport_height / hours if self._viewport_height > 0 else 0
+        self._hour_height = max(float(self.HOUR_HEIGHT), fit)
+        height = int(round(self._hour_height * hours))
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
+
+    def _minutes_to_y(self, minutes: float) -> float:
+        return (minutes - self._first_hour * 60) / 60 * self._hour_height
 
     def set_selected_day(self, day: date | None) -> None:
         self._selected_day = day
@@ -581,8 +675,8 @@ class WeekGridWidget(QWidget):
                 placed.append((ev, day_x + 2 + column * width, start, end, width))
 
         for ev, x, start_minutes, end_minutes, width in placed:
-            y = start_minutes / 60 * self.HOUR_HEIGHT
-            h = (end_minutes - start_minutes) / 60 * self.HOUR_HEIGHT
+            y = self._minutes_to_y(start_minutes)
+            h = (end_minutes - start_minutes) / 60 * self._hour_height
 
             block = _EventBlock(ev, self, calendar_color=self._calendar_colors.get(ev.calendar_id))
             # Зазор в пиксель между соседями, чтобы карточки не сливались.
@@ -607,7 +701,8 @@ class WeekGridWidget(QWidget):
         day_index = int((pos.x() - self.TIME_AXIS_WIDTH) / col_w)
         if not (0 <= day_index < 7):
             return None
-        minutes = max(0, min(24 * 60 - self._SNAP_MINUTES, int(pos.y() / self.HOUR_HEIGHT * 60)))
+        minutes = int(pos.y() / self._hour_height * 60) + self._first_hour * 60
+        minutes = max(0, min(24 * 60 - self._SNAP_MINUTES, minutes))
         minutes = round(minutes / self._SNAP_MINUTES) * self._SNAP_MINUTES
         return self._week_start + timedelta(days=day_index), minutes
 
@@ -636,7 +731,7 @@ class WeekGridWidget(QWidget):
     def _on_block_drag_finished(self, calendar_event: Event, old_geom, new_geom) -> None:
         col_w = self._day_column_width()
         day_delta = round((new_geom.x() - old_geom.x()) / col_w)
-        minutes_per_pixel = 60 / self.HOUR_HEIGHT
+        minutes_per_pixel = 60 / self._hour_height
         raw_minute_delta = (new_geom.y() - old_geom.y()) * minutes_per_pixel
         minute_delta = round(raw_minute_delta / self._SNAP_MINUTES) * self._SNAP_MINUTES
         if day_delta == 0 and minute_delta == 0:
@@ -646,7 +741,7 @@ class WeekGridWidget(QWidget):
 
     def scroll_position_for_now(self) -> int:
         now = datetime.now()
-        return max(0, int((now.hour - 1) * self.HOUR_HEIGHT))
+        return max(0, int(self._minutes_to_y((now.hour - 1) * 60)))
 
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         painter = QPainter(self)
@@ -666,8 +761,8 @@ class WeekGridWidget(QWidget):
         today_index = (date.today() - self._week_start).days
 
         painter.setPen(grid_pen)
-        for hour in range(25):
-            y = hour * self.HOUR_HEIGHT
+        for hour in range(self._first_hour, self._last_hour + 1):
+            y = int(self._minutes_to_y(hour * 60))
             painter.drawLine(self.TIME_AXIS_WIDTH, y, self.width(), y)
 
         for i in range(8):
@@ -675,10 +770,10 @@ class WeekGridWidget(QWidget):
             painter.drawLine(int(x), 0, int(x), self.height())
 
         painter.setPen(text_color)
-        for hour in range(24):
-            y = hour * self.HOUR_HEIGHT
+        for hour in range(self._first_hour, self._last_hour):
+            y = self._minutes_to_y(hour * 60)
             painter.drawText(
-                QRectF(0, y + 2, self.TIME_AXIS_WIDTH - 6, self.HOUR_HEIGHT),
+                QRectF(0, y + 2, self.TIME_AXIS_WIDTH - 6, self._hour_height),
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop,
                 f"{hour:02d}:00",
             )
@@ -697,7 +792,7 @@ class WeekGridWidget(QWidget):
             painter.fillRect(QRectF(x, 0, col_w, self.height()), highlight)
 
             now = datetime.now()
-            now_y = (now.hour * 60 + now.minute) / 60 * self.HOUR_HEIGHT
+            now_y = self._minutes_to_y(now.hour * 60 + now.minute)
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             now_pen = QPen(QColor(_NOW_LINE_COLOR))
             now_pen.setWidth(2)

@@ -151,6 +151,7 @@ from redmail.config_store import (
     load_auto_archive_enabled,
     load_maintenance_window,
     load_others_reminder,
+    load_calendar_compact,
     load_disabled_accounts,
     load_domain_rewrites,
     load_tls_ca_file,
@@ -202,6 +203,7 @@ from redmail.config_store import (
     save_auto_archive_enabled,
     save_maintenance_window,
     save_others_reminder,
+    save_calendar_compact,
     save_disabled_accounts,
     save_domain_rewrites_by_account,
     save_tls_ca_file,
@@ -7513,6 +7515,20 @@ class MainWindow(QMainWindow):
         if isinstance(sync_button, QToolButton):
             sync_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
             sync_button.setText("Синхронизировать")
+        # Сжатый режим: ночные и ранние часы без встреч скрыты, рабочий день
+        # растягивается на всю высоту окна (пожелание: «можно скрыть всё до
+        # 7:00 — рамка станет шире; включил — убралось, выключил — появилось»).
+        self.calendar_compact_action = QAction("Сжатый режим", self)
+        self.calendar_compact_action.setCheckable(True)
+        self.calendar_compact_action.setToolTip(
+            "Показывать только рабочие часы (7:00–20:00). Если в неделе есть встречи раньше или позже — "
+            "рамка раздвигается, чтобы их не спрятать."
+        )
+        self.calendar_compact_action.toggled.connect(self._on_calendar_compact_toggled)
+        calendar_toolbar.addAction(self.calendar_compact_action)
+        compact_button = calendar_toolbar.widgetForAction(self.calendar_compact_action)
+        if isinstance(compact_button, QToolButton):
+            compact_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         calendar_toolbar.addWidget(self.calendar_view_combo)
 
         # Левая панель: мини-календарь для быстрого перехода к неделе +
@@ -7585,6 +7601,17 @@ class MainWindow(QMainWindow):
         calendar_scroll.setWidgetResizable(True)
         calendar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._calendar_scroll = calendar_scroll
+        # Сетка растягивается на высоту видимой области: раньше при
+        # растягивании окна внизу оставалась пустота.
+        calendar_scroll.viewport().installEventFilter(self)
+        try:
+            compact = load_calendar_compact()
+        except Exception:
+            compact = False
+        self.calendar_week_grid.set_compact(compact)
+        self.calendar_compact_action.blockSignals(True)
+        self.calendar_compact_action.setChecked(compact)
+        self.calendar_compact_action.blockSignals(False)
 
         week_view = QWidget(self)
         week_view_layout = QVBoxLayout(week_view)
@@ -10673,6 +10700,9 @@ class MainWindow(QMainWindow):
         return info is not None and info.count > 1 and not info.is_head and info.key not in self._expanded_threads
 
     def eventFilter(self, watched, event) -> bool:  # noqa: N802 - Qt override
+        calendar_scroll = getattr(self, "_calendar_scroll", None)
+        if calendar_scroll is not None and watched is calendar_scroll.viewport() and event.type() == QEvent.Type.Resize:
+            self.calendar_week_grid.set_viewport_height(calendar_scroll.viewport().height())
         if watched is self.table.viewport() and event.type() == QEvent.Type.MouseButtonPress \
                 and event.button() == Qt.MouseButton.LeftButton:
             pos = event.position().toPoint()
@@ -10686,6 +10716,15 @@ class MainWindow(QMainWindow):
                         self._toggle_thread(info.key)
                         return True
         return super().eventFilter(watched, event)
+
+    def _on_calendar_compact_toggled(self, compact: bool) -> None:
+        self.calendar_week_grid.set_compact(compact)
+        try:
+            save_calendar_compact(compact)
+        except Exception as exc:
+            _log.info("Сжатый режим календаря не сохранён: %s", exc)
+        # После смены видимых часов — к текущему времени, как при открытии.
+        self._calendar_scroll.verticalScrollBar().setValue(self.calendar_week_grid.scroll_position_for_now())
 
     def _sync_sort_menu(self) -> None:
         header = self.table.horizontalHeader()

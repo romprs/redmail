@@ -628,6 +628,17 @@ def greeting_text(mode: str, now=None) -> str:
     return ""
 
 
+def load_calendar_compact() -> bool:
+    """Сжатый режим недельной сетки: скрывать ночные и ранние часы."""
+    return bool(_load_settings_dict().get("calendar_compact", False))
+
+
+def save_calendar_compact(compact: bool) -> None:
+    data = _load_settings_dict()
+    data["calendar_compact"] = bool(compact)
+    _save_settings_dict(data)
+
+
 def load_font_scale() -> float:
     try:
         value = float(_load_settings_dict().get("font_scale", _DEFAULT_FONT_SCALE))

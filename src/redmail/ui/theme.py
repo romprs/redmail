@@ -47,6 +47,16 @@ _DARK = {
 }
 
 _QSS_TEMPLATE = """
+/* Подсказки — всегда своим цветом. Иначе подсказка наследует стиль
+   виджета, над которым всплыла: у надписи в карточке встречи прозрачный
+   фон и тёмный текст, и подсказка выходила чёрным квадратом без текста
+   (прозрачное на X11 рисуется чёрным). */
+QToolTip {{
+    color: {text};
+    background-color: {base};
+    border: 1px solid {border};
+    padding: 4px;
+}}
 QToolBar {{
     background-color: {alt_base};
     border: none;
