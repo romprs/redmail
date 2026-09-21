@@ -343,6 +343,19 @@ def test_connection_waits_when_server_asks_to_throttle() -> None:
     assert policy.max_wait >= 120
 
 
+def test_connection_allows_parallel_requests() -> None:
+    """У библиотеки по умолчанию одно соединение на ящик: пока фоновая
+    синхронизация календаря ждала сервер (по минуте на запрос), пометка,
+    удаление и отправка письма стояли в очереди за ней. Соединений должно
+    быть несколько."""
+    with patch("redmail.ews_client.Configuration") as config, patch("redmail.ews_client.ExchangeAccount"):
+        EwsSession(_account(server="mail.example.com"))
+
+    assert config.call_args.kwargs["max_connections"] > 1
+    # И повтор после таймаута не должен растягиваться на минуты.
+    assert config.call_args.kwargs["retry_policy"].max_wait <= 120
+
+
 class ErrorItemNotFound(Exception):
     """Так exchangelib сообщает, что письма на сервере нет."""
 

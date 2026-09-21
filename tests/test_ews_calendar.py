@@ -254,3 +254,43 @@ def test_shared_mailbox_calendar_uses_own_credentials(monkeypatch) -> None:
     assert [e.uid for e in events] == ["my"] and opened == []
     events = ews_calendar.fetch_events(session, start, start + timedelta(days=1), "me@x.ru", "ivanov@x.ru")
     assert [e.uid for e in events] == ["theirs"] and opened == ["ivanov@x.ru"]
+
+
+def test_calendar_pass_stops_after_three_timeouts_in_a_row(monkeypatch) -> None:
+    """Журнал пользователя: каждая часть окна висела по минуте, проход длился
+    10–18 минут и всё это время держал соединение с Exchange. После трёх
+    таймаутов подряд проход прекращается до следующей синхронизации."""
+    monkeypatch.setattr(ews_calendar, "CalendarItem", FakeItem)
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    calls = {"n": 0}
+
+    class Calendar:
+        def view(self, start, end):
+            calls["n"] += 1
+            raise RuntimeError("The request timed out.")
+
+    with pytest.raises(ews_calendar.EwsCalendarError):
+        ews_calendar.fetch_events(SimpleNamespace(calendar=Calendar()), start, start + timedelta(days=200), "me@x.ru")
+    assert calls["n"] == 3
+
+
+def test_calendar_view_asks_only_for_needed_fields(monkeypatch) -> None:
+    """Просмотр календаря по умолчанию тянет встречи целиком — с HTML-телом и
+    вложениями; на настоящем сервере двухнедельная часть окна так не
+    успевала за минуту. Просим только то, что читаем."""
+    monkeypatch.setattr(ews_calendar, "CalendarItem", FakeItem)
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    asked: list[tuple] = []
+
+    class View(list):
+        def only(self, *fields):
+            asked.append(fields)
+            return self
+
+    class Calendar:
+        def view(self, start, end):
+            return View()
+
+    ews_calendar.fetch_events(SimpleNamespace(calendar=Calendar()), start, start + timedelta(days=7), "me@x.ru")
+    assert asked and "body" not in asked[0] and "attachments" not in asked[0]
+    assert {"uid", "start", "end", "subject", "organizer"} <= set(asked[0])

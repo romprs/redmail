@@ -115,8 +115,34 @@ def item_to_event(item: CalendarItem, my_email: str) -> Event:
 
 EWS_VIEW_CHUNK = timedelta(days=14)
 
+#: Поля встречи, которые реально читает item_to_event. По умолчанию
+#: просмотр календаря отдаёт встречи целиком — с HTML-телом, вложениями и
+#: всеми служебными свойствами; на настоящем сервере двухнедельная часть
+#: окна так не успевала за минуту («The request timed out» на каждой части).
+_VIEW_FIELDS = (
+    "uid", "subject", "start", "end", "location", "is_all_day", "organizer",
+    "my_response_type", "required_attendees", "optional_attendees",
+    "is_cancelled", "type", "original_start", "text_body",
+)
+
 #: Признаки того, что сервер просит снизить темп, а не что запрос плохой.
 _THROTTLE_MARKERS = ("back off", "ErrorServerBusy", "Max timeout reached", "server is busy", "too busy")
+
+
+#: Сколько частей окна подряд могут не ответить, прежде чем проход
+#: прекращается до следующей синхронизации. Одна-две — бывает (у
+#: пользователя ближние части падали, а дальние приходили: 424 встречи), но
+#: три подряд — сервер сейчас не отвечает, и перебирать дальше значит
+#: держать соединение ещё десяток минут.
+_MAX_TIMEOUTS_IN_ROW = 3
+
+
+def _is_timeout(exc: Exception) -> bool:
+    """Сервер не ответил на часть окна за отведённое время. Остальные части
+    сейчас, скорее всего, ответят так же — на журнале пользователя проход по
+    календарю из-за этого длился 10–18 минут, по минуте на каждую часть, и
+    всё это время держал соединение с сервером."""
+    return "timed out" in str(exc).casefold()
 
 
 def _is_throttled(exc: Exception) -> bool:
@@ -144,11 +170,14 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str, mailbox
         events: dict[str, Event] = {}
         chunk_start = start
         failed = 0
+        timeouts_in_row = 0
         last_error: Exception | None = None
         while chunk_start < end:
             chunk_end = min(chunk_start + EWS_VIEW_CHUNK, end)
             try:
-                items = list(account.calendar.view(start=_ews_datetime(chunk_start), end=_ews_datetime(chunk_end)))
+                view = account.calendar.view(start=_ews_datetime(chunk_start), end=_ews_datetime(chunk_end))
+                only = getattr(view, "only", None)
+                items = list(only(*_VIEW_FIELDS) if only is not None else view)
             except Exception as exc:
                 # Сервер не ответил на эту часть окна («The request timed out»)
                 # — берём остальные, а не теряем весь календарь.
@@ -156,7 +185,8 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str, mailbox
                 last_error = exc
                 _log.warning("EWS календарь: часть окна %s — %s не получена: %s", chunk_start.date(), chunk_end.date(), exc)
                 chunk_start = chunk_end
-                if _is_throttled(exc):
+                timeouts_in_row = timeouts_in_row + 1 if _is_timeout(exc) else 0
+                if _is_throttled(exc) or timeouts_in_row >= _MAX_TIMEOUTS_IN_ROW:
                     # Сервер просит притормозить — остальные части окна
                     # сейчас ответят тем же. Останавливаемся и оставляем то,
                     # что уже получили: на журнале пользователя такой
@@ -165,6 +195,7 @@ def fetch_events(session, start: datetime, end: datetime, my_email: str, mailbox
                     _log.warning("EWS календарь: сервер просит подождать — остальные части окна отложены")
                     break
                 continue
+            timeouts_in_row = 0
             for item in items:
                 if not isinstance(item, CalendarItem):
                     continue
