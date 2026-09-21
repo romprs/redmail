@@ -17,6 +17,10 @@ echo "SUMS vm=$VMSUM dist=$LOCSUM d111=$D11SUM"
 
 bash /e/rrr/redos-mail-client/scripts/ship80.sh /d/111/mail/$RPM
 $H80 "rpm -K /var/tmp/$RPM && dnf -y install /var/tmp/$RPM 2>&1 | tail -1; rpm -qf /usr/bin/redmail" </dev/null 2>/dev/null
+# На .80 сбоит ОЗУ и портит часть файлов уже при установке (клиент падал с
+# segfault в 136 и 140): сверяем установленное с пакетом и чиним битое.
+scp -q -i "$HOME/.ssh/redos_80" -o StrictHostKeyChecking=no /e/rrr/redos-mail-client/scripts/repair80.sh root@192.168.0.80:/root/repair80.sh 2>/dev/null
+$H80 "bash /root/repair80.sh /var/tmp/$RPM redmail" </dev/null 2>/dev/null
 $H80 "pkill -u test -f '/usr/bin/redmail'; sleep 2; sudo -u test env HOME=/home/test DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority XDG_RUNTIME_DIR=/run/user/1000 setsid nohup /usr/bin/redmail >/tmp/redmail-launch.log 2>&1 < /dev/null & sleep 40; pgrep -u test -f /usr/bin/redmail >/dev/null && echo CLIENT_RUNNING || echo CLIENT_DOWN" </dev/null 2>/dev/null
 $H80 "grep -c ERROR /home/test/.config/redmail/logs/redmail.log 2>/dev/null | sed 's/^/ERRORS_IN_LOG=/'" </dev/null 2>/dev/null
 echo "DELIVERY_DONE"
