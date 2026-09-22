@@ -307,7 +307,7 @@ def test_resident_stays_alive_while_the_app_runs(monkeypatch) -> None:
     monkeypatch.setattr(reminder_tray, "QApplication", lambda argv: app)
     monkeypatch.setattr(app, "exec", fake_exec)
     monkeypatch.setattr(QSystemTrayIcon, "isSystemTrayAvailable", staticmethod(lambda: True))
-    monkeypatch.setattr(reminder_tray.applog, "setup_logging", lambda: None)
+    monkeypatch.setattr(reminder_tray.applog, "setup_logging", lambda *_args: None)
 
     assert reminder_tray.main(["redmail-reminder"]) == 0
     assert alive_during_exec == [True]

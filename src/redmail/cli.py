@@ -46,7 +46,7 @@ def run(argv: list[str]) -> int:
         # От root с --home журнал сотрудника не трогаем: при ротации файл
         # достался бы root и программа сотрудника перестала бы в него писать.
         # Запись о действии администратора всё равно уходит в системный журнал.
-        applog.setup_logging()
+        applog.setup_logging(applog.CLI_LOG_FILE_NAME)
     mode, brand = profile_transfer.export_policy()
     if not profile_transfer.allowed_here():
         print(

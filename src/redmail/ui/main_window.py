@@ -135,6 +135,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail import keyboard_layout, mail_export, memory_report, profile_transfer
+from redmail import outbox as outbox_store
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
 from redmail.config_store import (
@@ -743,9 +744,42 @@ class _MailWebPage(QWebEnginePage):
 
     def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame: bool) -> bool:  # noqa: N802
         if nav_type == QWebEnginePage.NavigationType.NavigationTypeLinkClicked:
-            QDesktopServices.openUrl(url)
+            _open_mail_link(url)
             return False
         return True
+
+    def createWindow(self, _web_window_type):  # noqa: N802 - Qt override
+        # Ссылка с target="_blank" (кнопки в письмах VK — «Перейти к
+        # календарям» — и почти всех рассылок) идёт не через
+        # acceptNavigationRequest, а просит новое окно. Раньше мы отвечали
+        # «нет», и щелчок молча пропадал (жалоба: «не срабатывает нажатие на
+        # кнопку»). Теперь окно — невидимая страница, которая отдаёт адрес
+        # системному браузеру и тут же удаляется.
+        return _ExternalLinkPage(self.profile(), self)
+
+
+#: Что из письма можно открыть щелчком: браузер и новое письмо. file:,
+#: smb: и прочее не открываем — ссылка в чужом письме не должна запускать
+#: локальные файлы.
+_MAIL_LINK_SCHEMES = ("http", "https", "mailto")
+
+
+def _open_mail_link(url: QUrl) -> bool:
+    if url.scheme().lower() not in _MAIL_LINK_SCHEMES:
+        _log.info("Ссылка из письма не открыта (схема %s)", url.scheme())
+        return False
+    return QDesktopServices.openUrl(url)
+
+
+class _ExternalLinkPage(QWebEnginePage):
+    """«Новое окно» для ссылки target=_blank: первый же адрес уходит в
+    системный браузер, сама страница ничего не загружает."""
+
+    def acceptNavigationRequest(self, url: QUrl, nav_type, is_main_frame: bool) -> bool:  # noqa: N802
+        if not url.isEmpty() and url.scheme() != "about":
+            _open_mail_link(url)
+            self.deleteLater()
+        return False
 
     def createWindow(self, _web_window_type):  # noqa: N802 - Qt override
         return None
@@ -1237,7 +1271,7 @@ def _expand_recipients(text: str, contacts: list[contact_store.Contact] | None) 
             if addr not in result:
                 result.append(addr)
     for _name, addr in getaddresses([rest]):
-        if addr and "@" in addr and addr not in result:
+        if _looks_like_email(addr) and addr not in result:
             result.append(addr)
     return result
 
@@ -1369,7 +1403,51 @@ def _parse_recipient_list(text: str, contacts: list[contact_store.Contact] | Non
     имя пополам, и второй адрес в списке переставал распознаваться."""
     if "[" in text:
         return _expand_recipients(text, contacts)
-    return [addr for _name, addr in getaddresses([text]) if addr]
+    return [addr for _name, addr in getaddresses([text]) if _looks_like_email(addr)]
+
+
+def _looks_like_email(addr: str) -> bool:
+    """Похоже на почтовый адрес: одна «@», часть до и после неё, в домене
+    точка, без пробелов. Одно имя («Патриевская») getaddresses выдаёт за
+    адрес — такое письмо ушло и вернулось «550 invalid recipient address»."""
+    addr = (addr or "").strip()
+    local, sep, domain = addr.rpartition("@")
+    return bool(sep and local and "." in domain.strip(".") and not any(ch.isspace() for ch in addr))
+
+
+def _resolve_recipient_names(
+    text: str, contacts: list[contact_store.Contact] | None
+) -> tuple[str, list[str]]:
+    """Поле адресатов перед отправкой: элемент без адреса (набрали имя и не
+    выбрали из подсказки) ищем в адресной книге. Один подходящий контакт —
+    подставляем «Имя <адрес>»; ни одного или несколько — элемент попадает в
+    нераспознанные, отправлять такое нельзя.
+    Возвращает (новый текст поля, нераспознанные элементы)."""
+    groups, rest = _split_recipient_text(text)
+    unresolved = [f"[{name}]" for name in groups if _find_group(contacts, name) is None]
+    entries: list[str] = [f"[{name}]" for name in groups]
+    changed = False
+    for name, addr in getaddresses([rest]):
+        if not addr and not name:
+            continue
+        if _looks_like_email(addr):
+            entries.append(_format_recipient_candidate(name, addr))
+            continue
+        typed = (name or addr).strip()
+        needle = typed.casefold()
+        matches = [
+            contact for contact in contacts or ()
+            if not contact.is_group and contact.emails and needle and needle in contact.display_name.casefold()
+        ]
+        if len(matches) == 1:
+            entries.append(_format_recipient_candidate(matches[0].display_name, matches[0].emails[0]))
+            changed = True
+        else:
+            entries.append(typed)
+            unresolved.append(typed)
+    if not changed:
+        return text, unresolved
+    return ", ".join(entries), unresolved
 
 
 def _recipient_search_prefix(prefix: str, candidates: list[str]) -> str:
@@ -4531,6 +4609,8 @@ class ComposeDialog(QDialog):
         # Без получателя письмо не отправить — и окно не закрывать: раньше
         # окно закрывалось, выходило предупреждение, а письмо пропадало
         # (жалоба). Черновик сохраняется и без получателей.
+        if not self._save_as_draft and not self._resolve_recipient_fields():
+            return
         if not self._save_as_draft and not (self.recipients() or self.cc_recipients() or self.bcc_recipients()):
             QMessageBox.warning(
                 self, "Нет получателя",
@@ -4540,6 +4620,34 @@ class ComposeDialog(QDialog):
             self.to_edit.setFocus()
             return
         super().accept()
+
+    def _resolve_recipient_fields(self) -> bool:
+        """Имена без адреса — по адресной книге; не нашлось — не отправляем
+        и называем, кого не удалось распознать (письмо на «Патриевская» без
+        адреса ушло и вернулось отказом сервера)."""
+        problems: list[str] = []
+        first_bad = None
+        for label, edit in (("Кому", self.to_edit), ("Копия", self.cc_edit), ("Скрытая копия", self.bcc_edit)):
+            text = edit.text()
+            if not text.strip():
+                continue
+            fixed, unresolved = _resolve_recipient_names(text, self._contacts)
+            if fixed != text:
+                edit.setText(fixed)
+            if unresolved:
+                problems.append(f"{label}: " + ", ".join(unresolved))
+                first_bad = first_bad or edit
+        if not problems:
+            return True
+        QMessageBox.warning(
+            self, "Не распознан адрес получателя",
+            "Для этих получателей нет почтового адреса:\n" + "\n".join(problems)
+            + "\n\nВыберите получателя из подсказки или адресной книги либо введите адрес полностью.",
+        )
+        if first_bad is not self.to_edit:
+            self._show_cc_bcc_fields(True)
+        first_bad.setFocus()
+        return False
 
     def save_as_draft_requested(self) -> bool:
         return self._save_as_draft
@@ -7884,6 +7992,17 @@ class MainWindow(QMainWindow):
         self.busy_bar.hide()
         self.statusBar().addPermanentWidget(self.busy_label)
         self.statusBar().addPermanentWidget(self.busy_bar)
+        # «Исходящие»: видно, что письмо ещё отправляется или не ушло.
+        self.outbox = outbox_store.Outbox(load_profile_dir() / outbox_store.OUTBOX_DIR)
+        self._outbox_sending: set[str] = set()
+        self.outbox_button = QPushButton("", self)
+        self.outbox_button.setFlat(True)
+        self.outbox_button.setToolTip("Письма, которые ещё не отправлены")
+        self.outbox_button.clicked.connect(self.on_show_outbox)
+        self.outbox_button.hide()
+        self.statusBar().addPermanentWidget(self.outbox_button)
+        self.outbox.recover_interrupted()
+        QTimer.singleShot(0, self._update_outbox_button)
         self._refresh_in_progress = False
         self._sync_worker: _SyncWorker | None = None
         self._autoarchive_active = False
@@ -13099,6 +13218,8 @@ class MainWindow(QMainWindow):
         failure_title: str,
         severity: str = "critical",
         on_success_extra: Callable[[], None] | None = None,
+        on_failure_extra: Callable[[str], None] | None = None,
+        failure_note: str = "",
     ) -> None:
         # Событие/ответ на приглашение уже сохранены локально к моменту
         # вызова — сама отправка (SMTP или EWS, обычно 1-2 секунды на
@@ -13120,9 +13241,11 @@ class MainWindow(QMainWindow):
                 on_success_extra()
 
         def on_failure(error_text: str) -> None:
-            dialog = QMessageBox.warning if severity == "warning" else QMessageBox.critical
-            dialog(self, failure_title, error_text)
             self._background_workers.remove(worker)
+            if on_failure_extra is not None:
+                on_failure_extra(error_text)
+            dialog = QMessageBox.warning if severity == "warning" else QMessageBox.critical
+            dialog(self, failure_title, error_text + failure_note)
 
         worker.succeeded.connect(on_success)
         worker.failed.connect(on_failure)
@@ -13743,20 +13866,161 @@ class MainWindow(QMainWindow):
             attachments=dialog.attachments,
         )
 
+        # Сначала — в «Исходящие»: при ошибке письмо не пропадёт, а пока
+        # идёт отправка, это видно в строке состояния.
+        item = self.outbox.add(
+            account_key or self._mailbox_key() or "", message, source_draft=source_draft,
+            edit_html=dialog.body_html(), edit_text=dialog.body(),
+        )
+        self._send_outbox_item(item, reply_source=reply_source)
+
+    def _send_outbox_item(self, item: outbox_store.OutboxItem, *, reply_source=None) -> None:
+        """Отправка письма из «Исходящих» (новое или повтор). Ушло — убираем
+        из «Исходящих», кладём копию в «Отправленные»; не ушло — остаётся
+        там с текстом ошибки."""
+        message = item.message
+        account_key = item.account_key or None
+        if item.id in self._outbox_sending:
+            return
+        self._outbox_sending.add(item.id)
+        self.outbox.mark_sending(item)
+        self._update_outbox_button()
+        recipients = ", ".join(message.to + message.cc + message.bcc)
+        self.statusBar().showMessage(f"Отправляется: «{item.title}» → {recipients}")
+
         def after_send() -> None:
+            self._outbox_sending.discard(item.id)
+            self.outbox.remove(item)
+            self._update_outbox_button()
             with self._account_context(account_key):
-                self._after_send(message, source_draft, reply_source)
+                self._after_send(message, item.source_draft, reply_source)
+            self.statusBar().showMessage(f"Письмо отправлено: «{item.title}» → {recipients}. Копия — в «Отправленных».", 10000)
+
+        def on_failed(error_text: str) -> None:
+            self._outbox_sending.discard(item.id)
+            self.outbox.mark_failed(item, error_text)
+            self._update_outbox_button()
+            self.statusBar().showMessage(f"Письмо «{item.title}» не отправлено — оно в «Исходящих»", 10000)
 
         # Раньше отправка шла синхронно прямо здесь — окно подвисало на
         # время SMTP-разговора с сервером, как и у календарных приглашений
         # (см. _send_message_in_background); теперь то же самое одним
         # общим путём, вместе с поддержкой EWS-аккаунтов.
-        self._send_message_in_background(
-            message,
-            success_status=f"Письмо отправлено: {', '.join(recipients)}",
-            failure_title="Ошибка отправки",
-            on_success_extra=after_send,
+        with self._account_context(account_key):
+            self._send_message_in_background(
+                message,
+                success_status=f"Письмо отправлено: {recipients}",
+                failure_title="Ошибка отправки",
+                on_success_extra=after_send,
+                on_failure_extra=on_failed,
+                failure_note="\n\nПисьмо сохранено в «Исходящих»: его можно отправить ещё раз или открыть для правки.",
+            )
+
+    def _update_outbox_button(self) -> None:
+        items = self.outbox.items()
+        if not items:
+            self.outbox_button.hide()
+            return
+        failed = sum(1 for item in items if item.status == outbox_store.FAILED)
+        sending = len(items) - failed
+        parts = []
+        if sending:
+            parts.append(f"отправляется {sending}")
+        if failed:
+            parts.append(f"не отправлено {failed}")
+        self.outbox_button.setText(f"Исходящие: {', '.join(parts)}")
+        self.outbox_button.setStyleSheet("color: #c62828; font-weight: bold;" if failed else "")
+        self.outbox_button.show()
+
+    def on_show_outbox(self) -> None:
+        """Окно «Исходящие»: что не ушло и почему; отправить ещё раз,
+        открыть для правки, удалить."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Исходящие")
+        dialog.resize(760, 360)
+        layout = QVBoxLayout(dialog)
+        table = QTreeWidget(dialog)
+        table.setHeaderLabels(["Состояние", "Тема", "Кому", "Ошибка"])
+        table.setRootIsDecorated(False)
+        layout.addWidget(table, 1)
+
+        def fill() -> None:
+            table.clear()
+            for item in self.outbox.items():
+                sending = item.id in self._outbox_sending
+                state = "Отправляется…" if sending else ("Не отправлено" if item.status == outbox_store.FAILED else "Ожидает")
+                row = QTreeWidgetItem([state, item.title, ", ".join(item.message.to), item.error.replace("\n", " ")])
+                row.setToolTip(3, item.error)
+                row.setData(0, Qt.ItemDataRole.UserRole, item.id)
+                table.addTopLevelItem(row)
+            for column in range(3):
+                table.resizeColumnToContents(column)
+            if table.topLevelItemCount():
+                table.setCurrentItem(table.topLevelItem(0))
+
+        def selected() -> outbox_store.OutboxItem | None:
+            row = table.currentItem()
+            if row is None:
+                return None
+            item_id = row.data(0, Qt.ItemDataRole.UserRole)
+            return next((item for item in self.outbox.items() if item.id == item_id), None)
+
+        def resend() -> None:
+            item = selected()
+            if item is not None and item.id not in self._outbox_sending:
+                self._send_outbox_item(item)
+                fill()
+
+        def edit() -> None:
+            item = selected()
+            if item is None or item.id in self._outbox_sending:
+                return
+            self.outbox.remove(item)
+            self._update_outbox_button()
+            dialog.accept()
+            with self._account_context(item.account_key or None):
+                self._open_outbox_item_for_edit(item)
+
+        def delete() -> None:
+            item = selected()
+            if item is None or item.id in self._outbox_sending:
+                return
+            answer = QMessageBox.question(dialog, "Исходящие", f"Удалить неотправленное письмо «{item.title}»?")
+            if answer == QMessageBox.StandardButton.Yes:
+                self.outbox.remove(item)
+                self._update_outbox_button()
+                fill()
+
+        buttons = QHBoxLayout()
+        for label, handler in (("Отправить ещё раз", resend), ("Открыть для правки", edit), ("Удалить", delete)):
+            button = QPushButton(label, dialog)
+            button.clicked.connect(handler)
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        close_button = QPushButton("Закрыть", dialog)
+        close_button.clicked.connect(dialog.accept)
+        buttons.addWidget(close_button)
+        layout.addLayout(buttons)
+        fill()
+        dialog.exec()
+
+    def _open_outbox_item_for_edit(self, item: outbox_store.OutboxItem) -> None:
+        """Неотправленное письмо — снова в окно письма, со всеми полями и
+        вложениями."""
+        message = item.message
+        dialog = ComposeDialog(
+            self,
+            to=", ".join(message.to),
+            cc=", ".join(message.cc),
+            bcc=", ".join(message.bcc),
+            subject=message.subject,
+            body=item.edit_text or message.body,
+            body_html=item.edit_html,
+            inline_images=dict(message.inline_images),
+            attachments=list(message.attachments),
+            contacts=self._load_contacts(),
         )
+        self._exec_compose(dialog, in_reply_to=message.in_reply_to, source_draft=item.source_draft)
 
     def _after_send(self, message, source_draft, reply_source) -> None:
         """Копия в «Отправленные», удаление черновика, отметка «отвечено» —
@@ -13775,7 +14039,10 @@ class MainWindow(QMainWindow):
         # добавили его в "Отправленные" (см. _append_sent_copy) —
         # обновляем кэш этой папки сразу, не дожидаясь следующего
         # ручного "Обновить" или счастливого совпадения exists_count.
-        if self.account_protocol == "imap" and self.sent_folder_name and self.mailbox is not None:
+        # Exchange кладёт копию в «Отправленные» сам, но наш кэш папки об
+        # этом не знает до следующего прохода (жалоба: «ушло или нет —
+        # гадаем, пока не появится в Отправленных, а это не мгновенно»).
+        if self.account_protocol in ("imap", "ews") and self.sent_folder_name and self.mailbox is not None:
             # В фоне: сетевой запрос в потоке интерфейса подвешивал окно
             # сразу после отправки.
             self._sync_folders_async([self.sent_folder_name])

@@ -307,7 +307,7 @@ class ReminderTray:
 
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
-    applog.setup_logging()
+    applog.setup_logging(applog.REMINDER_LOG_FILE_NAME)
     app = QApplication(argv)
     app.setApplicationName("redmail-reminder")
     app.setQuitOnLastWindowClosed(False)  # окна напоминаний приходят и уходят, резидент живёт

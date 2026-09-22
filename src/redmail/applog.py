@@ -30,31 +30,42 @@ def log_dir() -> Path:
     return app_dir() / "logs"
 
 
-def log_path() -> Path:
-    return log_dir() / LOG_FILE_NAME
+#: Напоминалка и выгрузка из командной строки пишут в свои файлы: два
+#: процесса с RotatingFileHandler на одном файле мешают друг другу — один
+#: переименовывает файл при ротации, второй продолжает писать в уже
+#: переименованный. Так журнал почты оказался в redmail.log.1, а в
+#: redmail.log — одна строка напоминалки (окно журнала показывало только её).
+REMINDER_LOG_FILE_NAME = "reminder.log"
+CLI_LOG_FILE_NAME = "redmail-cli.log"
 
 
-def setup_logging() -> Path | None:
+def log_path(file_name: str = LOG_FILE_NAME) -> Path:
+    return log_dir() / file_name
+
+
+def setup_logging(file_name: str = LOG_FILE_NAME) -> Path | None:
     """Настраивает файловый журнал; повторные вызовы безвредны. Возвращает
     путь к файлу или None, если каталог недоступен на запись (журнал не
     должен мешать запуску программы)."""
     global _configured
     root = logging.getLogger("redmail")
     if _configured:
-        return log_path()
+        return log_path(file_name)
     level = logging.DEBUG if os.environ.get("REDMAIL_DEBUG") else logging.INFO
     root.setLevel(level)
     root.propagate = False
     try:
         log_dir().mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(log_path(), maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8")
+        handler = RotatingFileHandler(
+            log_path(file_name), maxBytes=_MAX_BYTES, backupCount=_BACKUP_COUNT, encoding="utf-8"
+        )
     except OSError:
         return None
     handler.setFormatter(logging.Formatter(_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
     root.addHandler(handler)
     _configured = True
     _install_excepthook()
-    return log_path()
+    return log_path(file_name)
 
 
 def _install_excepthook() -> None:
@@ -71,9 +82,7 @@ def _install_excepthook() -> None:
     sys.excepthook = hook
 
 
-def tail_text(max_bytes: int = 128 * 1024) -> str:
-    """Хвост журнала для окна просмотра; пустая строка, если файла нет."""
-    path = log_path()
+def _file_tail(path: Path, max_bytes: int) -> str:
     try:
         size = path.stat().st_size
         with path.open("rb") as fh:
@@ -83,6 +92,19 @@ def tail_text(max_bytes: int = 128 * 1024) -> str:
             return fh.read().decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+
+def tail_text(max_bytes: int = 128 * 1024) -> str:
+    """Хвост журнала для окна просмотра; пустая строка, если файла нет.
+    Файл только что сменился при ротации и в нём мало строк — добавляем
+    конец предыдущего (redmail.log.1), иначе в окне было бы почти пусто."""
+    current = _file_tail(log_path(), max_bytes)
+    if len(current.encode("utf-8")) >= max_bytes:
+        return current
+    previous = _file_tail(log_dir() / f"{LOG_FILE_NAME}.1", max_bytes - len(current.encode("utf-8")))
+    if not previous:
+        return current
+    return previous + current
 
 
 def get_logger(name: str) -> logging.Logger:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import smtplib
+import ssl
 import sys
 from unittest.mock import MagicMock, patch
+import pytest
 
 from redmail.smtp_client import OutgoingAttachment, OutgoingMessage, SmtpAccount, build_email_message, send_message
 from redmail.smtp_client import test_connection as smtp_test_connection
@@ -47,8 +49,9 @@ def test_send_message_starttls_flow() -> None:
         )
         send_message(account, message)
 
-    smtp_ctor.assert_called_once_with("smtp.example.com", 587, timeout=30)
+    smtp_ctor.assert_called_once_with("smtp.example.com", 587, timeout=20)
     fake_client.starttls.assert_called_once()
+    assert fake_client.starttls.call_args.kwargs["context"].verify_mode == ssl.CERT_REQUIRED
     fake_client.login.assert_called_once_with("ivan", "secret")
     fake_client.send_message.assert_called_once()
 
@@ -135,7 +138,9 @@ def test_send_message_implicit_ssl_skips_starttls() -> None:
         message = OutgoingMessage(sender="ivan@example.com", to=["a@example.com"], subject="S", body="B")
         send_message(account, message)
 
-    smtp_ctor.assert_called_once_with("smtp.example.com", 465, timeout=30)
+    smtp_ctor.assert_called_once()
+    assert smtp_ctor.call_args.args == ("smtp.example.com", 465) and smtp_ctor.call_args.kwargs["timeout"] == 20
+    assert smtp_ctor.call_args.kwargs["context"].verify_mode == ssl.CERT_REQUIRED
     fake_client.starttls.assert_not_called()
     fake_client.login.assert_called_once_with("ivan", "secret")
 
@@ -367,3 +372,25 @@ def test_send_message_without_html_body_stays_plain_text_only() -> None:
 
     sent = fake_client.send_message.call_args[0][0]
     assert not sent.is_multipart() or sent.get_content_type() != "multipart/alternative"
+
+
+def test_silent_server_is_retried_in_the_other_tls_mode() -> None:
+    """VK: STARTTLS на порту неявного TLS — сервер молчит до таймаута.
+    Клиент пробует SSL на том же порту и входит."""
+    from redmail import smtp_client
+
+    silent = smtplib.SMTPServerDisconnected("Connection unexpectedly closed: timed out")
+    ssl_client = _retry_client()
+    with patch("redmail.smtp_client.smtplib.SMTP", side_effect=silent),             patch("redmail.smtp_client.smtplib.SMTP_SSL", return_value=ssl_client) as ssl_ctor:
+        smtp_client.test_connection(_retry_account())
+    ssl_ctor.assert_called_once()
+    ssl_client.login.assert_called_once_with("ivan", "secret")
+
+
+def test_refused_port_is_not_retried_in_other_mode() -> None:
+    from redmail import smtp_client
+
+    with patch("redmail.smtp_client.smtplib.SMTP", side_effect=ConnectionRefusedError()),             patch("redmail.smtp_client.smtplib.SMTP_SSL") as ssl_ctor:
+        with pytest.raises(ConnectionRefusedError):
+            smtp_client.test_connection(_retry_account())
+    ssl_ctor.assert_not_called()

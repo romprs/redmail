@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import smtplib
+import socket
+import ssl
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from email import policy
@@ -143,11 +145,77 @@ def _with_retry(operation: Callable[[], None]) -> None:
         operation()
 
 
+#: Сколько ждать приветствия сервера (и рукопожатия TLS) до входа.
+_GREETING_TIMEOUT = 20
+
+
+def _mode_name(use_ssl: bool) -> str:
+    return "SSL" if use_ssl else "STARTTLS"
+
+
+def _tls_context() -> ssl.SSLContext:
+    """Проверка сертификата сервера. Без явного контекста smtplib её НЕ
+    делает (ssl._create_stdlib_context — CERT_NONE): подменный сервер в
+    сети получил бы пароль. Корни — системные или файл из настроек
+    (tls_trust выставляет SSL_CERT_FILE, create_default_context его
+    читает), как у IMAP, который сертификат проверял всегда."""
+    return ssl.create_default_context()
+
+
+def _open_tls(host: str, port: int, use_ssl: bool, timeout: float) -> smtplib.SMTP:
+    """Соединение до входа: неявный TLS или приветствие + STARTTLS."""
+    if use_ssl:
+        return smtplib.SMTP_SSL(host, port, timeout=timeout, context=_tls_context())
+    client = smtplib.SMTP(host, port, timeout=timeout)
+    try:
+        client.starttls(context=_tls_context())
+    except BaseException:
+        client.close()
+        raise
+    return client
+
+
+def _connect(account: SmtpAccount) -> smtplib.SMTP:
+    """Соединение в заданном режиме; сервер молчит или не понимает режим —
+    второй режим на том же порту. С VK отправка неделю падала «timed out»
+    ещё до входа: так выглядит STARTTLS на порту неявного TLS (клиент ждёт
+    приветствия, сервер — рукопожатия TLS) и наоборот."""
+    try:
+        return _open_tls(account.host, account.port, account.use_ssl, _GREETING_TIMEOUT)
+    except (OSError, smtplib.SMTPException) as first:
+        # Пробуем другой режим только при признаках «не тот режим»: сервер
+        # молчит до таймаута или рукопожатие TLS не сложилось. Имя не
+        # находится, порт закрыт, случайный обрыв — дело не в режиме
+        # (обрыв повторит _with_retry).
+        if not _looks_like_wrong_mode(first):
+            raise
+        other = not account.use_ssl
+        _log.warning(
+            "SMTP %s:%s: режим %s не ответил (%s), пробую %s",
+            account.host, account.port, _mode_name(account.use_ssl), first, _mode_name(other),
+        )
+        try:
+            client = _open_tls(account.host, account.port, other, _GREETING_TIMEOUT)
+        except (OSError, smtplib.SMTPException) as second:
+            _log.warning("SMTP %s:%s: режим %s тоже не ответил (%s)", account.host, account.port, _mode_name(other), second)
+            raise first from None
+        _log.warning(
+            "SMTP %s:%s: работает режим %s, а в настройках %s — поправьте «SSL» в параметрах исходящей почты",
+            account.host, account.port, _mode_name(other), _mode_name(account.use_ssl),
+        )
+        return client
+
+
+def _looks_like_wrong_mode(exc: BaseException) -> bool:
+    if isinstance(exc, (socket.timeout, TimeoutError, ssl.SSLError)):
+        return True
+    return isinstance(exc, smtplib.SMTPServerDisconnected) and "timed out" in str(exc)
+
+
 def _connect_and_authenticate(account: SmtpAccount) -> smtplib.SMTP:
-    smtp_cls = smtplib.SMTP_SSL if account.use_ssl else smtplib.SMTP
-    client = smtp_cls(account.host, account.port, timeout=30)
-    if not account.use_ssl:
-        client.starttls()
+    client = _connect(account)
+    if client.sock is not None:
+        client.sock.settimeout(30)
     if account.auth_type == "kerberos":
         # Импорт внутри функции — см. imap_client.py._login: gssapi
         # нужен только для SSO и не должен ломать обычный пароль там,
@@ -191,6 +259,9 @@ def send_message(account: SmtpAccount, message: OutgoingMessage) -> None:
     try:
         _with_retry(attempt)
     except Exception as exc:
-        _log.error("SMTP %s: отправка не удалась (получателей %d, тема %r): %s", account.host, len(recipients), message.subject, exc)
+        _log.error(
+            "SMTP %s:%s (%s): отправка не удалась (получателей %d, тема %r): %s",
+            account.host, account.port, _mode_name(account.use_ssl), len(recipients), message.subject, exc,
+        )
         raise
     _log.info("SMTP %s: письмо отправлено (получателей %d, тема %r)", account.host, len(recipients), message.subject)
