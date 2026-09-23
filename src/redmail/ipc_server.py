@@ -179,7 +179,7 @@ def _handle_ping(_controller, _args) -> dict:
     return {"pong": True, "version": _app_version(), "protocol": PROTOCOL}
 
 
-_SECTIONS = ("mail", "calendar", "contacts")
+_SECTIONS = ("mail", "calendar", "contacts", "diary")
 
 
 def _handle_focus(controller, args) -> dict:
@@ -188,7 +188,7 @@ def _handle_focus(controller, args) -> dict:
         controller.ipc_focus()
         return {"focused": True}
     if section not in _SECTIONS:
-        raise ValueError("section: mail, calendar или contacts")
+        raise ValueError("section: mail, calendar, contacts или diary")
     controller.ipc_focus(section=section)
     return {"focused": True, "section": section}
 

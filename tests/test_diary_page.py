@@ -128,3 +128,22 @@ def test_reminder_resident_also_reminds_about_tasks(tmp_path: Path) -> None:
     assert [r.summary for r in due] == ["Задача: Сдать отчёт"]
     state.mark_shown(due[0], now)
     assert reminders.task_reminders(path, state, now) == []
+
+
+def test_diary_section_can_be_opened_by_command() -> None:
+    """Раздел ежедневника должен открываться и командой канала управления
+    (её шлёт напоминалка и голосовой помощник)."""
+    from redmail import ipc_server
+
+    assert "diary" in ipc_server._SECTIONS
+
+    class _Controller:
+        def __init__(self):
+            self.section = None
+
+        def ipc_focus(self, section=None):
+            self.section = section
+
+    controller = _Controller()
+    reply = ipc_server.handle_request(controller, {"action": "focus", "args": {"section": "diary"}})
+    assert reply["ok"] is True and controller.section == "diary"
