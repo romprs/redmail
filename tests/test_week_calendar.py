@@ -221,3 +221,73 @@ def test_clicking_an_empty_slot_in_compact_mode_gives_real_time() -> None:
     grid.set_compact(True)
     day, minutes = grid._slot_at(QPoint(grid.TIME_AXIS_WIDTH + 10, int(grid.hour_height() * 2)))
     assert minutes == 9 * 60  # два часа от верха сжатой сетки — 9:00
+
+
+def _in_calendar(event: Event, calendar_id: str, **changes) -> Event:
+    from dataclasses import replace
+
+    return replace(event, calendar_id=calendar_id, **changes)
+
+
+def test_same_meeting_from_two_calendars_becomes_one_card() -> None:
+    """Позвали и меня, и коллегу: встреча лежит в двух календарях и раньше
+    рисовалась двумя карточками рядом, мешая соседним."""
+    monday = wc.week_start_for(datetime.now().date())
+    at_ten = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=10)
+    mine = _in_calendar(_event("a", at_ten), "my")
+    colleague = _in_calendar(_event("b-другой-uid", at_ten), "zaharov")
+    merged = wc.merge_same_meetings([mine, colleague])
+    assert len(merged) == 1
+    event, calendars = merged[0]
+    assert calendars == ["my", "zaharov"]
+    assert event.uid == "a"  # показываем свою копию: её можно править
+
+
+def test_different_meetings_are_not_merged() -> None:
+    monday = wc.week_start_for(datetime.now().date())
+    at_ten = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=10)
+    first = _in_calendar(_event("a", at_ten), "my")
+    other_topic = _in_calendar(_event("b", at_ten, summary="Совещание"), "zaharov")
+    later = _in_calendar(_event("c", at_ten + timedelta(minutes=30)), "zaharov")
+    # две встречи в ОДНОМ календаре на одно время — это две встречи
+    twin = _in_calendar(_event("d", at_ten), "my")
+    merged = wc.merge_same_meetings([first, other_topic, later, twin])
+    assert len(merged) == 4
+
+
+def test_merged_card_shows_a_dot_for_every_calendar() -> None:
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.resize(7 * 150 + grid.TIME_AXIS_WIDTH, grid.HOUR_HEIGHT * 24)
+    monday = wc.week_start_for(datetime.now().date())
+    at_ten = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=10)
+    mine = _in_calendar(_event("a", at_ten), "my")
+    colleague = _in_calendar(_event("b", at_ten), "zaharov")
+    grid.set_week(monday, [mine, colleague], {"my": "#1A73E8", "zaharov": "#E64A4A"},
+                  {"my": "Мой", "zaharov": "Захаров"})
+    try:
+        assert len(grid._blocks) == 1
+        block = grid._blocks[0]
+        assert block._source_colors == ["#1A73E8", "#E64A4A"]
+        assert "Захаров" in block.toolTip() and "Календари:" in block.toolTip()
+        # карточка занимает всю ширину дня: соседей по времени больше нет
+        assert block.geometry().width() > grid._day_column_width() * 0.8
+    finally:
+        grid.deleteLater()
+
+
+def test_multiday_event_does_not_cover_the_whole_column() -> None:
+    """Встреча с концом на следующий день рисовалась во всю колонку и
+    накрывала соседние."""
+    _app()
+    grid = wc.WeekGridWidget()
+    grid.resize(7 * 150 + grid.TIME_AXIS_WIDTH, grid.HOUR_HEIGHT * 24)
+    monday = wc.week_start_for(datetime.now().date())
+    at_ten = datetime.combine(monday, datetime.min.time()).astimezone().replace(hour=10)
+    long_one = _in_calendar(_event("long", at_ten, minutes=60 * 30), "my")
+    grid.set_week(monday, [long_one], {"my": "#1A73E8"})
+    try:
+        block = grid._blocks[0]
+        assert block.geometry().bottom() <= grid.height() + 2
+    finally:
+        grid.deleteLater()

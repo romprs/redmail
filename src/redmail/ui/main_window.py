@@ -12577,6 +12577,7 @@ class MainWindow(QMainWindow):
         # календаре по умолчанию (жалоба: "не видно связи события с
         # календарём"). См. _event_color в week_calendar.py.
         calendar_colors = {cal.id: cal.color for cal in self._calendars_by_row}
+        calendar_names = {cal.id: cal.name for cal in self._calendars_by_row}
 
         if self.calendar_view_mode == "month":
             self.calendar_month_label.setText(
@@ -12595,8 +12596,12 @@ class MainWindow(QMainWindow):
             self.calendar_month_label.setText(f"{_MONTH_NAMES[anchor.month - 1]} {anchor.year}")
             self.calendar_week_header.set_week_start(self.calendar_week_start)
             self.calendar_week_header.set_selected_day(self.calendar_selected_day)
-            self.calendar_all_day_row.set_week(self.calendar_week_start, all_day_events, calendar_colors)
-            self.calendar_week_grid.set_week(self.calendar_week_start, timed_events, calendar_colors)
+            self.calendar_all_day_row.set_week(
+                self.calendar_week_start, all_day_events, calendar_colors, calendar_names
+            )
+            self.calendar_week_grid.set_week(
+                self.calendar_week_start, timed_events, calendar_colors, calendar_names
+            )
             self.calendar_week_grid.set_selected_day(self.calendar_selected_day)
             # Раньше здесь всегда подставлялся понедельник недели — если
             # пользователь кликал в мини-календаре не по понедельнику

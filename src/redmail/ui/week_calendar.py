@@ -3,7 +3,7 @@ from __future__ import annotations
 import html
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QRectF, Qt, QTimer, Signal
+from PySide6.QtCore import QPointF, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QFrame, QGridLayout, QLabel, QVBoxLayout, QWidget
 
@@ -67,6 +67,56 @@ def _lighten_color(hex_color: str, factor: float = 3) -> str:
         round(color.blue() + (255 - color.blue()) * blend),
     )
     return QColor(*channels).name()
+
+
+
+def _same_meeting_key(event: Event) -> tuple:
+    """Признак «это одна и та же встреча»: время, тема и организатор.
+    Календарь и идентификатор нарочно не учитываются — у копии в чужом
+    календаре они другие."""
+    organizer = (event.organizer_email or event.organizer_name or "").strip().casefold()
+    summary = " ".join((event.summary or "").split()).casefold()
+    return (event.dtstart, event.dtend, summary, organizer, bool(event.all_day))
+
+
+def merge_same_meetings(events: list[Event]) -> list[tuple[Event, list[str]]]:
+    """Одна встреча из нескольких календарей — одной карточкой.
+
+    Если на совещание позвали и вас, и коллегу, чей календарь подключён,
+    одна и та же встреча лежит в двух календарях и рисуется двумя
+    карточками рядом: они мешают друг другу и перекрывают соседние
+    (жалоба: «встречи одинаковы — приглашены оба, встают рядом, мешая и
+    перекрывая; сливать в одну, но подсвечивать точкой»).
+
+    Возвращает пары (встреча, список календарей-источников в порядке
+    появления). Показываем свою копию, если она есть: её можно править,
+    а чужую — нет."""
+    groups: dict[tuple, list[Event]] = {}
+    order: list[tuple] = []
+    # Две одинаковые встречи в ОДНОМ календаре — это две встречи (их и
+    # ставим рядом), а не копии: номер внутри своего календаря разводит их
+    # по разным группам.
+    seen_in_calendar: dict[tuple, int] = {}
+    for event in events:
+        base = _same_meeting_key(event)
+        index = seen_in_calendar.get((base, event.calendar_id), 0)
+        seen_in_calendar[(base, event.calendar_id)] = index + 1
+        key = (base, index)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(event)
+    merged: list[tuple[Event, list[str]]] = []
+    for key in order:
+        group = groups[key]
+        calendars: list[str] = []
+        for event in group:
+            if event.calendar_id not in calendars:
+                calendars.append(event.calendar_id)
+        # Своя копия важнее: только её можно перенести или изменить.
+        primary = next((event for event in group if event.is_organizer), group[0])
+        merged.append((primary, calendars))
+    return merged
 
 
 def _event_color(calendar_event: Event, calendar_color: str | None = None) -> str:
@@ -134,7 +184,7 @@ def overlap_columns(intervals: list[tuple[float, float]]) -> list[tuple[int, int
 _WEEKDAYS = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
 
 
-def event_tooltip(calendar_event: Event) -> str:
+def event_tooltip(calendar_event: Event, calendar_names: list[str] | None = None) -> str:
     """Подсказка при наведении — развёрнутая, каждое поле своей строкой:
     тема, день и время, место, организатор, участники (пожелание: «тема в 1
     строку, время в другой, место в 3-ю»). Строки не переносятся — длинная
@@ -156,6 +206,10 @@ def event_tooltip(calendar_event: Event) -> str:
     if organizer:
         who = "вы" if calendar_event.is_organizer else organizer
         lines.append(line(f"Организатор: {html.escape(who)}"))
+    if calendar_names and len(calendar_names) > 1:
+        # Встреча пришла из нескольких календарей — показываем, из каких
+        # (на карточке это точки).
+        lines.append(line("Календари: " + html.escape(", ".join(calendar_names))))
     names = [a.name or a.email for a in calendar_event.attendees if (a.name or a.email)]
     if names:
         shown = ", ".join(names[:5])
@@ -182,6 +236,8 @@ class _EventBlock(QFrame):
         *,
         pill: bool = False,
         calendar_color: str | None = None,
+        source_colors: list[str] | None = None,
+        source_names: list[str] | None = None,
     ):
         super().__init__(parent)
         # ВАЖНО: не называть этот атрибут self.event — QWidget.event() уже
@@ -192,6 +248,9 @@ class _EventBlock(QFrame):
         # так при первом же офлайн-смоук-тесте.
         self.calendar_event = calendar_event
         self._color = _event_color(calendar_event, calendar_color)
+        # Встреча пришла из нескольких календарей (она же у коллеги): по
+        # точке на каждый — видно, откуда она, и карточка одна.
+        self._source_colors = [color for color in (source_colors or []) if color]
         self._radius = 11 if pill else 4
         self._pill = pill
         self._selected = False
@@ -255,7 +314,7 @@ class _EventBlock(QFrame):
         # наследовала её прозрачный фон и тёмный текст и выходила чёрным
         # квадратом без текста.
         label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        self.setToolTip(event_tooltip(calendar_event))
+        self.setToolTip(event_tooltip(calendar_event, source_names))
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
         if event.button() == Qt.MouseButton.LeftButton and self._draggable:
@@ -319,6 +378,22 @@ class _EventBlock(QFrame):
         self._selected = selected
         self.update()
 
+    def _paint_source_dots(self, painter) -> None:
+        """Точки календарей-источников в правом верхнем углу карточки."""
+        radius = 3.0
+        gap = 2.0
+        x = self.width() - 4 - radius
+        y = 4 + radius
+        for color in reversed(self._source_colors[:4]):
+            if x - radius < 6:
+                break
+            painter.setPen(QPen(QColor("#FFFFFF"), 1))
+            painter.setBrush(QColor(color))
+            painter.drawEllipse(QPointF(x, y), radius, radius)
+            x -= radius * 2 + gap
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
         # Карточка события в сетке — светлый фон с цветной полосой слева и
         # тёмным текстом, а не сплошная заливка цветом: так выглядят
@@ -352,6 +427,9 @@ class _EventBlock(QFrame):
             painter.fillRect(self.rect(), QColor(_lighten_color(self._color)))
             accent_width = min(4, self.width())
             painter.fillRect(QRectF(0, 0, accent_width, self.height()), QColor(self._color))
+
+        if len(self._source_colors) > 1:
+            self._paint_source_dots(painter)
 
         painter.setClipping(False)
         if self._selected:
@@ -460,15 +538,19 @@ class AllDayRowWidget(QWidget):
         self._events: list[Event] = []
         self._blocks: list[_EventBlock] = []
         self._calendar_colors: dict[str, str] = {}
+        self._calendar_names: dict[str, str] = {}
         self.setMinimumHeight(1)
 
     def set_week(
-        self, week_start: date, all_day_events: list[Event], calendar_colors: dict[str, str] | None = None
+        self, week_start: date, all_day_events: list[Event], calendar_colors: dict[str, str] | None = None,
+        calendar_names: dict[str, str] | None = None,
     ) -> None:
         self._week_start = week_start
         self._events = all_day_events
         if calendar_colors is not None:
             self._calendar_colors = calendar_colors
+        if calendar_names is not None:
+            self._calendar_names = calendar_names
         self._relayout()
 
     def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -487,7 +569,9 @@ class AllDayRowWidget(QWidget):
         row_height = 22
         stack_by_day: dict[int, int] = {}
         max_stack = 0
-        for ev in self._events:
+        merged = merge_same_meetings(self._events)
+        sources = {id(event): calendars for event, calendars in merged}
+        for ev in [event for event, _calendars in merged]:
             day_index = (ev.dtstart.astimezone().date() - self._week_start).days
             if not (0 <= day_index < 7):
                 continue
@@ -495,7 +579,11 @@ class AllDayRowWidget(QWidget):
             stack_by_day[day_index] = row + 1
             max_stack = max(max_stack, row + 1)
 
-            block = _EventBlock(ev, self, pill=True, calendar_color=self._calendar_colors.get(ev.calendar_id))
+            block = _EventBlock(
+                ev, self, pill=True, calendar_color=self._calendar_colors.get(ev.calendar_id),
+                source_colors=[self._calendar_colors.get(cid, "") for cid in sources.get(id(ev), [])],
+                source_names=[self._calendar_names.get(cid, "") for cid in sources.get(id(ev), []) if self._calendar_names.get(cid)],
+            )
             x = self.TIME_AXIS_WIDTH + day_index * col_w
             block.setGeometry(int(x) + 2, row * (row_height + 2), int(col_w) - 4, row_height)
             block.clicked.connect(self.eventClicked.emit)
@@ -561,6 +649,7 @@ class WeekGridWidget(QWidget):
         self._blocks: list[_EventBlock] = []
         self._selected_day: date | None = None
         self._calendar_colors: dict[str, str] = {}
+        self._calendar_names: dict[str, str] = {}
 
         # Красная линия "сейчас" должна сама сдвигаться, пока приложение
         # открыто — минутной точности достаточно, не гоняем чаще раза в минуту.
@@ -569,12 +658,15 @@ class WeekGridWidget(QWidget):
         self._now_timer.start(60_000)
 
     def set_week(
-        self, week_start: date, timed_events: list[Event], calendar_colors: dict[str, str] | None = None
+        self, week_start: date, timed_events: list[Event], calendar_colors: dict[str, str] | None = None,
+        calendar_names: dict[str, str] | None = None,
     ) -> None:
         self._week_start = week_start
         self._events = timed_events
         if calendar_colors is not None:
             self._calendar_colors = calendar_colors
+        if calendar_names is not None:
+            self._calendar_names = calendar_names
         self._update_scale()
         self._relayout()
 
@@ -664,7 +756,11 @@ class WeekGridWidget(QWidget):
         # Встречи раскладываются по дням, внутри дня — по колонкам, если
         # пересекаются по времени (см. overlap_columns).
         by_day: dict[int, list[tuple[Event, float, float]]] = {}
-        for ev in self._events:
+        # Одна и та же встреча из двух календарей — одной карточкой с
+        # точками источников, иначе копии стоят рядом и мешают соседям.
+        merged = merge_same_meetings(self._events)
+        sources = {id(event): calendars for event, calendars in merged}
+        for ev in [event for event, _calendars in merged]:
             start_local = ev.dtstart.astimezone()
             end_local = ev.dtend.astimezone()
             day_index = (start_local.date() - self._week_start).days
@@ -674,7 +770,12 @@ class WeekGridWidget(QWidget):
             # Короткие встречи рисуются не ниже 20 минут — и занимают столько
             # же места при раскладке, иначе соседняя легла бы на них сверху.
             duration_minutes = max(20, (end_local - start_local).total_seconds() / 60)
-            by_day.setdefault(day_index, []).append((ev, start_minutes, start_minutes + duration_minutes))
+            # Встреча, которая тянется на следующий день (многодневная или
+            # с ошибочно сдвинутым концом), рисуется до конца своего дня:
+            # иначе её карточка уходит за пределы суток и накрывает всё,
+            # что ниже по колонке.
+            end_minutes = min(start_minutes + duration_minutes, 24 * 60)
+            by_day.setdefault(day_index, []).append((ev, start_minutes, max(start_minutes + 20, end_minutes)))
 
         placed: list[tuple[Event, float, float, float, float]] = []
         for day_index, day_events in by_day.items():
@@ -688,7 +789,11 @@ class WeekGridWidget(QWidget):
             y = self._minutes_to_y(start_minutes)
             h = (end_minutes - start_minutes) / 60 * self._hour_height
 
-            block = _EventBlock(ev, self, calendar_color=self._calendar_colors.get(ev.calendar_id))
+            block = _EventBlock(
+                ev, self, calendar_color=self._calendar_colors.get(ev.calendar_id),
+                source_colors=[self._calendar_colors.get(cid, "") for cid in sources.get(id(ev), [])],
+                source_names=[self._calendar_names.get(cid, "") for cid in sources.get(id(ev), []) if self._calendar_names.get(cid)],
+            )
             # Зазор в пиксель между соседями, чтобы карточки не сливались.
             block.setGeometry(int(x), int(y), max(8, int(width) - 1), max(20, int(h)))
             block.clicked.connect(self.eventClicked.emit)
@@ -899,17 +1004,21 @@ class MonthCellWidget(QFrame):
         for block in self._event_blocks:
             block.deleteLater()
         self._event_blocks = []
-        visible = events[:_MONTH_CELL_MAX_EVENTS]
+        merged = merge_same_meetings(events)
+        visible = merged[:_MONTH_CELL_MAX_EVENTS]
         colors = calendar_colors or {}
-        for ev in visible:
-            block = _EventBlock(ev, self, pill=True, calendar_color=colors.get(ev.calendar_id))
+        for ev, ev_calendars in visible:
+            block = _EventBlock(
+                ev, self, pill=True, calendar_color=colors.get(ev.calendar_id),
+                source_colors=[colors.get(cid, "") for cid in ev_calendars],
+            )
             block.setFixedHeight(15)
             block.clicked.connect(self.eventClicked.emit)
             block.doubleClicked.connect(self.eventDoubleClicked.emit)
             block.contextMenuRequested.connect(self.eventContextMenuRequested.emit)
             self.events_layout.addWidget(block)
             self._event_blocks.append(block)
-        extra = len(events) - len(visible)
+        extra = len(merged) - len(visible)
         self.more_label.setText(f"+{extra} ещё" if extra > 0 else "")
 
     def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override
@@ -938,6 +1047,7 @@ class MonthGridWidget(QWidget):
         self._events: list[Event] = []
         self._selected_day: date | None = None
         self._calendar_colors: dict[str, str] = {}
+        self._calendar_names: dict[str, str] = {}
         self._cells: list[MonthCellWidget] = []
 
         grid = QGridLayout(self)
