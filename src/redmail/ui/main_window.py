@@ -135,7 +135,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail import keyboard_layout, mail_export, memory_report, profile_transfer
-from redmail import address_books, carddav_sync
+from redmail import address_books, carddav_sync, sharing_invites
 from redmail import outbox as outbox_store
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
@@ -7739,12 +7739,17 @@ class MainWindow(QMainWindow):
         calendar_refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         calendar_refresh_action.triggered.connect(self.refresh_calendar_view)
         calendar_toolbar.addAction(calendar_refresh_action)
+        shared_action = QAction(_toolbar_icon("group"), "Общие папки и календари…", self)
+        shared_action.setToolTip("Найти приглашения коллег в почте и подключить общие папки и календари")
+        shared_action.triggered.connect(lambda: self.on_discover_shared())
+        self.discover_shared_action = shared_action
         caldav_sync_action = QAction(_toolbar_icon("sync"), "Синхронизировать календари", self)
         caldav_sync_action.setToolTip(
             "Синхронизировать календари — Exchange, CalDAV (VK и др.) и подписки по ссылке. "
             "Идёт и сама: после подключения почты и затем каждые три опроса."
         )
         caldav_sync_action.triggered.connect(lambda: self.on_caldav_sync())
+        calendar_toolbar.addAction(shared_action)
         calendar_toolbar.addAction(caldav_sync_action)
         # Подпись рядом со значком: одной иконки было мало, кнопку не находили
         # (жалоба: "нет кнопки синхронизации календаря exchange").
@@ -8143,6 +8148,9 @@ class MainWindow(QMainWindow):
         self._address_books_timer.timeout.connect(lambda: self.sync_address_books(silent=True))
         self._address_books_timer.start()
         QTimer.singleShot(45_000, lambda: self.sync_address_books(silent=True))
+        # Приглашения коллег ищем тогда же: письмо могло прийти, пока
+        # программа была закрыта.
+        QTimer.singleShot(75_000, lambda: self.on_discover_shared(silent=True))
         QTimer.singleShot(0, self._update_outbox_button)
         self._refresh_in_progress = False
         self._sync_worker: _SyncWorker | None = None
@@ -13322,6 +13330,255 @@ class MainWindow(QMainWindow):
                 _log.warning("Книга организации: контакт не сохранён: %s", exc)
         self.refresh_contacts_view()
         self.statusBar().showMessage(f"Из книги организации добавлено контактов: {added}", 8000)
+
+
+    # ------------------------------------------------------------------
+    # Общие папки и календари коллег — по приглашениям в почте
+    # ------------------------------------------------------------------
+
+    def _inbox_folders(self, key: str) -> list[str]:
+        """Папки, где ищем приглашения: «Входящие» учётной записи."""
+        mailbox = self.mailboxes.get(key)
+        if mailbox is None:
+            return []
+        try:
+            names = [folder.name for folder in mailbox.session.list_folders()]
+        except Exception as exc:
+            _log.info("Приглашения: список папок %s не получен: %s", key, exc)
+            return []
+        inboxes = [name for name in names if name.lower() in ("inbox", "входящие")]
+        return inboxes or names[:1]
+
+    def on_discover_shared(self, *, silent: bool = False) -> None:
+        """Найти в почте приглашения к общим папкам и календарям и
+        подключить то, что ещё не подключено.
+
+        Ручное подключение оставалось единственным способом (жалоба:
+        «папки не появляются и календари тоже — только ручное
+        подключение»), хотя в письме-приглашении есть и владелец, и то,
+        чем он поделился."""
+        targets = [(key, self._inbox_folders(key)) for key in list(self.mailboxes)]
+        mailboxes = dict(self.mailboxes)
+
+        def work() -> list:
+            found: list = []
+            for key, folders in targets:
+                mailbox = mailboxes.get(key)
+                if mailbox is None or not folders:
+                    continue
+                for invite in sharing_invites.scan_mailbox(mailbox, folders):
+                    if invite not in found:
+                        found.append(invite)
+            return found
+
+        worker = _CallableWorker(work, parent=self)
+
+        def done(result: object) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            invites = result if isinstance(result, list) else []
+            self._apply_shared_invites(invites, silent=silent)
+
+        def failed(error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if not silent:
+                QMessageBox.warning(self, "Общие папки и календари", error_text)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        self._background_workers.append(worker)
+        self.statusBar().showMessage("Ищу приглашения к общим папкам и календарям…")
+        worker.start()
+
+    def _apply_shared_invites(self, invites: list, *, silent: bool) -> None:
+        if not invites:
+            self.statusBar().showMessage("Приглашений к общим папкам и календарям не найдено", 8000)
+            if not silent:
+                QMessageBox.information(
+                    self, "Общие папки и календари",
+                    "В почте не нашлось приглашений. Они приходят письмом, когда коллега даёт доступ.",
+                )
+            return
+        added: list[str] = []
+        skipped: list[str] = []
+        pending: list = []
+        for invite in invites:
+            try:
+                state = self._connect_shared(invite)
+            except Exception as exc:
+                _log.warning("Общий доступ «%s» не подключён: %s", invite.title, exc)
+                skipped.append(f"{invite.title} — {exc}")
+                continue
+            if state == "added":
+                added.append(invite.title)
+            elif state == "pending":
+                pending.append(invite)
+            else:
+                skipped.append(f"{invite.title} — уже подключено")
+        if added:
+            self._refresh_calendars_list()
+            self.refresh_calendar_view()
+            self._schedule_calendar_sync(500)
+        parts = []
+        if added:
+            parts.append("подключено: " + ", ".join(added))
+        if pending:
+            parts.append("нужно подтвердить на сайте: " + ", ".join(i.title for i in pending))
+        self.statusBar().showMessage("Общий доступ — " + ("; ".join(parts) if parts else "нового нет"), 12000)
+        if silent and not pending:
+            return
+        lines = []
+        if added:
+            lines.append("Подключено:\n  " + "\n  ".join(added))
+        if pending:
+            lines.append(
+                "Требуется подтверждение на сайте почты (ссылка в письме-приглашении):\n  "
+                + "\n  ".join(i.title for i in pending)
+            )
+        if skipped and not silent:
+            lines.append("Пропущено:\n  " + "\n  ".join(skipped))
+        if not lines:
+            if not silent:
+                QMessageBox.information(self, "Общие папки и календари", "Всё, чем с вами поделились, уже подключено.")
+            return
+        QMessageBox.information(self, "Общие папки и календари", "\n\n".join(lines))
+
+    def _connect_shared(self, invite) -> str:
+        """Подключить один общий ресурс. Возвращает «added», «pending»
+        (ждёт подтверждения на сайте) или «known» (уже подключено)."""
+        if invite.kind == sharing_invites.KIND_CALENDAR:
+            if invite.source == sharing_invites.SOURCE_EXCHANGE:
+                return self._connect_exchange_calendar(invite)
+            return self._connect_vk_calendar(invite)
+        if invite.kind == sharing_invites.KIND_MAIL:
+            if invite.source == sharing_invites.SOURCE_EXCHANGE:
+                return self._connect_exchange_mailbox(invite)
+            return self._connect_vk_folders(invite)
+        return "known"
+
+    def _next_calendar_color(self) -> str:
+        used = {cal.color for cal in calendar_store.list_calendars(self.calendar_path)}
+        return next(
+            (hexval for _label, hexval in _EVENT_COLOR_PALETTE if hexval not in used),
+            _EVENT_COLOR_PALETTE[0][1],
+        )
+
+    def _connect_exchange_calendar(self, invite) -> str:
+        """Календарь коллеги открывается нашей же учётной записью Exchange
+        по выданным правам — нужен только его адрес, он есть в приглашении."""
+        owner = invite.owner_email
+        calendars = calendar_store.list_calendars(self.calendar_path)
+        if any(
+            cal.source_type == calendar_store.SOURCE_EWS and (cal.caldav_url or "").casefold() == owner.casefold()
+            for cal in calendars
+        ):
+            return "known"
+        session = next(
+            (getattr(self.mailboxes[key], "session", None)
+             for key, protocol in self.mailbox_protocols.items() if protocol == "ews"),
+            None,
+        )
+        if session is None:
+            raise RuntimeError("учётная запись Exchange не подключена")
+        # Проверяем доступ ДО того, как заводить календарь: без прав сервер
+        # ответит отказом, и пустой календарь только мешал бы.
+        ews_calendar.fetch_events(
+            session,
+            datetime.now(timezone.utc) - timedelta(days=1),
+            datetime.now(timezone.utc) + timedelta(days=1),
+            self.account.username if self.account else "",
+            mailbox=owner,
+        )
+        created = calendar_store.create_user_calendar(
+            self.calendar_path, f"Календарь: {invite.owner_name or owner}", self._next_calendar_color(),
+            source_type=calendar_store.SOURCE_EWS, caldav_url=owner,
+        )
+        _log.info("Подключён календарь коллеги «%s» (%s)", created.name, owner)
+        return "added"
+
+    def _connect_vk_calendar(self, invite) -> str:
+        """У VK календарь коллеги после принятия приглашения лежит в НАШЕМ
+        доме календарей и называется «Основной», как и свой: находим его по
+        тому, чьи встречи внутри (владелец известен из приглашения)."""
+        calendars = calendar_store.list_calendars(self.calendar_path)
+        connected = {(cal.caldav_url or "").rstrip("/") for cal in calendars if cal.caldav_url}
+        base_url = next(
+            (cal.caldav_url for cal in calendars
+             if cal.source_type == calendar_store.SOURCE_CALDAV and cal.caldav_url),
+            "",
+        )
+        if not base_url:
+            raise RuntimeError("календарь CalDAV не настроен")
+        credentials = self._calendar_credentials(base_url)
+        if credentials is None:
+            raise RuntimeError("нет учётных данных для сервера календарей")
+        username, password, auth_type = credentials
+        session = caldav_sync.CalDavSession(caldav_sync.CalDavAccount(
+            url=base_url, username=username, password=password, auth_type=auth_type
+        ))
+        who = (invite.owner_name or invite.owner_email).casefold()
+        login = invite.owner_email.split("@", 1)[0].casefold()
+        for info in session.list_calendars_detailed():
+            if info.url.rstrip("/") in connected:
+                continue
+            haystack = f"{info.organizers} {info.owner or ''} {info.url}".casefold()
+            if who not in haystack and login not in haystack:
+                continue
+            created = calendar_store.create_user_calendar(
+                self.calendar_path, f"Календарь: {invite.owner_name or invite.owner_email}",
+                self._next_calendar_color(),
+                source_type=calendar_store.SOURCE_CALDAV, caldav_url=info.url,
+            )
+            _log.info("Подключён календарь коллеги «%s» (%s)", created.name, info.url)
+            return "added"
+        # Календаря в нашем доме нет — значит приглашение ещё не принято.
+        return "pending"
+
+    def _connect_exchange_mailbox(self, invite) -> str:
+        """Папки коллеги в Exchange — подписка нашей учётной записью."""
+        owner = invite.owner_email
+        for key, protocol in self.mailbox_protocols.items():
+            if protocol != "ews":
+                continue
+            account = self.mailbox_accounts.get(key)
+            if account is None:
+                continue
+            if owner.casefold() in {a.casefold() for a in getattr(account, "shared_mailboxes", ()) or ()}:
+                return "known"
+            account.shared_mailboxes = tuple([*(account.shared_mailboxes or ()), owner])
+            try:
+                merge_ews_accounts([account])
+            except Exception as exc:
+                raise RuntimeError(f"настройка не сохранена: {exc}") from exc
+            _log.info("Подписка на ящик коллеги %s добавлена в учётную запись %s", owner, key)
+            self.statusBar().showMessage(
+                f"Папки {owner} подключены — они появятся после обновления почты", 10000
+            )
+            return "added"
+        raise RuntimeError("учётная запись Exchange не подключена")
+
+    def _connect_vk_folders(self, invite) -> str:
+        """У VK общие папки появляются сами — но только после того, как
+        доступ принят на сайте почты. Есть они уже или нет, видно по списку
+        папок сервера."""
+        owner_login = invite.owner_email.split("@", 1)[0].casefold()
+        who = (invite.owner_name or "").casefold()
+        for key, protocol in self.mailbox_protocols.items():
+            if protocol != "imap":
+                continue
+            mailbox = self.mailboxes.get(key)
+            if mailbox is None:
+                continue
+            try:
+                names = [folder.name for folder in mailbox.session.list_folders()]
+            except Exception:
+                continue
+            for name in names:
+                lowered = name.casefold()
+                if owner_login in lowered or (who and who.split()[0] in lowered):
+                    return "known"
+        return "pending"
 
 
     def on_import_contacts(self) -> None:

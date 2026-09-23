@@ -373,11 +373,50 @@ class ImapSession:
         # trash_folder(), без второго похода на сервер (find_special_folder
         # библиотеки сам заново вызывает list_folders).
         self._raw_folders = self._client.list_folders()
+        self._raw_folders += self._shared_namespace_folders()
         return [
             FolderInfo(name=name, delimiter=(delimiter or b"/").decode("ascii", errors="replace"))
             for flags, delimiter, name in self._raw_folders
             if b"\\Noselect" not in flags
         ]
+
+    def _shared_namespace_folders(self) -> list:
+        """Папки, которыми с нами поделились коллеги.
+
+        Обычный LIST показывает только СВОЁ пространство имён: общие папки
+        сервер держит в отдельных («Общие»/«Shared», «Другие пользователи»/
+        «Other Users» — RFC 2342 NAMESPACE), и их приходилось подключать
+        руками (жалоба: «папки не появляются, только ручное подключение»).
+        Спрашиваем у сервера сами пространства и перечисляем каждое.
+
+        Что отдал сервер — в журнал: у разных серверов префиксы свои, и
+        без этого не понять, почему общих папок не видно."""
+        try:
+            namespaces = self._client.namespace()
+        except Exception as exc:
+            _log.info("IMAP %s: NAMESPACE не поддержан (%s)", self.account.host, exc)
+            return []
+        extra: list = []
+        seen = {name for _flags, _delimiter, name in self._raw_folders}
+        for kind, group in (("общие", getattr(namespaces, "shared", None)),
+                            ("других пользователей", getattr(namespaces, "other", None))):
+            for entry in group or ():
+                prefix = entry[0] if isinstance(entry, (list, tuple)) and entry else ""
+                if not isinstance(prefix, str):
+                    continue
+                _log.info("IMAP %s: пространство имён %s: «%s»", self.account.host, kind, prefix)
+                try:
+                    found = self._client.list_folders(directory=prefix)
+                except Exception as exc:
+                    _log.info("IMAP %s: пространство «%s» не перечислено: %s", self.account.host, prefix, exc)
+                    continue
+                for flags, delimiter, name in found:
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    extra.append((flags, delimiter, name))
+                _log.info("IMAP %s: в пространстве «%s» папок %d", self.account.host, prefix, len(found))
+        return extra
 
     @_reconnecting
     def create_folder(self, name: str) -> None:
