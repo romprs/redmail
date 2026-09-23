@@ -1053,3 +1053,48 @@ def save_ews_accounts(accounts: list[EwsAccount]) -> None:
             }
         )
     path.write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+#: Адресные книги с серверов: CardDAV (общая книга VK приходит ссылкой
+#: вида https://e.../carddav/principal/addressbook/common/) и контакты
+#: ящика Exchange. Хранится список словарей: kind — "carddav" или "ews",
+#: url — адрес книги (для ews пусто), account — ключ учётной записи, чьи
+#: логин и пароль использовать.
+_ADDRESS_BOOKS_KEY = "address_books"
+
+
+def load_address_books() -> list[dict]:
+    data = _load_settings_dict()
+    raw = data.get(_ADDRESS_BOOKS_KEY)
+    if not isinstance(raw, list):
+        return []
+    books = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        kind = str(entry.get("kind") or "carddav")
+        if kind not in ("carddav", "ews"):
+            continue
+        books.append({
+            "kind": kind,
+            "name": str(entry.get("name") or "Адресная книга"),
+            "url": str(entry.get("url") or ""),
+            "account": str(entry.get("account") or ""),
+            "enabled": bool(entry.get("enabled", True)),
+        })
+    return books
+
+
+def save_address_books(books: list[dict]) -> None:
+    data = _load_settings_dict()
+    data[_ADDRESS_BOOKS_KEY] = [
+        {
+            "kind": str(book.get("kind") or "carddav"),
+            "name": str(book.get("name") or "Адресная книга"),
+            "url": str(book.get("url") or ""),
+            "account": str(book.get("account") or ""),
+            "enabled": bool(book.get("enabled", True)),
+        }
+        for book in books
+    ]
+    _save_settings_dict(data)

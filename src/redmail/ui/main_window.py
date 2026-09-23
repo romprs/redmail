@@ -135,6 +135,7 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail import keyboard_layout, mail_export, memory_report, profile_transfer
+from redmail import address_books, carddav_sync
 from redmail import outbox as outbox_store
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
@@ -176,6 +177,8 @@ from redmail.config_store import (
     load_greetings,
     save_greetings,
     validate_greeting,
+    load_address_books,
+    save_address_books,
     load_profile_dir,
     load_contacts_view_mode,
     load_mail_view_mode,
@@ -5616,6 +5619,121 @@ class _EditCalendarUrlDialog(QDialog):
         return self.url_edit.text().strip()
 
 
+
+class AddressBooksDialog(QDialog):
+    """Адресные книги с серверов: общая книга организации по CardDAV
+    (у VK её адрес присылают ссылкой) и контакты ящика Exchange.
+
+    Книга обновляется целиком: свои контакты, заведённые здесь или
+    импортированные файлом, остаются на месте."""
+
+    def __init__(self, parent, books: list[dict], accounts: list[tuple[str, str]]):
+        super().__init__(parent)
+        self.setWindowTitle("Адресные книги")
+        self.resize(640, 340)
+        self._books = [dict(book) for book in books]
+        self._accounts = accounts  # (ключ, подпись)
+
+        self.list_widget = QListWidget(self)
+        self.list_widget.itemChanged.connect(self._on_item_changed)
+
+        add_carddav = QPushButton("Добавить книгу CardDAV…", self)
+        add_carddav.clicked.connect(self._add_carddav)
+        add_ews = QPushButton("Добавить контакты Exchange", self)
+        add_ews.clicked.connect(self._add_ews)
+        remove = QPushButton("Убрать", self)
+        remove.clicked.connect(self._remove)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить и обновить")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        row = QHBoxLayout()
+        row.addWidget(add_carddav)
+        row.addWidget(add_ews)
+        row.addWidget(remove)
+        row.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("Книги, которые загружаются с серверов (галочка — загружать):", self))
+        layout.addWidget(self.list_widget, 1)
+        layout.addLayout(row)
+        layout.addWidget(buttons)
+        self._fill()
+
+    def _fill(self) -> None:
+        self.list_widget.blockSignals(True)
+        self.list_widget.clear()
+        for book in self._books:
+            where = book.get("url") or dict(self._accounts).get(book.get("account", ""), book.get("account", ""))
+            item = QListWidgetItem(f"{address_books.book_title(book)} — {where}")
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if book.get("enabled", True) else Qt.CheckState.Unchecked)
+            self.list_widget.addItem(item)
+        self.list_widget.blockSignals(False)
+
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        index = self.list_widget.row(item)
+        if 0 <= index < len(self._books):
+            self._books[index]["enabled"] = item.checkState() == Qt.CheckState.Checked
+
+    def _add_carddav(self) -> None:
+        url, ok = QInputDialog.getText(
+            self, "Книга CardDAV",
+            "Адрес книги на сервере (его присылают ссылкой, например\n"
+            "https://e.example.ru/carddav/principal/addressbook/common/):",
+        )
+        url = (url or "").strip()
+        if not ok or not url:
+            return
+        if not url.lower().startswith(("http://", "https://")):
+            QMessageBox.warning(self, "Адрес книги", "Адрес должен начинаться с http:// или https://")
+            return
+        if url.lower().startswith("http://"):
+            # Логин и пароль почты уйдут на сервер книги; без шифрования их
+            # видно любому в сети — спрашиваем прямо.
+            answer = QMessageBox.question(
+                self, "Адрес книги",
+                "Адрес без шифрования (http://). Логин и пароль уйдут на сервер в открытом виде.\n"
+                "Добавить книгу всё равно?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        name, ok = QInputDialog.getText(self, "Книга CardDAV", "Название книги:", text="Книга организации")
+        if not ok:
+            return
+        self._books.append({
+            "kind": address_books.KIND_CARDDAV, "name": (name or "Книга организации").strip(),
+            "url": url, "account": "", "enabled": True,
+        })
+        self._fill()
+
+    def _add_ews(self) -> None:
+        if not self._accounts:
+            QMessageBox.information(self, "Контакты Exchange", "Нет подключённых учётных записей Exchange.")
+            return
+        labels = [label for _key, label in self._accounts]
+        label, ok = QInputDialog.getItem(self, "Контакты Exchange", "Ящик:", labels, 0, False)
+        if not ok:
+            return
+        key = next((k for k, name in self._accounts if name == label), "")
+        self._books.append({
+            "kind": address_books.KIND_EWS, "name": f"Контакты Exchange ({label})",
+            "url": "", "account": key, "enabled": True,
+        })
+        self._fill()
+
+    def _remove(self) -> None:
+        index = self.list_widget.currentRow()
+        if 0 <= index < len(self._books):
+            del self._books[index]
+            self._fill()
+
+    def books(self) -> list[dict]:
+        return [dict(book) for book in self._books]
+
+
 class AddCalendarDialog(QDialog):
     """Новый календарь — локальный или подключённый к внешнему CalDAV-серверу.
 
@@ -7803,6 +7921,17 @@ class MainWindow(QMainWindow):
         contacts_refresh_action = QAction(_toolbar_icon("refresh"), "Обновить", self)
         contacts_refresh_action.triggered.connect(self.refresh_contacts_view)
         contacts_toolbar.addAction(contacts_refresh_action)
+        contacts_toolbar.addSeparator()
+        # Книга с сервера вместо выгрузки файлом (пожелание: «почему бы не
+        # качать книгу с серверов, на Exchange тоже есть книга»).
+        books_action = QAction(_toolbar_icon("sync"), "Адресные книги…", self)
+        books_action.setToolTip("Книги с серверов: CardDAV и контакты Exchange")
+        books_action.triggered.connect(self.on_address_books)
+        contacts_toolbar.addAction(books_action)
+        gal_action = QAction(_toolbar_icon("search"), "Найти в книге организации…", self)
+        gal_action.setToolTip("Поиск по адресной книге Exchange (как в Outlook)")
+        gal_action.triggered.connect(self.on_search_global_address_list)
+        contacts_toolbar.addAction(gal_action)
 
         # Поиск и фильтр по типу (жалобы: "по книге нет поиска", "не
         # отфильтровать группы, признак не виден").
@@ -8007,6 +8136,13 @@ class MainWindow(QMainWindow):
         self.outbox_button.hide()
         self.statusBar().addPermanentWidget(self.outbox_button)
         self.outbox.recover_interrupted()
+        # Адресные книги с серверов: обновляем вскоре после запуска и раз в
+        # несколько часов — книгу организации незачем дёргать чаще.
+        self._address_books_timer = QTimer(self)
+        self._address_books_timer.setInterval(6 * 60 * 60 * 1000)
+        self._address_books_timer.timeout.connect(lambda: self.sync_address_books(silent=True))
+        self._address_books_timer.start()
+        QTimer.singleShot(45_000, lambda: self.sync_address_books(silent=True))
         QTimer.singleShot(0, self._update_outbox_button)
         self._refresh_in_progress = False
         self._sync_worker: _SyncWorker | None = None
@@ -12879,6 +13015,10 @@ class MainWindow(QMainWindow):
                 tooltip = "\n".join(
                     part for part in (contact.display_name, contact.title, contact.department, contact.organization) if part
                 )
+                if contact.source:
+                    # Контакт пришёл с сервера: при следующей загрузке книги
+                    # он будет перезаписан — правки здесь не сохранятся.
+                    tooltip += ("\n" if tooltip else "") + "Из адресной книги на сервере (обновляется с сервера)"
                 name_item.setToolTip(tooltip)
             self.contacts_table.setItem(row, 0, name_item)
             self.contacts_table.setItem(row, 1, QTableWidgetItem(contact.title))
@@ -13023,6 +13163,166 @@ class MainWindow(QMainWindow):
         self.selected_contact = None
         self.refresh_contacts_view()
         self.statusBar().showMessage(f"Удалено контактов: {count}", 5000)
+
+    # ------------------------------------------------------------------
+    # Адресные книги с серверов
+    # ------------------------------------------------------------------
+
+    def _ews_account_choices(self) -> list[tuple[str, str]]:
+        return [
+            (key, self.mailbox_accounts[key].username or key)
+            for key, protocol in self.mailbox_protocols.items()
+            if protocol == "ews" and key in self.mailbox_accounts
+        ]
+
+    def on_address_books(self) -> None:
+        dialog = AddressBooksDialog(self, load_address_books(), self._ews_account_choices())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        books = dialog.books()
+        try:
+            save_address_books(books)
+        except Exception as exc:
+            QMessageBox.warning(self, "Адресные книги", f"Настройки не сохранены: {exc}")
+            return
+        self._forget_removed_books(books)
+        self.sync_address_books()
+
+    def _forget_removed_books(self, books: list[dict]) -> None:
+        """Книгу убрали из списка — её контакты тоже убираем: иначе в книге
+        навсегда остался бы снимок чужого сервера."""
+        keep = {address_books.source_key(book) for book in books}
+        try:
+            for source in contact_store.list_sources(self.contacts_path):
+                if source not in keep:
+                    contact_store.replace_source_contacts(self.contacts_path, source, [])
+        except Exception as exc:
+            _log.warning("Адресные книги: прежние контакты не убраны: %s", exc)
+
+    def sync_address_books(self, *, silent: bool = False) -> None:
+        """Загрузка всех включённых книг в фоне."""
+        books = [book for book in load_address_books() if book.get("enabled", True)]
+        if not books:
+            if not silent:
+                QMessageBox.information(
+                    self, "Адресные книги",
+                    "Книги с серверов не настроены. Нажмите «Адресные книги…» и добавьте книгу.",
+                )
+            return
+        contacts_path = self.contacts_path
+        sessions = {key: self.mailboxes[key] for key in self.mailboxes}
+        carddav_accounts = {
+            book.get("url", ""): self._carddav_account_for(book.get("url", ""))
+            for book in books if book.get("kind") != address_books.KIND_EWS
+        }
+
+        def work() -> list[str]:
+            report: list[str] = []
+            for book in books:
+                title = address_books.book_title(book)
+                try:
+                    if book.get("kind") == address_books.KIND_EWS:
+                        mailbox = sessions.get(book.get("account") or "")
+                        session = getattr(mailbox, "session", None)
+                        if session is None:
+                            report.append(f"{title}: учётная запись не подключена")
+                            continue
+                        entries = ews_client.fetch_contacts(session)
+                        count = address_books.sync_ews(contacts_path, book, entries)
+                    else:
+                        account = carddav_accounts.get(book.get("url", ""))
+                        count = address_books.sync_carddav(contacts_path, book, account)
+                    report.append(f"{title}: {count}")
+                except Exception as exc:
+                    _log.warning("Книга «%s» не загружена: %s", title, exc)
+                    report.append(f"{title}: ошибка — {exc}")
+            return report
+
+        worker = _CallableWorker(work, parent=self)
+
+        def done(report: object) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            self.refresh_contacts_view()
+            lines = report if isinstance(report, list) else []
+            self.statusBar().showMessage("Адресные книги — " + "; ".join(lines), 10000)
+            if not silent and any("ошибка" in line for line in lines):
+                QMessageBox.warning(self, "Адресные книги", "\n".join(lines))
+
+        def failed(error_text: str) -> None:
+            if worker in self._background_workers:
+                self._background_workers.remove(worker)
+            if not silent:
+                QMessageBox.warning(self, "Адресные книги", error_text)
+
+        worker.succeeded.connect(done)
+        worker.failed.connect(failed)
+        self._background_workers.append(worker)
+        self.statusBar().showMessage("Загружаю адресные книги…")
+        worker.start()
+
+    def _carddav_account_for(self, url: str) -> carddav_sync.CardDavAccount:
+        """Логин и пароль для книги — от учётной записи, чей сервер ближе
+        по домену (тот же подбор, что у календарей)."""
+        credentials = self._calendar_credentials(url)
+        username, password, auth_type = credentials or ("", "", "password")
+        return carddav_sync.CardDavAccount(
+            url=url, username=username, password=password, auth_type=auth_type
+        )
+
+    def on_search_global_address_list(self) -> None:
+        """Поиск по книге организации через Exchange: книгу целиком сервер
+        не отдаёт, но по части имени или адреса находит — как в Outlook."""
+        session = getattr(self.mailbox, "session", None)
+        if self.account_protocol != "ews" or session is None:
+            session = next(
+                (getattr(self.mailboxes[key], "session", None)
+                 for key, protocol in self.mailbox_protocols.items() if protocol == "ews"),
+                None,
+            )
+        if session is None:
+            QMessageBox.information(
+                self, "Книга организации",
+                "Поиск работает через учётную запись Exchange, а она не подключена.",
+            )
+            return
+        query, ok = QInputDialog.getText(self, "Книга организации", "Фамилия или часть адреса:")
+        query = (query or "").strip()
+        if not ok or len(query) < 2:
+            return
+        try:
+            found = ews_client.search_address_book(session, query)
+        except Exception as exc:
+            QMessageBox.warning(self, "Книга организации", str(exc))
+            return
+        if not found:
+            QMessageBox.information(self, "Книга организации", f"По запросу «{query}» никого не нашлось.")
+            return
+        lines = [
+            f"{entry['display_name']} — {', '.join(entry['emails'])}"
+            + (f" ({entry['title']})" if entry.get("title") else "")
+            for entry in found
+        ]
+        answer = QMessageBox.question(
+            self, "Книга организации",
+            f"Найдено: {len(found)}\n\n" + "\n".join(lines[:20])
+            + ("\n…" if len(lines) > 20 else "") + "\n\nДобавить их в адресную книгу?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        added = 0
+        for entry in found:
+            contact = address_books.contacts_from_ews([entry], "")[0]
+            contact.uid = ""
+            contact.source = ""
+            try:
+                contact_store.save_contact(self.contacts_path, contact)
+                added += 1
+            except Exception as exc:
+                _log.warning("Книга организации: контакт не сохранён: %s", exc)
+        self.refresh_contacts_view()
+        self.statusBar().showMessage(f"Из книги организации добавлено контактов: {added}", 8000)
+
 
     def on_import_contacts(self) -> None:
         menu = QMenu(self)

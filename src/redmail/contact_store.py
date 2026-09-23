@@ -45,11 +45,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     title TEXT NOT NULL DEFAULT '',
     department TEXT NOT NULL DEFAULT '',
     photo BLOB,
-    photo_type TEXT NOT NULL DEFAULT ''
+    photo_type TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT ''
 );
 """
 
-_COLUMNS = "id, uid, display_name, emails, phone, organization, notes, is_group, title, department, photo, photo_type"
+_COLUMNS = ("id, uid, display_name, emails, phone, organization, notes, is_group, title, department, "
+            "photo, photo_type, source")
 
 
 @dataclass
@@ -75,6 +77,11 @@ class Contact:
     # встречается и base64, и ссылка file:// на локальный файл.
     photo: bytes = b""
     photo_type: str = ""
+    #: Откуда контакт: пусто — свой (заведён здесь или импортирован
+    #: файлом), иначе ключ книги на сервере («carddav:<адрес>»,
+    #: «ews:<ящик>»). Книга с сервера обновляется целиком, поэтому свои
+    #: контакты от серверных отделены: раньше их пришлось бы затирать.
+    source: str = ""
 
     @property
     def primary_email(self) -> str:
@@ -216,6 +223,7 @@ def _row_to_contact(row) -> Contact:
         department=row[9] if len(row) > 9 and row[9] else "",
         photo=bytes(row[10]) if len(row) > 10 and row[10] else b"",
         photo_type=row[11] if len(row) > 11 and row[11] else "",
+        source=row[12] if len(row) > 12 and row[12] else "",
     )
 
 
@@ -229,6 +237,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         ("department", "TEXT NOT NULL DEFAULT ''"),
         ("photo", "BLOB"),
         ("photo_type", "TEXT NOT NULL DEFAULT ''"),
+        ("source", "TEXT NOT NULL DEFAULT ''"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE contacts ADD COLUMN {name} {definition}")
@@ -298,12 +307,12 @@ def save_contact(path: Path, contact: Contact) -> Contact:
     with closing(_connect(path)) as conn:
         conn.execute(
             "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes, is_group, "
-            "title, department, photo, photo_type) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "title, department, photo, photo_type, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(uid) DO UPDATE SET "
             "display_name=excluded.display_name, emails=excluded.emails, phone=excluded.phone, "
             "organization=excluded.organization, notes=excluded.notes, is_group=excluded.is_group, "
-            "title=excluded.title, department=excluded.department, "
+            "title=excluded.title, department=excluded.department, source=excluded.source, "
             # Фото при повторном импорте не затираем пустым значением: в одних
             # выгрузках оно есть, в других (та же книга без кэша картинок) нет.
             "photo=COALESCE(NULLIF(excluded.photo, X''), contacts.photo), "
@@ -321,6 +330,7 @@ def save_contact(path: Path, contact: Contact) -> Contact:
                 contact.department,
                 contact.photo or b"",
                 contact.photo_type,
+                contact.source,
             ),
         )
         conn.commit()
@@ -386,7 +396,7 @@ def _iter_vcard_blocks(text: str):
                 buffer = []
 
 
-def _contact_from_vcard(card) -> Contact | None:
+def _contact_from_vcard(card, allow_local_files: bool = True) -> Contact | None:
     emails = [e.value.strip() for e in card.contents.get("email", []) if e.value.strip()]
     display_name = ""
     if hasattr(card, "n"):
@@ -434,7 +444,7 @@ def _contact_from_vcard(card) -> Contact | None:
         if value is not None and str(value.value).strip():
             title = _decode_rfc2047(str(value.value).strip())
             break
-    photo, photo_type = _photo_from_vcard(card)
+    photo, photo_type = _photo_from_vcard(card, allow_local_files)
     notes = str(card.note.value).strip() if hasattr(card, "note") else ""
 
     contact = Contact(
@@ -460,9 +470,13 @@ _PHOTO_TYPES = {"JPEG": "image/jpeg", "JPG": "image/jpeg", "PNG": "image/png", "
 _MAX_PHOTO_BYTES = 2 * 1024 * 1024
 
 
-def _photo_from_vcard(card) -> tuple[bytes, str]:
+def _photo_from_vcard(card, allow_local_files: bool = True) -> tuple[bytes, str]:
     """Фотография из PHOTO: либо встроенная (base64), либо ссылка
-    file:// на локальный файл — так её выгружает Evolution/Exchange."""
+    file:// на локальный файл — так её выгружает Evolution/Exchange.
+
+    allow_local_files=False — для карточек, пришедших С СЕРВЕРА: там
+    карточку пишет кто угодно из организации, и ссылка file:// заставила
+    бы чужой клиент прочитать у себя на диске произвольный файл."""
     photo = getattr(card, "photo", None)
     if photo is None:
         return b"", ""
@@ -474,6 +488,9 @@ def _photo_from_vcard(card) -> tuple[bytes, str]:
     else:
         text = str(value).strip()
         if text.lower().startswith("file://"):
+            if not allow_local_files:
+                _log.info("Книга: ссылка file:// в фотографии пропущена")
+                return b"", ""
             try:
                 # url2pathname, а не голый путь из URL: на разных системах
                 # file:// раскрывается по-своему.
@@ -580,3 +597,80 @@ def import_csv(path: Path, csv_bytes: bytes) -> int:
         save_contact(path, _reuse_existing_uid(path, contact))
         count += 1
     return count
+
+
+def list_sources(path: Path) -> dict[str, int]:
+    """Сколько контактов пришло из каждой книги на сервере."""
+    create_contacts_book(path)
+    with closing(_connect(path)) as conn:
+        rows = conn.execute(
+            "SELECT source, COUNT(*) FROM contacts WHERE source <> '' GROUP BY source"
+        ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def replace_source_contacts(path: Path, source: str, contacts: list[Contact]) -> int:
+    """Книга с сервера загружена заново: её контакты заменяются целиком.
+
+    Свои контакты (source пуст) не трогаются, а удалённые на сервере
+    пропадают и здесь — иначе книга копила бы уволившихся. Всё одной
+    транзакцией: оборванная связь не должна оставить книгу пустой."""
+    if not source:
+        raise ValueError("source обязателен")
+    create_contacts_book(path)
+    prepared = []
+    for contact in contacts:
+        emails = []
+        for email in contact.emails:
+            normalized = (email or "").strip().lower()
+            if normalized and normalized not in emails:
+                emails.append(normalized)
+        if not emails and not contact.display_name:
+            continue
+        prepared.append((contact, emails))
+    with closing(_connect(path)) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("DELETE FROM contacts WHERE source = ?", (source,))
+        for contact, emails in prepared:
+            conn.execute(
+                "INSERT INTO contacts (uid, display_name, emails, phone, organization, notes, is_group, "
+                "title, department, photo, photo_type, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(uid) DO UPDATE SET display_name=excluded.display_name, emails=excluded.emails, "
+                "phone=excluded.phone, organization=excluded.organization, notes=excluded.notes, "
+                "is_group=excluded.is_group, title=excluded.title, department=excluded.department, "
+                "photo=COALESCE(NULLIF(excluded.photo, X''), contacts.photo), "
+                "photo_type=CASE WHEN excluded.photo IS NOT NULL AND LENGTH(excluded.photo) > 0 "
+                "THEN excluded.photo_type ELSE contacts.photo_type END, source=excluded.source",
+                (
+                    contact.uid or new_uid(), contact.display_name,
+                    json.dumps(emails, ensure_ascii=False), contact.phone, contact.organization,
+                    contact.notes, int(bool(contact.is_group)), contact.title, contact.department,
+                    contact.photo or b"", contact.photo_type, source,
+                ),
+            )
+        conn.commit()
+    return len(prepared)
+
+
+def contacts_from_vcards(vcards: list[bytes], source: str) -> list[Contact]:
+    """Карточки с сервера → контакты. Разбор тот же, что у импорта файла,
+    чтобы должность, подразделение и фото разбирались одинаково."""
+    result: list[Contact] = []
+    for raw in vcards:
+        text = raw.decode("utf-8", errors="replace")
+        for block in _iter_vcard_blocks(text):
+            try:
+                card = vobject.readOne(block, ignoreUnreadable=True)
+            except Exception as exc:
+                _log.warning("Книга %s: карточка пропущена (%s)", source, exc)
+                continue
+            contact = _contact_from_vcard(card, allow_local_files=False)
+            if contact is None:
+                continue
+            # UID карточки уникален в пределах сервера, но в книге может
+            # уже лежать свой контакт с тем же UID (импорт того же файла) —
+            # адрес книги в UID разводит их.
+            contact.uid = f"{source}|{contact.uid}" if contact.uid else ""
+            contact.source = source
+            result.append(contact)
+    return result

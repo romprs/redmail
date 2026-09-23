@@ -717,3 +717,110 @@ def send_message(session: EwsSession, message: OutgoingMessage) -> None:
             FileAttachment(name=attachment.filename, content=attachment.payload, content_type=attachment.content_type)
         )
     ews_message.send()
+
+
+#: Поля контакта, которые есть смысл тянуть: остальное (заметки, адреса,
+#: фото) в книге не показывается, а запрос целиком заметно медленнее.
+_CONTACT_FIELDS = (
+    "display_name", "email_addresses", "business_phone_numbers", "mobile_phone",
+    "company_name", "job_title", "department",
+)
+
+
+def _contact_emails(item) -> list[str]:
+    result = []
+    for entry in getattr(item, "email_addresses", None) or []:
+        address = (getattr(entry, "email", "") or "").strip()
+        # У контакта из Exchange адрес бывает в виде X500-пути каталога —
+        # письмо по такому не отправить, в книгу его класть незачем.
+        if address and "@" in address and address.lower() not in result:
+            result.append(address.lower())
+    return result
+
+
+def _contact_phone(item) -> str:
+    for value in (getattr(item, "business_phone_numbers", None) or []):
+        phone = (getattr(value, "phone_number", "") or "").strip()
+        if phone:
+            return phone
+    return (getattr(item, "mobile_phone", "") or "").strip()
+
+
+def fetch_contacts(session: "EwsSession", limit: int = 5000) -> list[dict]:
+    """Личные контакты ящика Exchange (папка «Контакты» и вложенные).
+
+    Возвращает простые словари, а не объекты exchangelib: сетевой слой не
+    должен тащить свои типы в хранилище контактов.
+    """
+    account = session._account
+    result: list[dict] = []
+    folders = [account.contacts]
+    try:
+        folders.extend(list(account.contacts.walk().folder_class__in(["IPF.Contact"])))
+    except Exception as exc:
+        _log.info("EWS: вложенные папки контактов не получены: %s", exc)
+    seen_ids: set[str] = set()
+    for folder in folders:
+        if getattr(folder, "id", None) in seen_ids:
+            continue
+        seen_ids.add(getattr(folder, "id", None))
+        try:
+            items = folder.all().only(*_CONTACT_FIELDS)[:limit]
+            for item in items:
+                emails = _contact_emails(item)
+                name = (getattr(item, "display_name", "") or "").strip()
+                if not emails and not name:
+                    continue
+                result.append({
+                    "uid": getattr(item, "id", "") or "",
+                    "display_name": name or (emails[0] if emails else ""),
+                    "emails": emails,
+                    "phone": _contact_phone(item),
+                    "organization": (getattr(item, "company_name", "") or "").strip(),
+                    "title": (getattr(item, "job_title", "") or "").strip(),
+                    "department": (getattr(item, "department", "") or "").strip(),
+                })
+        except Exception as exc:
+            _log.warning("EWS: папка контактов %s не прочитана: %s", getattr(folder, "name", "?"), exc)
+    _log.info("EWS %s: контактов получено %d", session.account.email, len(result))
+    return result
+
+
+def search_address_book(session: "EwsSession", query: str, limit: int = 50) -> list[dict]:
+    """Поиск в адресной книге организации (GAL) — как в Outlook: книгу
+    целиком Exchange не отдаёт, но по части имени или адреса находит.
+    Перебором букв книгу не выкачиваем: это десятки тысяч запросов к
+    рабочему серверу."""
+    query = (query or "").strip()
+    if len(query) < 2:
+        return []
+    try:
+        found = session._account.protocol.resolve_names([query], return_full_contact_data=True)
+    except Exception as exc:
+        _log.warning("EWS: поиск «%s» в адресной книге не удался: %s", query, exc)
+        raise EwsConnectionError(f"Поиск в адресной книге не удался: {exc}") from exc
+    result: list[dict] = []
+    for entry in found:
+        if isinstance(entry, Exception):
+            _log.info("EWS: ответ поиска пропущен: %s", entry)
+            continue
+        mailbox, contact = (entry if isinstance(entry, tuple) else (entry, None))
+        address = (getattr(mailbox, "email_address", "") or "").strip()
+        name = (getattr(mailbox, "name", "") or "").strip()
+        if not address or "@" not in address:
+            continue
+        item = {
+            "display_name": name or address,
+            "emails": [address.lower()],
+            "phone": "", "organization": "", "title": "", "department": "",
+        }
+        if contact is not None:
+            item["phone"] = _contact_phone(contact)
+            item["organization"] = (getattr(contact, "company_name", "") or "").strip()
+            item["title"] = (getattr(contact, "job_title", "") or "").strip()
+            item["department"] = (getattr(contact, "department", "") or "").strip()
+        result.append(item)
+        if len(result) >= limit:
+            break
+    _log.info("EWS: поиск «%s» в адресной книге: найдено %d", query, len(result))
+    return result
