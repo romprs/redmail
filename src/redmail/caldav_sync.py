@@ -7,6 +7,8 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import unquote, urlparse
 from uuid import uuid4
 
+import time
+
 import caldav
 import icalendar
 import requests
@@ -51,6 +53,34 @@ def _with_connection_retry(func, *args, **kwargs):
         return func(*args, **kwargs)
     except requests.exceptions.ConnectionError:
         return func(*args, **kwargs)
+
+
+#: Ответы, после которых стоит просто повторить: сервер VK несколько раз в
+#: день отдаёт 500/502 и изредка «Unauthorized» на том же самом календаре,
+#: который секунду назад отвечал. Раньше такой проход просто пропускался с
+#: ошибкой в журнале, и встречи не обновлялись до следующего раза.
+_RETRIABLE_MARKERS = ("500 ", "502 ", "503 ", "504 ", "Unauthorized", "Bad Gateway", "Internal Server Error")
+_RETRY_PAUSES = (2.0, 6.0)
+
+
+def _is_retriable(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.exceptions.ConnectionError, requests.exceptions.Timeout)):
+        return True
+    text = str(exc)
+    return any(marker in text for marker in _RETRIABLE_MARKERS)
+
+
+def _with_server_retry(what: str, func, *args, **kwargs):
+    """Повтор при временном отказе сервера (5xx, разовый Unauthorized) с
+    короткой паузой; последняя ошибка пробрасывается как была."""
+    for pause in (*_RETRY_PAUSES, None):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            if pause is None or not _is_retriable(exc):
+                raise
+            _log.warning("CalDAV: %s не удалось (%s), повтор через %.0f с", what, exc, pause)
+            time.sleep(pause)
 
 # CalDAV с сервером клиента (VK Mail/Exchange) — сеть закрытая корпоративная,
 # у самого redmail нет прямого способа её нащупать заранее, поэтому адрес
@@ -125,6 +155,25 @@ def _auth_scheme_hint(url: str) -> str:
     return f" Сервер предлагает только: {', '.join(schemes)} — SSO (Negotiate) на этом сервере недоступен."
 
 
+def _organizers_in(raw: bytes) -> list[str]:
+    """Организаторы встреч из .ics: «Имя» или адрес, если имени нет."""
+    result: list[str] = []
+    try:
+        calendar = icalendar.Calendar.from_ical(raw)
+    except Exception:
+        return result
+    for component in calendar.walk("VEVENT"):
+        organizer = component.get("ORGANIZER")
+        if organizer is None:
+            continue
+        name = str(organizer.params.get("CN") or "").strip()
+        address = str(organizer).replace("mailto:", "").strip()
+        who = name or address
+        if who and who not in result:
+            result.append(who)
+    return result
+
+
 @dataclass
 class CalDavCalendarInfo:
     """Один календарь, обнаруженный на сервере при обходе calendar-home-set —
@@ -142,6 +191,12 @@ class CalDavCalendarInfo:
     owner: str | None
     is_shared: bool
     read_only: bool
+    #: Чьи встречи лежат в календаре («Захаров Н.А. <nazaharov@…>»). У VK
+    #: календарь коллеги лежит в НАШЕМ доме и владельцем помечен тоже мы,
+    #: а имя у всех — «Основной»: в списке их не различить (жалоба: три
+    #: одинаковых «Основной», пришлось переименовывать вручную). Кто
+    #: организует встречи внутри — единственный надёжный признак.
+    organizers: str = ""
 
 
 _CALDAV_CALENDAR_TAG = "{urn:ietf:params:xml:ns:caldav}calendar"
@@ -477,11 +532,46 @@ class CalDavSession:
                 raise failure
         _log.info("CalDAV %s: домов календарей %d, найдено календарей %d (расшаренных %d)",
                   self.account.url, len(home_urls), len(infos), sum(1 for i in infos if i.is_shared))
+        self._fill_organizers(infos)
         for info in infos:
             _log.info("CalDAV %s: календарь «%s» %s%s%s", self.account.url, info.name, info.url,
                       f", владелец {info.owner}" if info.owner else "",
                       " (расшаренный)" if info.is_shared else "")
         return infos
+
+    #: Сколько дней заглядывать в календарь, чтобы понять, чей он.
+    _ORGANIZER_PROBE_DAYS = 30
+    _ORGANIZER_PROBE_OBJECTS = 40
+
+    def _fill_organizers(self, infos: list[CalDavCalendarInfo]) -> None:
+        """Кто устраивает встречи в каждом найденном календаре. У VK имена
+        у всех одинаковые («Основной»), и без этого в списке нельзя понять,
+        где свой календарь, а где календарь коллеги."""
+        if len(infos) < 2:
+            return
+        now = datetime.now(timezone.utc)
+        window = timedelta(days=self._ORGANIZER_PROBE_DAYS)
+        for info in infos:
+            try:
+                calendar = self._client.calendar(url=info.url)
+                results = calendar.date_search(now - window, now + window, expand=False)
+            except Exception as exc:
+                _log.info("CalDAV %s: чей календарь %s — не определить: %s", self.account.url, info.url, exc)
+                continue
+            counts: dict[str, int] = {}
+            for obj in list(results)[: self._ORGANIZER_PROBE_OBJECTS]:
+                try:
+                    raw = obj.data
+                    raw_bytes = raw.encode("utf-8") if isinstance(raw, str) else raw
+                except Exception:
+                    continue
+                for who in _organizers_in(raw_bytes):
+                    counts[who] = counts.get(who, 0) + 1
+            if not counts:
+                continue
+            top = sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))[:2]
+            info.organizers = ", ".join(name for name, _count in top)
+            _log.info("CalDAV %s: календарь %s — встречи от: %s", self.account.url, info.url, info.organizers)
 
     def list_colleague_calendars(self, who: str) -> list[CalDavCalendarInfo]:
         """Календари коллеги — по его логину или адресу почты.
@@ -708,7 +798,9 @@ class CalDavSession:
             # Без разворачивания: сервер отдаёт серию целиком (основная запись
             # и изменённые дни), серия раскрывается у нас. С развёрнутыми днями
             # основная запись не приходила, и серию нельзя было править целиком.
-            results = _with_connection_retry(calendar.date_search, start, end, expand=False)
+            results = _with_server_retry(
+                "получение событий", calendar.date_search, start, end, expand=False
+            )
         except Exception as exc:
             _log.error("CalDAV %s: получение событий не удалось: %s", self.account.url, exc)
             raise CalDavSyncError(f"Не удалось получить события с сервера: {exc}") from exc

@@ -5495,6 +5495,11 @@ class _CalendarPickerDialog(QDialog):
                     suffix += ", только чтение"
             else:
                 suffix = " — только чтение" if info.read_only else ""
+            if info.organizers:
+                # У VK все календари зовутся «Основной» и владельцем помечены
+                # мы сами — единственное, по чему их различить, это чьи
+                # встречи внутри (жалоба: три одинаковых «Основной»).
+                suffix += f" — встречи: {info.organizers}"
             if names.count(info.name) > 1:
                 suffix += f" [{info.url.rstrip('/').rsplit('/', 1)[-1][:12]}]"
             item = QListWidgetItem(f"{info.name}{suffix}")

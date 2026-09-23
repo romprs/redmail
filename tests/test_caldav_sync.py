@@ -10,7 +10,7 @@ import requests
 from caldav.lib.error import AuthorizationError, NotFoundError
 from caldav.lib.url import URL
 
-from redmail import itip
+from redmail import caldav_sync, itip
 from redmail.caldav_sync import CalDavAccount, CalDavSession, CalDavSyncError, probe_auth_schemes
 from redmail.calendar_store import Attendee, Event
 
@@ -579,3 +579,43 @@ def test_colleague_calendars_are_found_under_his_principal() -> None:
     assert len(calendars) == 1
     assert calendars[0].is_shared is True and calendars[0].read_only is True
     assert calendars[0].url.endswith("/principals/corp.ru/petrov/calendars/aaa/")
+
+
+def test_transient_server_error_is_retried(monkeypatch) -> None:
+    """VK несколько раз в день отдаёт 500/502 на том же календаре: раньше
+    проход просто пропускался, встречи не обновлялись."""
+    monkeypatch.setattr(caldav_sync.time, "sleep", lambda _seconds: None)
+    calls = []
+
+    def flaky():
+        calls.append(1)
+        if len(calls) < 3:
+            raise RuntimeError("ReportError at '502 Bad Gateway'")
+        return "ok"
+
+    assert caldav_sync._with_server_retry("проверка", flaky) == "ok"
+    assert len(calls) == 3
+
+
+def test_permanent_error_is_not_retried(monkeypatch) -> None:
+    monkeypatch.setattr(caldav_sync.time, "sleep", lambda _seconds: None)
+    calls = []
+
+    def broken():
+        calls.append(1)
+        raise RuntimeError("404 Not Found")
+
+    with pytest.raises(RuntimeError):
+        caldav_sync._with_server_retry("проверка", broken)
+    assert len(calls) == 1
+
+
+def test_organizers_are_read_from_ics() -> None:
+    ics = (
+        b"BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:1\r\nDTSTART:20260923T060000Z\r\n"
+        b"ORGANIZER;CN=\xd0\x97\xd0\xb0\xd1\x85\xd0\xb0\xd1\x80\xd0\xbe\xd0\xb2:mailto:nazaharov@amurgpz.ru\r\n"
+        b"END:VEVENT\r\nBEGIN:VEVENT\r\nUID:2\r\nDTSTART:20260923T070000Z\r\n"
+        b"ORGANIZER:mailto:someone@amurgpz.ru\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    assert caldav_sync._organizers_in(ics) == ["Захаров", "someone@amurgpz.ru"]
+    assert caldav_sync._organizers_in("не ics".encode("utf-8")) == []
