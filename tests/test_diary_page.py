@@ -102,9 +102,11 @@ def test_diary_carry_over_and_day_note(qapp, tmp_path: Path, monkeypatch) -> Non
         window.on_diary_set_day(today)
         task_store.save_task(window.tasks_path, task_store.Task(title="Не успел", day=today))
         window.refresh_diary_view()
-        window.on_carry_tasks_over()
-        moved = task_store.list_tasks(window.tasks_path)[0]
-        assert moved.day == today + timedelta(days=1)
+        # Кнопки переноса нет: незакрытая задача сама висит в текущем дне
+        window.on_diary_set_day(today + timedelta(days=1))
+        titles = [window.diary_tasks_table.item(row, 1).text() for row in range(window.diary_tasks_table.rowCount())]
+        assert "Не успел" in titles
+        window.on_diary_set_day(today)
 
         window.diary_note_edit.setPlainText("Позвонить в 9:00")
         window._save_day_note()
@@ -147,3 +149,44 @@ def test_diary_section_can_be_opened_by_command() -> None:
     controller = _Controller()
     reply = ipc_server.handle_request(controller, {"action": "focus", "args": {"section": "diary"}})
     assert reply["ok"] is True and controller.section == "diary"
+
+
+def test_all_tasks_and_period_report(qapp, tmp_path: Path, monkeypatch) -> None:
+    """Общий список задач со статусом и список выполненного за период."""
+    window = _window(qapp, tmp_path, monkeypatch)
+    try:
+        today = date.today()
+        window.on_diary_set_day(today)
+        task_store.save_task(window.tasks_path, task_store.Task(title="Висит с прошлой недели", day=today - timedelta(days=7)))
+        task_store.save_task(window.tasks_path, task_store.Task(title="Без дня вообще"))
+        closed = task_store.save_task(window.tasks_path, task_store.Task(title="Закрыта сегодня", day=today))
+        task_store.set_status(window.tasks_path, closed.uid, task_store.STATUS_DONE)
+
+        window.diary_mode_combo.setCurrentIndex(window.diary_mode_combo.findData("all"))
+        assert window.diary_to_date_edit.isHidden()
+        titles = [window.diary_tasks_table.item(row, 1).text() for row in range(window.diary_tasks_table.rowCount())]
+        assert set(titles) == {"Висит с прошлой недели", "Без дня вообще"}
+        assert "Все незакрытые задачи: 2" in window.diary_title_label.text()
+        states = [window.diary_tasks_table.item(row, 5).text() for row in range(window.diary_tasks_table.rowCount())]
+        assert all(state for state in states)
+
+        window.diary_mode_combo.setCurrentIndex(window.diary_mode_combo.findData("done"))
+        # вторая дата периода появляется только в этом режиме
+        assert not window.diary_to_date_edit.isHidden()
+        titles = [window.diary_tasks_table.item(row, 1).text() for row in range(window.diary_tasks_table.rowCount())]
+        assert titles == ["Закрыта сегодня"]
+        assert "Выполнено за" in window.diary_title_label.text()
+    finally:
+        window.close()
+        window.deleteLater()
+
+
+def test_period_report_text(tmp_path: Path) -> None:
+    path = tmp_path / task_store.TASKS_DB
+    today = date.today()
+    first = task_store.save_task(path, task_store.Task(title="Сдал ведомость", notes="КТО-Г"))
+    task_store.set_status(path, first.uid, task_store.STATUS_DONE)
+    text = task_store.report_text(task_store.completed_between(path, today, today), today, today)
+    assert "Сдал ведомость" in text and "КТО-Г" in text and "Всего: 1" in text
+    empty = task_store.report_text([], today - timedelta(days=7), today)
+    assert "ничего не отмечено" in empty and "—" in empty

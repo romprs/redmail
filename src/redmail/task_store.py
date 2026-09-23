@@ -354,14 +354,23 @@ def list_tasks(
     tasks = [_row_to_task(row) for row in rows]
     if day is not None:
         day_end = datetime.combine(day + timedelta(days=1), datetime.min.time()).astimezone().astimezone(timezone.utc)
+        today = date.today()
         selected = []
         for task in tasks:
             if task.day == day:
                 selected.append(task)
             elif task.day is None and task.due is not None and task.due < day_end and not task.done:
                 selected.append(task)
-            elif task.day is not None and task.day < day and not task.done and task.status != STATUS_CANCELLED:
-                selected.append(task)  # незакрытая задача прошлых дней остаётся на виду
+            elif (
+                day >= today
+                and task.day is not None and task.day < day
+                and not task.done and task.status != STATUS_CANCELLED
+            ):
+                # Незакрытая задача никуда не девается сама: она висит в
+                # текущем дне, пока её не закроют (пожелание: «перенос без
+                # кнопки, задания висят пока не закрою»). В прошлых днях
+                # показываем только то, что на них и стояло.
+                selected.append(task)
         tasks = selected
     if only_open or not include_done:
         tasks = [task for task in tasks if task.status not in (STATUS_DONE, STATUS_CANCELLED)]
@@ -417,3 +426,44 @@ def day_summary(path: Path, day: date) -> tuple[int, int]:
     """(сколько задач на день, сколько из них выполнено) — для заголовка."""
     tasks = list_tasks(path, day=day)
     return len(tasks), sum(1 for task in tasks if task.done)
+
+
+def list_open(path: Path) -> list[Task]:
+    """Все незакрытые задачи — общий список «что на мне висит»."""
+    return list_tasks(path, include_done=False)
+
+
+def completed_between(path: Path, start: date, end: date) -> list[Task]:
+    """Что сделано за период (включительно) — для отчёта.
+
+    Сортировка по времени выполнения: отчёт читают сверху вниз, как
+    ленту."""
+    create_tasks_file(path)
+    first = datetime.combine(start, datetime.min.time()).astimezone().astimezone(timezone.utc)
+    last = datetime.combine(end + timedelta(days=1), datetime.min.time()).astimezone().astimezone(timezone.utc)
+    done = []
+    for task in list_tasks(path):
+        if not task.done or task.completed_at is None:
+            continue
+        if first <= task.completed_at < last:
+            done.append(task)
+    return sorted(done, key=lambda task: task.completed_at or first)
+
+
+def report_text(tasks: list[Task], start: date, end: date) -> str:
+    """Отчёт за период простым текстом — его копируют в письмо или печатают."""
+    header = (
+        f"Выполнено за {start:%d.%m.%Y}" if start == end
+        else f"Выполнено за период {start:%d.%m.%Y} — {end:%d.%m.%Y}"
+    )
+    lines = [header, ""]
+    for task in tasks:
+        when = task.completed_at.astimezone().strftime("%d.%m.%Y %H:%M") if task.completed_at else ""
+        lines.append(f"{when}  {task.title}")
+        if task.notes.strip():
+            lines += [f"    {line}" for line in task.notes.strip().splitlines()]
+    if not tasks:
+        lines.append("(ничего не отмечено выполненным)")
+    else:
+        lines += ["", f"Всего: {len(tasks)}"]
+    return "\n".join(lines)

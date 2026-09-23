@@ -8193,9 +8193,14 @@ class MainWindow(QMainWindow):
         delete_task_action.triggered.connect(self.on_delete_task)
         diary_toolbar.addAction(delete_task_action)
         diary_toolbar.addSeparator()
-        carry_action = QAction(_toolbar_icon("forward"), "Перенести незакрытые на завтра", self)
-        carry_action.triggered.connect(self.on_carry_tasks_over)
-        diary_toolbar.addAction(carry_action)
+        # Кнопки «перенести на завтра» нет намеренно: незакрытая задача и
+        # так висит в текущем дне, пока её не закроют (пожелание: «перенос
+        # без кнопки, задания висят пока не закрою»). Явный перенос на
+        # конкретный день — поле «День» в самой задаче.
+        self.diary_report_action = QAction(_toolbar_icon("import"), "Сохранить отчёт…", self)
+        self.diary_report_action.setToolTip("Сохранить список выполненного за период в файл")
+        self.diary_report_action.triggered.connect(self.on_save_task_report)
+        diary_toolbar.addAction(self.diary_report_action)
         diary_layout.addWidget(diary_toolbar)
 
         nav_row = QHBoxLayout()
@@ -8211,6 +8216,16 @@ class MainWindow(QMainWindow):
         self.diary_date_edit.setCalendarPopup(True)
         self.diary_date_edit.setDisplayFormat("dd.MM.yyyy")
         self.diary_date_edit.dateChanged.connect(self._on_diary_date_changed)
+        self.diary_mode_combo = QComboBox(self)
+        self.diary_mode_combo.addItem("День", "day")
+        self.diary_mode_combo.addItem("Все задачи", "all")
+        self.diary_mode_combo.addItem("Выполнено за период", "done")
+        self.diary_mode_combo.currentIndexChanged.connect(lambda _index: self._on_diary_mode_changed())
+        self.diary_to_label = QLabel("по", self)
+        self.diary_to_date_edit = QDateEdit(self)
+        self.diary_to_date_edit.setCalendarPopup(True)
+        self.diary_to_date_edit.setDisplayFormat("dd.MM.yyyy")
+        self.diary_to_date_edit.dateChanged.connect(lambda _date: self.refresh_diary_view())
         self.diary_title_label = QLabel("", self)
         title_font = self.diary_title_label.font()
         title_font.setBold(True)
@@ -8219,12 +8234,17 @@ class MainWindow(QMainWindow):
         nav_row.addWidget(today_button)
         nav_row.addWidget(next_day_button)
         nav_row.addWidget(self.diary_date_edit)
+        nav_row.addWidget(self.diary_to_label)
+        nav_row.addWidget(self.diary_to_date_edit)
+        nav_row.addSpacing(12)
+        nav_row.addWidget(QLabel("Показывать:", self))
+        nav_row.addWidget(self.diary_mode_combo)
         nav_row.addSpacing(12)
         nav_row.addWidget(self.diary_title_label, 1)
         diary_layout.addLayout(nav_row)
 
-        self.diary_tasks_table = QTableWidget(0, 5, self)
-        self.diary_tasks_table.setHorizontalHeaderLabels(["", "Задача", "Срок", "Важность", "Состояние"])
+        self.diary_tasks_table = QTableWidget(0, 6, self)
+        self.diary_tasks_table.setHorizontalHeaderLabels(["", "Задача", "День", "Срок", "Важность", "Состояние"])
         self.diary_tasks_table.verticalHeader().setVisible(False)
         self.diary_tasks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.diary_tasks_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -8233,6 +8253,9 @@ class MainWindow(QMainWindow):
         self.diary_tasks_table.itemDoubleClicked.connect(lambda _item: self.on_edit_task())
         self.diary_tasks_table.itemChanged.connect(self._on_task_item_changed)
         diary_layout.addWidget(self.diary_tasks_table, 3)
+
+        self.diary_to_label.hide()
+        self.diary_to_date_edit.hide()
 
         day_row = QHBoxLayout()
         meetings_box = QVBoxLayout()
@@ -13898,10 +13921,50 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             _log.warning("Заметка дня не сохранена: %s", exc)
 
+    def _diary_mode(self) -> str:
+        combo = getattr(self, "diary_mode_combo", None)
+        return combo.currentData() if combo is not None else "day"
+
+    def _on_diary_mode_changed(self) -> None:
+        mode = self._diary_mode()
+        period = mode == "done"
+        self.diary_to_label.setVisible(period)
+        self.diary_to_date_edit.setVisible(period)
+        if period and self.diary_to_date_edit.date() < self.diary_date_edit.date():
+            self.diary_to_date_edit.setDate(self.diary_date_edit.date())
+        self.refresh_diary_view()
+
+    def _diary_period(self) -> tuple[date, date]:
+        start = self.diary_day
+        qdate = self.diary_to_date_edit.date()
+        end = date(qdate.year(), qdate.month(), qdate.day())
+        return (start, end) if end >= start else (end, start)
+
+    def _diary_tasks(self) -> tuple[list, str]:
+        """Задачи для текущего режима и заголовок над ними."""
+        mode = self._diary_mode()
+        day = self.diary_day
+        if mode == "all":
+            tasks = task_store.list_open(self.tasks_path)
+            overdue = sum(1 for task in tasks if task.overdue)
+            title = f"Все незакрытые задачи: {len(tasks)}"
+            if overdue:
+                title += f", просрочено {overdue}"
+            return tasks, title
+        if mode == "done":
+            start, end = self._diary_period()
+            tasks = task_store.completed_between(self.tasks_path, start, end)
+            period = f"{start:%d.%m.%Y}" if start == end else f"{start:%d.%m.%Y} — {end:%d.%m.%Y}"
+            return tasks, f"Выполнено за {period}: {len(tasks)}"
+        tasks = task_store.list_tasks(self.tasks_path, day=day)
+        done = sum(1 for task in tasks if task.done)
+        weekday = _DIARY_WEEKDAYS[day.weekday()]
+        return tasks, f"{weekday}, {day:%d.%m.%Y} — задач {len(tasks)}, выполнено {done}"
+
     def refresh_diary_view(self) -> None:
         day = self.diary_day
         try:
-            tasks = task_store.list_tasks(self.tasks_path, day=day)
+            tasks, header = self._diary_tasks()
         except Exception as exc:
             QMessageBox.critical(self, "Ежедневник", f"Задачи не прочитаны: {exc}")
             return
@@ -13927,28 +13990,25 @@ class MainWindow(QMainWindow):
                     title.setToolTip((title.toolTip() + "\n" if title.toolTip() else "")
                                      + f"Осталась с {task.day.strftime('%d.%m.%Y')}")
                 table.setItem(row, 1, title)
+                table.setItem(row, 2, QTableWidgetItem(f"{task.day:%d.%m.%Y}" if task.day else ""))
                 due_text = task.due.astimezone().strftime("%d.%m %H:%M") if task.due else ""
                 due_item = QTableWidgetItem(due_text)
                 if task.overdue:
                     due_item.setForeground(QColor("#C62828"))
-                table.setItem(row, 2, due_item)
-                table.setItem(row, 3, QTableWidgetItem(task_store.PRIORITY_LABELS.get(task.priority, "")))
+                table.setItem(row, 3, due_item)
+                table.setItem(row, 4, QTableWidgetItem(task_store.PRIORITY_LABELS.get(task.priority, "")))
                 state = task_store.STATUS_LABELS.get(task.status, task.status)
                 if task.done and task.completed_at is not None:
                     state += f" {task.completed_at.astimezone():%d.%m %H:%M}"
                 elif task.status == task_store.STATUS_IN_PROGRESS and task.percent:
                     state += f" {task.percent}%"
-                table.setItem(row, 4, QTableWidgetItem(state))
+                table.setItem(row, 5, QTableWidgetItem(state))
             table.resizeColumnsToContents()
             table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         finally:
             del blocker
 
-        total, done = len(tasks), sum(1 for task in tasks if task.done)
-        weekday = _DIARY_WEEKDAYS[day.weekday()]
-        self.diary_title_label.setText(
-            f"{weekday}, {day.strftime('%d.%m.%Y')} — задач {total}, выполнено {done}"
-        )
+        self.diary_title_label.setText(header)
 
         self.diary_meetings_list.clear()
         for event in self._events_of_day(day):
@@ -14070,18 +14130,30 @@ class MainWindow(QMainWindow):
             return
         self.refresh_diary_view()
 
-    def on_carry_tasks_over(self) -> None:
-        target = self.diary_day + timedelta(days=1)
+    def on_save_task_report(self) -> None:
+        """Список выполненного за период — в текстовый файл: его отправляют
+        письмом или прикладывают к отчёту."""
+        start, end = self._diary_period() if self._diary_mode() == "done" else (self.diary_day, self.diary_day)
         try:
-            moved = task_store.carry_over(self.tasks_path, self.diary_day, target)
+            tasks = task_store.completed_between(self.tasks_path, start, end)
+            text = task_store.report_text(tasks, start, end)
         except Exception as exc:
-            QMessageBox.warning(self, "Ежедневник", f"Не удалось перенести: {exc}")
+            QMessageBox.warning(self, "Ежедневник", f"Отчёт не составлен: {exc}")
             return
-        self.statusBar().showMessage(
-            f"Перенесено задач на {target.strftime('%d.%m.%Y')}: {moved}" if moved else "Переносить нечего",
-            8000,
+        suggested = f"Выполнено {start:%Y-%m-%d}"
+        if end != start:
+            suggested += f" — {end:%Y-%m-%d}"
+        path_str, _filter = QFileDialog.getSaveFileName(
+            self, "Сохранить отчёт", str(Path.home() / f"{suggested}.txt"), "Текстовый файл (*.txt)"
         )
-        self.refresh_diary_view()
+        if not path_str:
+            return
+        try:
+            Path(path_str).write_text(text, encoding="utf-8")
+        except OSError as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Файл не сохранён: {exc}")
+            return
+        self.statusBar().showMessage(f"Отчёт сохранён: {path_str} (задач {len(tasks)})", 10000)
 
     def on_task_from_message(self) -> None:
         """«Создать задачу из письма» — как флажок в Outlook: тема письма
