@@ -49,7 +49,7 @@ EXPORT_BY_USER = "user"
 EXPORT_BY_ADMIN = "admin"
 
 CONFIG_FILES = ("settings.json", "accounts.json", "ews_accounts.json", "account.json")
-PROFILE_FILES = (profile.MAIL_DB, profile.CALENDAR_DB, profile.CONTACTS_DB, "categories.sqlite3")
+PROFILE_FILES = (profile.MAIL_DB, profile.CALENDAR_DB, profile.CONTACTS_DB, profile.TASKS_DB, "categories.sqlite3")
 # Пути этого компьютера: на другом они не имеют смысла.
 _LOCAL_SETTINGS = ("profile_dir", "archive_storage_dir")
 _PENDING = "pending-import.json"

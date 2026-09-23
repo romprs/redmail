@@ -305,3 +305,33 @@ def today_events(calendar_path: Path, now: datetime) -> list[calendar_store.Even
         (event for event in events if event.status != "cancelled"),
         key=lambda event: event.dtstart,
     )
+
+
+def task_reminders(tasks_path: Path, state: ReminderState, now: datetime) -> list[Reminder]:
+    """Напоминания о сроках задач ежедневника — тем же окном и тем же
+    голосом, что и о встречах: человеку незачем следить за двумя разными
+    напоминалками."""
+    try:
+        from redmail import task_store
+
+        due = task_store.due_tasks(tasks_path, now)
+    except Exception as exc:
+        _log.warning("Напоминания: задачи не прочитаны: %s", exc)
+        return []
+    result: list[Reminder] = []
+    for task in due:
+        reminder = Reminder(
+            uid=f"task:{task.uid}",
+            summary=f"Задача: {task.title}",
+            dtstart=task.due,
+            dtend=task.due,
+            location="",
+            mode=task.remind_mode,
+            organizer="",
+            mine=True,
+            calendar_name="Ежедневник",
+            description=task.notes,
+        )
+        if state.is_pending(reminder, now):
+            result.append(reminder)
+    return result

@@ -202,6 +202,7 @@ class ReminderTray:
     def __init__(self, app: QApplication) -> None:
         self._app = app
         self._calendar_path = profile.calendar_db_path()
+        self._tasks_path = profile.tasks_db_path()
         self._state = reminders.ReminderState(profile.profile_dir() / reminders.STATE_FILE)
         self._windows: list[ReminderWindow] = []
         self._enabled = True
@@ -275,6 +276,9 @@ class ReminderTray:
         # резидент живёт отдельно и перезапускать его ради этого незачем.
         policy = reminders.OthersPolicy.load()
         for reminder in reminders.due_reminders(self._calendar_path, self._state, now, policy):
+            self._fire(reminder, now)
+        # Сроки задач ежедневника — та же напоминалка.
+        for reminder in reminders.task_reminders(self._tasks_path, self._state, now):
             self._fire(reminder, now)
 
     def _fire(self, reminder: reminders.Reminder, now: datetime) -> None:

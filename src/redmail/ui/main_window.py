@@ -135,7 +135,9 @@ from PySide6.QtWebEngineWidgets import QWebEngineView
 
 from redmail import archive_store, branding, calendar_store, caldav_sync, contact_store, ews_client, itip
 from redmail import keyboard_layout, mail_export, memory_report, profile_transfer
-from redmail import address_books, carddav_sync, sharing_invites
+import html as html_module
+
+from redmail import address_books, carddav_sync, sharing_invites, task_store
 from redmail import outbox as outbox_store
 from redmail.ui.message_source import MessageSourceWindow
 from redmail.applog import get_logger, log_dir, log_path, tail_text
@@ -518,6 +520,10 @@ _REPLY_VERBS: dict[str, str] = {"accepted": "Принято", "declined": "От�
 
 # Не полагаемся на locale-зависимый strftime("%B") — на разных системах
 # (Windows-разработка/RED OS) он может отдать разное, вплоть до английского.
+_DIARY_WEEKDAYS = (
+    "Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье",
+)
+
 _MONTH_NAMES = (
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
     "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь",
@@ -5734,6 +5740,166 @@ class AddressBooksDialog(QDialog):
         return [dict(book) for book in self._books]
 
 
+
+class TaskDialog(QDialog):
+    """Задача ежедневника: тема, срок, важность, заметка и отметка
+    исполнения. Внизу — журнал: когда задачу завели, меняли состояние и
+    переносили (пожелание «фиксировать исполнение»)."""
+
+    def __init__(self, parent=None, *, task=None, day=None, mail=None, history=None):
+        super().__init__(parent)
+        self.setWindowTitle("Задача" if task is not None else "Новая задача")
+        self.resize(560, 520)
+        self._task = task
+        self._mail = mail if task is None else (task.mail if task is not None else None)
+        self._day = day or date.today()
+
+        self.title_edit = QLineEdit(task.title if task else (mail.subject if mail else ""), self)
+        self.title_edit.setPlaceholderText("Что нужно сделать")
+
+        self.day_check = QCheckBox("Поставить на день", self)
+        self.day_edit = QDateEdit(self)
+        self.day_edit.setCalendarPopup(True)
+        self.day_edit.setDisplayFormat("dd.MM.yyyy")
+        planned = task.day if task and task.day else self._day
+        self.day_edit.setDate(QDate(planned.year, planned.month, planned.day))
+        self.day_check.setChecked(bool(task.day) if task else True)
+        self.day_check.toggled.connect(self.day_edit.setEnabled)
+        self.day_edit.setEnabled(self.day_check.isChecked())
+
+        self.due_check = QCheckBox("Срок", self)
+        self.due_edit = QDateTimeEdit(self)
+        self.due_edit.setCalendarPopup(True)
+        self.due_edit.setDisplayFormat("dd.MM.yyyy HH:mm")
+        due_local = task.due.astimezone() if task and task.due else datetime.combine(
+            self._day, datetime.min.time()
+        ).replace(hour=18)
+        self.due_edit.setDateTime(QDateTime(
+            QDate(due_local.year, due_local.month, due_local.day),
+            QTime(due_local.hour, due_local.minute),
+        ))
+        self.due_check.setChecked(bool(task.due) if task else False)
+        self.due_check.toggled.connect(self.due_edit.setEnabled)
+        self.due_edit.setEnabled(self.due_check.isChecked())
+
+        self.priority_combo = QComboBox(self)
+        for value in task_store.PRIORITIES:
+            self.priority_combo.addItem(task_store.PRIORITY_LABELS[value], value)
+        self.priority_combo.setCurrentIndex(
+            max(0, self.priority_combo.findData(task.priority if task else task_store.PRIORITY_NORMAL))
+        )
+
+        self.status_combo = QComboBox(self)
+        for value in task_store.STATUSES:
+            self.status_combo.addItem(task_store.STATUS_LABELS[value], value)
+        self.status_combo.setCurrentIndex(
+            max(0, self.status_combo.findData(task.status if task else task_store.STATUS_NEW))
+        )
+
+        self.percent_spin = QSpinBox(self)
+        self.percent_spin.setRange(0, 100)
+        self.percent_spin.setSuffix(" %")
+        self.percent_spin.setValue(task.percent if task else 0)
+
+        self.remind_check = QCheckBox("Напомнить до срока", self)
+        self.remind_spin = QSpinBox(self)
+        self.remind_spin.setRange(0, 24 * 60)
+        self.remind_spin.setSuffix(" мин")
+        self.remind_spin.setValue(task.remind_minutes if task and task.remind_minutes >= 0 else 15)
+        self.remind_check.setChecked(bool(task and task.remind_minutes >= 0 and task.remind_mode != "none"))
+        self.remind_check.toggled.connect(self.remind_spin.setEnabled)
+        self.remind_spin.setEnabled(self.remind_check.isChecked())
+
+        self.notes_edit = QPlainTextEdit(task.notes if task else "", self)
+        self.notes_edit.setPlaceholderText("Подробности, ссылки, что уже сделано")
+
+        form = QFormLayout()
+        form.addRow("Задача", self.title_edit)
+        day_row = QHBoxLayout()
+        day_row.addWidget(self.day_check)
+        day_row.addWidget(self.day_edit)
+        day_row.addStretch(1)
+        form.addRow("День", day_row)
+        due_row = QHBoxLayout()
+        due_row.addWidget(self.due_check)
+        due_row.addWidget(self.due_edit)
+        due_row.addStretch(1)
+        form.addRow("Срок", due_row)
+        state_row = QHBoxLayout()
+        state_row.addWidget(self.status_combo)
+        state_row.addWidget(self.percent_spin)
+        state_row.addWidget(self.priority_combo)
+        state_row.addStretch(1)
+        form.addRow("Состояние", state_row)
+        remind_row = QHBoxLayout()
+        remind_row.addWidget(self.remind_check)
+        remind_row.addWidget(self.remind_spin)
+        remind_row.addStretch(1)
+        form.addRow("Напоминание", remind_row)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        if self._mail is not None and (self._mail.subject or self._mail.folder):
+            mail_label = QLabel(f"Из письма: {self._mail.subject} — {self._mail.sender}", self)
+            mail_label.setWordWrap(True)
+            layout.addWidget(mail_label)
+        layout.addWidget(QLabel("Заметка:", self))
+        layout.addWidget(self.notes_edit, 1)
+        if history:
+            layout.addWidget(QLabel("Журнал задачи:", self))
+            log_view = QPlainTextEdit(self)
+            log_view.setReadOnly(True)
+            log_view.setMaximumHeight(110)
+            log_view.setPlainText("\n".join(
+                f"{at.astimezone():%d.%m.%Y %H:%M} — {action}" + (f": {detail}" if detail else "")
+                for at, action, detail in history
+            ))
+            layout.addWidget(log_view)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Сохранить")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:  # noqa: N802 - Qt override
+        if not self.title_edit.text().strip():
+            QMessageBox.warning(self, "Задача", "Напишите, что нужно сделать.")
+            self.title_edit.setFocus()
+            return
+        super().accept()
+
+    def task(self):
+        day = None
+        if self.day_check.isChecked():
+            qdate = self.day_edit.date()
+            day = date(qdate.year(), qdate.month(), qdate.day())
+        due = None
+        if self.due_check.isChecked():
+            value = self.due_edit.dateTime().toPython()
+            due = value.astimezone() if value.tzinfo is None else value
+        status = self.status_combo.currentData()
+        remind_minutes = self.remind_spin.value() if self.remind_check.isChecked() else -1
+        return task_store.Task(
+            uid=self._task.uid if self._task else "",
+            title=self.title_edit.text(),
+            notes=self.notes_edit.toPlainText(),
+            day=day,
+            due=due,
+            status=status,
+            priority=self.priority_combo.currentData(),
+            percent=self.percent_spin.value(),
+            completed_at=self._task.completed_at if self._task else None,
+            created_at=self._task.created_at if self._task else None,
+            remind_minutes=remind_minutes,
+            remind_mode=calendar_store.REMIND_WINDOW if remind_minutes >= 0 else "none",
+            source=self._task.source if self._task else "",
+            external_id=self._task.external_id if self._task else "",
+            mail=self._mail,
+        )
+
+
 class AddCalendarDialog(QDialog):
     """Новый календарь — локальный или подключённый к внешнему CalDAV-серверу.
 
@@ -7317,6 +7483,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # необязательная миграция — при сбое старая настройка просто останется нетронутой
         self.contacts_path = profile.contacts_db_path()
+        self.tasks_path = profile.tasks_db_path()
+        self.diary_day = date.today()
+        self._diary_note_loaded = ""
+        self._diary_tasks_by_row: list = []
         # Крупные фото адресной книги — уменьшенными копиями, в фоне после запуска.
         QTimer.singleShot(20_000, self._shrink_contact_photos)
         # Модуль «Категории писем» (Параметры → «Модули»).
@@ -7411,6 +7581,12 @@ class MainWindow(QMainWindow):
         self.delete_action.setToolTip("Удалить — в корзину (Del). Безвозвратно — Ctrl+Del или Shift+Удалить.")
         self.delete_action.triggered.connect(lambda: self.on_delete_selected())
 
+        # Письмо в дело: из него заводится задача ежедневника, как флажок
+        # «к исполнению» в Outlook.
+        self.task_from_mail_action = QAction(_toolbar_icon("today"), "В ежедневник…", self)
+        self.task_from_mail_action.setToolTip("Создать задачу из этого письма")
+        self.task_from_mail_action.triggered.connect(self.on_task_from_message)
+
         self.archive_selected_action = QAction(_toolbar_icon("archive"), "В архив…", self)
         self.archive_selected_action.setToolTip("В архив — выгрузить отмеченные письма в архив (копия или перемещение)")
         self.archive_selected_action.triggered.connect(self.on_archive_selected)
@@ -7423,6 +7599,7 @@ class MainWindow(QMainWindow):
         for action in (
             compose_action,
             self.delete_action,
+            self.task_from_mail_action,
             self.archive_selected_action,
         ):
             mail_actions_toolbar.addAction(action)
@@ -7992,10 +8169,92 @@ class MainWindow(QMainWindow):
         self.contacts_view_mode = load_contacts_view_mode()
         self._set_contacts_view_mode(self.contacts_view_mode)
 
+        # ----------------------------------------------------------------
+        # Ежедневник: задачи дня, отметка исполнения и заметка дня
+        # (пожелание: «календарь — это события, но нужен ежедневник:
+        # записная книжка с задачами и фиксацией исполнения»).
+        # ----------------------------------------------------------------
+        diary_page = QWidget(self)
+        diary_layout = QVBoxLayout(diary_page)
+
+        diary_toolbar = QToolBar("Ежедневник", self)
+        diary_toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        new_task_action = QAction(_toolbar_icon("add"), "Новая задача…", self)
+        new_task_action.triggered.connect(self.on_new_task)
+        diary_toolbar.addAction(new_task_action)
+        self.task_done_action = QAction(_toolbar_icon("today"), "Выполнена", self)
+        self.task_done_action.setToolTip("Отметить выполнение — время фиксируется в журнале задачи")
+        self.task_done_action.triggered.connect(self.on_toggle_task_done)
+        diary_toolbar.addAction(self.task_done_action)
+        edit_task_action = QAction(_toolbar_icon("compose"), "Изменить…", self)
+        edit_task_action.triggered.connect(self.on_edit_task)
+        diary_toolbar.addAction(edit_task_action)
+        delete_task_action = QAction(_toolbar_icon("delete"), "Удалить", self)
+        delete_task_action.triggered.connect(self.on_delete_task)
+        diary_toolbar.addAction(delete_task_action)
+        diary_toolbar.addSeparator()
+        carry_action = QAction(_toolbar_icon("forward"), "Перенести незакрытые на завтра", self)
+        carry_action.triggered.connect(self.on_carry_tasks_over)
+        diary_toolbar.addAction(carry_action)
+        diary_layout.addWidget(diary_toolbar)
+
+        nav_row = QHBoxLayout()
+        prev_day_button = QPushButton("←", self)
+        prev_day_button.setFixedWidth(36)
+        prev_day_button.clicked.connect(lambda: self.on_diary_shift_day(-1))
+        today_button = QPushButton("Сегодня", self)
+        today_button.clicked.connect(lambda: self.on_diary_set_day(date.today()))
+        next_day_button = QPushButton("→", self)
+        next_day_button.setFixedWidth(36)
+        next_day_button.clicked.connect(lambda: self.on_diary_shift_day(1))
+        self.diary_date_edit = QDateEdit(self)
+        self.diary_date_edit.setCalendarPopup(True)
+        self.diary_date_edit.setDisplayFormat("dd.MM.yyyy")
+        self.diary_date_edit.dateChanged.connect(self._on_diary_date_changed)
+        self.diary_title_label = QLabel("", self)
+        title_font = self.diary_title_label.font()
+        title_font.setBold(True)
+        self.diary_title_label.setFont(title_font)
+        nav_row.addWidget(prev_day_button)
+        nav_row.addWidget(today_button)
+        nav_row.addWidget(next_day_button)
+        nav_row.addWidget(self.diary_date_edit)
+        nav_row.addSpacing(12)
+        nav_row.addWidget(self.diary_title_label, 1)
+        diary_layout.addLayout(nav_row)
+
+        self.diary_tasks_table = QTableWidget(0, 5, self)
+        self.diary_tasks_table.setHorizontalHeaderLabels(["", "Задача", "Срок", "Важность", "Состояние"])
+        self.diary_tasks_table.verticalHeader().setVisible(False)
+        self.diary_tasks_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.diary_tasks_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.diary_tasks_table.horizontalHeader().setStretchLastSection(False)
+        self.diary_tasks_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.diary_tasks_table.itemDoubleClicked.connect(lambda _item: self.on_edit_task())
+        self.diary_tasks_table.itemChanged.connect(self._on_task_item_changed)
+        diary_layout.addWidget(self.diary_tasks_table, 3)
+
+        day_row = QHBoxLayout()
+        meetings_box = QVBoxLayout()
+        meetings_box.addWidget(QLabel("Встречи этого дня:", self))
+        self.diary_meetings_list = QListWidget(self)
+        self.diary_meetings_list.itemDoubleClicked.connect(self._on_diary_meeting_activated)
+        meetings_box.addWidget(self.diary_meetings_list)
+        notes_box = QVBoxLayout()
+        notes_box.addWidget(QLabel("Заметка дня:", self))
+        self.diary_note_edit = QPlainTextEdit(self)
+        self.diary_note_edit.setPlaceholderText("Свободная запись: что обсудили, о чём помнить")
+        self.diary_note_edit.focusOutEvent = self._diary_note_focus_out(self.diary_note_edit.focusOutEvent)
+        notes_box.addWidget(self.diary_note_edit)
+        day_row.addLayout(meetings_box, 1)
+        day_row.addLayout(notes_box, 1)
+        diary_layout.addLayout(day_row, 2)
+
         self.pages = QStackedWidget(self)
         self.pages.addWidget(self.main_splitter)  # 0: почта
         self.pages.addWidget(calendar_page)  # 1: календарь
         self.pages.addWidget(contacts_page)  # 2: контакты
+        self.pages.addWidget(diary_page)  # 3: ежедневник
         self.setCentralWidget(self.pages)
 
         toolbar = QToolBar("Основная", self)
@@ -8021,10 +8280,15 @@ class MainWindow(QMainWindow):
         self.contacts_mode_action.triggered.connect(self._show_contacts_page)
         mode_group.addAction(self.mail_mode_action)
         mode_group.addAction(self.calendar_mode_action)
+        self.diary_mode_action = QAction("Ежедневник", self)
+        self.diary_mode_action.setCheckable(True)
+        self.diary_mode_action.triggered.connect(self._show_diary_page)
         mode_group.addAction(self.contacts_mode_action)
+        mode_group.addAction(self.diary_mode_action)
         toolbar.addAction(self.mail_mode_action)
         toolbar.addAction(self.calendar_mode_action)
         toolbar.addAction(self.contacts_mode_action)
+        toolbar.addAction(self.diary_mode_action)
 
         toolbar.addSeparator()
 
@@ -8065,7 +8329,9 @@ class MainWindow(QMainWindow):
         # оставленные текстом по явной просьбе пользователя; весь остальной
         # тулбар переведён на иконки.
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-        for mode_action in (self.mail_mode_action, self.calendar_mode_action, self.contacts_mode_action):
+        for mode_action in (
+            self.mail_mode_action, self.calendar_mode_action, self.contacts_mode_action, self.diary_mode_action
+        ):
             button = toolbar.widgetForAction(mode_action)
             if button is not None:
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
@@ -13586,6 +13852,255 @@ class MainWindow(QMainWindow):
         return "pending"
 
 
+    # ------------------------------------------------------------------
+    # Ежедневник
+    # ------------------------------------------------------------------
+
+    def _show_diary_page(self) -> None:
+        self.pages.setCurrentIndex(3)
+        self._update_mail_actions_enabled()
+        self.refresh_diary_view()
+
+    def on_diary_set_day(self, day: date) -> None:
+        self.diary_day = day
+        blocker = QSignalBlocker(self.diary_date_edit)
+        try:
+            self.diary_date_edit.setDate(QDate(day.year, day.month, day.day))
+        finally:
+            del blocker
+        self.refresh_diary_view()
+
+    def on_diary_shift_day(self, delta: int) -> None:
+        self.on_diary_set_day(self.diary_day + timedelta(days=delta))
+
+    def _on_diary_date_changed(self, qdate: QDate) -> None:
+        self._save_day_note()
+        self.diary_day = date(qdate.year(), qdate.month(), qdate.day())
+        self.refresh_diary_view()
+
+    def _diary_note_focus_out(self, original):
+        """Заметка дня сохраняется, когда из поля уходят: отдельной кнопки
+        «сохранить» для записной книжки не нужно."""
+
+        def handler(event) -> None:
+            self._save_day_note()
+            original(event)
+
+        return handler
+
+    def _save_day_note(self) -> None:
+        text = self.diary_note_edit.toPlainText()
+        if text == self._diary_note_loaded:
+            return
+        try:
+            task_store.save_day_note(self.tasks_path, self.diary_day, text)
+            self._diary_note_loaded = text
+        except Exception as exc:
+            _log.warning("Заметка дня не сохранена: %s", exc)
+
+    def refresh_diary_view(self) -> None:
+        day = self.diary_day
+        try:
+            tasks = task_store.list_tasks(self.tasks_path, day=day)
+        except Exception as exc:
+            QMessageBox.critical(self, "Ежедневник", f"Задачи не прочитаны: {exc}")
+            return
+        self._diary_tasks_by_row = tasks
+        table = self.diary_tasks_table
+        blocker = QSignalBlocker(table)
+        try:
+            table.setRowCount(len(tasks))
+            for row, task in enumerate(tasks):
+                check = QTableWidgetItem()
+                check.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                check.setCheckState(Qt.CheckState.Checked if task.done else Qt.CheckState.Unchecked)
+                table.setItem(row, 0, check)
+                title = QTableWidgetItem(task.title)
+                if task.mail is not None:
+                    # Тема письма — чужой текст: в подсказке Qt разобрал бы
+                    # её как разметку (и, например, полез бы за картинкой).
+                    title.setToolTip(
+                        "Из письма: "
+                        + html_module.escape(f"{task.mail.subject} ({task.mail.sender})")
+                    )
+                if task.day is not None and task.day < day and not task.done:
+                    title.setToolTip((title.toolTip() + "\n" if title.toolTip() else "")
+                                     + f"Осталась с {task.day.strftime('%d.%m.%Y')}")
+                table.setItem(row, 1, title)
+                due_text = task.due.astimezone().strftime("%d.%m %H:%M") if task.due else ""
+                due_item = QTableWidgetItem(due_text)
+                if task.overdue:
+                    due_item.setForeground(QColor("#C62828"))
+                table.setItem(row, 2, due_item)
+                table.setItem(row, 3, QTableWidgetItem(task_store.PRIORITY_LABELS.get(task.priority, "")))
+                state = task_store.STATUS_LABELS.get(task.status, task.status)
+                if task.done and task.completed_at is not None:
+                    state += f" {task.completed_at.astimezone():%d.%m %H:%M}"
+                elif task.status == task_store.STATUS_IN_PROGRESS and task.percent:
+                    state += f" {task.percent}%"
+                table.setItem(row, 4, QTableWidgetItem(state))
+            table.resizeColumnsToContents()
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        finally:
+            del blocker
+
+        total, done = len(tasks), sum(1 for task in tasks if task.done)
+        weekday = _DIARY_WEEKDAYS[day.weekday()]
+        self.diary_title_label.setText(
+            f"{weekday}, {day.strftime('%d.%m.%Y')} — задач {total}, выполнено {done}"
+        )
+
+        self.diary_meetings_list.clear()
+        for event in self._events_of_day(day):
+            start = event.dtstart.astimezone()
+            when = "весь день" if event.all_day else f"{start:%H:%M}"
+            item = QListWidgetItem(f"{when}  {event.summary or '(без темы)'}")
+            item.setData(Qt.ItemDataRole.UserRole, event.uid)
+            self.diary_meetings_list.addItem(item)
+
+        try:
+            note = task_store.day_note(self.tasks_path, day)
+        except Exception:
+            note = ""
+        self._diary_note_loaded = note
+        blocker = QSignalBlocker(self.diary_note_edit)
+        try:
+            self.diary_note_edit.setPlainText(note)
+        finally:
+            del blocker
+
+    def _events_of_day(self, day: date) -> list:
+        start = datetime(day.year, day.month, day.day).astimezone().astimezone(timezone.utc)
+        end = start + timedelta(days=1)
+        try:
+            events = calendar_store.list_events(self.calendar_path, start=start, end=end)
+        except Exception as exc:
+            _log.warning("Ежедневник: встречи дня не прочитаны: %s", exc)
+            return []
+        events = [e for e in events if e.status != "cancelled"]
+        return sorted(events, key=lambda e: (not e.all_day, e.dtstart))
+
+    def _on_diary_meeting_activated(self, item: QListWidgetItem) -> None:
+        uid = item.data(Qt.ItemDataRole.UserRole)
+        if not uid:
+            return
+        self.calendar_selected_day = self.diary_day
+        self.calendar_week_start = week_start_for(self.diary_day)
+        self.diary_mode_action.setChecked(False)
+        self.calendar_mode_action.setChecked(True)
+        self._show_calendar_page()
+        self.ipc_show_event(uid, datetime(self.diary_day.year, self.diary_day.month, self.diary_day.day).astimezone())
+
+    def _selected_task(self):
+        row = self.diary_tasks_table.currentRow()
+        tasks = getattr(self, "_diary_tasks_by_row", [])
+        return tasks[row] if 0 <= row < len(tasks) else None
+
+    def _on_task_item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() != 0:
+            return
+        tasks = getattr(self, "_diary_tasks_by_row", [])
+        row = item.row()
+        if not (0 <= row < len(tasks)):
+            return
+        task = tasks[row]
+        done = item.checkState() == Qt.CheckState.Checked
+        if done == task.done:
+            return
+        self._set_task_status(task, task_store.STATUS_DONE if done else task_store.STATUS_NEW)
+
+    def _set_task_status(self, task, status: str) -> None:
+        try:
+            saved = task_store.set_status(self.tasks_path, task.uid, status)
+        except Exception as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Не удалось изменить задачу: {exc}")
+            return
+        if saved is not None and saved.done and saved.completed_at is not None:
+            self.statusBar().showMessage(
+                f"«{saved.title}» выполнена {saved.completed_at.astimezone():%d.%m.%Y %H:%M}", 8000
+            )
+        self.refresh_diary_view()
+
+    def on_new_task(self, *, mail=None) -> None:
+        dialog = TaskDialog(self, day=self.diary_day, mail=mail)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            task_store.save_task(self.tasks_path, dialog.task())
+        except Exception as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Задача не сохранена: {exc}")
+            return
+        self.refresh_diary_view()
+
+    def on_edit_task(self) -> None:
+        task = self._selected_task()
+        if task is None:
+            return
+        try:
+            history = task_store.task_log(self.tasks_path, task.uid)
+        except Exception:
+            history = []
+        dialog = TaskDialog(self, task=task, day=self.diary_day, history=history)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            task_store.save_task(self.tasks_path, dialog.task())
+        except Exception as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Задача не сохранена: {exc}")
+            return
+        self.refresh_diary_view()
+
+    def on_toggle_task_done(self) -> None:
+        task = self._selected_task()
+        if task is None:
+            return
+        self._set_task_status(task, task_store.STATUS_NEW if task.done else task_store.STATUS_DONE)
+
+    def on_delete_task(self) -> None:
+        task = self._selected_task()
+        if task is None:
+            return
+        answer = QMessageBox.question(self, "Ежедневник", f"Удалить задачу «{task.title}»?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            task_store.delete_task(self.tasks_path, task.uid)
+        except Exception as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Задача не удалена: {exc}")
+            return
+        self.refresh_diary_view()
+
+    def on_carry_tasks_over(self) -> None:
+        target = self.diary_day + timedelta(days=1)
+        try:
+            moved = task_store.carry_over(self.tasks_path, self.diary_day, target)
+        except Exception as exc:
+            QMessageBox.warning(self, "Ежедневник", f"Не удалось перенести: {exc}")
+            return
+        self.statusBar().showMessage(
+            f"Перенесено задач на {target.strftime('%d.%m.%Y')}: {moved}" if moved else "Переносить нечего",
+            8000,
+        )
+        self.refresh_diary_view()
+
+    def on_task_from_message(self) -> None:
+        """«Создать задачу из письма» — как флажок в Outlook: тема письма
+        становится задачей, а само письмо остаётся привязанным."""
+        summary = self.selected_summary
+        if summary is None:
+            QMessageBox.information(self, "Ежедневник", "Выберите письмо, из которого сделать задачу.")
+            return
+        mail = task_store.MailRef(
+            account=self._mailbox_key() or "", folder=self.current_folder or "",
+            uid=int(getattr(summary, "uid", 0) or 0),
+            subject=getattr(summary, "subject", "") or "",
+            sender=getattr(summary, "sender_email", "") or getattr(summary, "sender", "") or "",
+        )
+        self.on_new_task(mail=mail)
+        self.diary_mode_action.setChecked(True)
+        self._show_diary_page()
+
+
     def on_import_contacts(self) -> None:
         menu = QMenu(self)
         vcard_action = menu.addAction("vCard (.vcf)…")
@@ -14731,15 +15246,22 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        # getattr, а не прямые ссылки: раздел может отсутствовать (так у
+        # заглушки окна в тестах канала управления), и одна недостающая
+        # кнопка не должна ронять команду «покажи почту».
         pages = {
-            "mail": (self.mail_mode_action, self._show_mail_page),
-            "calendar": (self.calendar_mode_action, self._show_calendar_page),
-            "contacts": (self.contacts_mode_action, self._show_contacts_page),
+            "mail": ("mail_mode_action", "_show_mail_page"),
+            "calendar": ("calendar_mode_action", "_show_calendar_page"),
+            "contacts": ("contacts_mode_action", "_show_contacts_page"),
+            "diary": ("diary_mode_action", "_show_diary_page"),
         }
         if section in pages:
-            action, show = pages[section]
-            action.setChecked(True)
-            show()
+            action = getattr(self, pages[section][0], None)
+            show = getattr(self, pages[section][1], None)
+            if action is not None:
+                action.setChecked(True)
+            if show is not None:
+                show()
 
     def ipc_show_event(self, uid: str, start: datetime | None = None) -> bool:
         """Календарь на неделе встречи, встреча выделена и открыта — клик

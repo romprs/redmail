@@ -29,6 +29,7 @@ _log = get_logger("profile")
 MAIL_DB = "mail.sqlite3"
 CALENDAR_DB = "calendar.rmcal"
 CONTACTS_DB = "contacts.rmcontacts"
+TASKS_DB = "tasks.rmtasks"
 ARCHIVES_DIR = "archives"
 
 _LEGACY_FILES = {
@@ -78,6 +79,11 @@ def mail_db_path() -> Path:
 
 def calendar_db_path() -> Path:
     return profile_dir() / CALENDAR_DB
+
+
+def tasks_db_path() -> Path:
+    """Ежедневник: задачи и заметки дня (см. task_store)."""
+    return profile_dir() / TASKS_DB
 
 
 def contacts_db_path() -> Path:
